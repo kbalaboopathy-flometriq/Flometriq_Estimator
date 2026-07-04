@@ -1112,10 +1112,11 @@ function Estimator({ user, masterData, onRefresh }) {
     setSavingRef(true);
     try {
       const ref=refNumber.trim();
+      const headerModel = (cart[0]&&cart[0].model) || selectedModel || "";
       const {data:existing}=await sb.from("estimates").select("id").eq("reference_number",ref).limit(1);
       let estimateId;
-      if(existing&&existing.length>0){estimateId=existing[0].id;await sb.from("estimates").update({description:refDesc,updated_at:new Date().toISOString()}).eq("id",estimateId);await sb.from("estimate_lines").delete().eq("reference_number",ref);}
-      else{const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,description:refDesc,created_by:user.username}).select().single();if(err)throw err;estimateId=created.id;}
+      if(existing&&existing.length>0){estimateId=existing[0].id;await sb.from("estimates").update({description:refDesc,model:headerModel,updated_at:new Date().toISOString()}).eq("id",estimateId);await sb.from("estimate_lines").delete().eq("reference_number",ref);}
+      else{const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,description:refDesc,model:headerModel,created_by:user.username}).select().single();if(err)throw err;estimateId=created.id;}
       const rows=cart.map((l,idx)=>({reference_number:ref,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,show_in_moc:l.show_in_moc===true}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
       setSaveMsg("Saved as ref \""+ref+"\" with "+rows.length+" line(s).");
@@ -1448,8 +1449,8 @@ function Estimator({ user, masterData, onRefresh }) {
 
 /* ---- SAVED ESTIMATES ---- */
 /* ---- DATASHEET GENERATOR (popup, driven by DATASHEET_TEMPLATES) ---- */
-function DatasheetModal({ openRef, openLines, user, onClose }) {
-  const itemName = (openLines && openLines[0] && openLines[0].item) || "";
+function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose }) {
+  const itemName = (modelItemMap&&model&&modelItemMap.get(model)) || (openLines && openLines[0] && openLines[0].item) || "";
   const template = useMemo(()=>findDatasheetTemplate(itemName), [itemName]);
   const [values,setValues] = useState({});
   const [overrides,setOverrides] = useState({});
@@ -1497,7 +1498,7 @@ function DatasheetModal({ openRef, openLines, user, onClose }) {
   const setField = (k,v)=>setValues(vv=>({...vv,[k]:v}));
 
   const getDisplayValue = (field)=>{
-    if(field.type==="auto_model") return (openLines&&openLines[0]&&openLines[0].model)||"";
+    if(field.type==="auto_model") return model||(openLines&&openLines[0]&&openLines[0].model)||"";
     if(field.type==="bom"){
       if(overrides[field.key]!==undefined) return overrides[field.key];
       return bomFieldDisplay(bomMatches[field.key]);
@@ -1529,7 +1530,7 @@ function DatasheetModal({ openRef, openLines, user, onClose }) {
       section.fields.forEach(field=>{
         let val;
         if(field.type==="bom") val = overrides[field.key]!==undefined ? overrides[field.key] : bomFieldDisplay(bomMatches[field.key]);
-        else if(field.type==="auto_model") val = (openLines&&openLines[0]&&openLines[0].model)||"";
+        else if(field.type==="auto_model") val = model||(openLines&&openLines[0]&&openLines[0].model)||"";
         else val = values[field.key]!==undefined ? values[field.key] : (field.default||"");
         rows.push([field.label, val, "", ""]);
       });
@@ -1594,7 +1595,7 @@ function DatasheetModal({ openRef, openLines, user, onClose }) {
             editableSections[sectionIdx].fields.map(field=>h("div",{key:field.key,style:{marginBottom:12}},
               h("label",{style:{fontSize:11,color:colors.muted,display:"block",marginBottom:3}},field.label),
               field.type==="auto_model"
-                ? h("input",{value:(openLines&&openLines[0]&&openLines[0].model)||"",disabled:true,style:{...inputStyle,background:"#f4f2ea"}})
+                ? h("input",{value:model||(openLines&&openLines[0]&&openLines[0].model)||"",disabled:true,style:{...inputStyle,background:"#f4f2ea"}})
               : field.type==="dropdown"
                 ? h(React.Fragment,null,
                     h("select",{value:values[field.key]!==undefined?values[field.key]:(field.default||""),onChange:e=>setField(field.key,e.target.value),style:inputStyle},
@@ -1697,6 +1698,17 @@ function SavedEstimates({ user }) {
   const [rateBySpecGrade,setRateBySpecGrade]=useState(new Map());
   const [uoms,setUoms]=useState([]);
   const [allSpecs,setAllSpecs]=useState([]);
+  const [modelItemMap,setModelItemMap]=useState(new Map());
+  const [headerModel,setHeaderModel]=useState("");
+  const [fixingModel,setFixingModel]=useState(false);
+
+  useEffect(()=>{
+    fetchAll("model_tbl","item,model").then(rows=>{
+      const m=new Map();
+      rows.forEach(row=>{ if(row.model) m.set(row.model, row.item||""); });
+      setModelItemMap(m);
+    });
+  },[]);
 
   useEffect(()=>{
     fetchAll("material_rates","material_spec,material_grade,rate,uom").then(rows=>{
@@ -1722,12 +1734,23 @@ function SavedEstimates({ user }) {
     setOpenRef(ref); setLoadingLines(true); setOrderQty(ref.order_qty||1);
     const{data}=await sb.from("estimate_lines").select("*").eq("reference_number",ref.reference_number).order("sl_no");
     setOpenLines(data||[]); setLoadingLines(false);
-    // Pre-fill model from estimate lines
-    if(data&&data.length>0) {
-      const m = data[0].model||"";
-      setAddModel(m);
-      if(m) fetchAll("bom","*").then(rows=>setBomForModel(rows.filter(r=>r.model===m)));
-    }
+    // Header Model: the estimates row is the authoritative "main form" value.
+    // Older estimates saved before this field existed fall back to the first line's model.
+    const m = ref.model || (data&&data[0]&&data[0].model) || "";
+    setHeaderModel(m);
+    setAddModel(m);
+    if(m) fetchAll("bom","*").then(rows=>setBomForModel(rows.filter(r=>r.model===m)));
+  };
+
+  const fixHeaderModel = async()=>{
+    if(!headerModel||!openRef) return;
+    setFixingModel(true);
+    try {
+      await sb.from("estimates").update({model:headerModel}).eq("id",openRef.id);
+      setOpenRef(r=>({...r,model:headerModel}));
+      setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,model:headerModel}:r));
+    } catch(e){ console.error("Fix model failed",e); }
+    finally{ setFixingModel(false); }
   };
 
   const openAddLine = ()=>{ setAddSubAssembly(""); setAddComponent(""); setAddSpec(""); setAddGrade(""); setAddQty(""); setAddUom(""); setAddSf(3.1); setAddMsg(""); setShowAddLine(true); };
@@ -1933,7 +1956,11 @@ function SavedEstimates({ user }) {
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
               h("div",null,
                 h("h3",{style:{margin:0}},openRef.reference_number),
-                openRef.description&&h("div",{style:{fontSize:12,color:colors.muted}},openRef.description)
+                openRef.description&&h("div",{style:{fontSize:12,color:colors.muted}},openRef.description),
+                h("div",{style:{display:"flex",alignItems:"center",gap:8,marginTop:4}},
+                  h("span",{style:{fontSize:12,color:colors.muted}},"Model: "+(headerModel||"—")+(headerModel&&modelItemMap.get(headerModel)?"  ("+modelItemMap.get(headerModel)+")":"")),
+                  !openRef.model && headerModel && h("button",{onClick:fixHeaderModel,disabled:fixingModel,style:{...btnSmall,color:"#b8472f",borderColor:"#e3b9b9"}},fixingModel?"Fixing…":"Fix — save Model to this estimate")
+                )
               ),
               h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
                 // Order Qty field
@@ -2185,7 +2212,7 @@ function SavedEstimates({ user }) {
         )
       )
     ),
-    showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, user, onClose:()=>setShowDatasheet(false) })
+    showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>setShowDatasheet(false) })
   );
 }
 
