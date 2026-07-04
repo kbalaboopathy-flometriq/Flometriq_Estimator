@@ -42,16 +42,16 @@ const COMPANY_LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAABlCAYA
 
 
 const MASTER_TABLES = [
-  { key: "model_tbl", label: "Models", columns: ["item","model","size"] },
-  { key: "item_tbl", label: "Items", columns: ["item","hsn_code"] },
-  { key: "size_tbl", label: "Sizes", columns: ["size"] },
-  { key: "component_item_tbl", label: "Components by item", columns: ["component","item"] },
-  { key: "subassembly_tbl", label: "Sub-assemblies", columns: ["item","component","sub_assembly"] },
-  { key: "materials_shape", label: "Material shapes", columns: ["shape"] },
-  { key: "material_spec", label: "Material specs", columns: ["material_spec","material_shape"] },
-  { key: "uom_tbl", label: "UOM", columns: ["uom"] },
-  { key: "material_rates", label: "Material rates", columns: ["material_spec","material_grade","material_shape","rate","uom","spec_grade"] },
-  { key: "bom", label: "BOM", columns: ["item","size","model","sub_assembly","component","material_shape","cutting_plan_layout_size","cutting_plan_qty","cutting_plan_uom","material_spec","qty_required","uom","spec_grade","rate","cost","sf","sales_price"] },
+  { key: "model_tbl", label: "Models", columns: ["item","model","size"], addLabel:"New model", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"size",from:"size_tbl",field:"size"}], freeText:["model"] },
+  { key: "item_tbl", label: "Items", columns: ["item","hsn_code"], addLabel:"New item", freeText:["item","hsn_code"] },
+  { key: "size_tbl", label: "Sizes", columns: ["size"], addLabel:"New size", freeText:["size"] },
+  { key: "component_item_tbl", label: "Components by item", columns: ["component","item"], addLabel:"New component", cascade:[{col:"item",from:"item_tbl",field:"item"}], freeText:["component"] },
+  { key: "subassembly_tbl", label: "Sub-assemblies", columns: ["item","component","sub_assembly"], addLabel:"New sub-assembly", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"component",from:"component_item_tbl",field:"component",filterBy:"item"}], freeText:["sub_assembly"] },
+  { key: "materials_shape", label: "Material shapes", columns: ["shape"], addLabel:"New shape", freeText:["shape"] },
+  { key: "material_spec", label: "Material specs", columns: ["material_spec","material_shape"], addLabel:"New material spec", cascade:[{col:"material_shape",from:"materials_shape",field:"shape"}], freeText:["material_spec"] },
+  { key: "uom_tbl", label: "UOM", columns: ["uom"], addLabel:"New UOM", freeText:["uom"] },
+  { key: "material_rates", label: "Material rates", columns: ["material_spec","material_grade","material_shape","rate","uom","spec_grade"], addLabel:"New rate", cascade:[{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"uom",from:"uom_tbl",field:"uom"}], freeText:["material_grade","rate","spec_grade"] },
+  { key: "bom", label: "BOM", columns: ["item","size","model","sub_assembly","component","material_shape","cutting_plan_layout_size","cutting_plan_qty","cutting_plan_uom","material_spec","qty_required","uom","spec_grade","rate","cost","sf","sales_price"], addLabel:"New BOM line", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"size",from:"size_tbl",field:"size"},{col:"model",from:"model_tbl",field:"model"},{col:"component",from:"component_item_tbl",field:"component"},{col:"sub_assembly",from:"subassembly_tbl",field:"sub_assembly"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"uom",from:"uom_tbl",field:"uom"}], freeText:["cutting_plan_layout_size","cutting_plan_qty","cutting_plan_uom","spec_grade","qty_required","rate","cost","sf","sales_price"] },
 ];
 const NUMERIC_COLS = new Set(["rate","cost","sf","sales_price","qty_required","cutting_plan_qty"]);
 
@@ -478,6 +478,7 @@ function MasterEditor({ tableKey, user }) {
   const [editingId,setEditingId]=useState(null); const [editDraft,setEditDraft]=useState({});
   const [adding,setAdding]=useState(false); const [addDraft,setAddDraft]=useState({});
   const [page,setPage]=useState(0); const pageSize=50;
+  const [cascadeOptions,setCascadeOptions]=useState({}); // col -> options[]
 
   // Duplicate model (BOM only)
   const [allModels,setAllModels]=useState([]); const [showDup,setShowDup]=useState(false);
@@ -485,6 +486,20 @@ function MasterEditor({ tableKey, user }) {
   const [dupBusy,setDupBusy]=useState(false); const [dupMsg,setDupMsg]=useState("");
 
   useEffect(()=>{ if(tableKey==="bom") fetchAll("bom","model").then(d=>setAllModels(Array.from(new Set(d.map(r=>r.model).filter(Boolean))).sort())); },[tableKey]);
+
+  // Load cascade options for all cascade fields
+  useEffect(()=>{
+    if(!tableDef.cascade) return;
+    const load=async()=>{
+      const opts={};
+      for(const c of tableDef.cascade){
+        const{data}=await sb.from(c.from).select(c.field).order(c.field);
+        opts[c.col]=Array.from(new Set((data||[]).map(r=>r[c.field]).filter(Boolean))).sort();
+      }
+      setCascadeOptions(opts);
+    };
+    load();
+  },[tableKey]);
 
   const load = useCallback(async()=>{
     setLoading(true); setError("");
@@ -507,7 +522,6 @@ function MasterEditor({ tableKey, user }) {
 
   const deleteRow = async(id)=>{
     if(!confirm("Delete this row?")) return;
-    // Get row data before deleting for audit
     const { data:rowData } = await sb.from(tableKey).select("*").eq("id",id).single();
     const { error:err } = await sb.from(tableKey).delete().eq("id",id);
     if(err) { alert("Delete failed: "+err.message); return; }
@@ -530,7 +544,7 @@ function MasterEditor({ tableKey, user }) {
     if(allModels.includes(dupTarget.trim())) { setDupMsg("That model already exists."); return; }
     setDupBusy(true);
     try {
-      const all = await fetchAll("bom","*"); // filtered below
+      const all = await fetchAll("bom","*");
       const src = all.filter(r=>r.model===dupSource);
       if(!src.length) { setDupMsg("Source model has no rows."); setDupBusy(false); return; }
       const newRows = src.map(r=>{ const c={...r}; delete c.id; c.model=dupTarget.trim(); return c; });
@@ -541,7 +555,32 @@ function MasterEditor({ tableKey, user }) {
     } catch(e) { setDupMsg("Failed: "+e.message); } finally { setDupBusy(false); }
   };
 
+  // Get filtered cascade options based on parent selections
+  const getCascadeOpts=(c)=>{
+    if(!c.filterBy) return cascadeOptions[c.col]||[];
+    const parentVal=addDraft[c.filterBy];
+    if(!parentVal) return cascadeOptions[c.col]||[];
+    // Filter by fetching dynamically
+    return cascadeOptions[c.col]||[];
+  };
+
+  // Render add field — cascade select or free text
+  const renderAddField=(col)=>{
+    const cascadeDef=tableDef.cascade?.find(c=>c.col===col);
+    const isFree=!cascadeDef||(tableDef.freeText||[]).includes(col);
+    const isNumeric=NUMERIC_COLS.has(col);
+    if(cascadeDef&&!isFree){
+      const opts=getCascadeOpts(cascadeDef);
+      return h("select",{value:addDraft[col]||"",onChange:e=>setAddDraft(d=>({...d,[col]:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+        h("option",{value:""},"Select "+col.replace(/_/g," ")+"…"),
+        opts.map(o=>h("option",{key:o,value:o},o))
+      );
+    }
+    return h("input",{type:isNumeric?"number":"text",value:addDraft[col]??"",onChange:e=>setAddDraft(d=>({...d,[col]:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12},placeholder:col.replace(/_/g," ")+"…"});
+  };
+
   const filteredRows = useMemo(()=>{ if(!search) return rows; const s=search.toLowerCase(); return rows.filter(r=>tableDef.columns.some(c=>String(r[c]??"").toLowerCase().includes(s))); },[rows,search,tableDef]);
+  const addLabel = tableDef.addLabel||"New row";
 
   return h("div",{style:{padding:"20px 24px"}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
@@ -549,7 +588,24 @@ function MasterEditor({ tableKey, user }) {
       h("div",{style:{display:"flex",gap:8}},
         h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search…",style:{...inputStyle,width:200}}),
         tableKey==="bom"&&h("button",{onClick:()=>{setShowDup(v=>!v);setDupMsg("");},style:btnSecondary},"Duplicate model"),
-        h("button",{onClick:()=>{setAdding(true);setAddDraft({});},style:btnPrimary},"+ Add row")
+        h("button",{onClick:()=>{setAdding(v=>!v);setAddDraft({});},style:btnPrimary},"+ "+addLabel)
+      )
+    ),
+    // Cascading add form
+    adding&&h("div",{style:{padding:"14px 16px",background:"#fff8e1",border:"1px solid #f0c060",borderRadius:8,marginBottom:14}},
+      h("div",{style:{fontWeight:600,fontSize:12,color:"#7a5000",marginBottom:10}},addLabel),
+      h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}},
+        tableDef.columns.map(col=>h("div",{key:col,style:{display:"flex",flexDirection:"column",gap:3,minWidth:120,flex:1}},
+          h("label",{style:{fontSize:10,color:colors.muted,fontWeight:500}},
+            colLabel(col),
+            tableDef.cascade?.find(c=>c.col===col)&&!(tableDef.freeText||[]).includes(col)&&h("span",{style:{color:"#1c8c75",marginLeft:4,fontSize:9}},"▼ list")
+          ),
+          renderAddField(col)
+        )),
+        h("div",{style:{display:"flex",gap:6,paddingBottom:1}},
+          h("button",{onClick:saveAdd,style:{...btnPrimary,padding:"8px 16px",fontSize:12}},"Save"),
+          h("button",{onClick:()=>{setAdding(false);setAddDraft({});},style:{...btnSecondary,padding:"8px 12px",fontSize:12}},"Cancel")
+        )
       )
     ),
     tableKey==="bom"&&showDup&&h("div",{style:{padding:14,background:"#fbf6e8",borderRadius:8,marginBottom:16,display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap"}},
@@ -805,7 +861,7 @@ function Estimator({ user, masterData, onRefresh }) {
       else{rate=0;}
       const cost=qty*rate; const sf=ov.sf!==undefined?Number(ov.sf)||0:(l.sf||3.1);
       const salesPrice=sf*cost; const isZeroPrice=!cost||cost===0;
-      const showInMoc=overrides[l.id]?.show_in_moc!==undefined?overrides[l.id].show_in_moc:(l.show_in_moc!==false);
+      const showInMoc=overrides[l.id]?.show_in_moc!==undefined?overrides[l.id].show_in_moc:(l.show_in_moc===true);
       return {...l,material_spec:spec,hasSpec,gradeOptions,selGrade,qty,uom,rate,cost,sf,salesPrice,isZeroPrice,showInMoc};
     });
   },[lines,overrides,gradesBySpec,rateBySpecGrade]);
@@ -947,7 +1003,7 @@ function Estimator({ user, masterData, onRefresh }) {
       let estimateId;
       if(existing&&existing.length>0){estimateId=existing[0].id;await sb.from("estimates").update({description:refDesc,updated_at:new Date().toISOString()}).eq("id",estimateId);await sb.from("estimate_lines").delete().eq("reference_number",ref);}
       else{const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,description:refDesc,created_by:user.username}).select().single();if(err)throw err;estimateId=created.id;}
-      const rows=cart.map((l,idx)=>({reference_number:ref,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,show_in_moc:l.show_in_moc!==false}));
+      const rows=cart.map((l,idx)=>({reference_number:ref,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,show_in_moc:l.show_in_moc===true}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
       setSaveMsg("Saved as ref \""+ref+"\" with "+rows.length+" line(s).");
       setCart([]); setRefNumber(""); setRefDesc(""); setShowSave(false);
@@ -1091,7 +1147,17 @@ function Estimator({ user, masterData, onRefresh }) {
             )
           )
         ),
-        pendingCount>0&&!showSummary&&h("div",{style:{fontSize:12,color:colors.danger,margin:"10px 0"}},pendingCount+" item(s) need a grade."),
+        // MOC toggle header bar
+        !showSummary&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,padding:"8px 12px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:6,flexWrap:"wrap"}},
+          h("span",{style:{fontSize:11,color:colors.muted,fontWeight:600}},"Show in MOC:"),
+          h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden"}},
+            h("button",{onClick:()=>{ const o={...overrides}; computedLines.forEach(l=>{o[l.id]={...o[l.id],show_in_moc:true};}); setOverrides(o); },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,fontFamily:"inherit"}},"Select all"),
+            h("button",{onClick:()=>{ const o={...overrides}; computedLines.forEach(l=>{o[l.id]={...o[l.id],show_in_moc:false};}); setOverrides(o); },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Deselect all")
+          ),
+          h("button",{onClick:()=>{ const o={...overrides}; computedLines.forEach(l=>{o[l.id]={...o[l.id],show_in_moc:false};}); setOverrides(o); },style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"Reset to No"),
+          h("span",{style:{fontSize:10,color:colors.mutedLight}},computedLines.filter(l=>l.showInMoc).length+" of "+computedLines.length+" ticked")
+        ),
+        pendingCount>0&&!showSummary&&h("div",{style:{fontSize:12,color:colors.danger,margin:"6px 0"}},pendingCount+" item(s) need a grade."),
 
         // DETAIL VIEW
         !showSummary&&h("div",{style:{overflowX:"auto",overflowY:"hidden",marginTop:10,border:"1px solid "+colors.border,borderRadius:6}},
@@ -1299,12 +1365,12 @@ function SavedEstimates({ user }) {
     if(!edits||Object.keys(edits).length===0) return;
     setSavingLine(s=>({...s,[key]:true}));
     try {
-      // Compute new cost/sales from edited fields
+      // Always recompute cost and sales from current values (edited or stored)
       const qty=Number(edits.qty_required!==undefined?edits.qty_required:line.qty_required)||0;
       const rate=Number(edits.rate!==undefined?edits.rate:line.rate)||0;
       const sf=Number(edits.sf!==undefined?edits.sf:line.sf)||3.1;
-      const cost=qty*rate;
-      const sales_price=cost*sf;
+      const cost=Number((qty*rate).toFixed(4));
+      const sales_price=Number((cost*sf).toFixed(4));
       const payload={...edits,cost,sales_price};
       await sb.from("estimate_lines").update(payload).eq("reference_number",line.reference_number).eq("sl_no",line.sl_no);
       setOpenLines(ls=>ls.map(l=>l.reference_number===line.reference_number&&l.sl_no===line.sl_no?{...l,...payload}:l));
@@ -1589,6 +1655,24 @@ function SavedEstimates({ user }) {
                 h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line")
               )
             ),
+            !showSummarySaved&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,padding:"8px 12px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:6,flexWrap:"wrap"}},
+              h("span",{style:{fontSize:11,color:colors.muted,fontWeight:600}},"Show in MOC:"),
+              h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden"}},
+                h("button",{onClick:async()=>{
+                  await sb.from("estimate_lines").update({show_in_moc:true}).eq("reference_number",openRef.reference_number);
+                  setOpenLines(ls=>ls.map(l=>({...l,show_in_moc:true})));
+                },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,fontFamily:"inherit"}},"Select all"),
+                h("button",{onClick:async()=>{
+                  await sb.from("estimate_lines").update({show_in_moc:false}).eq("reference_number",openRef.reference_number);
+                  setOpenLines(ls=>ls.map(l=>({...l,show_in_moc:false})));
+                },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Deselect all")
+              ),
+              h("button",{onClick:async()=>{
+                await sb.from("estimate_lines").update({show_in_moc:false}).eq("reference_number",openRef.reference_number);
+                setOpenLines(ls=>ls.map(l=>({...l,show_in_moc:false})));
+              },style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"Reset to No"),
+              h("span",{style:{fontSize:10,color:colors.mutedLight}},openLines.filter(l=>l.show_in_moc===true).length+" of "+openLines.length+" ticked")
+            ),
             !showSummarySaved&&h("div",{style:{overflowX:"auto",border:"1px solid "+colors.border,borderRadius:6}},
               h("table",{style:{fontSize:12,minWidth:1200}},
                 h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left",borderBottom:"2px solid "+colors.dark}},
@@ -1608,7 +1692,7 @@ function SavedEstimates({ user }) {
                   const isZero=!cost||cost===0;
                   const qtyReqd=Number(getLineVal(l,"qty_required"))||0;
                   const qtyByOrder=qtyReqd*(orderQty||1);
-                  const showMoc=lineEdits[key]?.show_in_moc!==undefined?lineEdits[key].show_in_moc:(l.show_in_moc!==false);
+                  const showMoc=lineEdits[key]?.show_in_moc!==undefined?lineEdits[key].show_in_moc:(l.show_in_moc===true);
                   const rowBg=isZero?"#fdecea":"transparent";
                   const bdr=(changed)=>"0.5px solid "+(changed?"#1c8c75":colors.border);
                   const inBase={padding:"5px 7px",fontSize:12,borderRadius:5,fontFamily:"inherit",width:"100%",boxSizing:"border-box"};
