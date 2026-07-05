@@ -1731,6 +1731,37 @@ function DatasheetMasterEditor({ onGoToTab }){
     loadFields(selectedItem);
   };
 
+  const [deletingMaster,setDeletingMaster] = useState(false);
+  const deleteEntireMaster = async()=>{
+    if(!selectedItem) return;
+    if(!confirm("Delete the ENTIRE datasheet master for \""+selectedItem+"\" ("+fields.length+" fields)? This can't be undone — you'll need to drop in a fresh Excel file or rebuild it by hand afterward. Datasheets already saved on existing estimates for this item are not affected.")) return;
+    setDeletingMaster(true);
+    try {
+      await sb.from("datasheet_master_fields").delete().eq("item",selectedItem);
+      await logAudit("DELETE_ALL","datasheet_master_fields",selectedItem,"Deleted entire datasheet master for \""+selectedItem+"\" ("+fields.length+" fields)","admin",{item:selectedItem,count:fields.length},null);
+      loadFields(selectedItem); loadItems();
+    } catch(e){ alert("Delete failed: "+(e.message||"unknown")); }
+    finally{ setDeletingMaster(false); }
+  };
+
+  const [editingId,setEditingId] = useState(null);
+  const [editDraft,setEditDraft] = useState(null);
+  const startEdit = (row)=>{ setEditingId(row.id); setEditDraft({ field_label:row.field_label, field_type:row.field_type, options:row.options||"", bom_match:row.bom_match||"", default_value:row.default_value||"" }); };
+  const cancelEdit = ()=>{ setEditingId(null); setEditDraft(null); };
+  const saveEdit = async(row)=>{
+    const patch = {
+      field_label: editDraft.field_label.trim()||row.field_label,
+      field_type: editDraft.field_type,
+      options: editDraft.field_type==="dropdown" ? editDraft.options.split("|").map(s=>s.trim()).filter(Boolean).join("|") : null,
+      bom_match: editDraft.field_type==="bom" ? (editDraft.bom_match.trim()||row.field_label.toLowerCase()) : null,
+      default_value: editDraft.default_value.trim()||null,
+    };
+    await sb.from("datasheet_master_fields").update(patch).eq("id",row.id);
+    await logAudit("EDIT","datasheet_master_fields",row.id,row.item+" — "+row.field_label,"admin",row,{...row,...patch});
+    setEditingId(null); setEditDraft(null);
+    loadFields(selectedItem);
+  };
+
   const addField = async()=>{
     if(!selectedItem||!addLabel.trim()) return;
     const row = {
@@ -1880,18 +1911,44 @@ function DatasheetMasterEditor({ onGoToTab }){
     ),
 
     selectedItem && h(React.Fragment,null,
-      loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
+      loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):h(React.Fragment,null,
+      fields.length>0 && h("div",{style:{display:"flex",justifyContent:"flex-end",marginBottom:8}},
+        h("button",{onClick:deleteEntireMaster,disabled:deletingMaster,style:{...btnDanger,fontSize:11.5}},deletingMaster?"Deleting…":"Delete entire master for \""+selectedItem+"\" ("+fields.length+" fields)")
+      ),
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,marginBottom:16}},
         grouped.length===0 && h("div",{style:{padding:16,fontSize:12.5,color:colors.mutedLight}},"No fields yet for \""+selectedItem+"\". Drop an Excel file above, or add fields by hand below."),
         grouped.map(sec=>h("div",{key:sec.no},
           h("div",{style:{background:sec.isBom?"#1c8c75":colors.dark,color:"#fff",padding:"6px 14px",fontSize:11.5,fontWeight:700}},sec.no+". "+sec.title+(sec.isBom?"  (auto-matched from BOM)":"")),
-          sec.rows.map(r=>h("div",{key:r.id,style:{display:"flex",alignItems:"center",gap:10,padding:"5px 14px",fontSize:12,borderTop:"1px solid #f0efe8"}},
-            h("div",{style:{width:200}},r.field_label),
-            h("div",{style:{width:80,color:colors.mutedLight}},r.field_type),
-            h("div",{style:{flex:1,color:colors.mutedLight,fontSize:11}}, r.field_type==="dropdown"?(r.options||""):r.field_type==="bom"?("match: "+(r.bom_match||"")):(r.default_value||"")),
-            h("button",{onClick:()=>deleteField(r),style:{...btnDanger,padding:"3px 8px",fontSize:10}},"Delete")
-          ))
+          sec.rows.map(r=>r.id===editingId
+            ? h("div",{key:r.id,style:{padding:"8px 14px",borderTop:"1px solid #f0efe8",background:"#fffdf6"}},
+                h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:6}},
+                  h("input",{value:editDraft.field_label,onChange:e=>setEditDraft(d=>({...d,field_label:e.target.value})),style:{...inputStyle,width:180,fontSize:12}}),
+                  h("select",{value:editDraft.field_type,onChange:e=>setEditDraft(d=>({...d,field_type:e.target.value})),style:{...inputStyle,width:110,fontSize:12}},["text","dropdown","bom","auto_model"].map(t=>h("option",{key:t,value:t},t))),
+                  editDraft.field_type==="dropdown" && h("input",{placeholder:"Options separated by |",value:editDraft.options,onChange:e=>setEditDraft(d=>({...d,options:e.target.value})),style:{...inputStyle,flex:1,minWidth:260,fontSize:12}}),
+                  editDraft.field_type==="bom" && h("input",{placeholder:"BOM match keyword",value:editDraft.bom_match,onChange:e=>setEditDraft(d=>({...d,bom_match:e.target.value})),style:{...inputStyle,width:200,fontSize:12}}),
+                  editDraft.field_type==="text" && h("input",{placeholder:"Default value",value:editDraft.default_value,onChange:e=>setEditDraft(d=>({...d,default_value:e.target.value})),style:{...inputStyle,width:180,fontSize:12}})
+                ),
+                editDraft.field_type==="dropdown" && h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}},
+                  editDraft.options.split("|").map(s=>s.trim()).filter(Boolean).map((opt,oi)=>h("span",{key:oi,style:{display:"inline-flex",alignItems:"center",gap:5,background:"#eaf9f4",border:"1px solid #8fd0bf",borderRadius:12,padding:"2px 4px 2px 10px",fontSize:11}},
+                    opt,
+                    h("button",{onClick:()=>setEditDraft(d=>({...d,options:d.options.split("|").map(s=>s.trim()).filter(Boolean).filter((_,idx)=>idx!==oi).join("|")})),style:{background:"none",border:"none",cursor:"pointer",color:"#7a1f1f",fontSize:12,padding:"0 4px"}},"✕")
+                  ))
+                ),
+                h("div",{style:{display:"flex",gap:8}},
+                  h("button",{onClick:()=>saveEdit(r),style:{...btnPrimary,padding:"4px 10px",fontSize:11}},"Save"),
+                  h("button",{onClick:cancelEdit,style:{...btnSecondary,padding:"4px 10px",fontSize:11}},"Cancel")
+                )
+              )
+            : h("div",{key:r.id,style:{display:"flex",alignItems:"center",gap:10,padding:"5px 14px",fontSize:12,borderTop:"1px solid #f0efe8"}},
+                h("div",{style:{width:200}},r.field_label),
+                h("div",{style:{width:80,color:colors.mutedLight}},r.field_type),
+                h("div",{style:{flex:1,color:colors.mutedLight,fontSize:11}}, r.field_type==="dropdown"?(r.options||""):r.field_type==="bom"?("match: "+(r.bom_match||"")):(r.default_value||"")),
+                h("button",{onClick:()=>startEdit(r),style:{...btnSecondary,padding:"3px 8px",fontSize:10}},"Edit"),
+                h("button",{onClick:()=>deleteField(r),style:{...btnDanger,padding:"3px 8px",fontSize:10}},"Delete")
+              )
+          )
         ))
+      ),
       ),
 
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:14}},
