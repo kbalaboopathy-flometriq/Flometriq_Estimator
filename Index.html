@@ -272,11 +272,11 @@ function MenuTabs({ user, active, onChange }) {
     tabs.push({key:"audit_log",label:"Audit Log"});
   }
   tabs.push({key:"change_password",label:"Change Password"});
-  return h("div",{className:"menu-tabs",style:{display:"flex",gap:4,padding:"10px 20px",background:"#fff",borderBottom:"1px solid "+colors.border}},
+  return h("div",{className:"menu-tabs",style:{display:"flex",flexWrap:"wrap",gap:3,padding:"8px 20px",background:"#fff",borderBottom:"1px solid "+colors.border}},
     tabs.map(t=>h("button",{key:t.key,onClick:()=>onChange(t.key),style:{
-      padding:"7px 14px",fontSize:12.5,border:"none",cursor:"pointer",borderRadius:6,
-      background:active===t.key?colors.dark:"transparent",
-      color:active===t.key?"#fff":colors.text,fontWeight:active===t.key?600:400,flexShrink:0
+      padding:"5px 10px",fontSize:11.5,border:"none",cursor:"pointer",borderRadius:5,
+      background:active===t.key?"#b7ebc6":"transparent",
+      color:active===t.key?"#0f5132":colors.text,fontWeight:active===t.key?700:400,flexShrink:0
     }},t.label))
   );
 }
@@ -1515,8 +1515,8 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
                 ? h("input",{value:val,placeholder:hasMatch?"":"not on BOM — enter manually",
                     onChange:e=>setOverrides(o=>({...o,[field.key]:e.target.value})),
                     style:{flex:1,padding:"5px 8px",borderRadius:4,fontSize:12.5,
-                      border:"1px solid "+(isOverridden?"#e0a72e":hasMatch?"#8fd0bf":"#e3b9b9"),
-                      background:isOverridden?"#fff6e2":hasMatch?"#eaf9f4":"#fdf1f1"}})
+                      border:"1px solid "+(isOverridden?"#e0a72e":hasMatch?"#8fd0bf":"#e5484d"),
+                      background:isOverridden?"#fff6e2":hasMatch?"#eaf9f4":"#fde8e8"}})
                 : h("div",{style:{flex:1,color:val?colors.text:colors.mutedLight}}, val||"— not filled —")
             );
           })
@@ -1685,10 +1685,10 @@ function buildMasterRowsFromParse(item, sections, helperFields){
    Drag-and-drop an Excel file (sheet 1 = the datasheet layout, sheet 2 = optional
    helper sheet of dropdown option lists) to build or replace an item's datasheet
    master in one go. Fields can also be added or removed by hand below. */
-function DatasheetMasterEditor(){
-  const [items,setItems] = useState([]);
+function DatasheetMasterEditor({ onGoToTab }){
+  const [itemMasterList,setItemMasterList] = useState([]); // [{item, hsn_code}] from item_tbl
+  const [itemsWithMaster,setItemsWithMaster] = useState(new Set());
   const [selectedItem,setSelectedItem] = useState("");
-  const [newItemName,setNewItemName] = useState("");
   const [fields,setFields] = useState([]);
   const [loading,setLoading] = useState(false);
   const [dragOver,setDragOver] = useState(false);
@@ -1697,6 +1697,8 @@ function DatasheetMasterEditor(){
   const [previewRows,setPreviewRows] = useState(null);
   const [parseMsg,setParseMsg] = useState("");
   const [savingPreview,setSavingPreview] = useState(false);
+  const [newItemHsn,setNewItemHsn] = useState("");
+  const [addingItem,setAddingItem] = useState(false);
   const fileInputRef = useRef(null);
 
   const [addSecNo,setAddSecNo]=useState(1); const [addSecTitle,setAddSecTitle]=useState("");
@@ -1705,9 +1707,12 @@ function DatasheetMasterEditor(){
   const [addBomMatch,setAddBomMatch]=useState(""); const [addDefault,setAddDefault]=useState("");
 
   const loadItems = useCallback(async()=>{
-    const { data } = await sb.from("datasheet_master_fields").select("item");
-    const uniq = Array.from(new Set((data||[]).map(r=>r.item))).sort();
-    setItems(uniq);
+    const [{ data: masterItems }, { data: dsRows }] = await Promise.all([
+      sb.from("item_tbl").select("item,hsn_code").order("item"),
+      sb.from("datasheet_master_fields").select("item"),
+    ]);
+    setItemMasterList(masterItems||[]);
+    setItemsWithMaster(new Set((dsRows||[]).map(r=>normalizeItemName(r.item))));
   },[]);
   useEffect(()=>{ loadItems(); },[loadItems]);
 
@@ -1767,9 +1772,27 @@ function DatasheetMasterEditor(){
     finally{ setParsing(false); }
   };
 
+  const matchedMasterItem = useMemo(()=>{
+    const norm = normalizeItemName(previewItem);
+    return itemMasterList.find(i=>normalizeItemName(i.item)===norm) || null;
+  },[previewItem, itemMasterList]);
+
+  const addItemToMaster = async()=>{
+    const name = previewItem.trim();
+    if(!name) return;
+    setAddingItem(true);
+    try {
+      await sb.from("item_tbl").insert({ item:name, hsn_code: newItemHsn.trim()||null });
+      await logAudit("CREATE","item_tbl",name,"Added item \""+name+"\" from Datasheet Master upload","admin",null,{item:name,hsn_code:newItemHsn});
+      setNewItemHsn("");
+      await loadItems();
+    } catch(e){ setParseMsg("Couldn't add item: "+(e.message||"unknown")); }
+    finally{ setAddingItem(false); }
+  };
+
   const savePreview = async()=>{
-    const item = previewItem.trim();
-    if(!item){ setParseMsg("Enter an item name before saving."); return; }
+    if(!matchedMasterItem){ setParseMsg("This item isn't in your Items master yet — add it below before saving."); return; }
+    const item = matchedMasterItem.item; // use the master's exact spelling/casing
     setSavingPreview(true);
     try {
       await sb.from("datasheet_master_fields").delete().eq("item",item);
@@ -1812,14 +1835,21 @@ function DatasheetMasterEditor(){
 
     // Preview before committing
     previewRows && h("div",{style:{border:"1px solid "+colors.accent,borderRadius:8,padding:16,marginBottom:20,background:"#fffdf6"}},
-      h("div",{style:{display:"flex",gap:10,alignItems:"center",marginBottom:12,flexWrap:"wrap"}},
+      h("div",{style:{display:"flex",gap:10,alignItems:"center",marginBottom:8,flexWrap:"wrap"}},
         h("label",{style:{fontSize:12,color:colors.muted}},"Item name:"),
         h("input",{value:previewItem,onChange:e=>setPreviewItem(e.target.value),style:{...inputStyle,width:220}}),
         h("span",{style:{fontSize:11,color:colors.mutedLight}},previewRows.length+" fields parsed — review and fix anything before saving"),
         h("div",{style:{flex:1}}),
         h("button",{onClick:()=>{setPreviewRows(null);setPreviewItem("");},style:btnSecondary},"Discard"),
-        h("button",{onClick:savePreview,disabled:savingPreview,style:btnPrimary},savingPreview?"Saving…":"Save to Master")
+        h("button",{onClick:savePreview,disabled:savingPreview||!matchedMasterItem,style:{...btnPrimary,opacity:matchedMasterItem?1:0.5}},savingPreview?"Saving…":"Save to Master")
       ),
+      matchedMasterItem
+        ? h("div",{style:{fontSize:11.5,color:"#1c8c56",marginBottom:12}},"✓ Matches \""+matchedMasterItem.item+"\" in your Items master.")
+        : h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:12,padding:"8px 10px",background:"#fde8e8",border:"1px solid #e5484d",borderRadius:6,flexWrap:"wrap"}},
+            h("span",{style:{fontSize:11.5,color:"#7a1f1f"}},"\""+(previewItem||"(blank)")+"\" isn't in your Items master yet — add it there first so estimates and this datasheet stay linked to the same item."),
+            h("input",{placeholder:"HSN code (optional)",value:newItemHsn,onChange:e=>setNewItemHsn(e.target.value),style:{...inputStyle,width:140}}),
+            h("button",{onClick:addItemToMaster,disabled:addingItem||!previewItem.trim(),style:btnPrimary},addingItem?"Adding…":"Add \""+previewItem+"\" to Items master")
+          ),
       h("div",{style:{maxHeight:420,overflowY:"auto",border:"1px solid "+colors.border,borderRadius:6}},
         h("table",{style:{fontSize:11.5}},
           h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
@@ -1841,13 +1871,12 @@ function DatasheetMasterEditor(){
 
     h("div",{style:{display:"flex",gap:10,alignItems:"center",marginBottom:14,flexWrap:"wrap"}},
       h("label",{style:{fontSize:12,color:colors.muted}},"Manage item:"),
-      h("select",{value:selectedItem,onChange:e=>setSelectedItem(e.target.value),style:{...inputStyle,width:220}},
+      h("select",{value:selectedItem,onChange:e=>setSelectedItem(e.target.value),style:{...inputStyle,width:240}},
         h("option",{value:""},"— select —"),
-        items.map(it=>h("option",{key:it,value:it},it))
+        itemMasterList.map(it=>h("option",{key:it.item,value:it.item},it.item+(itemsWithMaster.has(normalizeItemName(it.item))?" ✓":" (no datasheet yet)")))
       ),
-      h("span",{style:{fontSize:11,color:colors.mutedLight}},"or"),
-      h("input",{placeholder:"type a new item name…",value:newItemName,onChange:e=>setNewItemName(e.target.value),style:{...inputStyle,width:200}}),
-      h("button",{onClick:()=>{ if(newItemName.trim()){ setSelectedItem(newItemName.trim()); setNewItemName(""); } },style:btnSecondary},"Use this item")
+      h("span",{style:{fontSize:11,color:colors.mutedLight}},"Don't see your item? Add it in the Items master first —"),
+      h("button",{onClick:()=>onGoToTab&&onGoToTab("item_tbl"),style:btnSecondary},"Go to Items master")
     ),
 
     selectedItem && h(React.Fragment,null,
@@ -3220,7 +3249,7 @@ function App() {
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab}):
     tab==="allowable_stress"?h(AllowableStressEditor,null):
-    tab==="datasheet_master"?h(DatasheetMasterEditor,null):
+    tab==="datasheet_master"?h(DatasheetMasterEditor,{onGoToTab:setTab}):
     tab==="users"?h(UsersEditor,{user}):
     tab==="permissions"?h(PermissionsEditor,null):
     tab==="login_history"?h(LoginHistoryViewer,null):
