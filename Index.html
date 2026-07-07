@@ -1407,6 +1407,14 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
     template.sections.forEach(sec=>sec.fields.forEach(f=>{ if(f.type==="bom") out[f.key] = matchDatasheetBomLine(f, mocLines, used); }));
     return out;
   }, [template, mocLines]);
+  // Material Data is always rebuilt straight from the ticked ("Show in MOC") lines —
+  // whatever field list the uploaded Excel defined for this section is ignored.
+  // Sub-assembly is the label, Grade is the value.
+  const materialDataRows = useMemo(()=> (mocLines||[]).map((l,i)=>({
+    key: (l.reference_number||"")+"-"+l.sl_no+"-"+i,
+    label: l.sub_assembly || l.component || "(unnamed)",
+    value: l.grade || "—"
+  })), [mocLines]);
 
   useEffect(()=>{
     let cancelled=false;
@@ -1475,14 +1483,17 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
     rows.push(["Ref Number", openRef.reference_number, "Date", new Date().toLocaleDateString("en-GB")]);
     rows.push([]);
     template.sections.forEach(section=>{
-      rows.push([section.title, section.no, "", ""]);
-      section.fields.forEach(field=>{
-        let val;
-        if(field.type==="bom") val = overrides[field.key]!==undefined ? overrides[field.key] : bomFieldDisplay(bomMatches[field.key]);
-        else if(field.type==="auto_model") val = model||(openLines&&openLines[0]&&openLines[0].model)||"";
-        else val = values[field.key]!==undefined ? values[field.key] : (field.default||"");
-        rows.push([field.label, val, "", ""]);
-      });
+      rows.push([section.bomSection?"Material Data":section.title, section.no, "", ""]);
+      if(section.bomSection){
+        materialDataRows.forEach(row=>rows.push([row.label, row.value, "", ""]));
+      } else {
+        section.fields.forEach(field=>{
+          let val;
+          if(field.type==="auto_model") val = model||(openLines&&openLines[0]&&openLines[0].model)||"";
+          else val = values[field.key]!==undefined ? values[field.key] : (field.default||"");
+          rows.push([field.label, val, "", ""]);
+        });
+      }
       rows.push([]);
     });
     const ws = XLSX.utils.aoa_to_sheet(rows);
@@ -1490,6 +1501,58 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Datasheet");
     XLSX.writeFile(wb, openRef.reference_number+"_"+itemName.replace(/\s+/g,"_")+"_Datasheet.xlsx");
+  };
+
+  const exportPDF = ()=>{
+    const today = new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
+    const W = doc.internal.pageSize.getWidth();
+    const teal = [0,128,117];
+    doc.setFillColor(...teal); doc.rect(0,0,W,28,"F");
+    try { doc.addImage(COMPANY_LOGO,"PNG",10,3,40,20); } catch(e){}
+    doc.setFontSize(11); doc.setTextColor(255,255,255); doc.setFont(undefined,"bold");
+    doc.text(COMPANY_NAME,W-14,10,{align:"right"});
+    doc.setFontSize(7.5); doc.setFont(undefined,"normal"); doc.setTextColor(200,240,235);
+    doc.text(COMPANY_ADDRESS,W-14,16,{align:"right"});
+    doc.setFontSize(8); doc.setTextColor(255,255,255); doc.setFont(undefined,"bold");
+    doc.text("TECHNICAL DATA SHEET",W-14,22,{align:"right"});
+    doc.setTextColor(28,31,26); doc.setFontSize(9); let y=35;
+    const lbl=(l,v)=>{ doc.setFont(undefined,"bold"); doc.text(l+":",12,y); doc.setFont(undefined,"normal"); doc.text(String(v||""),42,y); y+=6; };
+    lbl("Item",itemName); lbl("Ref No",openRef.reference_number);
+    if(openRef.description) lbl("Description",openRef.description);
+    lbl("Date",today);
+    y += 2;
+    template.sections.forEach(section=>{
+      const head = [[{content:(section.bomSection?"Material Data":section.title),colSpan:2,styles:{fillColor:teal,textColor:255,fontStyle:"bold",fontSize:9}}]];
+      let body;
+      if(section.bomSection){
+        body = materialDataRows.length ? materialDataRows.map(row=>[row.label,row.value]) : [["","No lines ticked \"Show in MOC\" yet."]];
+      } else {
+        body = section.fields.map(field=>{
+          let val;
+          if(field.type==="auto_model") val = model||(openLines&&openLines[0]&&openLines[0].model)||"";
+          else val = values[field.key]!==undefined ? values[field.key] : (field.default||"");
+          return [field.label, val||""];
+        });
+      }
+      doc.autoTable({
+        startY:y, head, body, theme:"grid",
+        bodyStyles:{fontSize:8.5,textColor:[28,31,26]},
+        columnStyles:{0:{cellWidth:65,fontStyle:"bold",textColor:[100,100,100]},1:{cellWidth:"auto"}},
+        margin:{left:12,right:12},
+      });
+      y = doc.lastAutoTable.finalY + 6;
+      if(y > doc.internal.pageSize.getHeight()-30){ doc.addPage(); y = 20; }
+    });
+    const pageCount = doc.internal.getNumberOfPages();
+    for(let i=1;i<=pageCount;i++){
+      doc.setPage(i); doc.setFontSize(7); doc.setTextColor(150);
+      doc.text("Page "+i+" of "+pageCount,W-12,doc.internal.pageSize.getHeight()-5,{align:"right"});
+      doc.setTextColor(...teal);
+      doc.text(COMPANY_NAME+" | Datasheet | "+today,12,doc.internal.pageSize.getHeight()-5);
+    }
+    doc.save(openRef.reference_number+"_"+itemName.replace(/\s+/g,"_")+"_Datasheet.pdf");
   };
 
   const filledCount = editableSections.reduce((sum,s)=>sum+s.fields.filter(f=>(values[f.key]!==undefined&&values[f.key]!=="")||f.default).length,0);
@@ -1509,29 +1572,37 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
         h("div",{style:{display:"flex",gap:10,alignItems:"center",marginBottom:14,flexWrap:"wrap"}},
           h("button",{onClick:()=>{setSectionIdx(0);setFillOpen(true);},style:btnPrimary},"Fill remaining details ("+filledCount+"/"+totalCount+")"),
           h("button",{onClick:saveAll,style:{...btnSecondary,color:saved?"#1c8c56":colors.text}}, saving?"Saving…":(saved?"Saved ✓":"Save")),
-          h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel")
+          h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel"),
+          h("button",{onClick:exportPDF,style:btnSecondary},"Export PDF")
         ),
         template.sections.map(section=>h("div",{key:section.no,style:{marginBottom:2,border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden",marginBottom:10}},
           h("div",{style:{background:section.bomSection?"#1c8c75":colors.dark,color:"#fff",padding:"6px 14px",fontSize:12,fontWeight:700,display:"flex",justifyContent:"space-between"}},
-            h("span",null,section.no+". "+section.title),
-            section.bomSection&&h("span",{style:{fontWeight:400,opacity:0.85}},"auto-matched from BOM ("+mocLines.length+" ticked lines)")
+            h("span",null,section.no+". "+(section.bomSection?"Material Data":section.title)),
+            section.bomSection&&h("span",{style:{fontWeight:400,opacity:0.85}},"rebuilt from "+mocLines.length+" ticked lines")
           ),
-          section.fields.map(field=>{
-            const isBom = field.type==="bom";
-            const hasMatch = isBom && bomMatches[field.key];
-            const isOverridden = isBom && overrides[field.key]!==undefined;
-            const val = getDisplayValue(field);
-            return h("div",{key:field.key,style:{display:"flex",alignItems:"center",padding:"6px 14px",fontSize:12.5,borderTop:"1px solid #f0efe8"}},
-              h("div",{style:{width:220,color:colors.muted,flexShrink:0}},field.label),
-              isBom
-                ? h("input",{value:val,placeholder:hasMatch?"":"not on BOM — enter manually",
-                    onChange:e=>setOverrides(o=>({...o,[field.key]:e.target.value})),
-                    style:{flex:1,padding:"5px 8px",borderRadius:4,fontSize:12.5,
-                      border:"1px solid "+(isOverridden?"#e0a72e":hasMatch?"#8fd0bf":"#e5484d"),
-                      background:isOverridden?"#fff6e2":hasMatch?"#eaf9f4":"#fde8e8"}})
-                : h("div",{style:{flex:1,color:val?colors.text:colors.mutedLight}}, val||"— not filled —")
-            );
-          })
+          section.bomSection
+            ? (materialDataRows.length===0
+                ? h("div",{style:{padding:"10px 14px",fontSize:12,color:colors.mutedLight}},"No lines ticked \"Show in MOC\" yet.")
+                : materialDataRows.map(row=>h("div",{key:row.key,style:{display:"flex",alignItems:"center",padding:"6px 14px",fontSize:12.5,borderTop:"1px solid #f0efe8"}},
+                    h("div",{style:{width:220,color:colors.muted,flexShrink:0}},row.label),
+                    h("div",{style:{flex:1,color:colors.text}},row.value)
+                  )))
+            : section.fields.map(field=>{
+                const isBom = field.type==="bom";
+                const hasMatch = isBom && bomMatches[field.key];
+                const isOverridden = isBom && overrides[field.key]!==undefined;
+                const val = getDisplayValue(field);
+                return h("div",{key:field.key,style:{display:"flex",alignItems:"center",padding:"6px 14px",fontSize:12.5,borderTop:"1px solid #f0efe8"}},
+                  h("div",{style:{width:220,color:colors.muted,flexShrink:0}},field.label),
+                  isBom
+                    ? h("input",{value:val,placeholder:hasMatch?"":"not on BOM — enter manually",
+                        onChange:e=>setOverrides(o=>({...o,[field.key]:e.target.value})),
+                        style:{flex:1,padding:"5px 8px",borderRadius:4,fontSize:12.5,
+                          border:"1px solid "+(isOverridden?"#e0a72e":hasMatch?"#8fd0bf":"#e5484d"),
+                          background:isOverridden?"#fff6e2":hasMatch?"#eaf9f4":"#fde8e8"}})
+                    : h("div",{style:{flex:1,color:val?colors.text:colors.mutedLight}}, val||"— not filled —")
+                );
+              })
         ))
       ),
       fillOpen && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:90}},
@@ -1556,6 +1627,10 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
                   )
                 : h("input",{value:values[field.key]!==undefined?values[field.key]:(field.default||""),onChange:e=>setField(field.key,e.target.value),style:inputStyle})
             ))
+          ),
+          h("div",{style:{padding:"8px 16px",borderTop:"1px solid "+colors.border,display:"flex",gap:8,justifyContent:"center"}},
+            h("button",{onClick:exportExcel,style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"Export Excel"),
+            h("button",{onClick:exportPDF,style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"Export PDF")
           ),
           h("div",{style:{padding:"10px 16px",borderTop:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
             h("button",{onClick:()=>setSectionIdx(i=>Math.max(0,i-1)),disabled:sectionIdx===0,style:{...btnSecondary,opacity:sectionIdx===0?0.4:1}},"Back"),
@@ -2322,7 +2397,10 @@ function SavedEstimates({ user }) {
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
         h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Saved estimates"),
         h("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
-          h("select",{value:refFilter,onChange:e=>setRefFilter(e.target.value),style:{...inputStyle,width:200}},
+          h("select",{value:refFilter,onChange:e=>{
+            const val=e.target.value; setRefFilter(val);
+            if(val){ const match=refs.find(r=>r.reference_number===val); if(match) openEstimate(match); }
+          },style:{...inputStyle,width:200}},
             h("option",{value:""},"All reference numbers"),
             refs.map(r=>h("option",{key:r.reference_number,value:r.reference_number},r.reference_number))
           ),
