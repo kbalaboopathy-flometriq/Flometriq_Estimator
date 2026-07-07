@@ -96,6 +96,63 @@ function matchDatasheetBomLine(field, lines, used){
 }
 function bomFieldDisplay(m){ return m ? (m.material_spec||"")+((m.grade&&m.grade!=="-")?" / "+m.grade:"") : ""; }
 
+function sanitizeSheetName(s){
+  return ((s||"Sheet").replace(/[:\\\/\?\*\[\]]/g,"").trim()||"Sheet").slice(0,31);
+}
+
+// Mirrors DatasheetModal's getSectionRows, but as a standalone function so the
+// quote-wide export can rebuild a datasheet's sections without mounting the modal.
+// mocLines must be the ticked ("Show in MOC") lines for that one Sl No only.
+function buildDatasheetSectionRows(template, fieldValues, mocLines, model){
+  const values = fieldValues || {};
+  const materialDataRows = (mocLines||[]).map(l=>({
+    key: "moc-"+(l.reference_number||"")+"-"+l.sl_no,
+    label: l.sub_assembly || l.component || "(unnamed)",
+    value: l.grade || "—"
+  }));
+  return template.sections.map(section=>{
+    const deleted = new Set((values.__deletedKeys && values.__deletedKeys[section.no]) || []);
+    let base;
+    if(section.bomSection){
+      base = materialDataRows.map(r=>({ key:r.key, label:r.label, value:r.value }));
+    } else {
+      base = section.fields.map(f=>{
+        let val;
+        if(f.type==="auto_model") val = model||"";
+        else val = values[f.key]!==undefined ? values[f.key] : (f.default||"");
+        return { key:f.key, label:f.label, value:val };
+      });
+    }
+    base = base.filter(r=>!deleted.has(r.key));
+    const extra = ((values.__extraRows && values.__extraRows[section.no]) || []).map(r=>({key:r.id,label:r.label,value:r.value}));
+    return { title: section.bomSection?"Material Data":section.title, rows:[...base,...extra] };
+  });
+}
+
+// Turns [{slNo, sectionsRows}] instances of the SAME item into a row/column
+// matrix per section: one row per field label (union across instances,
+// first-seen order), one column per Sl No.
+function buildItemMatrix(instances){
+  const sectionOrder=[]; const seenSec=new Set();
+  instances.forEach(inst=>inst.sectionsRows.forEach(sec=>{ if(!seenSec.has(sec.title)){ seenSec.add(sec.title); sectionOrder.push(sec.title); } }));
+  return sectionOrder.map(title=>{
+    const rowLabels=[]; const seenRow=new Set();
+    instances.forEach(inst=>{
+      const sec = inst.sectionsRows.find(s=>s.title===title);
+      if(sec) sec.rows.forEach(r=>{ if(!seenRow.has(r.label)){ seenRow.add(r.label); rowLabels.push(r.label); } });
+    });
+    return {
+      title,
+      columns: instances.map(inst=>{
+        const sec = inst.sectionsRows.find(s=>s.title===title);
+        const map = new Map((sec?sec.rows:[]).map(r=>[r.label,r.value]));
+        return { slNo: inst.slNo, values: rowLabels.map(lbl=> map.has(lbl)? map.get(lbl) : "") };
+      }),
+      rowLabels
+    };
+  });
+}
+
 
 const colors = {
   bg:"#f4f2ea", panel:"#ffffff", border:"#d8d4c5", dark:"#1c1f1a",
@@ -753,7 +810,7 @@ async function loadMasterData(setMasterData) {
 }
 
 /* ---- ESTIMATOR ---- */
-function Estimator({ user, masterData, onRefresh }) {
+function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   const { models, gradesBySpec, rateBySpecGrade, allSpecs, loadingMaster } = masterData;
   const [modelFilter,setModelFilter]=useState(""); const [selectedModel,setSelectedModel]=useState(null);
   const [lines,setLines]=useState([]); const [overrides,setOverrides]=useState({});
@@ -765,6 +822,9 @@ function Estimator({ user, masterData, onRefresh }) {
   const [enquiryNumber,setEnquiryNumber]=useState(""); const [enquiryDate,setEnquiryDate]=useState("");
   const [quoteDate,setQuoteDate]=useState("");
   const [existingQuoteHeader,setExistingQuoteHeader]=useState(null); // header fields + used Sl Nos, once refNumber matches a saved quote
+  const [quoteOptions,setQuoteOptions]=useState([]); // distinct saved quotes for the Quote# combo box
+  const [quoteDecision,setQuoteDecision]=useState(null); // {ref, rows:[{item_sl_no,model,...}]} — shown when an existing Quote# is picked
+  const [slNoPickerValue,setSlNoPickerValue]=useState("");
   const [savingRef,setSavingRef]=useState(false); const [saveMsg,setSaveMsg]=useState("");
 
   // MOC popup
@@ -1045,29 +1105,58 @@ function Estimator({ user, masterData, onRefresh }) {
     if(!selectedModel||computedLines.length===0) return;
     const toAdd=computedLines.map(l=>({model:selectedModel,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec||"",grade:l.selGrade||(l.hasSpec?"":""),qty_required:l.qty,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.salesPrice,show_in_moc:l.showInMoc}));
     setCart(c=>c.concat(toAdd));
-    setTimeout(()=>setShowSave(true), 0);
+    setTimeout(()=>{ setShowSave(true); loadQuoteOptions(); }, 0);
   };
 
   const removeFromCart = (idx)=>setCart(c=>c.filter((_,i)=>i!==idx));
   const cartTotalCost=useMemo(()=>cart.reduce((s,l)=>s+(l.cost||0),0),[cart]);
   const cartTotalSales=useMemo(()=>cart.reduce((s,l)=>s+(l.sales_price||0),0),[cart]);
 
-  const clearEstimate = ()=>{ if(!confirm("Clear the current estimate and all cart items?")) return; setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setExistingQuoteHeader(null);setShowSave(false);setSaveMsg(""); };
+  const clearEstimate = ()=>{ if(!confirm("Clear the current estimate and all cart items?")) return; setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg(""); };
 
-  // When the Quote# already exists, its enquiry number/dates are common to every
-  // Sl No under it — pull them in and lock them, and show which Sl Nos are taken.
+  // Populate the Quote# combo box with every saved quote + its customer, so the
+  // person can either pick an existing one or type a brand new Quote#.
+  const loadQuoteOptions = async()=>{
+    const { data } = await sb.from("estimates").select("reference_number,description").order("reference_number");
+    if(!data) return;
+    const seen = new Set(); const opts=[];
+    data.forEach(r=>{ if(!seen.has(r.reference_number)){ seen.add(r.reference_number); opts.push(r); } });
+    setQuoteOptions(opts);
+  };
+
+  // When the Quote# typed/picked already exists, don't silently auto-fill —
+  // ask whether to view the existing quote or add another line item to it.
   const lookupQuoteHeader = async()=>{
     const ref = refNumber.trim();
     if(!ref){ setExistingQuoteHeader(null); return; }
-    const { data } = await sb.from("estimates").select("item_sl_no,enquiry_number,enquiry_date,quote_date,description").eq("reference_number",ref);
+    const { data } = await sb.from("estimates").select("item_sl_no,model,enquiry_number,enquiry_date,quote_date,description").eq("reference_number",ref).order("item_sl_no");
     if(data && data.length>0){
-      const head = data[0];
-      setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
-      if(!refDesc) setRefDesc(head.description||"");
-      setExistingQuoteHeader({ usedSlNos: data.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
-    } else {
-      setExistingQuoteHeader(null);
+      setQuoteDecision({ ref, rows: data });
+      setSlNoPickerValue(String(data[0].item_sl_no));
     }
+  };
+
+  // "Create another line item" — lock in the shared header fields from the
+  // existing quote and let the person type a new Sl No for this new BOM.
+  const chooseAddLineItem = ()=>{
+    const head = quoteDecision.rows[0];
+    setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
+    if(!refDesc) setRefDesc(head.description||"");
+    setExistingQuoteHeader({ usedSlNos: quoteDecision.rows.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
+    setItemSlNo("");
+    setQuoteDecision(null);
+  };
+
+  // "Display existing quote" — hand off to the Quotes tab. If there's more than
+  // one Sl No under this Quote#, ask which one first.
+  const chooseDisplayExisting = (slNo)=>{
+    onOpenQuote(quoteDecision.ref, Number(slNo));
+    setQuoteDecision(null);
+    setShowSave(false);
+  };
+
+  const cancelQuoteDecision = ()=>{
+    setRefNumber(""); setQuoteDecision(null);
   };
 
   const saveReference = async()=>{
@@ -1373,7 +1462,8 @@ function Estimator({ user, masterData, onRefresh }) {
         h("div",{style:{padding:"14px 16px",borderBottom:"1px solid "+colors.border,display:"flex",gap:12,flexWrap:"wrap",flexShrink:0}},
           h("div",{style:{flex:1,minWidth:140}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Quote#"),
-            h("input",{value:refNumber,onChange:e=>setRefNumber(e.target.value),onBlur:lookupQuoteHeader,placeholder:"e.g. QT-2026-0451",style:inputStyle,autoFocus:true})
+            h("input",{value:refNumber,onChange:e=>setRefNumber(e.target.value),onBlur:lookupQuoteHeader,placeholder:"e.g. QT-2026-0451",list:"quote-options",style:inputStyle,autoFocus:true}),
+            h("datalist",{id:"quote-options"}, quoteOptions.map(o=>h("option",{key:o.reference_number,value:o.reference_number},o.reference_number+(o.description?" — "+o.description:""))))
           ),
           h("div",{style:{width:90}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Sl No"),
@@ -1436,6 +1526,27 @@ function Estimator({ user, masterData, onRefresh }) {
               h("button",{onClick:saveReference,disabled:savingRef,style:btnPrimary},savingRef?"Saving…":"Confirm save")
             )
           )
+        )
+      )
+    ),
+    quoteDecision && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.6)",zIndex:1100,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:420,maxWidth:"92vw",padding:"18px 20px"}},
+        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:6}},"Quote# "+quoteDecision.ref+" already exists"),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14}},
+          (quoteDecision.rows[0].description?quoteDecision.rows[0].description+" · ":"")+
+          "Enquiry "+(quoteDecision.rows[0].enquiry_number||"—")+" · "+quoteDecision.rows.length+" Sl No(s) saved"
+        ),
+        quoteDecision.rows.length>1 && h("div",{style:{marginBottom:12,padding:"10px 12px",background:"#faf9f4",borderRadius:6,border:"1px solid "+colors.border}},
+          h("div",{style:{fontSize:11.5,fontWeight:600,marginBottom:6}},"Which Sl No do you want to view?"),
+          h("select",{value:slNoPickerValue,onChange:e=>setSlNoPickerValue(e.target.value),style:{...inputStyle,marginBottom:8}},
+            quoteDecision.rows.map(r=>h("option",{key:r.item_sl_no,value:r.item_sl_no},"Sl "+r.item_sl_no+" — "+(r.model||"(no model)")))
+          ),
+          h("button",{onClick:()=>chooseDisplayExisting(slNoPickerValue),style:{...btnPrimary,width:"100%"}},"Open Sl No "+slNoPickerValue)
+        ),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+          quoteDecision.rows.length===1 && h("button",{onClick:()=>chooseDisplayExisting(quoteDecision.rows[0].item_sl_no),style:{...btnPrimary,textAlign:"left",padding:"9px 14px"}},"Display existing quote"),
+          h("button",{onClick:chooseAddLineItem,style:{border:"1px solid #1c8c75",borderRadius:6,padding:"9px 14px",background:"#eaf9f4",color:"#085041",fontSize:12.5,textAlign:"left",cursor:"pointer"}},"Create another line item (new Sl No)"),
+          h("button",{onClick:cancelQuoteDecision,style:{...btnSecondary,textAlign:"left",padding:"9px 14px"}},"Cancel")
         )
       )
     )
@@ -2176,13 +2287,14 @@ function DatasheetMasterEditor({ onGoToTab }){
   );
 }
 
-function SavedEstimates({ user }) {
+function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [refs,setRefs]=useState([]); const [loading,setLoading]=useState(true);
   const [refFilter,setRefFilter]=useState(""); const [slNoFilter,setSlNoFilter]=useState(""); const [descSearch,setDescSearch]=useState(""); const [openRef,setOpenRef]=useState(null);
   const [showDatasheet,setShowDatasheet]=useState(false);
   const [openLines,setOpenLines]=useState([]); const [loadingLines,setLoadingLines]=useState(false);
   const [lineEdits,setLineEdits]=useState({}); // {refNum-slNo: {field:value}} — pending unsaved edits
   const [savingLine,setSavingLine]=useState({}); // {refNum-slNo: true} — saving in progress
+  const [quoteExportRef,setQuoteExportRef]=useState(""); const [exportingQuote,setExportingQuote]=useState("");
 
   const setLineEdit=(refNum,slNo,field,value,extraFields)=>{
     const key=refNum+"-"+slNo;
@@ -2282,6 +2394,13 @@ function SavedEstimates({ user }) {
 
   const load=useCallback(async()=>{ setLoading(true); const{data}=await sb.from("estimates").select("*").order("created_at",{ascending:false}); setRefs(data||[]); setLoading(false); },[]);
   useEffect(()=>{load();},[load]);
+
+  useEffect(()=>{
+    if(!openTarget || loading || refs.length===0) return;
+    const match = refs.find(r=>r.reference_number===openTarget.reference_number && (openTarget.item_sl_no==null || r.item_sl_no===openTarget.item_sl_no));
+    if(match){ setRefFilter(match.reference_number); setSlNoFilter(String(match.item_sl_no)); openEstimate(match); }
+    if(onConsumedTarget) onConsumedTarget();
+  },[openTarget, loading, refs]);
 
   const filtered=useMemo(()=>{
     let out = refs;
@@ -2501,6 +2620,269 @@ function SavedEstimates({ user }) {
     options.map(o=>h("option",{key:o,value:o},o))
   );
 
+  // ---- Quote-wide exports: pull every Sl No under one Quote# together ----
+  const fetchQuoteBundle = async(ref)=>{
+    const [{data:estimatesRows},{data:linesRows},{data:datasheetsRows}] = await Promise.all([
+      sb.from("estimates").select("*").eq("reference_number",ref).order("item_sl_no"),
+      sb.from("estimate_lines").select("*").eq("reference_number",ref).order("item_sl_no").order("sl_no"),
+      sb.from("datasheets").select("*").eq("reference_number",ref)
+    ]);
+    return { estimatesRows: estimatesRows||[], linesRows: linesRows||[], datasheetsRows: datasheetsRows||[] };
+  };
+
+  const BOM_HEADERS = ["Sl","Component","Material spec","Grade","Qty Reqd Per Item","UOM","Qty by Order/Quote","Rate","Sf","Cost","Sales price","Show in MOC"];
+  const bomRowArray = (l, orderQtyForSl)=>{
+    const qtyReqd = Number(l.qty_required)||0;
+    const qtyByOrder = qtyReqd*(orderQtyForSl||1);
+    const rate = Number(l.rate)||0;
+    const sf = Number(l.sf)||3.1;
+    return [l.sl_no, l.component||"", l.material_spec||"", l.grade||"", qtyReqd, l.uom||"",
+      qtyByOrder%1===0?qtyByOrder:Number(qtyByOrder.toFixed(3)), rate, sf,
+      Number((qtyByOrder*rate).toFixed(2)), Number((qtyByOrder*rate*sf).toFixed(2)), l.show_in_moc===true?"Yes":"No"];
+  };
+  const groupBySubAssembly = (lines)=>{
+    const order=[]; const map=new Map();
+    lines.forEach(l=>{
+      const key = l.sub_assembly || "(ungrouped)";
+      if(!map.has(key)){ map.set(key,[]); order.push(key); }
+      map.get(key).push(l);
+    });
+    return order.map(key=>({ subAssembly:key, lines: map.get(key) }));
+  };
+
+  const exportQuoteBOMExcel = async()=>{
+    if(!quoteExportRef) return;
+    setExportingQuote("bom-xlsx");
+    try {
+      const {estimatesRows, linesRows} = await fetchQuoteBundle(quoteExportRef);
+      const wb = XLSX.utils.book_new();
+      estimatesRows.forEach(est=>{
+        const lines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+        const rows=[];
+        rows.push(["Sl No "+est.item_sl_no+" — "+(est.model||"")]);
+        rows.push([]);
+        groupBySubAssembly(lines).forEach(grp=>{
+          rows.push([grp.subAssembly]);
+          rows.push(BOM_HEADERS);
+          grp.lines.forEach(l=>rows.push(bomRowArray(l, est.order_qty||1)));
+          rows.push([]);
+        });
+        const ws = XLSX.utils.aoa_to_sheet(rows);
+        XLSX.utils.book_append_sheet(wb, ws, sanitizeSheetName("Sl"+est.item_sl_no+"-"+(est.model||"").replace(/\s+/g,"")));
+      });
+      XLSX.writeFile(wb, quoteExportRef.replace(/\s+/g,"_")+"_BOM.xlsx");
+    } finally { setExportingQuote(""); }
+  };
+
+  const drawQuoteLetterhead = (doc, W, title, ref, customer)=>{
+    const dark=[28,31,26];
+    try{ doc.addImage(COMPANY_LOGO,"PNG",10,4,36,18); }catch(e){}
+    doc.setFontSize(10); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+    doc.text(COMPANY_NAME,W-14,8,{align:"right"});
+    doc.setFontSize(7); doc.setFont(undefined,"normal"); doc.setTextColor(100,100,100);
+    doc.text(COMPANY_ADDRESS,W-14,13,{align:"right"});
+    doc.text(COMPANY_WEBSITE+"   |   "+COMPANY_EMAIL,W-14,17.5,{align:"right"});
+    doc.setFontSize(8.5); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+    doc.text(title,W-14,23,{align:"right"});
+    doc.setFontSize(8); doc.setFont(undefined,"normal");
+    doc.text("Quote#: "+ref+(customer?"   Client: "+customer:""),12,23);
+    doc.setDrawColor(200,197,185); doc.setLineWidth(0.4);
+    doc.line(10,27,W-10,27);
+  };
+  const numberQuotePages = (doc, W)=>{
+    const pageCount = doc.internal.getNumberOfPages();
+    for(let i=1;i<=pageCount;i++){
+      doc.setPage(i); doc.setFontSize(7); doc.setTextColor(150);
+      doc.text("Page "+i+" of "+pageCount, W-12, doc.internal.pageSize.getHeight()-5, {align:"right"});
+    }
+  };
+
+  const exportQuoteBOMPDF = async()=>{
+    if(!quoteExportRef) return;
+    setExportingQuote("bom-pdf");
+    try {
+      const {estimatesRows, linesRows} = await fetchQuoteBundle(quoteExportRef);
+      const customer = (estimatesRows[0]&&estimatesRows[0].description)||"";
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
+      const W = doc.internal.pageSize.getWidth();
+      const dark=[28,31,26]; const neutral=[244,242,234];
+      const header = ()=>drawQuoteLetterhead(doc,W,"QUOTE BOM",quoteExportRef,customer);
+      header();
+      let y=34;
+      estimatesRows.forEach((est,idx)=>{
+        if(idx>0){ doc.addPage(); header(); y=34; }
+        doc.setFontSize(10); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+        doc.text("Sl No "+est.item_sl_no+" — "+(est.model||""),12,y);
+        y+=4;
+        const lines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+        groupBySubAssembly(lines).forEach(grp=>{
+          doc.autoTable({
+            startY:y+2,
+            head:[[{content:grp.subAssembly,colSpan:BOM_HEADERS.length,styles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8}}],BOM_HEADERS],
+            body: grp.lines.map(l=>bomRowArray(l, est.order_qty||1)),
+            theme:"grid",
+            headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:7.5,lineColor:[216,212,197],lineWidth:0.2},
+            bodyStyles:{fontSize:7,textColor:dark},
+            margin:{left:12,right:12},
+            didDrawPage: header
+          });
+          y = doc.lastAutoTable.finalY + 4;
+        });
+      });
+      numberQuotePages(doc,W);
+      doc.save(quoteExportRef.replace(/\s+/g,"_")+"_BOM.pdf");
+    } finally { setExportingQuote(""); }
+  };
+
+  const buildQuoteDatasheetGroups = async(estimatesRows, linesRows, datasheetsRows)=>{
+    const itemGroups = new Map(); // itemName -> [{slNo, sectionsRows}]
+    for(const est of estimatesRows){
+      const itemName = modelItemMap.get(est.model) || est.model || "Unknown item";
+      const template = await loadDatasheetMaster(itemName);
+      if(!template) continue;
+      const ds = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.template_key===normalizeItemName(itemName));
+      const mocLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no && l.show_in_moc===true);
+      const sectionsRows = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocLines, est.model);
+      if(!itemGroups.has(itemName)) itemGroups.set(itemName, []);
+      itemGroups.get(itemName).push({ slNo: est.item_sl_no, sectionsRows });
+    }
+    itemGroups.forEach(instances=>instances.sort((a,b)=>a.slNo-b.slNo));
+    return itemGroups;
+  };
+
+  const exportQuoteDatasheetsExcel = async()=>{
+    if(!quoteExportRef) return;
+    setExportingQuote("ds-xlsx");
+    try {
+      const {estimatesRows, linesRows, datasheetsRows} = await fetchQuoteBundle(quoteExportRef);
+      const itemGroups = await buildQuoteDatasheetGroups(estimatesRows, linesRows, datasheetsRows);
+      const rows = [];
+      for(const [itemName, instances] of itemGroups){
+        const matrix = buildItemMatrix(instances);
+        rows.push([itemName]);
+        matrix.forEach(sec=>{
+          rows.push([sec.title, ...sec.columns.map(c=>"Sl "+c.slNo)]);
+          sec.rowLabels.forEach((lbl,i)=>rows.push([lbl, ...sec.columns.map(c=>c.values[i])]));
+        });
+        rows.push([]);
+      }
+      if(rows.length===0) rows.push(["No datasheet masters found for any item in this quote."]);
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Datasheets");
+      XLSX.writeFile(wb, quoteExportRef.replace(/\s+/g,"_")+"_Datasheets.xlsx");
+    } finally { setExportingQuote(""); }
+  };
+
+  const exportQuoteDatasheetsPDF = async()=>{
+    if(!quoteExportRef) return;
+    setExportingQuote("ds-pdf");
+    try {
+      const {estimatesRows, linesRows, datasheetsRows} = await fetchQuoteBundle(quoteExportRef);
+      const customer = (estimatesRows[0]&&estimatesRows[0].description)||"";
+      const itemGroups = await buildQuoteDatasheetGroups(estimatesRows, linesRows, datasheetsRows);
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
+      const W = doc.internal.pageSize.getWidth();
+      const dark=[28,31,26]; const neutral=[244,242,234];
+      const header = ()=>drawQuoteLetterhead(doc,W,"QUOTE DATASHEETS",quoteExportRef,customer);
+      header();
+      let y=34; let first=true;
+      for(const [itemName, instances] of itemGroups){
+        const matrix = buildItemMatrix(instances);
+        if(!first){ doc.addPage(); header(); y=34; }
+        first=false;
+        doc.setFontSize(10); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+        doc.text(itemName,12,y); y+=3;
+        matrix.forEach(sec=>{
+          const head=[["Field",...sec.columns.map(c=>"Sl "+c.slNo)]];
+          const body=sec.rowLabels.map((lbl,i)=>[lbl,...sec.columns.map(c=>c.values[i]||"")]);
+          doc.autoTable({
+            startY:y+2,
+            head:[[{content:sec.title,colSpan:sec.columns.length+1,styles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8}}],...head],
+            body,
+            theme:"grid",
+            headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:7.5,lineColor:[216,212,197],lineWidth:0.2},
+            bodyStyles:{fontSize:7,textColor:dark},
+            margin:{left:12,right:12},
+            didDrawPage: header
+          });
+          y = doc.lastAutoTable.finalY + 4;
+        });
+      }
+      if(itemGroups.size===0){ doc.setFontSize(10); doc.text("No datasheet masters found for any item in this quote.",12,34); }
+      numberQuotePages(doc,W);
+      doc.save(quoteExportRef.replace(/\s+/g,"_")+"_Datasheets.pdf");
+    } finally { setExportingQuote(""); }
+  };
+
+  const buildQuoteSummary = (estimatesRows, linesRows)=>{
+    const orderQtyBySl = new Map(estimatesRows.map(e=>[e.item_sl_no, e.order_qty||1]));
+    const map = new Map();
+    linesRows.forEach(l=>{
+      const key = (l.material_spec||"(no spec)")+"|||"+(l.grade||"(no grade)");
+      const qtyByOrder = (Number(l.qty_required)||0)*(orderQtyBySl.get(l.item_sl_no)||1);
+      const rate = Number(l.rate)||0;
+      const sf = Number(l.sf)||3.1;
+      if(!map.has(key)) map.set(key,{spec:l.material_spec||"(no spec)",grade:l.grade||"",uom:l.uom||"",rate,totalQty:0,totalCost:0,totalSales:0,slNos:new Set()});
+      const g = map.get(key);
+      g.totalQty += qtyByOrder; g.totalCost += qtyByOrder*rate; g.totalSales += qtyByOrder*rate*sf;
+      g.slNos.add(l.item_sl_no);
+    });
+    return Array.from(map.values()).map(g=>({...g, slNoList: Array.from(g.slNos).sort((a,b)=>a-b).join(", ")}))
+      .sort((a,b)=>a.spec.localeCompare(b.spec)||a.grade.localeCompare(b.grade));
+  };
+
+  const exportQuoteSummaryExcel = async()=>{
+    if(!quoteExportRef) return;
+    setExportingQuote("sum-xlsx");
+    try {
+      const {estimatesRows, linesRows} = await fetchQuoteBundle(quoteExportRef);
+      const summary = buildQuoteSummary(estimatesRows, linesRows);
+      const headers = ["Material spec","Grade","Total qty","UOM","Rate","Total cost","Total sales price","Sl Nos"];
+      const rows = summary.map(g=>[g.spec,g.grade,g.totalQty%1===0?g.totalQty:Number(g.totalQty.toFixed(3)),g.uom,g.rate,Number(g.totalCost.toFixed(2)),Number(g.totalSales.toFixed(2)),g.slNoList]);
+      const totalCost = summary.reduce((s,g)=>s+g.totalCost,0);
+      const totalSales = summary.reduce((s,g)=>s+g.totalSales,0);
+      rows.push(["","","","","TOTAL",Number(totalCost.toFixed(2)),Number(totalSales.toFixed(2)),""]);
+      const ws = XLSX.utils.aoa_to_sheet([headers,...rows]);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Quote Summary");
+      XLSX.writeFile(wb, quoteExportRef.replace(/\s+/g,"_")+"_Summary.xlsx");
+    } finally { setExportingQuote(""); }
+  };
+
+  const exportQuoteSummaryPDF = async()=>{
+    if(!quoteExportRef) return;
+    setExportingQuote("sum-pdf");
+    try {
+      const {estimatesRows, linesRows} = await fetchQuoteBundle(quoteExportRef);
+      const customer = (estimatesRows[0]&&estimatesRows[0].description)||"";
+      const summary = buildQuoteSummary(estimatesRows, linesRows);
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
+      const W = doc.internal.pageSize.getWidth();
+      const neutral=[244,242,234]; const dark=[28,31,26];
+      drawQuoteLetterhead(doc,W,"QUOTE SUMMARY",quoteExportRef,customer);
+      const totalCost = summary.reduce((s,g)=>s+g.totalCost,0);
+      const totalSales = summary.reduce((s,g)=>s+g.totalSales,0);
+      doc.autoTable({
+        startY:34,
+        head:[["Material spec","Grade","Total qty","UOM","Rate","Total cost","Total sales price","Sl Nos"]],
+        body: summary.map(g=>[g.spec,g.grade,g.totalQty%1===0?g.totalQty:g.totalQty.toFixed(3),g.uom,fmt(g.rate),fmt(g.totalCost),fmt(g.totalSales),g.slNoList]),
+        foot:[["","","","","TOTAL",fmt(totalCost),fmt(totalSales),""]],
+        theme:"grid",
+        headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8,lineColor:[216,212,197],lineWidth:0.2},
+        footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8},
+        bodyStyles:{fontSize:7.5,textColor:dark},
+        margin:{left:12,right:12},
+        didDrawPage:()=>drawQuoteLetterhead(doc,W,"QUOTE SUMMARY",quoteExportRef,customer)
+      });
+      numberQuotePages(doc,W);
+      doc.save(quoteExportRef.replace(/\s+/g,"_")+"_Summary.pdf");
+    } finally { setExportingQuote(""); }
+  };
+
   return h(React.Fragment,null,
     h("div",{style:{padding:"20px 24px"}},
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
@@ -2522,6 +2904,40 @@ function SavedEstimates({ user }) {
             slNoOptions.map(sn=>h("option",{key:sn,value:sn},sn))
           ),
           h("input",{value:descSearch,onChange:e=>setDescSearch(e.target.value),placeholder:"Search description…",style:{...inputStyle,width:200}})
+        )
+      ),
+      h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
+        h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},"Export full quote"),
+        h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}},
+          h("select",{value:quoteExportRef,onChange:e=>setQuoteExportRef(e.target.value),style:{...inputStyle,width:320}},
+            h("option",{value:""},"Select a quote…"),
+            Array.from(new Map(refs.map(r=>[r.reference_number,r.description])).entries()).map(([rn,desc])=>
+              h("option",{key:rn,value:rn},rn+(desc?" — "+desc:""))
+            )
+          )
+        ),
+        h("div",{style:{display:"flex",gap:16,flexWrap:"wrap"}},
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"BOM ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(per Sl No)")),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:exportQuoteBOMExcel,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:exportQuoteBOMPDF,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-pdf"?"Working…":"PDF")
+            )
+          ),
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Datasheets ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(grouped by item)")),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:exportQuoteDatasheetsExcel,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="ds-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:exportQuoteDatasheetsPDF,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="ds-pdf"?"Working…":"PDF")
+            )
+          ),
+          h("div",{style:{border:"1px solid #8fd0bf",borderRadius:6,padding:"8px 10px",background:"#eaf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:"#085041",textTransform:"uppercase",marginBottom:6}},"Summary ",h("span",{style:{fontWeight:400,color:"#4a8d78"}},"(whole quote, by spec + grade)")),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:exportQuoteSummaryExcel,disabled:!quoteExportRef||!!exportingQuote,style:{...btnSmall,border:"1px solid #1c8c75",color:"#085041"}},exportingQuote==="sum-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:exportQuoteSummaryPDF,disabled:!quoteExportRef||!!exportingQuote,style:{...btnSmall,border:"1px solid #1c8c75",color:"#085041"}},exportingQuote==="sum-pdf"?"Working…":"PDF")
+            )
+          )
         )
       ),
       h("div",{style:{display:"flex",gap:20,flexWrap:"wrap"}},
@@ -3535,6 +3951,7 @@ function CalcHistoryViewer({ user }) {
 function App() {
   const [user,setUser]=useState(null); const [tab,setTab]=useState("estimator");
   const [masterData,setMasterData]=useState({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});
+  const [quoteToOpen,setQuoteToOpen]=useState(null); // {reference_number,item_sl_no} bridge from Estimator's save popup to Quotes
 
   useEffect(()=>{ if(user) loadMasterData(setMasterData); },[user]);
   const refresh=useCallback(()=>{ setMasterData(m=>({...m,loadingMaster:true})); loadMasterData(setMasterData); },[]);
@@ -3544,8 +3961,8 @@ function App() {
   return h("div",{style:{minHeight:"100vh"}},
     h(TopBar,{user,onLogout:()=>{setUser(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
     h(MenuTabs,{user,active:tab,onChange:setTab}),
-    h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,onRefresh:refresh})),
-    tab==="saved"?h(SavedEstimates,{user}):
+    h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}})),
+    tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null)}):
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab}):
     tab==="allowable_stress"?h(AllowableStressEditor,null):
