@@ -99,6 +99,24 @@ function bomFieldDisplay(m){ return m ? (m.material_spec||"")+((m.grade&&m.grade
 function sanitizeSheetName(s){
   return ((s||"Sheet").replace(/[:\\\/\?\*\[\]]/g,"").trim()||"Sheet").slice(0,31);
 }
+function r2(n){ const x = Number(n); return isNaN(x) ? 0 : Math.round(x*100)/100; }
+// Applies a 2-decimal, thousands-separated number format to every numeric cell
+// from fromRow (1-indexed) onward. Note: the free/community build of SheetJS
+// used here (xlsx.full.min.js) can set number formats but cannot write font
+// styles (bold, color) into .xlsx — that requires the Pro build. So Excel
+// output below uses spacing/structure for readability instead of bold text;
+// PDF output uses real bold via jsPDF, which has no such limitation.
+function applyNumberFormat(ws, fromRow){
+  if(!ws['!ref']) return;
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  for(let R=fromRow-1; R<=range.e.r; R++){
+    for(let C=range.s.c; C<=range.e.c; C++){
+      const addr = XLSX.utils.encode_cell({r:R,c:C});
+      const cell = ws[addr];
+      if(cell && typeof cell.v === "number") cell.z = "#,##0.00";
+    }
+  }
+}
 
 // Mirrors DatasheetModal's getSectionRows, but as a standalone function so the
 // quote-wide export can rebuild a datasheet's sections without mounting the modal.
@@ -2295,6 +2313,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [lineEdits,setLineEdits]=useState({}); // {refNum-slNo: {field:value}} — pending unsaved edits
   const [savingLine,setSavingLine]=useState({}); // {refNum-slNo: true} — saving in progress
   const [quoteExportRef,setQuoteExportRef]=useState(""); const [exportingQuote,setExportingQuote]=useState("");
+  const [includeSalesPrice,setIncludeSalesPrice]=useState(true);
 
   const setLineEdit=(refNum,slNo,field,value,extraFields)=>{
     const key=refNum+"-"+slNo;
@@ -2630,15 +2649,23 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     return { estimatesRows: estimatesRows||[], linesRows: linesRows||[], datasheetsRows: datasheetsRows||[] };
   };
 
-  const BOM_HEADERS = ["Sl","Component","Material spec","Grade","Qty Reqd Per Item","UOM","Qty by Order/Quote","Rate","Sf","Cost","Sales price","Show in MOC"];
-  const bomRowArray = (l, orderQtyForSl)=>{
-    const qtyReqd = Number(l.qty_required)||0;
-    const qtyByOrder = qtyReqd*(orderQtyForSl||1);
-    const rate = Number(l.rate)||0;
-    const sf = Number(l.sf)||3.1;
-    return [l.sl_no, l.component||"", l.material_spec||"", l.grade||"", qtyReqd, l.uom||"",
-      qtyByOrder%1===0?qtyByOrder:Number(qtyByOrder.toFixed(3)), rate, sf,
-      Number((qtyByOrder*rate).toFixed(2)), Number((qtyByOrder*rate*sf).toFixed(2)), l.show_in_moc===true?"Yes":"No"];
+  const bomHeaders = (withSales)=> withSales
+    ? ["Component","Sub Assembly","Material spec","Grade","Qty Reqd Per Item","UOM","Qty by Order/Quote","Rate","Sf","Cost","Sales price"]
+    : ["Component","Sub Assembly","Material spec","Grade","Qty Reqd Per Item","UOM","Qty by Order/Quote","Rate","Cost"];
+  // Column A ("Component" header) is always blank on data rows — the sub-assembly
+  // name is shown once as its own group-header row instead. Column B ("Sub
+  // Assembly" header) carries the line's own component value.
+  const bomDataRow = (l, orderQtyForSl, withSales)=>{
+    const qtyReqd = r2(l.qty_required);
+    const qtyByOrder = r2(qtyReqd*(orderQtyForSl||1));
+    const rate = r2(l.rate);
+    const sf = r2(l.sf||3.1);
+    const cost = r2(qtyByOrder*rate);
+    const row = ["", l.component||"", l.material_spec||"", l.grade||"", qtyReqd, l.uom||"", qtyByOrder, rate];
+    if(withSales) row.push(sf);
+    row.push(cost);
+    if(withSales) row.push(r2(cost*sf));
+    return row;
   };
   const groupBySubAssembly = (lines)=>{
     const order=[]; const map=new Map();
@@ -2650,27 +2677,36 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     return order.map(key=>({ subAssembly:key, lines: map.get(key) }));
   };
 
-  const exportQuoteBOMExcel = async()=>{
+  const exportQuoteBOMExcel = async(withSales)=>{
     if(!quoteExportRef) return;
     setExportingQuote("bom-xlsx");
     try {
       const {estimatesRows, linesRows} = await fetchQuoteBundle(quoteExportRef);
+      const customer = (estimatesRows[0]&&estimatesRows[0].description)||"";
       const wb = XLSX.utils.book_new();
       estimatesRows.forEach(est=>{
+        const itemName = modelItemMap.get(est.model) || "";
         const lines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
         const rows=[];
-        rows.push(["Sl No "+est.item_sl_no+" — "+(est.model||"")]);
+        rows.push(["BOM WITH ESTIMATE"]);
         rows.push([]);
+        rows.push(["Sl No", est.item_sl_no, "", "Client", customer, "Quote date", est.quote_date||""]);
+        rows.push(["Item", itemName, "", "Quote No", est.reference_number]);
+        rows.push(["Model", est.model||""]);
+        rows.push([]);
+        rows.push(bomHeaders(withSales));
+        const headerRowCount = rows.length; // for number-format start (1-indexed row after this)
         groupBySubAssembly(lines).forEach(grp=>{
-          rows.push([grp.subAssembly]);
-          rows.push(BOM_HEADERS);
-          grp.lines.forEach(l=>rows.push(bomRowArray(l, est.order_qty||1)));
           rows.push([]);
+          rows.push([grp.subAssembly]);
+          grp.lines.forEach(l=>rows.push(bomDataRow(l, est.order_qty||1, withSales)));
         });
         const ws = XLSX.utils.aoa_to_sheet(rows);
+        ws["!cols"] = [{wch:14},{wch:18},{wch:36},{wch:15},{wch:12},{wch:8},{wch:14},{wch:11},{wch:7},{wch:12},{wch:13}];
+        applyNumberFormat(ws, headerRowCount+1);
         XLSX.utils.book_append_sheet(wb, ws, sanitizeSheetName("Sl"+est.item_sl_no+"-"+(est.model||"").replace(/\s+/g,"")));
       });
-      XLSX.writeFile(wb, quoteExportRef.replace(/\s+/g,"_")+"_BOM.xlsx");
+      XLSX.writeFile(wb, quoteExportRef.replace(/\s+/g,"_")+"_BOM"+(withSales?"":"_cost")+".xlsx");
     } finally { setExportingQuote(""); }
   };
 
@@ -2696,8 +2732,27 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       doc.text("Page "+i+" of "+pageCount, W-12, doc.internal.pageSize.getHeight()-5, {align:"right"});
     }
   };
+  // The "BOM WITH ESTIMATE" / "DATA SHEET" title + Sl No/Client/Quote date/Item/
+  // Quote No/Model block, drawn below the company letterhead. Returns the y
+  // position to continue from.
+  const drawDocHeaderBlock = (doc, title, fields)=>{
+    const dark=[28,31,26];
+    doc.setFontSize(15); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+    doc.text(title, doc.internal.pageSize.getWidth()/2, 34, {align:"center"});
+    let y=41;
+    const lbl=(x,label,value)=>{ doc.setFont(undefined,"bold"); doc.setFontSize(9); doc.text(label,x,y); doc.setFont(undefined,"normal"); doc.text(String(value||""),x+22,y); };
+    lbl(12,"Sl No", fields.slNo);
+    lbl(60,"Client", fields.client);
+    lbl(140,"Quote date", fields.quoteDate);
+    y+=6;
+    lbl(12,"Item", fields.item);
+    lbl(60,"Quote No", fields.quoteNo);
+    y+=6;
+    lbl(12,"Model", fields.model);
+    return y+7;
+  };
 
-  const exportQuoteBOMPDF = async()=>{
+  const exportQuoteBOMPDF = async(withSales)=>{
     if(!quoteExportRef) return;
     setExportingQuote("bom-pdf");
     try {
@@ -2706,37 +2761,50 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
       const W = doc.internal.pageSize.getWidth();
-      const dark=[28,31,26]; const neutral=[244,242,234];
-      const header = ()=>drawQuoteLetterhead(doc,W,"QUOTE BOM",quoteExportRef,customer);
-      header();
-      let y=34;
+      const dark=[28,31,26];
+      const headers = bomHeaders(withSales);
       estimatesRows.forEach((est,idx)=>{
-        if(idx>0){ doc.addPage(); header(); y=34; }
-        doc.setFontSize(10); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
-        doc.text("Sl No "+est.item_sl_no+" — "+(est.model||""),12,y);
-        y+=4;
+        if(idx>0) doc.addPage();
+        drawQuoteLetterhead(doc,W,"BOM WITH ESTIMATE",quoteExportRef,customer);
+        const itemName = modelItemMap.get(est.model) || "";
+        let y = drawDocHeaderBlock(doc,"BOM WITH ESTIMATE",{slNo:est.item_sl_no,client:customer,quoteDate:est.quote_date,item:itemName,quoteNo:est.reference_number,model:est.model});
         const lines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+        const numericCols = withSales ? [4,6,7,8,9,10] : [4,6,7,8];
+        const columnStyles = {}; numericCols.forEach(ci=>columnStyles[ci]={halign:"right"});
+        doc.autoTable({
+          startY:y,
+          head:[headers],
+          body: [],
+          theme:"grid",
+          headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,lineColor:[200,200,200],lineWidth:0.2},
+          bodyStyles:{fontSize:7.5,textColor:dark},
+          columnStyles,
+          margin:{left:14,right:14}
+        });
+        y = doc.lastAutoTable.finalY;
         groupBySubAssembly(lines).forEach(grp=>{
+          y += 5;
+          doc.setFont(undefined,"bold"); doc.setFontSize(8.5); doc.setTextColor(...dark);
+          doc.text(grp.subAssembly, 14, y);
           doc.autoTable({
             startY:y+2,
-            head:[[{content:grp.subAssembly,colSpan:BOM_HEADERS.length,styles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8}}],BOM_HEADERS],
-            body: grp.lines.map(l=>bomRowArray(l, est.order_qty||1)),
-            theme:"grid",
-            headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:7.5,lineColor:[216,212,197],lineWidth:0.2},
-            bodyStyles:{fontSize:7,textColor:dark},
-            margin:{left:12,right:12},
-            didDrawPage: header
+            body: grp.lines.map(l=>bomDataRow(l, est.order_qty||1, withSales).map(v=>typeof v==="number"?fmt(v):v)),
+            theme:"plain",
+            bodyStyles:{fontSize:7.5,textColor:dark},
+            columnStyles,
+            margin:{left:14,right:14},
+            didDrawPage:()=>{ drawQuoteLetterhead(doc,W,"BOM WITH ESTIMATE",quoteExportRef,customer); }
           });
-          y = doc.lastAutoTable.finalY + 4;
+          y = doc.lastAutoTable.finalY;
         });
       });
       numberQuotePages(doc,W);
-      doc.save(quoteExportRef.replace(/\s+/g,"_")+"_BOM.pdf");
+      doc.save(quoteExportRef.replace(/\s+/g,"_")+"_BOM"+(withSales?"":"_cost")+".pdf");
     } finally { setExportingQuote(""); }
   };
 
   const buildQuoteDatasheetGroups = async(estimatesRows, linesRows, datasheetsRows)=>{
-    const itemGroups = new Map(); // itemName -> [{slNo, sectionsRows}]
+    const itemGroups = new Map(); // itemName -> [{slNo, model, sectionsRows}]
     for(const est of estimatesRows){
       const itemName = modelItemMap.get(est.model) || est.model || "Unknown item";
       const template = await loadDatasheetMaster(itemName);
@@ -2745,7 +2813,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const mocLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no && l.show_in_moc===true);
       const sectionsRows = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocLines, est.model);
       if(!itemGroups.has(itemName)) itemGroups.set(itemName, []);
-      itemGroups.get(itemName).push({ slNo: est.item_sl_no, sectionsRows });
+      itemGroups.get(itemName).push({ slNo: est.item_sl_no, model: est.model||"", sectionsRows });
     }
     itemGroups.forEach(instances=>instances.sort((a,b)=>a.slNo-b.slNo));
     return itemGroups;
@@ -2756,16 +2824,26 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     setExportingQuote("ds-xlsx");
     try {
       const {estimatesRows, linesRows, datasheetsRows} = await fetchQuoteBundle(quoteExportRef);
+      const customer = (estimatesRows[0]&&estimatesRows[0].description)||"";
       const itemGroups = await buildQuoteDatasheetGroups(estimatesRows, linesRows, datasheetsRows);
       const rows = [];
       for(const [itemName, instances] of itemGroups){
         const matrix = buildItemMatrix(instances);
-        rows.push([itemName]);
+        rows.push(["DATA SHEET"]);
+        rows.push([]);
+        rows.push(["Sl No", ...instances.map(i=>i.slNo)]);
+        rows.push(["Client", customer]);
+        rows.push(["Item", itemName]);
+        rows.push(["Quote No", estimatesRows[0]&&estimatesRows[0].reference_number]);
+        rows.push(["Model", ...instances.map(i=>i.model)]);
+        rows.push([]);
+        rows.push(["Parameters", ...instances.map(i=>i.slNo)]);
         matrix.forEach(sec=>{
-          rows.push([sec.title, ...sec.columns.map(c=>"Sl "+c.slNo)]);
+          rows.push([]);
+          rows.push([sec.title]);
           sec.rowLabels.forEach((lbl,i)=>rows.push([lbl, ...sec.columns.map(c=>c.values[i])]));
         });
-        rows.push([]);
+        rows.push([]); rows.push([]);
       }
       if(rows.length===0) rows.push(["No datasheet masters found for any item in this quote."]);
       const ws = XLSX.utils.aoa_to_sheet(rows);
@@ -2785,33 +2863,41 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
       const W = doc.internal.pageSize.getWidth();
-      const dark=[28,31,26]; const neutral=[244,242,234];
-      const header = ()=>drawQuoteLetterhead(doc,W,"QUOTE DATASHEETS",quoteExportRef,customer);
-      header();
-      let y=34; let first=true;
+      const dark=[28,31,26];
+      let first=true;
       for(const [itemName, instances] of itemGroups){
         const matrix = buildItemMatrix(instances);
-        if(!first){ doc.addPage(); header(); y=34; }
+        if(!first) doc.addPage();
         first=false;
-        doc.setFontSize(10); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
-        doc.text(itemName,12,y); y+=3;
+        drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer);
+        let y = drawDocHeaderBlock(doc,"DATA SHEET",{
+          slNo: instances.map(i=>i.slNo).join(", "),
+          client: customer, item: itemName,
+          quoteNo: estimatesRows[0]&&estimatesRows[0].reference_number,
+          model: instances.map(i=>i.model).join(", ")
+        });
+        const head=[["Parameters", ...instances.map(i=>String(i.slNo))]];
+        doc.autoTable({
+          startY:y, head, body:[], theme:"grid",
+          headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,lineColor:[200,200,200],lineWidth:0.2},
+          margin:{left:14,right:14}
+        });
+        y = doc.lastAutoTable.finalY;
         matrix.forEach(sec=>{
-          const head=[["Field",...sec.columns.map(c=>"Sl "+c.slNo)]];
-          const body=sec.rowLabels.map((lbl,i)=>[lbl,...sec.columns.map(c=>c.values[i]||"")]);
+          y += 5;
+          doc.setFont(undefined,"bold"); doc.setFontSize(8.5); doc.setTextColor(...dark);
+          doc.text(sec.title, 14, y);
+          const body = sec.rowLabels.map((lbl,i)=>[lbl, ...sec.columns.map(c=>c.values[i]||"")]);
           doc.autoTable({
-            startY:y+2,
-            head:[[{content:sec.title,colSpan:sec.columns.length+1,styles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8}}],...head],
-            body,
-            theme:"grid",
-            headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:7.5,lineColor:[216,212,197],lineWidth:0.2},
-            bodyStyles:{fontSize:7,textColor:dark},
-            margin:{left:12,right:12},
-            didDrawPage: header
+            startY:y+2, body, theme:"plain",
+            bodyStyles:{fontSize:7.5,textColor:dark},
+            margin:{left:14,right:14},
+            didDrawPage:()=>{ drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer); }
           });
-          y = doc.lastAutoTable.finalY + 4;
+          y = doc.lastAutoTable.finalY;
         });
       }
-      if(itemGroups.size===0){ doc.setFontSize(10); doc.text("No datasheet masters found for any item in this quote.",12,34); }
+      if(itemGroups.size===0){ drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer); doc.setFontSize(10); doc.text("No datasheet masters found for any item in this quote.",12,40); }
       numberQuotePages(doc,W);
       doc.save(quoteExportRef.replace(/\s+/g,"_")+"_Datasheets.pdf");
     } finally { setExportingQuote(""); }
@@ -2919,9 +3005,13 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         h("div",{style:{display:"flex",gap:16,flexWrap:"wrap"}},
           h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
             h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"BOM ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(per Sl No)")),
+            h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:colors.muted,marginBottom:6,cursor:"pointer"}},
+              h("input",{type:"checkbox",checked:includeSalesPrice,onChange:e=>setIncludeSalesPrice(e.target.checked)}),
+              "Include Sf + Sales price"
+            ),
             h("div",{style:{display:"flex",gap:6}},
-              h("button",{onClick:exportQuoteBOMExcel,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-xlsx"?"Working…":"Excel"),
-              h("button",{onClick:exportQuoteBOMPDF,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-pdf"?"Working…":"PDF")
+              h("button",{onClick:()=>exportQuoteBOMExcel(includeSalesPrice),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:()=>exportQuoteBOMPDF(includeSalesPrice),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-pdf"?"Working…":"PDF")
             )
           ),
           h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
