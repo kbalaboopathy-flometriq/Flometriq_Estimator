@@ -259,7 +259,7 @@ function MenuTabs({ user, active, onChange }) {
   const groups = [
     { label:"Transaction", tabs:[
       {key:"estimator",label:"Estimator"},
-      {key:"saved",label:"Saved Estimates"},
+      {key:"saved",label:"Quotes"},
       {key:"calcs",label:"Engineering Calcs"},
     ]},
   ];
@@ -761,6 +761,10 @@ function Estimator({ user, masterData, onRefresh }) {
   const [cart,setCart]=useState([]); const [showSave,setShowSave]=useState(false);
   const [saveMaximised,setSaveMaximised]=useState(false);
   const [refNumber,setRefNumber]=useState(""); const [refDesc,setRefDesc]=useState("");
+  const [itemSlNo,setItemSlNo]=useState(""); 
+  const [enquiryNumber,setEnquiryNumber]=useState(""); const [enquiryDate,setEnquiryDate]=useState("");
+  const [quoteDate,setQuoteDate]=useState("");
+  const [existingQuoteHeader,setExistingQuoteHeader]=useState(null); // header fields + used Sl Nos, once refNumber matches a saved quote
   const [savingRef,setSavingRef]=useState(false); const [saveMsg,setSaveMsg]=useState("");
 
   // MOC popup
@@ -1001,7 +1005,7 @@ function Estimator({ user, masterData, onRefresh }) {
     doc.setTextColor(...dark); doc.setFontSize(9); let y=34;
     const lbl=(l,v)=>{ doc.setFont(undefined,"bold"); doc.text(l+":",12,y); doc.setFont(undefined,"normal"); doc.text(String(v||""),42,y); y+=6; };
     lbl("Model",selectedModel);
-    if(refNumber) lbl("Ref No",refNumber);
+    if(refNumber) lbl("Quote#",refNumber+(itemSlNo?" — Sl No "+itemSlNo:""));
     if(refDesc) lbl("Description",refDesc);
     lbl("Date",today);
     lbl("Prepared by",user.username);
@@ -1048,24 +1052,54 @@ function Estimator({ user, masterData, onRefresh }) {
   const cartTotalCost=useMemo(()=>cart.reduce((s,l)=>s+(l.cost||0),0),[cart]);
   const cartTotalSales=useMemo(()=>cart.reduce((s,l)=>s+(l.sales_price||0),0),[cart]);
 
-  const clearEstimate = ()=>{ if(!confirm("Clear the current estimate and all cart items?")) return; setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setShowSave(false);setSaveMsg(""); };
+  const clearEstimate = ()=>{ if(!confirm("Clear the current estimate and all cart items?")) return; setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setExistingQuoteHeader(null);setShowSave(false);setSaveMsg(""); };
+
+  // When the Quote# already exists, its enquiry number/dates are common to every
+  // Sl No under it — pull them in and lock them, and show which Sl Nos are taken.
+  const lookupQuoteHeader = async()=>{
+    const ref = refNumber.trim();
+    if(!ref){ setExistingQuoteHeader(null); return; }
+    const { data } = await sb.from("estimates").select("item_sl_no,enquiry_number,enquiry_date,quote_date,description").eq("reference_number",ref);
+    if(data && data.length>0){
+      const head = data[0];
+      setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
+      if(!refDesc) setRefDesc(head.description||"");
+      setExistingQuoteHeader({ usedSlNos: data.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
+    } else {
+      setExistingQuoteHeader(null);
+    }
+  };
 
   const saveReference = async()=>{
-    setSaveMsg(""); if(!refNumber.trim()){setSaveMsg("Enter a reference number.");return;} if(cart.length===0){setSaveMsg("Add at least one model's lines to the estimate first.");return;}
+    setSaveMsg("");
+    if(!refNumber.trim()){setSaveMsg("Enter a Quote#.");return;}
+    if(!String(itemSlNo).trim()){setSaveMsg("Enter a Sl No.");return;}
+    if(!enquiryNumber.trim()){setSaveMsg("Enter an Enquiry number.");return;}
+    if(cart.length===0){setSaveMsg("Add at least one model's lines to the estimate first.");return;}
     setSavingRef(true);
     try {
       const ref=refNumber.trim();
+      const slNo=Number(itemSlNo);
       const headerModel = (cart[0]&&cart[0].model) || selectedModel || "";
-      const {data:existing}=await sb.from("estimates").select("id").eq("reference_number",ref).limit(1);
+      const {data:existing}=await sb.from("estimates").select("id").eq("reference_number",ref).eq("item_sl_no",slNo).limit(1);
       let estimateId;
-      if(existing&&existing.length>0){estimateId=existing[0].id;await sb.from("estimates").update({description:refDesc,model:headerModel,updated_at:new Date().toISOString()}).eq("id",estimateId);await sb.from("estimate_lines").delete().eq("reference_number",ref);}
-      else{const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,description:refDesc,model:headerModel,created_by:user.username}).select().single();if(err)throw err;estimateId=created.id;}
-      const rows=cart.map((l,idx)=>({reference_number:ref,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,show_in_moc:l.show_in_moc===true}));
+      const headerPayload={description:refDesc,model:headerModel,enquiry_number:enquiryNumber.trim(),enquiry_date:enquiryDate||null,quote_date:quoteDate||null,updated_at:new Date().toISOString()};
+      if(existing&&existing.length>0){
+        estimateId=existing[0].id;
+        await sb.from("estimates").update(headerPayload).eq("id",estimateId);
+        await sb.from("estimate_lines").delete().eq("reference_number",ref).eq("item_sl_no",slNo);
+      } else {
+        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,created_by:user.username}).select().single();
+        if(err) throw err;
+        estimateId=created.id;
+      }
+      const rows=cart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,show_in_moc:l.show_in_moc===true}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
-      setSaveMsg("Saved as ref \""+ref+"\" with "+rows.length+" line(s).");
-      setCart([]); setRefNumber(""); setRefDesc(""); setShowSave(false);
+      setSaveMsg("Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).");
+      setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setExistingQuoteHeader(null); setShowSave(false);
     } catch(e){setSaveMsg("Save failed: "+(e.message||"unknown"));} finally{setSavingRef(false);}
   };
+
 
   return h(React.Fragment, null,
     // MOC Selection Popup
@@ -1335,15 +1369,34 @@ function Estimator({ user, masterData, onRefresh }) {
             )
           )
         ),
-        // Ref number inputs
+        // Quote# / Sl No / Enquiry inputs
         h("div",{style:{padding:"14px 16px",borderBottom:"1px solid "+colors.border,display:"flex",gap:12,flexWrap:"wrap",flexShrink:0}},
+          h("div",{style:{flex:1,minWidth:140}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Quote#"),
+            h("input",{value:refNumber,onChange:e=>setRefNumber(e.target.value),onBlur:lookupQuoteHeader,placeholder:"e.g. QT-2026-0451",style:inputStyle,autoFocus:true})
+          ),
+          h("div",{style:{width:90}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Sl No"),
+            h("input",{value:itemSlNo,onChange:e=>setItemSlNo(e.target.value),placeholder:"1",style:inputStyle})
+          ),
           h("div",{style:{flex:1,minWidth:160}},
-            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Reference number"),
-            h("input",{value:refNumber,onChange:e=>setRefNumber(e.target.value),placeholder:"e.g. QTN-2026-0451",style:inputStyle,autoFocus:true})
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Enquiry number"),
+            h("input",{value:enquiryNumber,onChange:e=>setEnquiryNumber(e.target.value),disabled:!!existingQuoteHeader,placeholder:"e.g. ENQ-8821",style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
+          ),
+          h("div",{style:{width:130}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Enquiry date"),
+            h("input",{type:"date",value:enquiryDate,onChange:e=>setEnquiryDate(e.target.value),disabled:!!existingQuoteHeader,style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
+          ),
+          h("div",{style:{width:130}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Quote date"),
+            h("input",{type:"date",value:quoteDate,onChange:e=>setQuoteDate(e.target.value),disabled:!!existingQuoteHeader,style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
           ),
           h("div",{style:{flex:2,minWidth:200}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Description (optional)"),
             h("input",{value:refDesc,onChange:e=>setRefDesc(e.target.value),placeholder:"Customer / project name",style:inputStyle})
+          ),
+          existingQuoteHeader && h("div",{style:{flexBasis:"100%",fontSize:11,color:"#085041",background:"#eaf9f4",border:"1px solid #8fd0bf",borderRadius:4,padding:"6px 10px"}},
+            "Quote# \""+refNumber.trim()+"\" already exists — Enquiry number/dates are shared across its Sl Nos and locked here. Sl No(s) already used: "+existingQuoteHeader.usedSlNos.join(", ")+". Enter a new Sl No to add another line item, or an existing one to overwrite it."
           )
         ),
         // Cart lines table
@@ -1429,7 +1482,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       if(cancelled) return;
       setTemplate(t);
       if(t){
-        const { data } = await sb.from("datasheets").select("*").eq("reference_number",openRef.reference_number).eq("template_key",normalizeItemName(itemName)).maybeSingle();
+        const { data } = await sb.from("datasheets").select("*").eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no).eq("template_key",normalizeItemName(itemName)).maybeSingle();
         if(!cancelled){
           setValues((data&&data.field_values)||{});
           setOverrides((data&&data.overrides)||{});
@@ -1438,7 +1491,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       if(!cancelled) setLoading(false);
     })();
     return ()=>{ cancelled=true; };
-  },[itemName, openRef.reference_number]);
+  },[itemName, openRef.reference_number, openRef.item_sl_no]);
 
   if(loading){
     return h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:80}},
@@ -1525,9 +1578,9 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   const saveAll = async()=>{
     setSaving(true);
     try {
-      const payload = { reference_number: openRef.reference_number, template_key: normalizeItemName(itemName), field_values: values, overrides, updated_by: user.username, updated_at: new Date().toISOString() };
-      await sb.from("datasheets").upsert(payload, { onConflict: "reference_number,template_key" });
-      await logAudit("SAVE","datasheets",openRef.reference_number,"Datasheet ("+itemName+") for "+openRef.reference_number,user.username,null,payload);
+      const payload = { reference_number: openRef.reference_number, item_sl_no: openRef.item_sl_no, template_key: normalizeItemName(itemName), field_values: values, overrides, updated_by: user.username, updated_at: new Date().toISOString() };
+      await sb.from("datasheets").upsert(payload, { onConflict: "reference_number,item_sl_no,template_key" });
+      await logAudit("SAVE","datasheets",openRef.reference_number+"-"+openRef.item_sl_no,"Datasheet ("+itemName+") for "+openRef.reference_number+" Sl No "+openRef.item_sl_no,user.username,null,payload);
       setSaved(true); setTimeout(()=>setSaved(false),2000);
     } catch(e){ console.error("Datasheet save failed",e); }
     finally{ setSaving(false); }
@@ -1549,7 +1602,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
     ws["!cols"] = [{wch:28},{wch:40},{wch:14},{wch:16}];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Datasheet");
-    XLSX.writeFile(wb, openRef.reference_number+"_"+itemName.replace(/\s+/g,"_")+"_Datasheet.xlsx");
+    XLSX.writeFile(wb, openRef.reference_number+"_sl"+openRef.item_sl_no+"_"+itemName.replace(/\s+/g,"_")+"_Datasheet.xlsx");
   };
 
   const exportPDF = ()=>{
@@ -1571,7 +1624,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
     doc.line(10,27,W-10,27);
     doc.setTextColor(...dark); doc.setFontSize(9); let y=34;
     const lbl=(l,v)=>{ doc.setFont(undefined,"bold"); doc.text(l+":",12,y); doc.setFont(undefined,"normal"); doc.text(String(v||""),42,y); y+=6; };
-    lbl("Item",itemName); lbl("Ref No",openRef.reference_number);
+    lbl("Item",itemName); lbl("Quote#",openRef.reference_number+" — Sl No "+openRef.item_sl_no);
     if(openRef.description) lbl("Description",openRef.description);
     lbl("Date",today);
     y += 2;
@@ -1597,7 +1650,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       doc.setTextColor(...dark);
       doc.text(COMPANY_NAME+" | Datasheet | "+today,12,doc.internal.pageSize.getHeight()-5);
     }
-    doc.save(openRef.reference_number+"_"+itemName.replace(/\s+/g,"_")+"_Datasheet.pdf");
+    doc.save(openRef.reference_number+"_sl"+openRef.item_sl_no+"_"+itemName.replace(/\s+/g,"_")+"_Datasheet.pdf");
   };
 
   const filledCount = editableSections.reduce((sum,s)=>sum+s.fields.filter(f=>(values[f.key]!==undefined&&values[f.key]!=="")||f.default).length,0);
@@ -1607,7 +1660,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
     h("div",{style:{background:"#fff",borderRadius:8,width:900,maxWidth:"96vw",maxHeight:"92vh",display:"flex",flexDirection:"column"}},
       h("div",{style:{background:colors.dark,color:"#fff",padding:"12px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderRadius:"8px 8px 0 0"}},
         h("div",null,
-          h("div",{style:{fontWeight:700,fontSize:14}},"Datasheet — "+openRef.reference_number),
+          h("div",{style:{fontWeight:700,fontSize:14}},"Datasheet — "+openRef.reference_number+" · Sl No "+openRef.item_sl_no),
           h("div",{style:{fontSize:11,opacity:0.75}},template.docTitle)
         ),
         h("button",{onClick:onClose,style:{background:"none",border:"none",color:"#fff",cursor:"pointer",fontSize:16}},"✕")
@@ -1985,7 +2038,7 @@ function DatasheetMasterEditor({ onGoToTab }){
 
   return h("div",{style:{padding:"20px 24px"}},
     h("h2",{style:{margin:"0 0 4px",fontSize:18,fontWeight:700}},"Datasheet Master"),
-    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},"One master per item. Drop an Excel file to build or replace it, or add fields by hand below. The Saved Estimates \"Datasheet\" button reads straight from here."),
+    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},"One master per item. Drop an Excel file to build or replace it, or add fields by hand below. The Quotes \"Datasheet\" button reads straight from here."),
 
     // Drag & drop upload zone
     h("div",{
@@ -2125,7 +2178,7 @@ function DatasheetMasterEditor({ onGoToTab }){
 
 function SavedEstimates({ user }) {
   const [refs,setRefs]=useState([]); const [loading,setLoading]=useState(true);
-  const [refFilter,setRefFilter]=useState(""); const [descSearch,setDescSearch]=useState(""); const [openRef,setOpenRef]=useState(null);
+  const [refFilter,setRefFilter]=useState(""); const [slNoFilter,setSlNoFilter]=useState(""); const [descSearch,setDescSearch]=useState(""); const [openRef,setOpenRef]=useState(null);
   const [showDatasheet,setShowDatasheet]=useState(false);
   const [openLines,setOpenLines]=useState([]); const [loadingLines,setLoadingLines]=useState(false);
   const [lineEdits,setLineEdits]=useState({}); // {refNum-slNo: {field:value}} — pending unsaved edits
@@ -2162,7 +2215,7 @@ function SavedEstimates({ user }) {
       const cost=Number((qty*(orderQty||1)*rate).toFixed(4));
       const sales_price=Number((cost*sf).toFixed(4));
       const payload={...edits,cost,sales_price};
-      await sb.from("estimate_lines").update(payload).eq("reference_number",line.reference_number).eq("sl_no",line.sl_no);
+      await sb.from("estimate_lines").update(payload).eq("reference_number",line.reference_number).eq("item_sl_no",line.item_sl_no).eq("sl_no",line.sl_no);
       setOpenLines(ls=>ls.map(l=>l.reference_number===line.reference_number&&l.sl_no===line.sl_no?{...l,...payload}:l));
       setLineEdits(e=>{ const n={...e}; delete n[key]; return n; });
     } catch(err){ console.error("Save failed",err); }
@@ -2233,13 +2286,20 @@ function SavedEstimates({ user }) {
   const filtered=useMemo(()=>{
     let out = refs;
     if(refFilter) out = out.filter(r=>r.reference_number===refFilter);
+    if(slNoFilter) out = out.filter(r=>String(r.item_sl_no)===String(slNoFilter));
     if(descSearch){ const s=descSearch.toLowerCase(); out = out.filter(r=>(r.description||"").toLowerCase().includes(s)); }
     return out;
-  },[refs,refFilter,descSearch]);
+  },[refs,refFilter,slNoFilter,descSearch]);
+
+  // Sl No options narrow to whichever Quote# is currently selected
+  const slNoOptions = useMemo(()=>{
+    const pool = refFilter ? refs.filter(r=>r.reference_number===refFilter) : refs;
+    return Array.from(new Set(pool.map(r=>r.item_sl_no))).sort((a,b)=>a-b);
+  },[refs,refFilter]);
 
   const openEstimate=async(ref)=>{
-    setOpenRef(ref); setLoadingLines(true); setOrderQty(ref.order_qty||1);
-    const{data}=await sb.from("estimate_lines").select("*").eq("reference_number",ref.reference_number).order("sl_no");
+    setOpenRef(ref); setLoadingLines(true); setOrderQty(ref.order_qty||1); setLineEdits({}); setSavingLine({});
+    const{data}=await sb.from("estimate_lines").select("*").eq("reference_number",ref.reference_number).eq("item_sl_no",ref.item_sl_no).order("sl_no");
     setOpenLines(data||[]); setLoadingLines(false);
     // Header Model: the estimates row is the authoritative "main form" value.
     // Older estimates saved before this field existed fall back to the first line's model.
@@ -2298,7 +2358,7 @@ function SavedEstimates({ user }) {
       const bomMatch=bomForModel.find(r=>r.component===addComponent&&r.material_spec===addSpec);
       const materialShape=bomMatch?bomMatch.material_shape||"":"";
       const payload={
-        reference_number:openRef.reference_number, sl_no:nextSl, estimate_id:openRef.id,
+        reference_number:openRef.reference_number, item_sl_no:openRef.item_sl_no, sl_no:nextSl, estimate_id:openRef.id,
         model:addModel, sub_assembly:addSubAssembly, component:addComponent,
         material_shape:materialShape,
         material_spec:addSpec, grade:addGrade, qty_required:Number(addQty)||0,
@@ -2313,12 +2373,12 @@ function SavedEstimates({ user }) {
     } catch(e){setAddMsg("Failed: "+e.message);} finally{setSavingAdd(false);}
   };
 
-  const deleteEstimateLine=async(refNumber,slNo)=>{
+  const deleteEstimateLine=async(refNumber,itemSlNo,slNo)=>{
     if(!confirm("Delete Sl No "+slNo+"?")) return;
-    const{data:rowData}=await sb.from("estimate_lines").select("*").eq("reference_number",refNumber).eq("sl_no",slNo).single();
-    await sb.from("estimate_lines").delete().eq("reference_number",refNumber).eq("sl_no",slNo);
-    await logAudit("DELETE","estimate_lines",refNumber+"-"+slNo,"Ref: "+refNumber+" Sl: "+slNo+(rowData?.component?" — "+rowData.component:""),user?.username||"unknown",rowData,null);
-    setOpenLines(l=>l.filter(x=>!(x.reference_number===refNumber&&x.sl_no===slNo)));
+    const{data:rowData}=await sb.from("estimate_lines").select("*").eq("reference_number",refNumber).eq("item_sl_no",itemSlNo).eq("sl_no",slNo).single();
+    await sb.from("estimate_lines").delete().eq("reference_number",refNumber).eq("item_sl_no",itemSlNo).eq("sl_no",slNo);
+    await logAudit("DELETE","estimate_lines",refNumber+"-"+itemSlNo+"-"+slNo,"Quote#: "+refNumber+" Sl: "+itemSlNo+" Line: "+slNo+(rowData?.component?" — "+rowData.component:""),user?.username||"unknown",rowData,null);
+    setOpenLines(l=>l.filter(x=>!(x.reference_number===refNumber&&x.item_sl_no===itemSlNo&&x.sl_no===slNo)));
   };
 
   const [orderQty,setOrderQty]=useState(1);
@@ -2362,7 +2422,7 @@ function SavedEstimates({ user }) {
     rows.push(["","","","","","","","TOTAL",Number(totalCost.toFixed(2)),"",Number(totalSales.toFixed(2))]);
     const ws=XLSX.utils.aoa_to_sheet([headers].concat(rows));
     const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"Estimate");
-    XLSX.writeFile(wb,"estimate_"+openRef.reference_number+".xlsx");
+    XLSX.writeFile(wb,"estimate_"+openRef.reference_number+"_sl"+openRef.item_sl_no+".xlsx");
   };
   const exportSummaryXlsxSaved=()=>{
     const headers=["#","Shape","Material spec","Grade","Total qty","UOM","Rate","Total cost","Total sales price","Lines"];
@@ -2376,12 +2436,12 @@ function SavedEstimates({ user }) {
     const ws=XLSX.utils.aoa_to_sheet([headers].concat(rows));
     ws["!cols"]=[{wch:5},{wch:14},{wch:36},{wch:22},{wch:12},{wch:8},{wch:10},{wch:14},{wch:16},{wch:7}];
     const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"Summary BOM");
-    XLSX.writeFile(wb,"summary_"+openRef.reference_number+".xlsx");
+    XLSX.writeFile(wb,"summary_"+openRef.reference_number+"_sl"+openRef.item_sl_no+".xlsx");
   };
   const exportPDF=()=>{
     const headers=["Sl","Model","Component","Material Spec","Grade","Qty","UOM","Rate","Cost","Sf","Sales Price"];
     const rows=openLines.map(l=>[l.sl_no,l.model||"",l.component||"",l.material_spec||"",l.grade||"",l.qty_required,l.uom||"",fmt(Number(l.rate)||0),fmt(Number(l.cost)||0),l.sf,fmt(Number(l.sales_price)||0)]);
-    generatePDF({title:"Estimate",refNumber:openRef.reference_number,description:openRef.description,createdBy:openRef.created_by,createdAt:openRef.created_at,headers,rows,footerRows:[["","","","","","","","Total",fmt(totalCost),"",fmt(totalSales)]],filename:"estimate_"+openRef.reference_number+".pdf"});
+    generatePDF({title:"Estimate",refNumber:openRef.reference_number+" — Sl No "+openRef.item_sl_no,description:openRef.description,createdBy:openRef.created_by,createdAt:openRef.created_at,headers,rows,footerRows:[["","","","","","","","Total",fmt(totalCost),"",fmt(totalSales)]],filename:"estimate_"+openRef.reference_number+"_sl"+openRef.item_sl_no+".pdf"});
   };
   const exportSummaryPDFSaved=()=>{
     const today=new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
@@ -2402,7 +2462,7 @@ function SavedEstimates({ user }) {
     doc.line(10,27,W-10,27);
     doc.setTextColor(...dark); doc.setFontSize(9); let y=34;
     const lbl=(l,v)=>{ doc.setFont(undefined,"bold"); doc.text(l+":",12,y); doc.setFont(undefined,"normal"); doc.text(String(v||""),42,y); y+=6; };
-    lbl("Ref No",openRef.reference_number);
+    lbl("Quote#",openRef.reference_number+" — Sl No "+openRef.item_sl_no);
     if(openRef.description) lbl("Description",openRef.description);
     lbl("Date",today); lbl("Prepared by",openRef.created_by||"");
     const tableHead=[["#","Material spec","Grade","Total qty","UOM","Rate","Total cost","Total sales price","Lines"]];
@@ -2429,7 +2489,7 @@ function SavedEstimates({ user }) {
       doc.setTextColor(...dark);
       doc.text(COMPANY_NAME+" | Summary BOM | "+today,12,doc.internal.pageSize.getHeight()-5);
     }
-    doc.save("summary_"+openRef.reference_number+".pdf");
+    doc.save("summary_"+openRef.reference_number+"_sl"+openRef.item_sl_no+".pdf");
   };
 
   const fld=(label,note,ctrl)=>h("div",{style:{flex:1,minWidth:120}},
@@ -2444,16 +2504,24 @@ function SavedEstimates({ user }) {
   return h(React.Fragment,null,
     h("div",{style:{padding:"20px 24px"}},
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
-        h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Saved estimates"),
+        h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Quotes"),
         h("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
           h("select",{value:refFilter,onChange:e=>{
-            const val=e.target.value; setRefFilter(val);
-            if(val){ const match=refs.find(r=>r.reference_number===val); if(match) openEstimate(match); }
-          },style:{...inputStyle,width:200}},
-            h("option",{value:""},"All reference numbers"),
-            refs.map(r=>h("option",{key:r.reference_number,value:r.reference_number},r.reference_number))
+            const val=e.target.value; setRefFilter(val); setSlNoFilter("");
+            const pool = val ? refs.filter(r=>r.reference_number===val) : [];
+            if(val && pool.length===1) openEstimate(pool[0]);
+          },style:{...inputStyle,width:190}},
+            h("option",{value:""},"All quotes"),
+            Array.from(new Set(refs.map(r=>r.reference_number))).map(rn=>h("option",{key:rn,value:rn},rn))
           ),
-          h("input",{value:descSearch,onChange:e=>setDescSearch(e.target.value),placeholder:"Search description…",style:{...inputStyle,width:220}})
+          h("select",{value:slNoFilter,onChange:e=>{
+            const val=e.target.value; setSlNoFilter(val);
+            if(refFilter && val){ const match=refs.find(r=>r.reference_number===refFilter&&String(r.item_sl_no)===String(val)); if(match) openEstimate(match); }
+          },style:{...inputStyle,width:110}},
+            h("option",{value:""},"Sl No"),
+            slNoOptions.map(sn=>h("option",{key:sn,value:sn},sn))
+          ),
+          h("input",{value:descSearch,onChange:e=>setDescSearch(e.target.value),placeholder:"Search description…",style:{...inputStyle,width:200}})
         )
       ),
       h("div",{style:{display:"flex",gap:20,flexWrap:"wrap"}},
@@ -2461,21 +2529,26 @@ function SavedEstimates({ user }) {
           loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
           h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,maxHeight:520,overflowY:"auto"}},
             filtered.map(r=>h("div",{key:r.id,onClick:()=>openEstimate(r),style:{padding:"10px 12px",cursor:"pointer",borderBottom:"1px solid #eceae0",background:openRef&&openRef.id===r.id?colors.dark:"#fff",color:openRef&&openRef.id===r.id?"#fff":colors.text}},
-              h("div",{style:{fontWeight:600,fontSize:13}},r.reference_number),
+              h("div",{style:{fontWeight:600,fontSize:13}},r.reference_number+"  ·  Sl "+r.item_sl_no),
               r.description&&h("div",{style:{fontSize:11,opacity:0.8}},r.description),
               h("div",{style:{fontSize:10.5,opacity:0.6,marginTop:2}},(r.created_by||"")+" · "+new Date(r.created_at).toLocaleDateString())
             )),
-            filtered.length===0&&h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No saved estimates yet.")
+            filtered.length===0&&h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No quotes yet.")
           )
         ),
         h("div",{style:{flex:"1 1 400px",minWidth:0}},
-          !openRef?h("div",{style:{color:colors.mutedLight,fontSize:14,marginTop:30}},"Select a reference number to view its line items."):
+          !openRef?h("div",{style:{color:colors.mutedLight,fontSize:14,marginTop:30}},"Enter a Quote# and Sl No (or pick from the list) to view its line items."):
           loadingLines?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
           h(React.Fragment,null,
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
               h("div",null,
-                h("h3",{style:{margin:0}},openRef.reference_number),
+                h("h3",{style:{margin:0}},openRef.reference_number+"  ·  Sl No "+openRef.item_sl_no),
                 openRef.description&&h("div",{style:{fontSize:12,color:colors.muted}},openRef.description),
+                h("div",{style:{display:"flex",flexWrap:"wrap",gap:12,marginTop:4}},
+                  h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry#: "+(openRef.enquiry_number||"—")),
+                  h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry date: "+(openRef.enquiry_date||"—")),
+                  h("span",{style:{fontSize:12,color:colors.muted}},"Quote date: "+(openRef.quote_date||"—"))
+                ),
                 h("div",{style:{display:"flex",alignItems:"center",gap:8,marginTop:4}},
                   h("span",{style:{fontSize:12,color:colors.muted}},"Model: "+(headerModel||"—")+(headerModel&&modelItemMap.get(headerModel)?"  ("+modelItemMap.get(headerModel)+")":"")),
                   !openRef.model && headerModel && h("button",{onClick:fixHeaderModel,disabled:fixingModel,style:{...btnSmall,color:"#b8472f",borderColor:"#e3b9b9"}},fixingModel?"Fixing…":"Fix — save Model to this estimate")
@@ -2503,16 +2576,16 @@ function SavedEstimates({ user }) {
               h("span",{style:{fontSize:11,color:colors.muted,fontWeight:600}},"Show in MOC:"),
               h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden"}},
                 h("button",{onClick:async()=>{
-                  await sb.from("estimate_lines").update({show_in_moc:true}).eq("reference_number",openRef.reference_number);
+                  await sb.from("estimate_lines").update({show_in_moc:true}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
                   setOpenLines(ls=>ls.map(l=>({...l,show_in_moc:true})));
                 },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,fontFamily:"inherit"}},"Select all"),
                 h("button",{onClick:async()=>{
-                  await sb.from("estimate_lines").update({show_in_moc:false}).eq("reference_number",openRef.reference_number);
+                  await sb.from("estimate_lines").update({show_in_moc:false}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
                   setOpenLines(ls=>ls.map(l=>({...l,show_in_moc:false})));
                 },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Deselect all")
               ),
               h("button",{onClick:async()=>{
-                await sb.from("estimate_lines").update({show_in_moc:false}).eq("reference_number",openRef.reference_number);
+                await sb.from("estimate_lines").update({show_in_moc:false}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
                 setOpenLines(ls=>ls.map(l=>({...l,show_in_moc:false})));
               },style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"Reset to No"),
               h("span",{style:{fontSize:10,color:colors.mutedLight}},openLines.filter(l=>l.show_in_moc===true).length+" of "+openLines.length+" ticked")
@@ -2600,7 +2673,7 @@ function SavedEstimates({ user }) {
                       h("input",{type:"checkbox",checked:showMoc,
                         onChange:e=>{
                           setLineEdit(l.reference_number,l.sl_no,"show_in_moc",e.target.checked);
-                          sb.from("estimate_lines").update({show_in_moc:e.target.checked}).eq("reference_number",l.reference_number).eq("sl_no",l.sl_no);
+                          sb.from("estimate_lines").update({show_in_moc:e.target.checked}).eq("reference_number",l.reference_number).eq("item_sl_no",l.item_sl_no).eq("sl_no",l.sl_no);
                         },
                         style:{width:15,height:15,cursor:"pointer",accentColor:"#1c8c75"}
                       })
@@ -2608,7 +2681,7 @@ function SavedEstimates({ user }) {
                     h("td",{style:{padding:"5px 6px",whiteSpace:"nowrap"}},
                       h("div",{style:{display:"flex",gap:4}},
                         isDirty&&!isSaving&&h("button",{onClick:()=>saveLineEdit(l),style:{background:"#e1f5ee",color:"#0f6e56",border:"0.5px solid #9fe1cb",borderRadius:4,padding:"4px 8px",fontSize:11,cursor:"pointer"}},"Save"),
-                        h("button",{onClick:()=>deleteEstimateLine(l.reference_number,l.sl_no),style:{...btnDanger,padding:"4px 8px"}},"✕")
+                        h("button",{onClick:()=>deleteEstimateLine(l.reference_number,l.item_sl_no,l.sl_no),style:{...btnDanger,padding:"4px 8px"}},"✕")
                       )
                     )
                   );
@@ -2619,7 +2692,7 @@ function SavedEstimates({ user }) {
               h("div",{style:{padding:"12px 16px",background:"#1c2b28",borderRadius:"8px 8px 0 0",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
                 h("div",null,
                   h("div",{style:{fontWeight:700,fontSize:15,color:"#fff"}},"Summary BOM"),
-                  h("div",{style:{fontSize:11,color:colors.accent,marginTop:3}},"Ref: "+openRef.reference_number),
+                  h("div",{style:{fontSize:11,color:colors.accent,marginTop:3}},"Quote#: "+openRef.reference_number+" · Sl No "+openRef.item_sl_no),
                   openRef.description&&h("div",{style:{fontSize:11,color:"#8ab8ad",fontStyle:"italic",marginTop:1}},openRef.description)
                 ),
                 h("div",{style:{textAlign:"right"}},
@@ -2680,7 +2753,7 @@ function SavedEstimates({ user }) {
         h("div",{style:{background:colors.dark,padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}},
           h("div",null,
             h("div",{style:{fontWeight:600,fontSize:14,color:"#fff"}},"Add line item"),
-            h("div",{style:{fontSize:11,color:"#9a9d8f",marginTop:2}},"Ref: "+openRef.reference_number+" — next Sl No will be "+((openLines.length>0?Math.max(...openLines.map(l=>l.sl_no)):0)+1))
+            h("div",{style:{fontSize:11,color:"#9a9d8f",marginTop:2}},"Quote#: "+openRef.reference_number+" · Sl No "+openRef.item_sl_no+" — next line will be "+((openLines.length>0?Math.max(...openLines.map(l=>l.sl_no)):0)+1))
           ),
           h("button",{onClick:()=>setShowAddLine(false),style:{background:"rgba(184,71,47,0.3)",border:"none",borderRadius:6,width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",color:"#f09595",fontSize:14}},
             h("i",{className:"ti ti-x","aria-hidden":"true"})
