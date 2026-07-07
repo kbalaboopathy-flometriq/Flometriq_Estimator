@@ -2650,8 +2650,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   };
 
   const bomHeaders = (withSales)=> withSales
-    ? ["Component","Sub Assembly","Material spec","Grade","Qty Reqd Per Item","UOM","Qty by Order/Quote","Rate","Sf","Cost","Sales price"]
-    : ["Component","Sub Assembly","Material spec","Grade","Qty Reqd Per Item","UOM","Qty by Order/Quote","Rate","Cost"];
+    ? ["Component","Sub Assembly","Material spec","Grade","Reqd Qty/ Unit","UOM","Total Qty","Rate","Sf","Cost","Sales price"]
+    : ["Component","Sub Assembly","Material spec","Grade","Reqd Qty/ Unit","UOM","Total Qty","Rate","Cost"];
   // Column A ("Component" header) is always blank on data rows — the sub-assembly
   // name is shown once as its own group-header row instead. Column B ("Sub
   // Assembly" header) carries the line's own component value.
@@ -2690,15 +2690,17 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         const rows=[];
         rows.push(["BOM WITH ESTIMATE"]);
         rows.push([]);
-        rows.push(["Sl No", est.item_sl_no, "", "Client", customer, "Quote date", est.quote_date||""]);
-        rows.push(["Item", itemName, "", "Quote No", est.reference_number]);
-        rows.push(["Model", est.model||""]);
+        rows.push(["Sl No", est.item_sl_no, "Client", customer, "Quote date", est.quote_date||""]);
+        rows.push(["Item", itemName, "Quote No", est.reference_number]);
+        rows.push(["Model", est.model||"", "Qty By Order", est.order_qty||1]);
         rows.push([]);
         rows.push(bomHeaders(withSales));
+        rows.push(["","","","","","","(Qty By Order x Reqd Qty)"]);
         const headerRowCount = rows.length; // for number-format start (1-indexed row after this)
         groupBySubAssembly(lines).forEach(grp=>{
           rows.push([]);
           rows.push([grp.subAssembly]);
+          rows.push([]);
           grp.lines.forEach(l=>rows.push(bomDataRow(l, est.order_qty||1, withSales)));
         });
         const ws = XLSX.utils.aoa_to_sheet(rows);
@@ -2733,8 +2735,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     }
   };
   // The "BOM WITH ESTIMATE" / "DATA SHEET" title + Sl No/Client/Quote date/Item/
-  // Quote No/Model block, drawn below the company letterhead. Returns the y
-  // position to continue from.
+  // Quote No/Model/Qty By Order block, drawn below the company letterhead.
+  // Returns the y position to continue from.
   const drawDocHeaderBlock = (doc, title, fields)=>{
     const dark=[28,31,26];
     doc.setFontSize(15); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
@@ -2743,12 +2745,13 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     const lbl=(x,label,value)=>{ doc.setFont(undefined,"bold"); doc.setFontSize(9); doc.text(label,x,y); doc.setFont(undefined,"normal"); doc.text(String(value||""),x+22,y); };
     lbl(12,"Sl No", fields.slNo);
     lbl(60,"Client", fields.client);
-    lbl(140,"Quote date", fields.quoteDate);
+    lbl(150,"Quote date", fields.quoteDate);
     y+=6;
     lbl(12,"Item", fields.item);
     lbl(60,"Quote No", fields.quoteNo);
     y+=6;
     lbl(12,"Model", fields.model);
+    if(fields.qtyByOrder!==undefined) lbl(60,"Qty By Order", fields.qtyByOrder);
     return y+7;
   };
 
@@ -2767,7 +2770,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         if(idx>0) doc.addPage();
         drawQuoteLetterhead(doc,W,"BOM WITH ESTIMATE",quoteExportRef,customer);
         const itemName = modelItemMap.get(est.model) || "";
-        let y = drawDocHeaderBlock(doc,"BOM WITH ESTIMATE",{slNo:est.item_sl_no,client:customer,quoteDate:est.quote_date,item:itemName,quoteNo:est.reference_number,model:est.model});
+        let y = drawDocHeaderBlock(doc,"BOM WITH ESTIMATE",{slNo:est.item_sl_no,client:customer,quoteDate:est.quote_date,item:itemName,quoteNo:est.reference_number,model:est.model,qtyByOrder:est.order_qty||1});
         const lines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
         const numericCols = withSales ? [4,6,7,8,9,10] : [4,6,7,8];
         const columnStyles = {}; numericCols.forEach(ci=>columnStyles[ci]={halign:"right"});
@@ -2782,12 +2785,16 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           margin:{left:14,right:14}
         });
         y = doc.lastAutoTable.finalY;
+        doc.setFont(undefined,"italic"); doc.setFontSize(7); doc.setTextColor(120,120,120);
+        doc.text("(Qty By Order x Reqd Qty)", 14, y+4);
+        y += 3;
         groupBySubAssembly(lines).forEach(grp=>{
-          y += 5;
+          y += 6;
           doc.setFont(undefined,"bold"); doc.setFontSize(8.5); doc.setTextColor(...dark);
           doc.text(grp.subAssembly, 14, y);
+          y += 5;
           doc.autoTable({
-            startY:y+2,
+            startY:y,
             body: grp.lines.map(l=>bomDataRow(l, est.order_qty||1, withSales).map(v=>typeof v==="number"?fmt(v):v)),
             theme:"plain",
             bodyStyles:{fontSize:7.5,textColor:dark},
