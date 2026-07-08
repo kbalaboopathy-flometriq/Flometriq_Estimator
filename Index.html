@@ -1281,13 +1281,25 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
     if(!String(itemSlNo).trim()){setSaveMsg("Enter a Sl No.");return;}
     if(!enquiryNumber.trim()){setSaveMsg("Enter an Enquiry number.");return;}
     if(cart.length===0){setSaveMsg("Add at least one model's lines to the estimate first.");return;}
+    const ref=refNumber.trim();
+    const slNo=Number(itemSlNo);
+    // Always confirm before writing into an existing Quote# — whether that
+    // means adding a brand-new Sl No alongside it, or overwriting one that's
+    // already there. A fresh Quote# (no siblings at all) needs no prompt.
+    const { data: siblingRows } = await sb.from("estimates").select("item_sl_no").eq("reference_number",ref);
+    if(siblingRows && siblingRows.length>0){
+      const usedSlNos = siblingRows.map(r=>r.item_sl_no);
+      const isOverwrite = usedSlNos.includes(slNo);
+      const msg = isOverwrite
+        ? "Sl No "+slNo+" already exists under Quote# \""+ref+"\". Saving now will overwrite its existing line items. Proceed?"
+        : "Quote# \""+ref+"\" already exists. This will add a new line item as Sl No "+slNo+" alongside its existing Sl No(s) ("+usedSlNos.join(", ")+"). Proceed?";
+      if(!confirm(msg)) return;
+    }
     setSavingRef(true);
+    let estimateId, createdNewHeader=false;
     try {
-      const ref=refNumber.trim();
-      const slNo=Number(itemSlNo);
       const headerModel = (cart[0]&&cart[0].model) || selectedModel || "";
       const {data:existing}=await sb.from("estimates").select("id").eq("reference_number",ref).eq("item_sl_no",slNo).limit(1);
-      let estimateId;
       const headerPayload={description:refDesc,model:headerModel,enquiry_number:enquiryNumber.trim(),enquiry_date:enquiryDate||null,quote_date:quoteDate||null,updated_at:new Date().toISOString()};
       if(existing&&existing.length>0){
         estimateId=existing[0].id;
@@ -1296,13 +1308,23 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
       } else {
         const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,created_by:user.username}).select().single();
         if(err) throw err;
-        estimateId=created.id;
+        estimateId=created.id; createdNewHeader=true;
       }
       const rows=cart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,show_in_moc:l.show_in_moc===true}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
       setSaveMsg("Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).");
       setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setExistingQuoteHeader(null); setShowSave(false);
-    } catch(e){setSaveMsg("Save failed: "+(e.message||"unknown"));} finally{setSavingRef(false);}
+    } catch(e){
+      // If the lines insert is what failed, don't leave a header behind with
+      // no lines under it — that's how "dirty" quotes with no sub-form data
+      // get created. Only safe to remove if THIS attempt created it fresh;
+      // an existing header's lines were already cleared above, so it's left
+      // as-is (empty) rather than deleting a quote header that pre-dates this save.
+      if(createdNewHeader && estimateId){
+        try{ await sb.from("estimates").delete().eq("id",estimateId); }catch(cleanupErr){}
+      }
+      setSaveMsg("Save failed: "+(e.message||"unknown"));
+    } finally{setSavingRef(false);}
   };
 
 
