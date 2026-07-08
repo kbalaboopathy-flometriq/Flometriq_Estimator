@@ -100,6 +100,14 @@ function sanitizeSheetName(s){
   return ((s||"Sheet").replace(/[:\\\/\?\*\[\]]/g,"").trim()||"Sheet").slice(0,31);
 }
 function r2(n){ const x = Number(n); return isNaN(x) ? 0 : Math.round(x*100)/100; }
+// Inserts a blank spacer row between every row in an array (not around the
+// whole array) — used to put breathing room between every BOM/datasheet line
+// in both Excel and PDF exports.
+function withRowSpacing(rowsArr, blankRow){
+  const out=[];
+  rowsArr.forEach((r,i)=>{ if(i>0) out.push(blankRow); out.push(r); });
+  return out;
+}
 // Applies a 2-decimal, thousands-separated number format to every numeric cell
 // from fromRow (1-indexed) onward. Note: the free/community build of SheetJS
 // used here (xlsx.full.min.js) can set number formats but cannot write font
@@ -1035,14 +1043,108 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   };
 
   const exportPDF = ()=>{
-    const headers=["Sl","Component","Sub Assembly","Material Spec","Grade","Qty","UOM","Rate","Cost","Sf","Sales Price"];
-    const rows=computedLines.map((l,idx)=>[idx+1,l.component||"",l.sub_assembly||"",l.material_spec||"",l.selGrade||"",l.qty,l.uom||"",fmt(l.rate),fmt(l.cost),l.sf,fmt(l.salesPrice)]);
-    generatePDF({
-      title:"BOM Estimate", refNumber:selectedModel, description:"", createdBy:user.username,
-      createdAt:Date.now(), headers, rows,
-      footerRows:[["","","","","","","","Total",fmt(total),"",fmt(totalSalesPrice)]],
-      filename:"estimate_"+selectedModel+".pdf"
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
+    const W = doc.internal.pageSize.getWidth();
+    const pageH = doc.internal.pageSize.getHeight();
+    const dark = [28,31,26];
+    const today = new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
+
+    // Same 10-column layout as the Quotes BOM PDF, minus Total Qty (there's no
+    // separate order-quantity multiplier yet at this pre-save stage).
+    const headRow = [
+      {content:"Component"}, {content:"Sub Assembly"}, {content:"Material spec"}, {content:"Grade"},
+      {content:"Qty", styles:{halign:"right"}},
+      {content:"UOM", styles:{halign:"center"}},
+      {content:"Rate", styles:{halign:"right"}},
+      {content:"Sf", styles:{halign:"right"}},
+      {content:"Cost", styles:{halign:"right"}},
+      {content:"Sales price", styles:{halign:"right"}},
+    ];
+    const widths = [26,36,60,28,18,16,22,15,24,24]; // sums to 269mm usable width
+    const columnStyles = {};
+    widths.forEach((w,ci)=>{
+      let halign = "left";
+      if([4,6,7,8,9].includes(ci)) halign="right";
+      else if(ci===5) halign="center";
+      columnStyles[ci] = { cellWidth:w, halign };
     });
+    const blankRow = widths.map(()=>"");
+
+    const drawLetterhead = ()=>{
+      try{ doc.addImage(COMPANY_LOGO,"PNG",10,4,36,18); }catch(e){}
+      doc.setFontSize(10); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+      doc.text(COMPANY_NAME,W-14,8,{align:"right"});
+      doc.setFontSize(7); doc.setFont(undefined,"normal"); doc.setTextColor(100,100,100);
+      doc.text(COMPANY_ADDRESS,W-14,13,{align:"right"});
+      doc.text(COMPANY_WEBSITE+"   |   "+COMPANY_EMAIL,W-14,17.5,{align:"right"});
+      doc.setFontSize(8.5); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+      doc.text("BOM ESTIMATE",W-14,23,{align:"right"});
+      doc.setDrawColor(200,197,185); doc.setLineWidth(0.4);
+      doc.line(10,27,W-10,27);
+    };
+    let letterheadPage = 0;
+    const ensureLetterhead = ()=>{
+      const p = doc.internal.getNumberOfPages();
+      if(p !== letterheadPage){ drawLetterhead(); letterheadPage = p; }
+    };
+    ensureLetterhead();
+
+    doc.setFontSize(15); doc.setTextColor(...dark); doc.setFont("times","bold");
+    doc.text("BOM ESTIMATE", W/2, 34, {align:"center"});
+    let y = 41;
+    const lbl = (x,label,value)=>{ doc.setFont("times","bold"); doc.setFontSize(9); doc.text(label,x,y); doc.setFont(undefined,"normal"); doc.text(String(value||""),x+22,y); };
+    lbl(12,"Model", selectedModel);
+    lbl(90,"Date", today);
+    lbl(160,"Prepared by", user.username);
+    y += 9;
+
+    doc.autoTable({
+      startY:y, head:[headRow], body:[], theme:"grid", tableWidth:"wrap",
+      styles:{font:"times",cellPadding:{top:1.5,right:3.5,bottom:1.5,left:3.5}},
+      headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,font:"times",lineColor:[200,200,200],lineWidth:0.2},
+      columnStyles,
+      margin:{top:32,left:14,right:14,bottom:18},
+      didDrawPage: ensureLetterhead
+    });
+    y = doc.lastAutoTable.finalY + 3;
+
+    const groups=[]; const map=new Map();
+    computedLines.forEach(l=>{
+      const key = l.component||"(ungrouped)";
+      if(!map.has(key)){ map.set(key,[]); groups.push(key); }
+      map.get(key).push(l);
+    });
+    groups.forEach(key=>{
+      const grpLines = map.get(key);
+      if(y + 6 + 5 + 8 > pageH - 18){ doc.addPage(); ensureLetterhead(); y = 32; } else { y += 6; }
+      doc.setFont("times","bold"); doc.setFontSize(8.5); doc.setTextColor(...dark);
+      doc.text(key, 14, y);
+      y += 5;
+      const dataRows = grpLines.map(l=>["", l.sub_assembly||"", l.material_spec||"", l.selGrade||"", fmt(l.qty), l.uom||"", fmt(l.rate), fmt(l.sf), fmt(l.cost), fmt(l.salesPrice)]);
+      doc.autoTable({
+        startY:y,
+        body: withRowSpacing(dataRows, blankRow),
+        theme:"plain", tableWidth:"wrap",
+        styles:{cellPadding:{top:1.2,right:3.5,bottom:1.2,left:3.5}},
+        bodyStyles:{fontSize:7.5,textColor:dark},
+        columnStyles,
+        margin:{top:32,left:14,right:14,bottom:18},
+        didDrawPage: ensureLetterhead
+      });
+      y = doc.lastAutoTable.finalY;
+    });
+
+    if(y + 10 > pageH - 18){ doc.addPage(); ensureLetterhead(); y = 32; } else { y += 8; }
+    doc.setFont("times","bold"); doc.setFontSize(9); doc.setTextColor(...dark);
+    doc.text("Total cost: "+fmt(total)+"        Total sales price: "+fmt(totalSalesPrice), 14, y);
+
+    const pageCount = doc.internal.getNumberOfPages();
+    for(let i=1;i<=pageCount;i++){
+      doc.setPage(i); doc.setFontSize(7); doc.setTextColor(150);
+      doc.text("Page "+i+" of "+pageCount, W-12, doc.internal.pageSize.getHeight()-5, {align:"right"});
+    }
+    doc.save("estimate_"+selectedModel+".pdf");
   };
 
   const exportSummaryXlsx = ()=>{
@@ -2664,6 +2766,22 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const bomHeaders = (withSales)=> withSales
     ? ["Component","Sub Assembly","Material spec","Grade","Reqd Qty/ Unit","UOM","Total Qty","Rate","Sf","Cost","Sales price"]
     : ["Component","Sub Assembly","Material spec","Grade","Reqd Qty/ Unit","UOM","Total Qty","Rate","Cost"];
+  // PDF-only: same labels as bomHeaders, but as autoTable cell objects so
+  // "Reqd Qty/ Unit" and "Total Qty" wrap onto two lines, and UOM/Total Qty
+  // are centered while the rest keep their column's normal alignment.
+  const bomHeadRowPDF = (withSales)=>{
+    const cells = [
+      {content:"Component"}, {content:"Sub Assembly"}, {content:"Material spec"}, {content:"Grade"},
+      {content:"Reqd Qty/\nUnit", styles:{halign:"right"}},
+      {content:"UOM", styles:{halign:"center"}},
+      {content:"Total\nQty", styles:{halign:"center"}},
+      {content:"Rate", styles:{halign:"right"}},
+    ];
+    if(withSales) cells.push({content:"Sf", styles:{halign:"right"}});
+    cells.push({content:"Cost", styles:{halign:"right"}});
+    if(withSales) cells.push({content:"Sales price", styles:{halign:"right"}});
+    return cells;
+  };
   // Column A ("Component" header) is always blank on data rows — the sub-assembly
   // name is shown once as its own group-header row instead. Column B ("Sub
   // Assembly" header) carries the line's own component value.
@@ -2713,7 +2831,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           rows.push([]);
           rows.push([grp.component]);
           rows.push([]);
-          grp.lines.forEach(l=>rows.push(bomDataRow(l, est.order_qty||1, withSales)));
+          withRowSpacing(grp.lines.map(l=>bomDataRow(l, est.order_qty||1, withSales)), []).forEach(r=>rows.push(r));
         });
         const ws = XLSX.utils.aoa_to_sheet(rows);
         ws["!cols"] = [{wch:14},{wch:18},{wch:36},{wch:15},{wch:12},{wch:8},{wch:14},{wch:11},{wch:7},{wch:12},{wch:13}];
@@ -2794,8 +2912,10 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   // line up in exactly the same columns (each autoTable call otherwise
   // auto-sizes independently, which is what caused the misalignment).
   const bomColumnWidths = (withSales)=> withSales
-    ? [24,32,50,26,23,16,20,20,14,22,22]
-    : [26,36,58,30,27,18,24,24,26];
+    ? [22,30,51,24,26,18,16,21,15,23,23]
+    : [24,34,66,28,30,20,18,24,25];
+  // Which columns are centered vs right-aligned in the body (everything else stays left).
+  const bomCenterCols = (withSales)=> withSales ? [5,6] : [5,6]; // UOM, Total Qty
 
   const CONTENT_TOP_Y = 32; // space reserved below the letterhead+divider, used on every continuation page
   const exportQuoteBOMPDF = async(withSales)=>{
@@ -2809,19 +2929,37 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const W = doc.internal.pageSize.getWidth();
       const pageH = doc.internal.pageSize.getHeight();
       const dark=[28,31,26];
-      const headers = bomHeaders(withSales);
-      const numericCols = withSales ? [4,6,7,8,9,10] : [4,6,7,8];
+      const headRow = bomHeadRowPDF(withSales);
+      const centerCols = bomCenterCols(withSales);
+      const numericCols = (withSales ? [4,7,8,9,10] : [4,7,8]).filter(c=>!centerCols.includes(c));
       const widths = bomColumnWidths(withSales);
-      const columnStyles = {}; widths.forEach((w,ci)=>{ columnStyles[ci] = { cellWidth:w, halign: numericCols.includes(ci)?"right":"left" }; });
+      const columnStyles = {};
+      widths.forEach((w,ci)=>{
+        let halign = "left";
+        if(numericCols.includes(ci)) halign="right";
+        else if(centerCols.includes(ci)) halign="center";
+        columnStyles[ci] = { cellWidth:w, halign };
+      });
+      const blankRow = widths.map(()=> "");
+      // The letterhead must be drawn exactly once per page. autoTable's
+      // didDrawPage fires for every page a table touches — including the page
+      // it starts on, which already has the letterhead drawn manually — so a
+      // naive "always redraw" causes the letterhead to be stamped twice on
+      // top of itself. Track which page we last drew it on instead.
+      let letterheadPage = 0;
+      const ensureLetterhead = ()=>{
+        const p = doc.internal.getNumberOfPages();
+        if(p !== letterheadPage){ drawQuoteLetterhead(doc,W,"BOM WITH ESTIMATE",quoteExportRef,customer); letterheadPage = p; }
+      };
       estimatesRows.forEach((est,idx)=>{
         if(idx>0) doc.addPage();
-        drawQuoteLetterhead(doc,W,"BOM WITH ESTIMATE",quoteExportRef,customer);
+        ensureLetterhead();
         const itemName = modelItemMap.get(est.model) || "";
         let y = drawDocHeaderBlock(doc,"BOM WITH ESTIMATE",{slNo:est.item_sl_no,client:customer,quoteDate:est.quote_date,item:itemName,quoteNo:est.reference_number,model:est.model,qtyByOrder:est.order_qty||1});
         const lines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
         doc.autoTable({
           startY:y,
-          head:[headers],
+          head:[headRow],
           body: [],
           theme:"grid",
           tableWidth:"wrap",
@@ -2829,7 +2967,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,font:"times",lineColor:[200,200,200],lineWidth:0.2},
           bodyStyles:{fontSize:7.5,textColor:dark},
           columnStyles,
-          margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18}
+          margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
+          didDrawPage: ensureLetterhead
         });
         y = doc.lastAutoTable.finalY;
         doc.setFont(undefined,"italic"); doc.setFontSize(7); doc.setTextColor(120,120,120);
@@ -2841,7 +2980,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           // plus at least one data row, start the group fresh on a new page.
           if(y + 6 + 5 + 8 > pageH - 18){
             doc.addPage();
-            drawQuoteLetterhead(doc,W,"BOM WITH ESTIMATE",quoteExportRef,customer);
+            ensureLetterhead();
             y = CONTENT_TOP_Y;
           } else {
             y += 6;
@@ -2849,16 +2988,17 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           doc.setFont("times","bold"); doc.setFontSize(8.5); doc.setTextColor(...dark);
           doc.text(grp.component, 14, y);
           y += 5;
+          const dataRows = grp.lines.map(l=>bomDataRow(l, est.order_qty||1, withSales).map(v=>typeof v==="number"?fmt(v):v));
           doc.autoTable({
             startY:y,
-            body: grp.lines.map(l=>bomDataRow(l, est.order_qty||1, withSales).map(v=>typeof v==="number"?fmt(v):v)),
+            body: withRowSpacing(dataRows, blankRow),
             theme:"plain",
             tableWidth:"wrap",
             styles:{cellPadding:{top:1.2,right:3.5,bottom:1.2,left:3.5}},
             bodyStyles:{fontSize:7.5,textColor:dark},
             columnStyles,
             margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
-            didDrawPage:()=>{ drawQuoteLetterhead(doc,W,"BOM WITH ESTIMATE",quoteExportRef,customer); }
+            didDrawPage: ensureLetterhead
           });
           y = doc.lastAutoTable.finalY;
         });
@@ -2930,12 +3070,17 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const W = doc.internal.pageSize.getWidth();
       const pageH = doc.internal.pageSize.getHeight();
       const dark=[28,31,26];
+      let letterheadPage = 0;
+      const ensureLetterhead = ()=>{
+        const p = doc.internal.getNumberOfPages();
+        if(p !== letterheadPage){ drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer); letterheadPage = p; }
+      };
       let first=true;
       for(const [itemName, instances] of itemGroups){
         const matrix = buildItemMatrix(instances);
         if(!first) doc.addPage();
         first=false;
-        drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer);
+        ensureLetterhead();
         let y = drawDocHeaderBlock(doc,"DATA SHEET",{
           slNo: instances.map(i=>i.slNo).join(", "),
           client: customer, item: itemName,
@@ -2954,7 +3099,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           styles:{cellPadding:{top:1.5,right:3.5,bottom:1.5,left:3.5}},
           headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,font:"times",lineColor:[200,200,200],lineWidth:0.2},
           columnStyles,
-          margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18}
+          margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
+          didDrawPage: ensureLetterhead
         });
         y = doc.lastAutoTable.finalY;
         matrix.forEach(sec=>{
@@ -2962,7 +3108,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           // strand the title alone at the bottom with data on the next page.
           if(y + 5 + 2 + 8 > pageH - 18){
             doc.addPage();
-            drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer);
+            ensureLetterhead();
             y = CONTENT_TOP_Y;
           } else {
             y += 5;
@@ -2976,12 +3122,12 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
             bodyStyles:{fontSize:7.5,textColor:dark},
             columnStyles,
             margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
-            didDrawPage:()=>{ drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer); }
+            didDrawPage: ensureLetterhead
           });
           y = doc.lastAutoTable.finalY;
         });
       }
-      if(itemGroups.size===0){ drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer); doc.setFontSize(10); doc.text("No datasheet masters found for any item in this quote.",12,40); }
+      if(itemGroups.size===0){ ensureLetterhead(); doc.setFontSize(10); doc.text("No datasheet masters found for any item in this quote.",12,40); }
       numberQuotePages(doc,W);
       doc.save(quoteExportRef.replace(/\s+/g,"_")+"_Datasheets.pdf");
     } finally { setExportingQuote(""); }
@@ -3033,7 +3179,12 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
       const W = doc.internal.pageSize.getWidth();
       const neutral=[244,242,234]; const dark=[28,31,26];
-      drawQuoteLetterhead(doc,W,"QUOTE SUMMARY",quoteExportRef,customer);
+      let letterheadPage = 0;
+      const ensureLetterhead = ()=>{
+        const p = doc.internal.getNumberOfPages();
+        if(p !== letterheadPage){ drawQuoteLetterhead(doc,W,"QUOTE SUMMARY",quoteExportRef,customer); letterheadPage = p; }
+      };
+      ensureLetterhead();
       const totalCost = summary.reduce((s,g)=>s+g.totalCost,0);
       const totalSales = summary.reduce((s,g)=>s+g.totalSales,0);
       doc.autoTable({
@@ -3046,7 +3197,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8},
         bodyStyles:{fontSize:7.5,textColor:dark},
         margin:{left:12,right:12},
-        didDrawPage:()=>drawQuoteLetterhead(doc,W,"QUOTE SUMMARY",quoteExportRef,customer)
+        didDrawPage: ensureLetterhead
       });
       numberQuotePages(doc,W);
       doc.save(quoteExportRef.replace(/\s+/g,"_")+"_Summary.pdf");
