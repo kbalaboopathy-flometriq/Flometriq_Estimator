@@ -1099,43 +1099,35 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
     lbl(160,"Prepared by", user.username);
     y += 9;
 
-    doc.autoTable({
-      startY:y, head:[headRow], body:[], theme:"grid", tableWidth:"wrap",
-      styles:{font:"times",cellPadding:{top:1.5,right:3.5,bottom:1.5,left:3.5}},
-      headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,font:"times",lineColor:[200,200,200],lineWidth:0.2},
-      columnStyles,
-      margin:{top:32,left:14,right:14,bottom:18},
-      didDrawPage: ensureLetterhead
-    });
-    y = doc.lastAutoTable.finalY + 3;
-
     const groups=[]; const map=new Map();
     computedLines.forEach(l=>{
       const key = l.component||"(ungrouped)";
       if(!map.has(key)){ map.set(key,[]); groups.push(key); }
       map.get(key).push(l);
     });
-    groups.forEach(key=>{
-      const grpLines = map.get(key);
-      if(y + 6 + 5 + 8 > pageH - 18){ doc.addPage(); ensureLetterhead(); y = 32; } else { y += 6; }
-      doc.setFont("times","bold"); doc.setFontSize(8.5); doc.setTextColor(...dark);
-      doc.text(key, 14, y);
-      y += 5;
-      const dataRows = grpLines.map(l=>["", l.sub_assembly||"", l.material_spec||"", l.selGrade||"", fmt(l.qty), l.uom||"", fmt(l.rate), fmt(l.sf), fmt(l.cost), fmt(l.salesPrice)]);
-      doc.autoTable({
-        startY:y,
-        body: withRowSpacing(dataRows, blankRow),
-        theme:"plain", tableWidth:"wrap",
-        styles:{cellPadding:{top:1.2,right:3.5,bottom:1.2,left:3.5}},
-        bodyStyles:{fontSize:7.5,textColor:dark},
-        columnStyles,
-        margin:{top:32,left:14,right:14,bottom:18},
-        didDrawPage: ensureLetterhead
-      });
-      y = doc.lastAutoTable.finalY;
+    // One continuous body — group headers and spacer rows live inside it — so
+    // autoTable's own pagination repeats the column header row on every page
+    // it creates. Separate autoTable() calls per group only ever draw the
+    // header once, on whichever page the first call happens to start on.
+    const body = [];
+    groups.forEach((key,gi)=>{
+      if(gi>0) body.push(blankRow);
+      body.push([{content:key, styles:{fontStyle:"bold", font:"times"}}]);
+      const dataRows = map.get(key).map(l=>["", l.sub_assembly||"", l.material_spec||"", l.selGrade||"", fmt(l.qty), l.uom||"", fmt(l.rate), fmt(l.sf), fmt(l.cost), fmt(l.salesPrice)]);
+      withRowSpacing(dataRows, blankRow).forEach(r=>body.push(r));
     });
+    doc.autoTable({
+      startY:y, head:[headRow], body, theme:"grid", tableWidth:"wrap",
+      styles:{font:"times",cellPadding:{top:1.5,right:3.5,bottom:1.5,left:3.5}},
+      headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,font:"times",lineColor:[200,200,200],lineWidth:0.2},
+      bodyStyles:{fontSize:7.5,textColor:dark,lineWidth:0},
+      columnStyles,
+      margin:{top:32,left:14,right:14,bottom:18},
+      didDrawPage: ensureLetterhead
+    });
+    y = doc.lastAutoTable.finalY;
 
-    if(y + 10 > pageH - 18){ doc.addPage(); ensureLetterhead(); y = 32; } else { y += 8; }
+    if(y + 10 > doc.internal.pageSize.getHeight() - 18){ doc.addPage(); ensureLetterhead(); y = 32; } else { y += 8; }
     doc.setFont("times","bold"); doc.setFontSize(9); doc.setTextColor(...dark);
     doc.text("Total cost: "+fmt(total)+"        Total sales price: "+fmt(totalSalesPrice), 14, y);
 
@@ -2927,7 +2919,6 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
       const W = doc.internal.pageSize.getWidth();
-      const pageH = doc.internal.pageSize.getHeight();
       const dark=[28,31,26];
       const headRow = bomHeadRowPDF(withSales);
       const centerCols = bomCenterCols(withSales);
@@ -2956,51 +2947,34 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         ensureLetterhead();
         const itemName = modelItemMap.get(est.model) || "";
         let y = drawDocHeaderBlock(doc,"BOM WITH ESTIMATE",{slNo:est.item_sl_no,client:customer,quoteDate:est.quote_date,item:itemName,quoteNo:est.reference_number,model:est.model,qtyByOrder:est.order_qty||1});
+        doc.setFont(undefined,"italic"); doc.setFontSize(7); doc.setTextColor(120,120,120);
+        doc.text("(Qty By Order x Reqd Qty)", 14, y);
+        y += 3;
         const lines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+        // One continuous body for the whole Sl No — group headers and spacer
+        // rows live inside it — so autoTable's own pagination repeats the
+        // column header row on every page it creates. Separate autoTable()
+        // calls per group (the earlier approach) only ever draw the header
+        // once, on whichever page the very first call happens to start on.
+        const body = [];
+        groupByComponent(lines).forEach((grp,gi)=>{
+          if(gi>0) body.push(blankRow);
+          body.push([{content:grp.component, styles:{fontStyle:"bold", font:"times"}}]);
+          const dataRows = grp.lines.map(l=>bomDataRow(l, est.order_qty||1, withSales).map(v=>typeof v==="number"?fmt(v):v));
+          withRowSpacing(dataRows, blankRow).forEach(r=>body.push(r));
+        });
         doc.autoTable({
           startY:y,
           head:[headRow],
-          body: [],
+          body,
           theme:"grid",
           tableWidth:"wrap",
           styles:{font:"times",cellPadding:{top:1.5,right:3.5,bottom:1.5,left:3.5}},
           headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,font:"times",lineColor:[200,200,200],lineWidth:0.2},
-          bodyStyles:{fontSize:7.5,textColor:dark},
+          bodyStyles:{fontSize:7.5,textColor:dark,lineWidth:0},
           columnStyles,
           margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
           didDrawPage: ensureLetterhead
-        });
-        y = doc.lastAutoTable.finalY;
-        doc.setFont(undefined,"italic"); doc.setFontSize(7); doc.setTextColor(120,120,120);
-        doc.text("(Qty By Order x Reqd Qty)", 14, y+4);
-        y += 3;
-        groupByComponent(lines).forEach(grp=>{
-          // A group header must never be stranded alone at the bottom with its
-          // data pushed to the next page — if there isn't room for the header
-          // plus at least one data row, start the group fresh on a new page.
-          if(y + 6 + 5 + 8 > pageH - 18){
-            doc.addPage();
-            ensureLetterhead();
-            y = CONTENT_TOP_Y;
-          } else {
-            y += 6;
-          }
-          doc.setFont("times","bold"); doc.setFontSize(8.5); doc.setTextColor(...dark);
-          doc.text(grp.component, 14, y);
-          y += 5;
-          const dataRows = grp.lines.map(l=>bomDataRow(l, est.order_qty||1, withSales).map(v=>typeof v==="number"?fmt(v):v));
-          doc.autoTable({
-            startY:y,
-            body: withRowSpacing(dataRows, blankRow),
-            theme:"plain",
-            tableWidth:"wrap",
-            styles:{cellPadding:{top:1.2,right:3.5,bottom:1.2,left:3.5}},
-            bodyStyles:{fontSize:7.5,textColor:dark},
-            columnStyles,
-            margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
-            didDrawPage: ensureLetterhead
-          });
-          y = doc.lastAutoTable.finalY;
         });
       });
       numberQuotePages(doc,W);
@@ -3068,7 +3042,6 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
       const W = doc.internal.pageSize.getWidth();
-      const pageH = doc.internal.pageSize.getHeight();
       const dark=[28,31,26];
       let letterheadPage = 0;
       const ensureLetterhead = ()=>{
@@ -3087,44 +3060,32 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           quoteNo: estimatesRows[0]&&estimatesRows[0].reference_number,
           model: instances.map(i=>i.model).join(", ")
         });
-        // Fixed widths shared by the header row and every section's own table,
-        // so columns line up regardless of how many separate autoTable calls draw them.
+        // Fixed widths shared across the header row and every section row, so
+        // columns line up. One continuous body (below) means autoTable's own
+        // pagination repeats the "Parameters" header row on every page it
+        // creates — separate autoTable() calls per section (the earlier
+        // approach) only ever drew that header once, on the first page.
         const paramsWidth = 55;
         const colWidth = Math.max(18, (182-14-14-paramsWidth)/Math.max(1,instances.length));
         const columnStyles = {0:{cellWidth:paramsWidth}};
         instances.forEach((inst,i)=>{ columnStyles[i+1] = {cellWidth:colWidth, halign:"right"}; });
         const head=[["Parameters", ...instances.map(i=>String(i.slNo))]];
+        const blankRow = Array(instances.length+1).fill("");
+        const body = [];
+        matrix.forEach((sec,si)=>{
+          if(si>0) body.push(blankRow);
+          body.push([{content:sec.title, styles:{fontStyle:"bold", font:"times"}}]);
+          const secRows = sec.rowLabels.map((lbl,i)=>[lbl, ...sec.columns.map(c=>c.values[i]||"")]);
+          withRowSpacing(secRows, blankRow).forEach(r=>body.push(r));
+        });
         doc.autoTable({
-          startY:y, head, body:[], theme:"grid", tableWidth:"wrap",
+          startY:y, head, body, theme:"grid", tableWidth:"wrap",
           styles:{cellPadding:{top:1.5,right:3.5,bottom:1.5,left:3.5}},
           headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,font:"times",lineColor:[200,200,200],lineWidth:0.2},
+          bodyStyles:{fontSize:7.5,textColor:dark,lineWidth:0},
           columnStyles,
           margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
           didDrawPage: ensureLetterhead
-        });
-        y = doc.lastAutoTable.finalY;
-        matrix.forEach(sec=>{
-          // Keep a section title with at least its first data row — never
-          // strand the title alone at the bottom with data on the next page.
-          if(y + 5 + 2 + 8 > pageH - 18){
-            doc.addPage();
-            ensureLetterhead();
-            y = CONTENT_TOP_Y;
-          } else {
-            y += 5;
-          }
-          doc.setFont("times","bold"); doc.setFontSize(8.5); doc.setTextColor(...dark);
-          doc.text(sec.title, 14, y);
-          const body = sec.rowLabels.map((lbl,i)=>[lbl, ...sec.columns.map(c=>c.values[i]||"")]);
-          doc.autoTable({
-            startY:y+2, body, theme:"plain", tableWidth:"wrap",
-            styles:{cellPadding:{top:1.2,right:3.5,bottom:1.2,left:3.5}},
-            bodyStyles:{fontSize:7.5,textColor:dark},
-            columnStyles,
-            margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
-            didDrawPage: ensureLetterhead
-          });
-          y = doc.lastAutoTable.finalY;
         });
       }
       if(itemGroups.size===0){ ensureLetterhead(); doc.setFontSize(10); doc.text("No datasheet masters found for any item in this quote.",12,40); }
