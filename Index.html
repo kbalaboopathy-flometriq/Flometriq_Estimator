@@ -100,6 +100,26 @@ function sanitizeSheetName(s){
   return ((s||"Sheet").replace(/[:\\\/\?\*\[\]]/g,"").trim()||"Sheet").slice(0,31);
 }
 function r2(n){ const x = Number(n); return isNaN(x) ? 0 : Math.round(x*100)/100; }
+function fmt2(n){ const x=r2(n); return x.toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2}); }
+// "Price Data" is always appended as the last section on every datasheet —
+// it's computed from the quote's own lines, not a user-fillable template
+// field, so it's exempt from the "drop if every value is blank" rule.
+// Rate is the per-unit sales price (total sales value across all of this
+// Sl No's BOM lines, divided by its order qty); Total Price is that value
+// back out again (Rate x Qty), shown as an explicit check figure.
+function buildPriceDataSection(currency, orderQty, totalSalesValue){
+  const cur = currency || "INR";
+  const qty = r2(orderQty)||0;
+  const rate = qty>0 ? r2(totalSalesValue/qty) : r2(totalSalesValue);
+  return {
+    title: "Price Data",
+    rows: [
+      { key:"price-rate", label:"Rate - "+cur, value: fmt2(rate) },
+      { key:"price-qty", label:"Qty", value: fmt2(qty)+" Nos" },
+      { key:"price-total", label:"Total Price - "+cur, value: fmt2(rate*qty) }
+    ]
+  };
+}
 // Inserts a blank spacer row between every row in an array (not around the
 // whole array) — used to put breathing room between every BOM/datasheet line
 // in both Excel and PDF exports.
@@ -855,6 +875,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   const [itemSlNo,setItemSlNo]=useState(""); 
   const [enquiryNumber,setEnquiryNumber]=useState(""); const [enquiryDate,setEnquiryDate]=useState("");
   const [quoteDate,setQuoteDate]=useState("");
+  const [currency,setCurrency]=useState("INR");
   const [existingQuoteHeader,setExistingQuoteHeader]=useState(null); // header fields + used Sl Nos, once refNumber matches a saved quote
   const [quoteOptions,setQuoteOptions]=useState([]); // distinct saved quotes for the Quote# combo box
   const [quoteDecision,setQuoteDecision]=useState(null); // {ref, rows:[{item_sl_no,model,...}]} — shown when an existing Quote# is picked
@@ -1235,7 +1256,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   const cartTotalCost=useMemo(()=>cart.reduce((s,l)=>s+(l.cost||0),0),[cart]);
   const cartTotalSales=useMemo(()=>cart.reduce((s,l)=>s+(l.sales_price||0),0),[cart]);
 
-  const clearEstimate = ()=>{ if(!confirm("Clear the current estimate and all cart items?")) return; setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg(""); };
+  const clearEstimate = ()=>{ if(!confirm("Clear the current estimate and all cart items?")) return; setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setCurrency("INR");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg(""); };
 
   // Populate the Quote# combo box with every saved quote + its customer, so the
   // person can either pick an existing one or type a brand new Quote#.
@@ -1252,7 +1273,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   const lookupQuoteHeader = async()=>{
     const ref = refNumber.trim();
     if(!ref){ setExistingQuoteHeader(null); return; }
-    const { data } = await sb.from("estimates").select("item_sl_no,model,enquiry_number,enquiry_date,quote_date,description").eq("reference_number",ref).order("item_sl_no");
+    const { data } = await sb.from("estimates").select("item_sl_no,model,enquiry_number,enquiry_date,quote_date,description,currency").eq("reference_number",ref).order("item_sl_no");
     if(data && data.length>0){
       setQuoteDecision({ ref, rows: data });
       setSlNoPickerValue(String(data[0].item_sl_no));
@@ -1264,6 +1285,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   const chooseAddLineItem = ()=>{
     const head = quoteDecision.rows[0];
     setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
+    setCurrency(head.currency||"INR");
     if(!refDesc) setRefDesc(head.description||"");
     setExistingQuoteHeader({ usedSlNos: quoteDecision.rows.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
     setItemSlNo("");
@@ -1307,7 +1329,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
     try {
       const headerModel = (cart[0]&&cart[0].model) || selectedModel || "";
       const {data:existing}=await sb.from("estimates").select("id").eq("reference_number",ref).eq("item_sl_no",slNo).limit(1);
-      const headerPayload={description:refDesc,model:headerModel,enquiry_number:enquiryNumber.trim(),enquiry_date:enquiryDate||null,quote_date:quoteDate||null,updated_at:new Date().toISOString()};
+      const headerPayload={description:refDesc,model:headerModel,enquiry_number:enquiryNumber.trim(),enquiry_date:enquiryDate||null,quote_date:quoteDate||null,currency:currency||"INR",updated_at:new Date().toISOString()};
       if(existing&&existing.length>0){
         estimateId=existing[0].id;
         await sb.from("estimates").update(headerPayload).eq("id",estimateId);
@@ -1320,7 +1342,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
       const rows=cart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,show_in_moc:l.show_in_moc===true}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
       setSaveMsg("Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).");
-      setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setExistingQuoteHeader(null); setShowSave(false);
+      setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setExistingQuoteHeader(null); setShowSave(false);
     } catch(e){
       // If the lines insert is what failed, don't leave a header behind with
       // no lines under it — that's how "dirty" quotes with no sub-form data
@@ -1626,6 +1648,13 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Quote date"),
             h("input",{type:"date",value:quoteDate,onChange:e=>setQuoteDate(e.target.value),disabled:!!existingQuoteHeader,style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
           ),
+          h("div",{style:{width:100}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Currency"),
+            h("select",{value:currency,onChange:e=>setCurrency(e.target.value),disabled:!!existingQuoteHeader,style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}},
+              h("option",{value:"INR"},"INR"),
+              h("option",{value:"USD"},"USD")
+            )
+          ),
           h("div",{style:{flex:2,minWidth:200}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Description (optional)"),
             h("input",{value:refDesc,onChange:e=>setRefDesc(e.target.value),placeholder:"Customer / project name",style:inputStyle})
@@ -1855,6 +1884,10 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       getSectionRows(section).forEach(row=>rows.push([row.label, row.value, "", ""]));
       rows.push([]);
     });
+    const totalSalesValue = (openLines||[]).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+    const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue);
+    rows.push([priceSection.title]);
+    priceSection.rows.forEach(row=>rows.push([row.label, row.value, "", ""]));
     const ws = XLSX.utils.aoa_to_sheet(rows);
     ws["!cols"] = [{wch:28},{wch:40},{wch:14},{wch:16}];
     const wb = XLSX.utils.book_new();
@@ -1892,11 +1925,11 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       // Blank values are skipped entirely — e.g. if Operating Pressure was left blank, that line does not appear.
       const filledRows = getSectionRows(section).filter(row=>row.value!==undefined && row.value!==null && String(row.value).trim()!=="" && row.value!=="—");
       if(filledRows.length===0) return; // whole section is empty — drop the header too, not just its rows
-      const head = [[{content:(section.bomSection?"Material Data":section.title),colSpan:2,styles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:9}}]];
+      const head = [[{content:(section.bomSection?"Material Data":section.title),colSpan:2,styles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:11,font:"times"}}]];
       doc.autoTable({
         startY:y, head, body:filledRows.map(row=>[row.label,row.value]), theme:"grid",
-        bodyStyles:{fontSize:8.5,textColor:dark},
-        headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:9,lineColor:[216,212,197],lineWidth:0.2},
+        bodyStyles:{fontSize:10,textColor:dark,font:"helvetica"},
+        headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:11,font:"times",lineColor:[216,212,197],lineWidth:0.2},
         columnStyles:{0:{cellWidth:65,fontStyle:"bold",textColor:[100,100,100]},1:{cellWidth:"auto"}},
         margin:{top:32,left:12,right:12,bottom:18},
         didDrawPage:drawLetterhead,
@@ -1904,6 +1937,20 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       y = doc.lastAutoTable.finalY + 6;
       if(y > doc.internal.pageSize.getHeight()-30){ doc.addPage(); drawLetterhead(); y = 34; }
     });
+    {
+      const totalSalesValue = (openLines||[]).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+      const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue);
+      doc.autoTable({
+        startY:y,
+        head:[[{content:priceSection.title,colSpan:2,styles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:11,font:"times"}}]],
+        body:priceSection.rows.map(row=>[row.label,row.value]), theme:"grid",
+        bodyStyles:{fontSize:10,textColor:dark,font:"helvetica"},
+        headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:11,font:"times",lineColor:[216,212,197],lineWidth:0.2},
+        columnStyles:{0:{cellWidth:65,fontStyle:"bold",textColor:[100,100,100]},1:{cellWidth:"auto",halign:"right"}},
+        margin:{top:32,left:12,right:12,bottom:18},
+        didDrawPage:drawLetterhead,
+      });
+    }
     const pageCount = doc.internal.getNumberOfPages();
     for(let i=1;i<=pageCount;i++){
       doc.setPage(i); doc.setFontSize(7); doc.setTextColor(150);
@@ -1963,7 +2010,18 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
               h("button",{onClick:()=>addLine(section.no),style:{...btnSecondary,fontSize:11,padding:"5px 10px"}},"+ Add line")
             )
           );
-        })
+        }),
+        (()=>{
+          const totalSalesValue = (openLines||[]).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+          const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue);
+          return h("div",{style:{marginBottom:10,border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+            h("div",{style:{background:"#1c8c75",color:"#fff",padding:"6px 14px",fontSize:12,fontWeight:700}},"Price Data"),
+            priceSection.rows.map(row=>h("div",{key:row.key,style:{display:"flex",alignItems:"center",gap:8,padding:"6px 14px",fontSize:12.5,borderTop:"1px solid #f0efe8"}},
+              h("div",{style:{width:220,color:colors.muted,flexShrink:0}},row.label),
+              h("div",{style:{flex:1,color:colors.text,textAlign:"right"}}, row.value)
+            ))
+          );
+        })()
       ),
       fillOpen && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:90}},
         h("div",{style:{background:"#fff",borderRadius:8,width:560,maxWidth:"92vw",maxHeight:"86vh",display:"flex",flexDirection:"column"}},
@@ -3024,9 +3082,12 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const template = await loadDatasheetMaster(itemName);
       if(!template) continue;
       const ds = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.template_key===normalizeItemName(itemName));
-      const mocLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no && l.show_in_moc===true);
+      const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+      const mocLines = slLines.filter(l=>l.show_in_moc===true);
       const allSections = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocLines, est.model, est.item_sl_no);
       const sectionsRows = allSections.filter(sec=>sec.rows.some(r=>r.value!==undefined && r.value!==null && String(r.value).trim()!==""));
+      const totalSalesValue = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+      sectionsRows.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue));
       list.push({ slNo: est.item_sl_no, model: est.model||"", itemName, sectionsRows });
     }
     list.sort((a,b)=>a.slNo-b.slNo);
@@ -3094,20 +3155,19 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         const p = doc.internal.getNumberOfPages();
         if(p !== letterheadPage){ drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer); letterheadPage = p; }
       };
-      const blankRow = ["",""];
       list.forEach((inst,idx)=>{
         if(idx>0) doc.addPage();
         ensureLetterhead();
         let y = drawDocHeaderBlock(doc,"DATA SHEET",{ slNo:inst.slNo, client:customer, item:inst.itemName, quoteNo, model:inst.model });
         const body = [];
         inst.sectionsRows.forEach((sec,si)=>{
-          if(si>0) body.push(blankRow);
-          body.push([{content:sec.title, colSpan:2, styles:{fontStyle:"bold", font:"times"}}]);
-          withRowSpacing(sec.rows.map(r=>[r.label, r.value]), blankRow).forEach(r=>body.push(r));
+          body.push([{content:sec.title, colSpan:2, styles:{fontStyle:"bold", font:"times", fontSize:11}}]);
+          const isPriceData = sec.title==="Price Data";
+          sec.rows.forEach(r=>body.push([r.label, isPriceData?{content:r.value,styles:{halign:"right"}}:r.value]));
         });
         doc.autoTable({
           startY:y, body, theme:"plain", tableWidth:"wrap",
-          styles:{font:"times", cellPadding:{top:1.2,right:6,bottom:1.2,left:6}, fontSize:9, textColor:dark},
+          styles:{font:"helvetica", cellPadding:{top:1.2,right:6,bottom:1.2,left:6}, fontSize:10, textColor:dark},
           columnStyles:{0:{cellWidth:60},1:{cellWidth:"auto"}},
           margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
           didDrawPage: ensureLetterhead
