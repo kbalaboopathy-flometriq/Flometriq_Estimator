@@ -126,10 +126,16 @@ function applyNumberFormat(ws, fromRow){
   }
 }
 
+// Matches labels like "Sl No", "SL NO", "Sl. No", "sl no." — any field named
+// like this is auto-filled from the quote's own Sl No and not user-editable.
+function isSlNoLabel(label){
+  return /^sl\.?\s*no\.?$/i.test((label||"").trim());
+}
+
 // Mirrors DatasheetModal's getSectionRows, but as a standalone function so the
 // quote-wide export can rebuild a datasheet's sections without mounting the modal.
 // mocLines must be the ticked ("Show in MOC") lines for that one Sl No only.
-function buildDatasheetSectionRows(template, fieldValues, mocLines, model){
+function buildDatasheetSectionRows(template, fieldValues, mocLines, model, slNo){
   const values = fieldValues || {};
   const materialDataRows = (mocLines||[]).map(l=>({
     key: "moc-"+(l.reference_number||"")+"-"+l.sl_no,
@@ -144,7 +150,8 @@ function buildDatasheetSectionRows(template, fieldValues, mocLines, model){
     } else {
       base = section.fields.map(f=>{
         let val;
-        if(f.type==="auto_model") val = model||"";
+        if(isSlNoLabel(f.label)) val = slNo!==undefined&&slNo!==null ? String(slNo) : "";
+        else if(f.type==="auto_model") val = model||"";
         else val = values[f.key]!==undefined ? values[f.key] : (f.default||"");
         return { key:f.key, label:f.label, value:val };
       });
@@ -1762,6 +1769,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   const setField = (k,v)=>setValues(vv=>({...vv,[k]:v}));
 
   const getDisplayValue = (field)=>{
+    if(isSlNoLabel(field.label)) return String(openRef.item_sl_no);
     if(field.type==="auto_model") return model||(openLines&&openLines[0]&&openLines[0].model)||"";
     if(field.type==="bom"){
       if(overrides[field.key]!==undefined) return overrides[field.key];
@@ -1881,12 +1889,12 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
     lbl("Date",today);
     y += 2;
     template.sections.forEach(section=>{
-      const head = [[{content:(section.bomSection?"Material Data":section.title),colSpan:2,styles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:9}}]];
       // Blank values are skipped entirely — e.g. if Operating Pressure was left blank, that line does not appear.
       const filledRows = getSectionRows(section).filter(row=>row.value!==undefined && row.value!==null && String(row.value).trim()!=="" && row.value!=="—");
-      const body = filledRows.length ? filledRows.map(row=>[row.label,row.value]) : [["","No data entered for this section."]];
+      if(filledRows.length===0) return; // whole section is empty — drop the header too, not just its rows
+      const head = [[{content:(section.bomSection?"Material Data":section.title),colSpan:2,styles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:9}}]];
       doc.autoTable({
-        startY:y, head, body, theme:"grid",
+        startY:y, head, body:filledRows.map(row=>[row.label,row.value]), theme:"grid",
         bodyStyles:{fontSize:8.5,textColor:dark},
         headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:9,lineColor:[216,212,197],lineWidth:0.2},
         columnStyles:{0:{cellWidth:65,fontStyle:"bold",textColor:[100,100,100]},1:{cellWidth:"auto"}},
@@ -1966,7 +1974,9 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
           h("div",{style:{padding:"14px 16px",overflowY:"auto",flex:1}},
             editableSections[sectionIdx].fields.map(field=>h("div",{key:field.key,style:{marginBottom:12}},
               h("label",{style:{fontSize:11,color:colors.muted,display:"block",marginBottom:3}},field.label),
-              field.type==="auto_model"
+              isSlNoLabel(field.label)
+                ? h("input",{value:String(openRef.item_sl_no),disabled:true,style:{...inputStyle,background:"#f4f2ea"}})
+              : field.type==="auto_model"
                 ? h("input",{value:model||(openLines&&openLines[0]&&openLines[0].model)||"",disabled:true,style:{...inputStyle,background:"#f4f2ea"}})
               : field.type==="dropdown"
                 ? h(React.Fragment,null,
@@ -3004,20 +3014,23 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     } finally { setExportingQuote(""); }
   };
 
-  const buildQuoteDatasheetGroups = async(estimatesRows, linesRows, datasheetsRows)=>{
-    const itemGroups = new Map(); // itemName -> [{slNo, model, sectionsRows}]
+  // One entry per Sl No, in order — no more grouping/matrixing multiple Sl Nos
+  // of the same item onto one page. Sections where every value is blank are
+  // dropped entirely (e.g. an unused "Design Data" section).
+  const buildQuoteDatasheetsBySlNo = async(estimatesRows, linesRows, datasheetsRows)=>{
+    const list = [];
     for(const est of estimatesRows){
       const itemName = modelItemMap.get(est.model) || est.model || "Unknown item";
       const template = await loadDatasheetMaster(itemName);
       if(!template) continue;
       const ds = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.template_key===normalizeItemName(itemName));
       const mocLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no && l.show_in_moc===true);
-      const sectionsRows = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocLines, est.model);
-      if(!itemGroups.has(itemName)) itemGroups.set(itemName, []);
-      itemGroups.get(itemName).push({ slNo: est.item_sl_no, model: est.model||"", sectionsRows });
+      const allSections = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocLines, est.model, est.item_sl_no);
+      const sectionsRows = allSections.filter(sec=>sec.rows.some(r=>r.value!==undefined && r.value!==null && String(r.value).trim()!==""));
+      list.push({ slNo: est.item_sl_no, model: est.model||"", itemName, sectionsRows });
     }
-    itemGroups.forEach(instances=>instances.sort((a,b)=>a.slNo-b.slNo));
-    return itemGroups;
+    list.sort((a,b)=>a.slNo-b.slNo);
+    return list;
   };
 
   const exportQuoteDatasheetsExcel = async()=>{
@@ -3026,30 +3039,40 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     try {
       const {estimatesRows, linesRows, datasheetsRows} = await fetchQuoteBundle(quoteExportRef);
       const customer = (estimatesRows[0]&&estimatesRows[0].description)||"";
-      const itemGroups = await buildQuoteDatasheetGroups(estimatesRows, linesRows, datasheetsRows);
-      const rows = [];
-      for(const [itemName, instances] of itemGroups){
-        const matrix = buildItemMatrix(instances);
+      const quoteNo = estimatesRows[0]&&estimatesRows[0].reference_number;
+      const list = await buildQuoteDatasheetsBySlNo(estimatesRows, linesRows, datasheetsRows);
+      const buildRowsFor = (inst)=>{
+        const rows=[];
         rows.push(["DATA SHEET"]);
         rows.push([]);
-        rows.push(["Sl No", ...instances.map(i=>i.slNo)]);
-        rows.push(["Client", customer]);
-        rows.push(["Item", itemName]);
-        rows.push(["Quote No", estimatesRows[0]&&estimatesRows[0].reference_number]);
-        rows.push(["Model", ...instances.map(i=>i.model)]);
+        rows.push(["Sl No", inst.slNo, "Client", customer]);
+        rows.push(["Item", inst.itemName, "Quote No", quoteNo]);
+        rows.push(["Model", inst.model]);
         rows.push([]);
-        rows.push(["Parameters", ...instances.map(i=>i.slNo)]);
-        matrix.forEach(sec=>{
-          rows.push([]);
+        inst.sectionsRows.forEach(sec=>{
           rows.push([sec.title]);
-          sec.rowLabels.forEach((lbl,i)=>rows.push([lbl, ...sec.columns.map(c=>c.values[i])]));
+          sec.rows.forEach(r=>rows.push([r.label, r.value]));
+          rows.push([]);
         });
-        rows.push([]); rows.push([]);
-      }
-      if(rows.length===0) rows.push(["No datasheet masters found for any item in this quote."]);
-      const ws = XLSX.utils.aoa_to_sheet(rows);
+        return rows;
+      };
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Datasheets");
+      // Combined overview sheet — every Sl No stacked, in order
+      const allRows = [];
+      list.forEach((inst,i)=>{
+        if(i>0) allRows.push([]);
+        buildRowsFor(inst).forEach(r=>allRows.push(r));
+      });
+      if(allRows.length===0) allRows.push(["No datasheet masters found for any item in this quote."]);
+      const wsAll = XLSX.utils.aoa_to_sheet(allRows);
+      wsAll["!cols"] = [{wch:26},{wch:40},{wch:14},{wch:18}];
+      XLSX.utils.book_append_sheet(wb, wsAll, "All Datasheets");
+      // Plus one sheet per Sl No, for quick individual reference
+      list.forEach(inst=>{
+        const ws = XLSX.utils.aoa_to_sheet(buildRowsFor(inst));
+        ws["!cols"] = [{wch:26},{wch:40},{wch:14},{wch:18}];
+        XLSX.utils.book_append_sheet(wb, ws, sanitizeSheetName("Sl"+inst.slNo+"-"+(inst.model||"").replace(/\s+/g,"")));
+      });
       XLSX.writeFile(wb, quoteExportRef.replace(/\s+/g,"_")+"_Datasheets.xlsx");
     } finally { setExportingQuote(""); }
   };
@@ -3060,7 +3083,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     try {
       const {estimatesRows, linesRows, datasheetsRows} = await fetchQuoteBundle(quoteExportRef);
       const customer = (estimatesRows[0]&&estimatesRows[0].description)||"";
-      const itemGroups = await buildQuoteDatasheetGroups(estimatesRows, linesRows, datasheetsRows);
+      const quoteNo = estimatesRows[0]&&estimatesRows[0].reference_number;
+      const list = await buildQuoteDatasheetsBySlNo(estimatesRows, linesRows, datasheetsRows);
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
       const W = doc.internal.pageSize.getWidth();
@@ -3070,47 +3094,26 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         const p = doc.internal.getNumberOfPages();
         if(p !== letterheadPage){ drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer); letterheadPage = p; }
       };
-      let first=true;
-      for(const [itemName, instances] of itemGroups){
-        const matrix = buildItemMatrix(instances);
-        if(!first) doc.addPage();
-        first=false;
+      const blankRow = ["",""];
+      list.forEach((inst,idx)=>{
+        if(idx>0) doc.addPage();
         ensureLetterhead();
-        let y = drawDocHeaderBlock(doc,"DATA SHEET",{
-          slNo: instances.map(i=>i.slNo).join(", "),
-          client: customer, item: itemName,
-          quoteNo: estimatesRows[0]&&estimatesRows[0].reference_number,
-          model: instances.map(i=>i.model).join(", ")
-        });
-        // Fixed widths shared across the header row and every section row, so
-        // columns line up. One continuous body (below) means autoTable's own
-        // pagination repeats the "Parameters" header row on every page it
-        // creates — separate autoTable() calls per section (the earlier
-        // approach) only ever drew that header once, on the first page.
-        const paramsWidth = 55;
-        const colWidth = Math.max(18, (182-14-14-paramsWidth)/Math.max(1,instances.length));
-        const columnStyles = {0:{cellWidth:paramsWidth}};
-        instances.forEach((inst,i)=>{ columnStyles[i+1] = {cellWidth:colWidth, halign:"right"}; });
-        const head=[["Parameters", ...instances.map(i=>String(i.slNo))]];
-        const blankRow = Array(instances.length+1).fill("");
+        let y = drawDocHeaderBlock(doc,"DATA SHEET",{ slNo:inst.slNo, client:customer, item:inst.itemName, quoteNo, model:inst.model });
         const body = [];
-        matrix.forEach((sec,si)=>{
+        inst.sectionsRows.forEach((sec,si)=>{
           if(si>0) body.push(blankRow);
-          body.push([{content:sec.title, styles:{fontStyle:"bold", font:"times"}}]);
-          const secRows = sec.rowLabels.map((lbl,i)=>[lbl, ...sec.columns.map(c=>c.values[i]||"")]);
-          withRowSpacing(secRows, blankRow).forEach(r=>body.push(r));
+          body.push([{content:sec.title, colSpan:2, styles:{fontStyle:"bold", font:"times"}}]);
+          withRowSpacing(sec.rows.map(r=>[r.label, r.value]), blankRow).forEach(r=>body.push(r));
         });
         doc.autoTable({
-          startY:y, head, body, theme:"grid", tableWidth:"wrap",
-          styles:{cellPadding:{top:1.5,right:3.5,bottom:1.5,left:3.5}},
-          headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,font:"times",lineColor:[200,200,200],lineWidth:0.2},
-          bodyStyles:{fontSize:7.5,textColor:dark,lineWidth:0},
-          columnStyles,
+          startY:y, body, theme:"plain", tableWidth:"wrap",
+          styles:{font:"times", cellPadding:{top:1.2,right:6,bottom:1.2,left:6}, fontSize:9, textColor:dark},
+          columnStyles:{0:{cellWidth:60},1:{cellWidth:"auto"}},
           margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
           didDrawPage: ensureLetterhead
         });
-      }
-      if(itemGroups.size===0){ ensureLetterhead(); doc.setFontSize(10); doc.text("No datasheet masters found for any item in this quote.",12,40); }
+      });
+      if(list.length===0){ ensureLetterhead(); doc.setFontSize(10); doc.text("No datasheet masters found for any item in this quote.",12,40); }
       numberQuotePages(doc,W);
       doc.save(quoteExportRef.replace(/\s+/g,"_")+"_Datasheets.pdf");
     } finally { setExportingQuote(""); }
