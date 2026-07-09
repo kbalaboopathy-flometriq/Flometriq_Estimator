@@ -4893,7 +4893,7 @@ function MaterialRatesReport({ user }){
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
   const [loadError,setLoadError]=useState("");
   const [editing,setEditing]=useState({}); // id -> {newRate}
-  const [specSearch,setSpecSearch]=useState(""); const [gradeSearch,setGradeSearch]=useState(""); const [shapeFilter,setShapeFilter]=useState("");
+  const [shapeSel,setShapeSel]=useState(""); const [specSel,setSpecSel]=useState(""); const [gradeSel,setGradeSel]=useState("");
   const [view,setView]=useState("all"); // all | stale | zero
   const isSuperAdmin = user.role==="super_admin";
   const canExport = isSuperAdmin;
@@ -4907,7 +4907,23 @@ function MaterialRatesReport({ user }){
   },[]);
   useEffect(()=>{ load(); },[load]);
 
+  const norm = (s)=> (s||"").trim().toLowerCase();
   const allShapes = useMemo(()=> Array.from(new Set(rows.map(r=>r.material_shape).filter(Boolean))).sort(), [rows]);
+  // Spec options narrow to the chosen Shape (if any); Grade options narrow to
+  // the chosen Shape + Spec (if any) — each dropdown only ever offers values
+  // that actually exist given what's picked above it, so there's no
+  // "0 results" surprise from typing something that doesn't exist.
+  const specOptions = useMemo(()=>{
+    const pool = shapeSel ? rows.filter(r=>norm(r.material_shape)===norm(shapeSel)) : rows;
+    return Array.from(new Set(pool.map(r=>r.material_spec).filter(Boolean))).sort();
+  },[rows,shapeSel]);
+  const gradeOptions = useMemo(()=>{
+    const pool = rows.filter(r=>(!shapeSel||norm(r.material_shape)===norm(shapeSel)) && (!specSel||r.material_spec===specSel));
+    return Array.from(new Set(pool.map(r=>r.material_grade).filter(Boolean))).sort();
+  },[rows,shapeSel,specSel]);
+
+  const onShapeChange = (v)=>{ setShapeSel(v); setSpecSel(""); setGradeSel(""); };
+  const onSpecChange = (v)=>{ setSpecSel(v); setGradeSel(""); };
 
   // Rows with no recorded date should have been fixed by the backfill SQL
   // (which writes a real "100 days ago" date into them). If one still has no
@@ -4923,13 +4939,12 @@ function MaterialRatesReport({ user }){
   }), [rows]);
 
   const searched = useMemo(()=>{
-    const sp = specSearch.trim().toLowerCase(); const gr = gradeSearch.trim().toLowerCase();
     return enriched.filter(r=>
-      (!sp || (r.material_spec||"").toLowerCase().includes(sp)) &&
-      (!gr || (r.material_grade||"").toLowerCase().includes(gr)) &&
-      (!shapeFilter || r.material_shape===shapeFilter)
+      (!shapeSel || norm(r.material_shape)===norm(shapeSel)) &&
+      (!specSel || r.material_spec===specSel) &&
+      (!gradeSel || r.material_grade===gradeSel)
     );
-  },[enriched,specSearch,gradeSearch,shapeFilter]);
+  },[enriched,shapeSel,specSel,gradeSel]);
 
   const counts = useMemo(()=>({
     all: searched.length,
@@ -4964,7 +4979,7 @@ function MaterialRatesReport({ user }){
     XLSX.writeFile(wb, "material_rates_"+view+".xlsx");
   };
   const exportPDF = ()=>{
-    generatePDF({ title:"Material rates — "+view, refNumber:specSearch||gradeSearch||shapeFilter?("Spec: "+(specSearch||"any")+"  Grade: "+(gradeSearch||"any")+"  Shape: "+(shapeFilter||"any")):"", description:"", createdBy:user.username, createdAt:Date.now(),
+    generatePDF({ title:"Material rates — "+view, refNumber:shapeSel||specSel||gradeSel?("Shape: "+(shapeSel||"any")+"  Spec: "+(specSel||"any")+"  Grade: "+(gradeSel||"any")):"", description:"", createdBy:user.username, createdAt:Date.now(),
       headers:["Material spec","Grade","Shape","Rate","UOM","Days old","Last updated","Created by"],
       rows:shown.map(r=>[r.material_spec,r.material_grade,r.material_shape,fmt(r.rate),r.uom,String(r.daysOld),r._date.toLocaleDateString()+(r._estimated?" (est.)":""),r.created_by||"—"]),
       filename:"material_rates_"+view+".pdf" });
@@ -4979,12 +4994,16 @@ function MaterialRatesReport({ user }){
         : h("span",{title:"Exports are limited to Super Admin",style:{fontSize:11,color:colors.mutedLight,alignSelf:"center"}},"Export: Super Admin only")
     ),
     h("div",{style:{background:"#faf9f4",border:"1px solid #eceae0",borderRadius:6,padding:12,marginBottom:12,display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap"}},
-      h("div",null, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Material spec contains"), h("input",{value:specSearch,onChange:e=>setSpecSearch(e.target.value),placeholder:"e.g. Pipe",style:{...inputStyle,width:160,padding:"6px 8px",fontSize:12}})),
-      h("div",null, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Grade contains"), h("input",{value:gradeSearch,onChange:e=>setGradeSearch(e.target.value),placeholder:"e.g. SS304",style:{...inputStyle,width:140,padding:"6px 8px",fontSize:12}})),
-      h("div",null, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Shape"), h("select",{value:shapeFilter,onChange:e=>setShapeFilter(e.target.value),style:{...inputStyle,width:130,padding:"6px 8px",fontSize:12}},
-        h("option",{value:""},"Any"), allShapes.map(sh=>h("option",{key:sh,value:sh},sh))
+      h("div",null, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Shape"), h("select",{value:shapeSel,onChange:e=>onShapeChange(e.target.value),style:{...inputStyle,width:150,padding:"6px 8px",fontSize:12}},
+        h("option",{value:""},"Any ("+allShapes.length+")"), allShapes.map(sh=>h("option",{key:sh,value:sh},sh))
       )),
-      h("button",{onClick:()=>{setSpecSearch("");setGradeSearch("");setShapeFilter("");},style:{...btnSmall}},"Clear"),
+      h("div",null, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Spec"), h("select",{value:specSel,onChange:e=>onSpecChange(e.target.value),style:{...inputStyle,width:180,padding:"6px 8px",fontSize:12}},
+        h("option",{value:""},"Any ("+specOptions.length+")"), specOptions.map(sp=>h("option",{key:sp,value:sp},sp))
+      )),
+      h("div",null, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Grade"), h("select",{value:gradeSel,onChange:e=>setGradeSel(e.target.value),style:{...inputStyle,width:160,padding:"6px 8px",fontSize:12}},
+        h("option",{value:""},"Any ("+gradeOptions.length+")"), gradeOptions.map(gr=>h("option",{key:gr,value:gr},gr))
+      )),
+      h("button",{onClick:()=>{setShapeSel("");setSpecSel("");setGradeSel("");},style:{...btnSmall}},"Clear"),
       h("span",{style:{fontSize:11,color:colors.muted,marginLeft:"auto"}},counts.all+" match"+(counts.all===1?"":"es")),
       view==="stale" && h(React.Fragment,null,
         h("span",{style:{fontSize:11,color:colors.muted}},"older than"),
