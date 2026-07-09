@@ -217,6 +217,21 @@ const btnSecondary = { background:"#fff", border:"1px solid "+colors.border, col
 const btnDanger = { background:"#fff", border:"1px solid "+colors.danger, color:colors.danger, padding:"6px 10px", fontSize:12, cursor:"pointer", borderRadius:6 };
 const btnSmall = { padding:"5px 10px", fontSize:12, cursor:"pointer", borderRadius:4, border:"1px solid "+colors.border, background:"#fff", color:colors.muted };
 
+// A faint tiled username+timestamp overlay on sensitive screens. This is a
+// deterrent and a trace-back aid if a screenshot leaks — it cannot actually
+// block screenshots, screen recording, or someone photographing the screen;
+// no web app can. Render it as the first child of a `position:relative`
+// container that should be covered.
+function Watermark({ user }){
+  const label = (user?.username||"")+"  ·  "+new Date().toLocaleString("en-IN");
+  const svg = "data:image/svg+xml,"+encodeURIComponent(
+    "<svg xmlns='http://www.w3.org/2000/svg' width='340' height='170'>"+
+    "<text x='10' y='90' transform='rotate(-28 10 90)' font-family='Segoe UI, Arial, sans-serif' font-size='13' fill='rgba(28,31,26,0.07)'>"+label+"</text>"+
+    "</svg>"
+  );
+  return h("div",{style:{position:"absolute",inset:0,backgroundImage:"url(\""+svg+"\")",backgroundRepeat:"repeat",pointerEvents:"none",zIndex:50}});
+}
+
 function fmt(n) {
   if (typeof n !== "number" || isNaN(n)) return "0.00";
   return n.toLocaleString("en-IN", { minimumFractionDigits:2, maximumFractionDigits:2 });
@@ -367,14 +382,22 @@ function TopBar({ user, onLogout }) {
 
 /* ---- MENU ---- */
 function MenuTabs({ user, active, onChange }) {
+  const isAdmin = user.role==="admin" || user.role==="super_admin";
+  const isSuperAdmin = user.role==="super_admin";
   const groups = [
     { label:"Transaction", tabs:[
       {key:"estimator",label:"Estimator"},
       {key:"saved",label:"Quotes"},
       {key:"calcs",label:"Engineering Calcs"},
     ]},
+    { label:"Reports", tabs:[
+      {key:"reports",label:"Available BOM"},
+      {key:"reports_activity",label:"Activity by User"},
+      {key:"reports_quotes",label:"Quotes"},
+      ...(isAdmin?[{key:"reports_masters",label:"Stale Rates"},{key:"reports_audit",label:"Masters Audit"}]:[]),
+    ]},
   ];
-  if(user.role==="admin") {
+  if(isAdmin) {
     groups.push({ label:"Master Data", tabs:[
       {key:"bom_form",label:"BOM Entry Form"},
       ...MASTER_TABLES.map(t=>({key:t.key,label:t.label})),
@@ -386,6 +409,7 @@ function MenuTabs({ user, active, onChange }) {
       {key:"permissions",label:"Permissions"},
       {key:"login_history",label:"Login History"},
       {key:"audit_log",label:"Audit Log"},
+      ...(isSuperAdmin?[{key:"deletion_codes",label:"Deletion Codes"}]:[]),
     ]});
   }
   groups.push({ label:"", tabs:[{key:"change_password",label:"Change Password"}] });
@@ -644,6 +668,18 @@ function MasterEditor({ tableKey, user }) {
   const [page,setPage]=useState(0); const pageSize=50;
   const [cascadeOptions,setCascadeOptions]=useState({}); // col -> options[]
 
+  // Deletion approval — rows added during THIS visit to the screen can be
+  // deleted freely (fixing your own just-made mistake); anything that
+  // already existed when the screen opened needs a Super-Admin-issued code
+  // if you're an Admin. This state naturally resets whenever the screen is
+  // remounted (i.e. you navigate away and back), since it's plain component state.
+  const isSuperAdmin = user?.role==="super_admin";
+  const isAdmin = user?.role==="admin" || isSuperAdmin;
+  const [freshIds,setFreshIds]=useState(new Set());
+  const [selectedIds,setSelectedIds]=useState(new Set());
+  const [pendingDeleteIds,setPendingDeleteIds]=useState(null); // array of ids awaiting a code
+  const [codeInput,setCodeInput]=useState(""); const [codeMsg,setCodeMsg]=useState(""); const [codeBusy,setCodeBusy]=useState(false);
+
   // Duplicate model (BOM only)
   const [allModels,setAllModels]=useState([]); const [showDup,setShowDup]=useState(false);
   const [dupSource,setDupSource]=useState(""); const [dupTarget,setDupTarget]=useState("");
@@ -684,21 +720,53 @@ function MasterEditor({ tableKey, user }) {
     setEditingId(null); setEditDraft({}); load();
   };
 
-  const deleteRow = async(id)=>{
-    if(!confirm("Delete this row?")) return;
-    const { data:rowData } = await sb.from(tableKey).select("*").eq("id",id).single();
-    const { error:err } = await sb.from(tableKey).delete().eq("id",id);
-    if(err) { alert("Delete failed: "+err.message); return; }
-    const summary = rowData ? tableDef.columns.slice(0,3).map(c=>rowData[c]).filter(Boolean).join(" — ") : String(id);
-    await logAudit("DELETE", tableKey, id, summary, user?.username||"unknown", rowData, null);
+  // Actually deletes the given ids, with audit logging — called either
+  // directly (super admin, or admin deleting rows added this session) or
+  // after a deletion code has been verified.
+  const performDelete = async(ids)=>{
+    for(const id of ids){
+      const { data:rowData } = await sb.from(tableKey).select("*").eq("id",id).single();
+      const { error:err } = await sb.from(tableKey).delete().eq("id",id);
+      if(err) { alert("Delete failed for row "+id+": "+err.message); continue; }
+      const summary = rowData ? tableDef.columns.slice(0,3).map(c=>rowData[c]).filter(Boolean).join(" — ") : String(id);
+      await logAudit("DELETE", tableKey, id, summary, user?.username||"unknown", rowData, null);
+    }
+    setSelectedIds(new Set());
     load();
+  };
+
+  const requestDelete = (ids)=>{
+    if(isSuperAdmin){ performDelete(ids); return; }
+    const needsCode = ids.filter(id=>!freshIds.has(id));
+    const free = ids.filter(id=>freshIds.has(id));
+    if(free.length) performDelete(free);
+    if(needsCode.length){
+      setPendingDeleteIds(needsCode); setCodeInput(""); setCodeMsg("");
+    }
+  };
+  const deleteRow = (id)=>{ if(!confirm("Delete this row?")) return; requestDelete([id]); };
+  const deleteSelected = ()=>{
+    if(selectedIds.size===0) return;
+    if(!confirm("Delete "+selectedIds.size+" selected row(s)?")) return;
+    requestDelete(Array.from(selectedIds));
+  };
+  const submitDeletionCode = async()=>{
+    setCodeBusy(true);
+    const result = await verifyAndConsumeDeletionCode(codeInput, user.username);
+    setCodeBusy(false);
+    if(!result.ok){ setCodeMsg(result.reason); return; }
+    const ids = pendingDeleteIds; setPendingDeleteIds(null);
+    await performDelete(ids);
   };
 
   const saveAdd = async()=>{
     const payload={};
     tableDef.columns.forEach(c=>{ let v=addDraft[c]; if(NUMERIC_COLS.has(c)) v=v===""||v===undefined?0:Number(v); payload[c]=v===undefined?"":v; });
-    const { error:err } = await sb.from(tableKey).insert(payload);
+    const { data, error:err } = await sb.from(tableKey).insert(payload).select().single();
     if(err) { alert("Add failed: "+err.message); return; }
+    if(data && data.id!==undefined) setFreshIds(prev=>new Set(prev).add(data.id));
+    const summary = tableDef.columns.slice(0,3).map(c=>payload[c]).filter(Boolean).join(" — ");
+    await logAudit("CREATE", tableKey, data?.id, summary, user?.username||"unknown", null, payload);
     setAdding(false); setAddDraft({}); load();
   };
 
@@ -746,10 +814,12 @@ function MasterEditor({ tableKey, user }) {
   const filteredRows = useMemo(()=>{ if(!search) return rows; const s=search.toLowerCase(); return rows.filter(r=>tableDef.columns.some(c=>String(r[c]??"").toLowerCase().includes(s))); },[rows,search,tableDef]);
   const addLabel = tableDef.addLabel||"New row";
 
-  return h("div",{style:{padding:"20px 24px"}},
+  return h("div",{style:{padding:"20px 24px",position:"relative"}},
+    h(Watermark,{user}),
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
       h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},tableDef.label),
-      h("div",{style:{display:"flex",gap:8}},
+      h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+        selectedIds.size>0 && h("button",{onClick:deleteSelected,style:btnDanger},"Delete "+selectedIds.size+" selected"),
         h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search…",style:{...inputStyle,width:200}}),
         tableKey==="bom"&&h("button",{onClick:()=>{setShowDup(v=>!v);setDupMsg("");},style:btnSecondary},"Duplicate model"),
         h("button",{onClick:()=>{setAdding(v=>!v);setAddDraft({});},style:btnPrimary},"+ "+addLabel)
@@ -783,11 +853,15 @@ function MasterEditor({ tableKey, user }) {
     h("div",{style:{overflowX:"auto",border:"1px solid "+colors.border,borderRadius:6}},
       h("table",{style:{fontSize:12.5,minWidth:600}},
         h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left",background:"#faf9f4"}},
+          h("th",{style:{padding:"8px 10px",width:28}},
+            h("input",{type:"checkbox",checked:filteredRows.length>0&&filteredRows.every(r=>selectedIds.has(r.id)),onChange:e=>setSelectedIds(e.target.checked?new Set(filteredRows.map(r=>r.id)):new Set())})
+          ),
           tableDef.columns.map(c=>h("th",{key:c,style:{padding:"8px 10px"}},colLabel(c))),
           h("th",{style:{padding:"8px 10px",width:120}},"")
         )),
         h("tbody",null,
           adding&&h("tr",{style:{background:"#fbf6e8"}},
+            h("td",null),
             tableDef.columns.map(c=>h("td",{key:c,style:{padding:"6px 8px"}},
               h("input",{value:addDraft[c]??"",onChange:e=>setAddDraft(d=>({...d,[c]:e.target.value})),style:{...inputStyle,padding:"5px 7px",fontSize:12}})
             )),
@@ -797,13 +871,14 @@ function MasterEditor({ tableKey, user }) {
             )
           ),
           filteredRows.map(row=>h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
+            h("td",{style:{padding:"7px 9px"}},h("input",{type:"checkbox",checked:selectedIds.has(row.id),onChange:e=>setSelectedIds(prev=>{ const next=new Set(prev); if(e.target.checked) next.add(row.id); else next.delete(row.id); return next; })})),
             tableDef.columns.map(c=>h("td",{key:c,style:{padding:"7px 9px"}},
               editingId===row.id?h("input",{value:editDraft[c]??"",onChange:e=>setEditDraft(d=>({...d,[c]:e.target.value})),style:{...inputStyle,padding:"5px 7px",fontSize:12}}):
               (NUMERIC_COLS.has(c)?fmt(Number(row[c])||0):String(row[c]??""))
             )),
             h("td",{style:{padding:"7px 9px",whiteSpace:"nowrap"}},
               editingId===row.id?h(React.Fragment,null,h("button",{onClick:saveEdit,style:{...btnSecondary,marginRight:6}},"Save"),h("button",{onClick:()=>{setEditingId(null);setEditDraft({});},style:btnSecondary},"Cancel")):
-              h(React.Fragment,null,h("button",{onClick:()=>{setEditingId(row.id);setEditDraft({...row});},style:{...btnSecondary,marginRight:6}},"Edit"),h("button",{onClick:()=>deleteRow(row.id),style:btnDanger},"Delete"))
+              h(React.Fragment,null,h("button",{onClick:()=>{setEditingId(row.id);setEditDraft({...row});},style:{...btnSecondary,marginRight:6}},"Edit"),h("button",{onClick:()=>deleteRow(row.id),style:btnDanger},freshIds.has(row.id)||isSuperAdmin?"Delete":"Delete 🔒"))
             )
           ))
         )
@@ -813,6 +888,20 @@ function MasterEditor({ tableKey, user }) {
       h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSecondary},"Previous"),
       h("span",{style:{fontSize:12,color:colors.muted,padding:"8px 0"}},"Page "+(page+1)),
       h("button",{onClick:()=>setPage(p=>p+1),disabled:rows.length<pageSize,style:btnSecondary},"Next")
+    ),
+    pendingDeleteIds && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:380,padding:"20px 22px"}},
+        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:8}},"Deletion approval required"),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},
+          "These "+pendingDeleteIds.length+" row(s) already existed before this session — deleting them needs a one-time code from a Super Admin."
+        ),
+        h("input",{value:codeInput,onChange:e=>setCodeInput(e.target.value),placeholder:"6-digit code",style:{...inputStyle,marginBottom:10,letterSpacing:2,fontSize:16,textAlign:"center"}}),
+        codeMsg && h("div",{style:{fontSize:12,color:colors.danger,marginBottom:10}},codeMsg),
+        h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
+          h("button",{onClick:()=>setPendingDeleteIds(null),style:btnSecondary},"Cancel"),
+          h("button",{onClick:submitDeletionCode,disabled:codeBusy,style:btnPrimary},codeBusy?"Checking…":"Confirm delete")
+        )
+      )
     )
   );
 }
@@ -3605,6 +3694,78 @@ async function logAudit(action, tableName, recordId, recordSummary, performedBy,
   } catch(e) { console.error("Audit log failed:", e); }
 }
 
+// Checks a deletion-approval code: must exist, be unused, and not expired.
+// Consumes it (marks used) on success so it can never be reused.
+async function verifyAndConsumeDeletionCode(code, username){
+  const trimmed = (code||"").trim();
+  if(!trimmed) return { ok:false, reason:"Enter the code." };
+  const { data, error } = await sb.from("deletion_codes").select("*").eq("code",trimmed).eq("used",false).limit(1);
+  if(error) return { ok:false, reason:"Could not verify code." };
+  if(!data || data.length===0) return { ok:false, reason:"Invalid or already-used code." };
+  const row = data[0];
+  if(new Date(row.expires_at) < new Date()) return { ok:false, reason:"That code has expired." };
+  await sb.from("deletion_codes").update({ used:true, used_by:username, used_at:new Date().toISOString() }).eq("id",row.id);
+  return { ok:true };
+}
+
+function DeletionCodesScreen({ user }){
+  const [codes,setCodes]=useState([]); const [loading,setLoading]=useState(true);
+  const [generating,setGenerating]=useState(false); const [justGenerated,setJustGenerated]=useState(null);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("deletion_codes").select("*").order("generated_at",{ascending:false}).limit(50);
+    setCodes(data||[]); setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const generate = async()=>{
+    setGenerating(true);
+    const code = String(Math.floor(100000+Math.random()*900000)); // 6-digit
+    const expires_at = new Date(Date.now()+15*60*1000).toISOString();
+    const { data, error:err } = await sb.from("deletion_codes").insert({ code, generated_by:user.username, expires_at }).select().single();
+    setGenerating(false);
+    if(err){ alert("Could not generate code: "+err.message); return; }
+    setJustGenerated(data);
+    load();
+  };
+
+  const statusOf = (c)=>{
+    if(c.used) return { label:"Used", color:"#6b6f60" };
+    if(new Date(c.expires_at) < new Date()) return { label:"Expired", color:"#b8472f" };
+    return { label:"Active", color:"#085041" };
+  };
+
+  return h("div",{style:{padding:"20px 24px",position:"relative"}},
+    h(Watermark,{user}),
+    h("h2",{style:{margin:"0 0 14px",fontSize:18,fontWeight:700}},"Deletion Codes"),
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:16,marginBottom:16}},
+      h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:10}},"Generate a one-time code and give it to the Admin who needs to delete already-saved master data. Valid for 15 minutes, and can only be used once — one code covers however many rows they've selected."),
+      h("button",{onClick:generate,disabled:generating,style:btnPrimary},generating?"Generating…":"Generate deletion code"),
+      justGenerated && h("div",{style:{marginTop:14,padding:"14px 18px",background:"#eaf9f4",border:"1px solid #8fd0bf",borderRadius:6,display:"inline-block"}},
+        h("div",{style:{fontSize:11,color:"#4a8d78",marginBottom:4}},"Give this code to the Admin — expires "+new Date(justGenerated.expires_at).toLocaleTimeString()),
+        h("div",{style:{fontSize:28,fontWeight:700,letterSpacing:4,color:"#085041"}},justGenerated.code)
+      )
+    ),
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",overflow:"hidden"}},
+      h("div",{style:{padding:"9px 14px",fontWeight:700,fontSize:12.5,background:colors.dark,color:"#fff"}},"Recent codes"),
+      loading ? h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"Loading…") :
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse"}},
+        h("thead",null,h("tr",{style:{background:"#f4f2ea"}},
+          ["Code","Generated by","Generated at","Status","Used by"].map(hd=>h("th",{key:hd,style:{textAlign:"left",padding:"7px 10px",fontWeight:700}},hd))
+        )),
+        h("tbody",null,codes.map(c=>{ const st=statusOf(c); return h("tr",{key:c.id,style:{borderTop:"1px solid #f0efe8"}},
+          h("td",{style:{padding:"6px 10px",fontFamily:"monospace"}},c.code),
+          h("td",{style:{padding:"6px 10px"}},c.generated_by),
+          h("td",{style:{padding:"6px 10px",color:colors.muted}},new Date(c.generated_at).toLocaleString()),
+          h("td",{style:{padding:"6px 10px",color:st.color,fontWeight:600}},st.label),
+          h("td",{style:{padding:"6px 10px",color:colors.muted}},c.used_by||"—")
+        );}))
+      )
+    )
+  );
+}
+
 /* ---- CHANGE PASSWORD ---- */
 function ChangePassword({ user }) {
   const [current,setCurrent]=useState(""); const [next,setNext]=useState(""); const [confirm,setConfirm]=useState("");
@@ -4317,6 +4478,467 @@ function CalcHistoryViewer({ user }) {
 }
 
 
+/* ---- REPORTS ---- */
+function ReportsScreen({ user }) {
+  const [loading,setLoading]=useState(true);
+  const [modelRows,setModelRows]=useState([]); // {item,model,size} from model_tbl
+  const [bomCounts,setBomCounts]=useState(new Map()); // model -> component count
+  const [search,setSearch]=useState("");
+  const [itemFilter,setItemFilter]=useState(new Set()); // empty = all items
+  const [itemPickerOpen,setItemPickerOpen]=useState(false);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const [models, bomRows] = await Promise.all([
+      fetchAll("model_tbl","item,model,size"),
+      fetchAll("bom","model"),
+    ]);
+    const counts = new Map();
+    bomRows.forEach(r=>{ if(!r.model) return; counts.set(r.model, (counts.get(r.model)||0)+1); });
+    setModelRows(models||[]);
+    setBomCounts(counts);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const allItems = useMemo(()=> Array.from(new Set(modelRows.map(r=>r.item).filter(Boolean))).sort(), [modelRows]);
+
+  // Group by Item -> Model -> Size, in the order items/models first appear.
+  const grouped = useMemo(()=>{
+    const s = search.trim().toLowerCase();
+    let filtered = itemFilter.size>0 ? modelRows.filter(r=>itemFilter.has(r.item)) : modelRows;
+    if(s) filtered = filtered.filter(r=>(r.item||"").toLowerCase().includes(s)||(r.model||"").toLowerCase().includes(s)||(r.size||"").toLowerCase().includes(s));
+    const items=[]; const itemMap=new Map();
+    filtered.forEach(r=>{
+      const itemKey = r.item||"(no item)";
+      if(!itemMap.has(itemKey)){ const g={item:itemKey, models:[], modelMap:new Map()}; itemMap.set(itemKey,g); items.push(g); }
+      const ig = itemMap.get(itemKey);
+      const modelKey = r.model||"(no model)";
+      if(!ig.modelMap.has(modelKey)){ const mg={model:modelKey, sizes:[]}; ig.modelMap.set(modelKey,mg); ig.models.push(mg); }
+      ig.modelMap.get(modelKey).sizes.push({ size:r.size||"—", count: bomCounts.get(r.model)||0 });
+    });
+    return items;
+  },[modelRows,bomCounts,search,itemFilter]);
+
+  const totalCombos = modelRows.length;
+  const availableCombos = modelRows.filter(r=>(bomCounts.get(r.model)||0)>0).length;
+  const missingCombos = totalCombos - availableCombos;
+
+  const toggleItem = (item)=> setItemFilter(prev=>{
+    const next = new Set(prev);
+    if(next.has(item)) next.delete(item); else next.add(item);
+    return next;
+  });
+
+  const exportExcel = ()=>{
+    const rows=[["Item","Model","Size","Components","Status"]];
+    grouped.forEach(ig=>ig.models.forEach(mg=>mg.sizes.forEach(s=>{
+      rows.push([ig.item, mg.model, s.size, s.count, s.count>0?"BOM available":"Not set up"]);
+    })));
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    ws["!cols"] = [{wch:22},{wch:26},{wch:12},{wch:12},{wch:16}];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Available BOM");
+    XLSX.writeFile(wb, "available_bom_report.xlsx");
+  };
+
+  return h("div",{style:{padding:"20px 24px",position:"relative"}},
+    h(Watermark,{user}),
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
+      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Available BOM"),
+      h("div",{style:{display:"flex",gap:8,alignItems:"flex-start"}},
+        h("div",{style:{position:"relative"}},
+          h("div",{onClick:()=>setItemPickerOpen(o=>!o),style:{border:"1px solid "+(itemFilter.size>0?"#1c8c75":colors.border),borderRadius:6,padding:"9px 11px",fontSize:12,width:180,background:itemFilter.size>0?"#eaf9f4":"#fff",color:itemFilter.size>0?"#085041":colors.text,fontWeight:itemFilter.size>0?600:400,display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}},
+            h("span",null, itemFilter.size===0?"All items":itemFilter.size+" item"+(itemFilter.size===1?"":"s")+" selected"),
+            h("span",{style:{fontSize:10}},"▾")
+          ),
+          itemPickerOpen && h("div",{style:{position:"absolute",top:38,left:0,width:220,background:"#fff",border:"1px solid "+colors.border,borderRadius:6,boxShadow:"0 2px 8px rgba(0,0,0,0.1)",fontSize:12,zIndex:5,maxHeight:280,overflowY:"auto"}},
+            h("div",{onClick:()=>setItemFilter(new Set()),style:{padding:"8px 11px",borderBottom:"1px solid #f0efe8",color:"#1c8c75",fontWeight:600,cursor:"pointer"}}, (itemFilter.size===0?"✓ ":"")+"All items"),
+            allItems.map(it=>h("div",{key:it,onClick:()=>toggleItem(it),style:{padding:"7px 11px",borderBottom:"1px solid #f0efe8",cursor:"pointer",display:"flex",alignItems:"center",gap:6}},
+              h("input",{type:"checkbox",checked:itemFilter.has(it),readOnly:true}),
+              h("span",null,it)
+            ))
+          )
+        ),
+        h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search item, model, size…",style:{...inputStyle,width:220}}),
+        user.role==="super_admin"
+          ? h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel")
+          : h("span",{title:"Master data exports are limited to Super Admin",style:{fontSize:11,color:colors.mutedLight,alignSelf:"center"}},"Export: Super Admin only")
+      )
+    ),
+    loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
+    h(React.Fragment,null,
+      grouped.map(ig=>h("div",{key:ig.item,style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden",marginBottom:10}},
+        h("div",{style:{background:colors.dark,color:"#fff",padding:"9px 14px",fontSize:12.5,fontWeight:700,display:"flex",justifyContent:"space-between"}},
+          h("span",null,ig.item),
+          h("span",{style:{fontWeight:400,opacity:0.7,fontSize:11}},ig.models.length+" model"+(ig.models.length===1?"":"s"))
+        ),
+        ig.models.map(mg=>h("div",{key:mg.model},
+          h("div",{style:{padding:"6px 14px 6px 28px",fontSize:12,fontWeight:700,background:"#faf9f4",borderTop:"1px solid #eceae0"}},mg.model),
+          mg.sizes.map((s,si)=>h("div",{key:si,style:{display:"flex",alignItems:"center",padding:"6px 14px 6px 44px",fontSize:12,borderTop:"1px solid #f0efe8"}},
+            h("div",{style:{width:90,color:colors.muted}},s.size),
+            h("div",{style:{width:130,color:s.count>0?colors.text:colors.mutedLight}},s.count+" component"+(s.count===1?"":"s")),
+            s.count>0
+              ? h("div",{style:{color:"#085041"}},"✓ BOM available")
+              : h("div",{style:{color:"#b8472f"}},"⚠ Not set up")
+          ))
+        ))
+      )),
+      grouped.length===0 && h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No models found."),
+      h("div",{style:{display:"flex",gap:20,marginTop:14,fontSize:11.5,color:colors.muted}},
+        h("span",null,"✓ "+availableCombos+" model+size combinations with BOM"),
+        h("span",null,"⚠ "+missingCombos+" missing")
+      )
+    )
+  );
+}
+
+/* ---- ACTIVITY BY USER ---- */
+function ActivityByUserReport({ user }){
+  const todayStr = new Date().toISOString().slice(0,10);
+  const [from,setFrom]=useState(todayStr); const [to,setTo]=useState(todayStr);
+  const [groupBy,setGroupBy]=useState("day");
+  const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
+
+  const setPreset = (p)=>{
+    const d = new Date();
+    const iso = (dt)=>dt.toISOString().slice(0,10);
+    if(p==="today"){ setFrom(iso(d)); setTo(iso(d)); }
+    else if(p==="yesterday"){ const y=new Date(d); y.setDate(y.getDate()-1); setFrom(iso(y)); setTo(iso(y)); }
+    else if(p==="week"){ const s=new Date(d); s.setDate(s.getDate()-s.getDay()); setFrom(iso(s)); setTo(iso(d)); }
+    else if(p==="month"){ const s=new Date(d.getFullYear(),d.getMonth(),1); setFrom(iso(s)); setTo(iso(d)); }
+    else if(p==="quarter"){ const q=Math.floor(d.getMonth()/3); const s=new Date(d.getFullYear(),q*3,1); setFrom(iso(s)); setTo(iso(d)); }
+    else if(p==="year"){ const s=new Date(d.getFullYear(),0,1); setFrom(iso(s)); setTo(iso(d)); }
+  };
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("estimates").select("created_by,created_at,reference_number,item_sl_no")
+      .gte("created_at", from+"T00:00:00").lte("created_at", to+"T23:59:59");
+    setRows(data||[]);
+    setLoading(false);
+  },[from,to]);
+  useEffect(()=>{ load(); },[load]);
+
+  const bucketKey = (dateStr)=>{
+    const d = new Date(dateStr);
+    if(groupBy==="day") return d.toISOString().slice(0,10);
+    if(groupBy==="month") return d.toLocaleDateString("en-IN",{month:"short",year:"numeric"});
+    // week: label by the Monday of that week
+    const s=new Date(d); s.setDate(s.getDate()-s.getDay()); return "Wk of "+s.toISOString().slice(0,10);
+  };
+
+  const { buckets, userTotals, matrix } = useMemo(()=>{
+    const bucketSet=new Set(); const users=new Set();
+    const m = new Map(); // user -> bucket -> count
+    rows.forEach(r=>{
+      const u = r.created_by||"unknown"; const b = bucketKey(r.created_at);
+      bucketSet.add(b); users.add(u);
+      if(!m.has(u)) m.set(u,new Map());
+      m.get(u).set(b, (m.get(u).get(b)||0)+1);
+    });
+    const bucketsArr = Array.from(bucketSet).sort();
+    const userTotalsMap = new Map();
+    users.forEach(u=>{ let t=0; (m.get(u)||new Map()).forEach(v=>t+=v); userTotalsMap.set(u,t); });
+    return { buckets:bucketsArr, userTotals:userTotalsMap, matrix:m };
+  },[rows,groupBy]);
+
+  const users = Array.from(userTotals.keys()).sort();
+
+  const exportExcel = ()=>{
+    const headerRow = ["User", ...buckets, "Total"];
+    const dataRows = users.map(u=>[u, ...buckets.map(b=>(matrix.get(u)&&matrix.get(u).get(b))||0), userTotals.get(u)]);
+    const ws = XLSX.utils.aoa_to_sheet([headerRow, ...dataRows]);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Activity by user");
+    XLSX.writeFile(wb, "activity_by_user_"+from+"_to_"+to+".xlsx");
+  };
+  const exportPDF = ()=>{
+    const headers = ["User", ...buckets, "Total"];
+    const pdfRows = users.map(u=>[u, ...buckets.map(b=>String((matrix.get(u)&&matrix.get(u).get(b))||0)), String(userTotals.get(u))]);
+    generatePDF({ title:"Activity by user", refNumber:from+" to "+to, description:"Grouped by "+groupBy, createdBy:user.username, createdAt:Date.now(), headers, rows:pdfRows, filename:"activity_by_user.pdf" });
+  };
+
+  return h("div",{style:{padding:"20px 24px",position:"relative"}},
+    h(Watermark,{user}),
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
+      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Activity by user"),
+      h("div",{style:{display:"flex",gap:8}}, h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel"), h("button",{onClick:exportPDF,style:btnSecondary},"Export PDF"))
+    ),
+    h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}},
+      ["today","yesterday","week","month","quarter","year"].map(p=>h("button",{key:p,onClick:()=>setPreset(p),style:btnSmall},p[0].toUpperCase()+p.slice(1)))
+    ),
+    h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:16,fontSize:12}},
+      h("span",{style:{color:colors.muted}},"Custom range:"),
+      h("input",{type:"date",value:from,onChange:e=>setFrom(e.target.value),style:{...inputStyle,width:150}}),
+      h("span",null,"to"),
+      h("input",{type:"date",value:to,onChange:e=>setTo(e.target.value),style:{...inputStyle,width:150}}),
+      h("select",{value:groupBy,onChange:e=>setGroupBy(e.target.value),style:{...inputStyle,width:150}},
+        h("option",{value:"day"},"Group by day"), h("option",{value:"week"},"Group by week"), h("option",{value:"month"},"Group by month")
+      )
+    ),
+    loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
+    h("div",{style:{overflowX:"auto",border:"1px solid "+colors.border,borderRadius:6}},
+      h("table",{style:{fontSize:12,minWidth:500,borderCollapse:"collapse"}},
+        h("thead",null,h("tr",{style:{background:"#f4f2ea"}},
+          h("th",{style:{padding:"7px 10px",textAlign:"left"}},"User"),
+          buckets.map(b=>h("th",{key:b,style:{padding:"7px 10px",textAlign:"right"}},b)),
+          h("th",{style:{padding:"7px 10px",textAlign:"right",fontWeight:700}},"Total")
+        )),
+        h("tbody",null, users.length===0 ? h("tr",null,h("td",{colSpan:buckets.length+2,style:{padding:16,color:colors.mutedLight}},"No quotes created in this range.")) :
+          users.map(u=>h("tr",{key:u,style:{borderTop:"1px solid #f0efe8"}},
+            h("td",{style:{padding:"6px 10px"}},u),
+            buckets.map(b=>h("td",{key:b,style:{padding:"6px 10px",textAlign:"right"}},(matrix.get(u)&&matrix.get(u).get(b))||0)),
+            h("td",{style:{padding:"6px 10px",textAlign:"right",fontWeight:700}},userTotals.get(u))
+          ))
+        )
+      )
+    ),
+    h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:10}},"Counts new quotes created (unique Quote# + Sl No combinations), not edits to existing ones.")
+  );
+}
+
+/* ---- QUOTE REPORTS (client summary, currency, most-quoted, date range) ---- */
+function QuoteReports({ user }){
+  const [loading,setLoading]=useState(true);
+  const [estimatesRows,setEstimatesRows]=useState([]);
+  const [linesByKey,setLinesByKey]=useState(new Map()); // "ref|slno" -> total sales value
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const [ests, lines] = await Promise.all([
+      fetchAll("estimates","reference_number,item_sl_no,description,model,currency,created_at,created_by"),
+      fetchAll("estimate_lines","reference_number,item_sl_no,sales_price"),
+    ]);
+    const m = new Map();
+    lines.forEach(l=>{ const k=l.reference_number+"|"+l.item_sl_no; m.set(k, (m.get(k)||0)+(Number(l.sales_price)||0)); });
+    setEstimatesRows(ests||[]); setLinesByKey(m);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const valueOf = (r)=> linesByKey.get(r.reference_number+"|"+r.item_sl_no)||0;
+
+  const byClient = useMemo(()=>{
+    const m = new Map();
+    estimatesRows.forEach(r=>{
+      const client = r.description||"(no client)";
+      if(!m.has(client)) m.set(client,{client,quotes:new Set(),slnos:0,value:0});
+      const g = m.get(client);
+      g.quotes.add(r.reference_number); g.slnos+=1; g.value+=valueOf(r);
+    });
+    return Array.from(m.values()).map(g=>({...g,quotes:g.quotes.size})).sort((a,b)=>b.value-a.value);
+  },[estimatesRows,linesByKey]);
+
+  const byCurrency = useMemo(()=>{
+    const m = new Map();
+    estimatesRows.forEach(r=>{
+      const cur = r.currency||"INR";
+      if(!m.has(cur)) m.set(cur,{currency:cur,quotes:0,value:0});
+      const g = m.get(cur); g.quotes+=1; g.value+=valueOf(r);
+    });
+    return Array.from(m.values());
+  },[estimatesRows,linesByKey]);
+
+  const byModel = useMemo(()=>{
+    const m = new Map();
+    estimatesRows.forEach(r=>{
+      const key = r.model||"(no model)";
+      m.set(key,(m.get(key)||0)+1);
+    });
+    return Array.from(m.entries()).map(([model,count])=>({model,count})).sort((a,b)=>b.count-a.count).slice(0,20);
+  },[estimatesRows]);
+
+  const exportExcel = ()=>{
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Client","Quotes","Sl Nos","Total value"],...byClient.map(g=>[g.client,g.quotes,g.slnos,r2(g.value)])]), "By client");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Currency","Quotes","Total value"],...byCurrency.map(g=>[g.currency,g.quotes,r2(g.value)])]), "Currency exposure");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Model","Times quoted"],...byModel.map(g=>[g.model,g.count])]), "Most quoted");
+    XLSX.writeFile(wb, "quote_reports.xlsx");
+  };
+  const exportPDF = ()=>{
+    generatePDF({ title:"Quote summary by client", refNumber:"", description:"", createdBy:user.username, createdAt:Date.now(),
+      headers:["Client","Quotes","Sl Nos","Total value"], rows:byClient.map(g=>[g.client,g.quotes,g.slnos,fmt(g.value)]), filename:"quote_reports.pdf" });
+  };
+
+  return h("div",{style:{padding:"20px 24px",position:"relative"}},
+    h(Watermark,{user}),
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
+      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Quote reports"),
+      h("div",{style:{display:"flex",gap:8}}, h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel"), h("button",{onClick:exportPDF,style:btnSecondary},"Export PDF (client summary)"))
+    ),
+    loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
+    h(React.Fragment,null,
+      h("div",{style:{fontSize:13,fontWeight:700,marginBottom:8}},"Quote summary by client"),
+      h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:14,marginBottom:20,overflowX:"auto"}},
+        h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse"}},
+          h("thead",null,h("tr",{style:{borderBottom:"1px solid "+colors.border}},["Client","Quotes","Sl Nos","Total value"].map(hh=>h("th",{key:hh,style:{textAlign:"left",padding:"5px 8px 5px 0"}},hh)))),
+          h("tbody",null,byClient.map(g=>h("tr",{key:g.client,style:{borderBottom:"1px solid #f0efe8"}},
+            h("td",{style:{padding:"5px 8px 5px 0"}},g.client), h("td",null,g.quotes), h("td",null,g.slnos), h("td",null,fmt(g.value))
+          )))
+        )
+      ),
+      h("div",{style:{fontSize:13,fontWeight:700,marginBottom:8}},"Currency exposure"),
+      h("div",{style:{display:"flex",gap:16,marginBottom:20,flexWrap:"wrap"}},
+        byCurrency.map(g=>h("div",{key:g.currency,style:{background:"#f4f2ea",borderRadius:6,padding:"12px 18px"}},
+          h("div",{style:{fontSize:11,color:colors.muted}},g.currency+" quotes"),
+          h("div",{style:{fontSize:20,fontWeight:700}},fmt(g.value)),
+          h("div",{style:{fontSize:11,color:colors.muted}},g.quotes+" quote(s)")
+        ))
+      ),
+      h("div",{style:{fontSize:13,fontWeight:700,marginBottom:8}},"Most-quoted models"),
+      h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:14,overflowX:"auto"}},
+        h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse"}},
+          h("thead",null,h("tr",{style:{borderBottom:"1px solid "+colors.border}},["Model","Times quoted"].map(hh=>h("th",{key:hh,style:{textAlign:"left",padding:"5px 8px 5px 0"}},hh)))),
+          h("tbody",null,byModel.map(g=>h("tr",{key:g.model,style:{borderBottom:"1px solid #f0efe8"}},h("td",{style:{padding:"5px 8px 5px 0"}},g.model),h("td",null,g.count))))
+        )
+      )
+    )
+  );
+}
+
+/* ---- STALE MATERIAL RATES ---- */
+function StaleRatesReport({ user }){
+  const [days,setDays]=useState(90);
+  const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
+  const [editing,setEditing]=useState({}); // id -> {newRate}
+  const isSuperAdmin = user.role==="super_admin";
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const data = await fetchAll("material_rates","id,material_spec,material_grade,rate,uom,created_at");
+    setRows(data||[]);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const cutoff = useMemo(()=> Date.now() - Number(days||0)*86400000, [days]);
+  const stale = useMemo(()=> rows.filter(r=>r.created_at && new Date(r.created_at).getTime() < cutoff)
+    .map(r=>({...r, daysOld: Math.floor((Date.now()-new Date(r.created_at).getTime())/86400000)}))
+    .sort((a,b)=>b.daysOld-a.daysOld), [rows,cutoff]);
+
+  const applyNewRate = async(row)=>{
+    const draft = editing[row.id];
+    if(!draft || !draft.newRate) return;
+    const newRate = Number(draft.newRate);
+    if(isNaN(newRate)){ alert("Enter a valid number."); return; }
+    const { error:err } = await sb.from("material_rates").update({ rate:newRate, created_at:new Date().toISOString() }).eq("id",row.id);
+    if(err){ alert("Update failed: "+err.message); return; }
+    await logAudit("UPDATE","material_rates",row.id,row.material_spec+" — "+row.material_grade,user.username,{rate:row.rate},{rate:newRate});
+    setEditing(e=>{ const n={...e}; delete n[row.id]; return n; });
+    load();
+  };
+
+  const exportExcel = ()=>{
+    const headerRow = ["Material spec","Grade","Current rate","UOM","Days since update","Last updated"];
+    const dataRows = stale.map(r=>[r.material_spec,r.material_grade,r2(r.rate),r.uom,r.daysOld,new Date(r.created_at).toLocaleDateString()]);
+    const ws = XLSX.utils.aoa_to_sheet([headerRow,...dataRows]);
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "Stale rates");
+    XLSX.writeFile(wb, "stale_material_rates.xlsx");
+  };
+  const exportPDF = ()=>{
+    generatePDF({ title:"Stale material rates", refNumber:"Older than "+days+" days", description:"", createdBy:user.username, createdAt:Date.now(),
+      headers:["Material spec","Grade","Rate","UOM","Days old","Last updated"],
+      rows:stale.map(r=>[r.material_spec,r.material_grade,fmt(r.rate),r.uom,String(r.daysOld),new Date(r.created_at).toLocaleDateString()]),
+      filename:"stale_material_rates.pdf" });
+  };
+
+  return h("div",{style:{padding:"20px 24px",position:"relative"}},
+    h(Watermark,{user}),
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
+      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Stale material rates"),
+      h("div",{style:{display:"flex",gap:8}}, h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel"), h("button",{onClick:exportPDF,style:btnSecondary},"Export PDF"))
+    ),
+    h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:16,fontSize:12.5}},
+      h("span",{style:{color:colors.muted}},"Show rates older than"),
+      h("input",{type:"number",value:days,onChange:e=>setDays(e.target.value),style:{...inputStyle,width:80}}),
+      h("span",{style:{color:colors.muted}},"days")
+    ),
+    loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflowX:"auto"}},
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",minWidth:700}},
+        h("thead",null,h("tr",{style:{background:"#f4f2ea"}},
+          ["Material spec","Grade","Current rate","UOM","Days since update","Last updated","New rate","New rate date",""].map(hh=>h("th",{key:hh,style:{padding:"7px 9px",textAlign:"left"}},hh))
+        )),
+        h("tbody",null, stale.length===0 ? h("tr",null,h("td",{colSpan:9,style:{padding:16,color:colors.mutedLight}},"No rates older than "+days+" days.")) :
+          stale.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #f0efe8"}},
+            h("td",{style:{padding:"6px 9px"}},r.material_spec),
+            h("td",{style:{padding:"6px 9px"}},r.material_grade),
+            h("td",{style:{padding:"6px 9px"}},fmt(r.rate)),
+            h("td",{style:{padding:"6px 9px"}},r.uom),
+            h("td",{style:{padding:"6px 9px",color:"#b8472f",fontWeight:600}},r.daysOld),
+            h("td",{style:{padding:"6px 9px",color:colors.muted}},new Date(r.created_at).toLocaleDateString()),
+            h("td",{style:{padding:"6px 9px"}},h("input",{value:(editing[r.id]&&editing[r.id].newRate)||"",onChange:e=>setEditing(ed=>({...ed,[r.id]:{newRate:e.target.value}})),placeholder:"New rate",style:{...inputStyle,width:100,padding:"5px 7px",fontSize:12}})),
+            h("td",{style:{padding:"6px 9px",color:colors.muted,fontSize:11}}, editing[r.id]&&editing[r.id].newRate ? new Date().toLocaleDateString() : "—"),
+            h("td",{style:{padding:"6px 9px"}}, editing[r.id]&&editing[r.id].newRate ? h("button",{onClick:()=>applyNewRate(r),style:{...btnSmall,color:"#085041"}},"Save") : null)
+          ))
+        )
+      )
+    )
+  );
+}
+
+/* ---- MASTERS AUDIT (built when/by whom, deletions) ---- */
+function MastersAuditReport({ user }){
+  const masterTableKeys = MASTER_TABLES.map(t=>t.key).concat(["datasheet_master_fields"]);
+  const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
+  const [mode,setMode]=useState("created"); // created | deleted
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const data = await fetchAll("audit_log","action,table_name,record_id,record_summary,performed_by,created_at");
+    setRows((data||[]).filter(r=>masterTableKeys.includes(r.table_name)));
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const filtered = useMemo(()=>{
+    const wantActions = mode==="created" ? ["CREATE","UPLOAD"] : ["DELETE","DELETE_ALL"];
+    return rows.filter(r=>wantActions.includes(r.action)).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+  },[rows,mode]);
+
+  const exportExcel = ()=>{
+    const headerRow = ["Table","Record","Summary","By","When","Action"];
+    const dataRows = filtered.map(r=>[r.table_name,r.record_id,r.record_summary,r.performed_by,new Date(r.created_at).toLocaleString(),r.action]);
+    const ws = XLSX.utils.aoa_to_sheet([headerRow,...dataRows]);
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, mode==="created"?"Masters created":"Masters deleted");
+    XLSX.writeFile(wb, "masters_audit_"+mode+".xlsx");
+  };
+  const exportPDF = ()=>{
+    generatePDF({ title:"Masters audit — "+(mode==="created"?"built":"deleted"), refNumber:"", description:"", createdBy:user.username, createdAt:Date.now(),
+      headers:["Table","Record","Summary","By","When"],
+      rows:filtered.map(r=>[r.table_name,String(r.record_id),r.record_summary||"",r.performed_by,new Date(r.created_at).toLocaleString()]),
+      filename:"masters_audit_"+mode+".pdf" });
+  };
+
+  return h("div",{style:{padding:"20px 24px",position:"relative"}},
+    h(Watermark,{user}),
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
+      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Masters audit"),
+      h("div",{style:{display:"flex",gap:8}}, h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel"), h("button",{onClick:exportPDF,style:btnSecondary},"Export PDF"))
+    ),
+    h("div",{style:{display:"flex",gap:6,marginBottom:14}},
+      h("button",{onClick:()=>setMode("created"),style:mode==="created"?{...btnSmall,background:"#1c1f1a",color:"#fff",borderColor:"#1c1f1a"}:btnSmall},"Built"),
+      h("button",{onClick:()=>setMode("deleted"),style:mode==="deleted"?{...btnSmall,background:"#1c1f1a",color:"#fff",borderColor:"#1c1f1a"}:btnSmall},"Deleted")
+    ),
+    loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflowX:"auto"}},
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",minWidth:600}},
+        h("thead",null,h("tr",{style:{background:"#f4f2ea"}},["Table","Record","Summary","By","When"].map(hh=>h("th",{key:hh,style:{padding:"7px 9px",textAlign:"left"}},hh)))),
+        h("tbody",null, filtered.length===0 ? h("tr",null,h("td",{colSpan:5,style:{padding:16,color:colors.mutedLight}},"No matching entries.")) :
+          filtered.map((r,i)=>h("tr",{key:i,style:{borderTop:"1px solid #f0efe8"}},
+            h("td",{style:{padding:"6px 9px"}},r.table_name),
+            h("td",{style:{padding:"6px 9px",color:colors.muted}},r.record_id),
+            h("td",{style:{padding:"6px 9px"}},r.record_summary),
+            h("td",{style:{padding:"6px 9px"}},r.performed_by),
+            h("td",{style:{padding:"6px 9px",color:colors.muted}},new Date(r.created_at).toLocaleString())
+          ))
+        )
+      )
+    )
+  );
+}
+
 function App() {
   const [user,setUser]=useState(null); const [tab,setTab]=useState("estimator");
   const [masterData,setMasterData]=useState({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});
@@ -4332,6 +4954,12 @@ function App() {
     h(MenuTabs,{user,active:tab,onChange:setTab}),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}})),
     tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null)}):
+    tab==="reports"?h(ReportsScreen,{user}):
+    tab==="reports_activity"?h(ActivityByUserReport,{user}):
+    tab==="reports_quotes"?h(QuoteReports,{user}):
+    tab==="reports_masters"?h(StaleRatesReport,{user}):
+    tab==="reports_audit"?h(MastersAuditReport,{user}):
+    tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab}):
     tab==="allowable_stress"?h(AllowableStressEditor,null):
