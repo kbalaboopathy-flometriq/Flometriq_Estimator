@@ -324,6 +324,65 @@ function generatePDF({ title, refNumber, description, createdBy, createdAt, head
   doc.save(filename||"export.pdf");
 }
 
+// Newspaper-style multi-column PDF for long, simple item/subtitle lists (e.g.
+// "Not Set BOM") — fills a landscape page in side-by-side columns instead of
+// one long single-column list, so fewer pages are needed.
+function generateMultiColumnListPDF({ title, subtitle, items, columnsCount, createdBy, filename }){
+  const cols = columnsCount || 3;
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation:"landscape", unit:"mm", format:"a4" });
+  const W = doc.internal.pageSize.getWidth(); const H = doc.internal.pageSize.getHeight();
+  const dark = [28,31,26]; const margin = 12; const colGap = 8;
+  const colWidth = (W - margin*2 - colGap*(cols-1)) / cols;
+  const colXs = Array.from({length:cols},(_,i)=>margin+i*(colWidth+colGap));
+
+  const drawHeader = ()=>{
+    try{ doc.addImage(COMPANY_LOGO,"PNG",margin,4,32,16); }catch(e){}
+    doc.setFontSize(10); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+    doc.text(COMPANY_NAME, W-margin, 8, {align:"right"});
+    doc.setFontSize(7); doc.setFont(undefined,"normal"); doc.setTextColor(100,100,100);
+    doc.text(COMPANY_ADDRESS, W-margin, 13, {align:"right"});
+    doc.setFontSize(8.5); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+    doc.text(title.toUpperCase(), W-margin, 19, {align:"right"});
+    if(subtitle){ doc.setFontSize(8); doc.setFont(undefined,"normal"); doc.text(subtitle, margin, 19); }
+    doc.setDrawColor(180,177,165); doc.setLineWidth(0.4);
+    doc.line(margin, 22, W-margin, 22);
+  };
+  const startY = 28; const bottomLimit = H-14;
+  const colHeaderRow = (col,y)=>{
+    doc.setFontSize(8.5); doc.setFont(undefined,"bold"); doc.setTextColor(...dark);
+    doc.text("Item / Model / Size", colXs[col], y);
+    doc.setDrawColor(120,120,120); doc.setLineWidth(0.3);
+    doc.line(colXs[col], y+1.5, colXs[col]+colWidth, y+1.5);
+  };
+
+  drawHeader();
+  let col=0, y=startY;
+  colHeaderRow(col,y); y+=6;
+  items.forEach(it=>{
+    if(y+9 > bottomLimit){
+      col++;
+      if(col>=cols){ doc.addPage(); drawHeader(); col=0; y=startY; }
+      else y=startY;
+      colHeaderRow(col,y); y+=6;
+    }
+    doc.setFont(undefined,"bold"); doc.setFontSize(8); doc.setTextColor(...dark);
+    doc.text(it.item, colXs[col], y);
+    y+=3.8;
+    doc.setFont(undefined,"normal"); doc.setFontSize(7.5); doc.setTextColor(100,100,100);
+    doc.text(it.sub, colXs[col], y);
+    y+=5.5;
+  });
+  const pageCount = doc.internal.getNumberOfPages();
+  for(let i=1;i<=pageCount;i++){
+    doc.setPage(i); doc.setFontSize(7); doc.setTextColor(150);
+    doc.text("Page "+i+" of "+pageCount, W-margin, H-6, {align:"right"});
+    doc.setTextColor(...dark);
+    doc.text(COMPANY_NAME+" | "+title, margin, H-6);
+  }
+  doc.save(filename||"report.pdf");
+}
+
 /* ---- LOGIN ---- */
 function LoginScreen({ onLogin }) {
   const [username, setUsername] = useState(""); const [password, setPassword] = useState("");
@@ -391,7 +450,7 @@ function MenuTabs({ user, active, onChange }) {
       {key:"calcs",label:"Engineering Calcs"},
     ]},
     { label:"Reports", tabs:[
-      {key:"reports",label:"Available BOM"},
+      {key:"reports",label:"BOM Coverage"},
       {key:"reports_activity",label:"Activity by User"},
       {key:"reports_quotes",label:"Quotes"},
       ...(isAdmin?[{key:"reports_masters",label:"Stale Rates"},{key:"reports_audit",label:"Masters Audit"}]:[]),
@@ -4482,12 +4541,14 @@ function CalcHistoryViewer({ user }) {
 
 /* ---- REPORTS ---- */
 function ReportsScreen({ user }) {
+  const [showMode,setShowMode]=useState("available"); // "available" | "missing" | "all"
   const [loading,setLoading]=useState(true);
   const [modelRows,setModelRows]=useState([]); // {item,model,size} from model_tbl
   const [bomCounts,setBomCounts]=useState(new Map()); // model -> component count
   const [search,setSearch]=useState("");
   const [itemFilter,setItemFilter]=useState(new Set()); // empty = all items
   const [itemPickerOpen,setItemPickerOpen]=useState(false);
+  const canExport = user.role==="admin" || user.role==="super_admin";
 
   const load = useCallback(async()=>{
     setLoading(true);
@@ -4505,11 +4566,27 @@ function ReportsScreen({ user }) {
 
   const allItems = useMemo(()=> Array.from(new Set(modelRows.map(r=>r.item).filter(Boolean))).sort(), [modelRows]);
 
-  // Group by Item -> Model -> Size, in the order items/models first appear.
-  const grouped = useMemo(()=>{
+  // Base filter (search + item picker) applied before the Available/Not Set/All
+  // split, so the three tab counts are always comparable against each other.
+  const baseFiltered = useMemo(()=>{
     const s = search.trim().toLowerCase();
     let filtered = itemFilter.size>0 ? modelRows.filter(r=>itemFilter.has(r.item)) : modelRows;
     if(s) filtered = filtered.filter(r=>(r.item||"").toLowerCase().includes(s)||(r.model||"").toLowerCase().includes(s)||(r.size||"").toLowerCase().includes(s));
+    return filtered;
+  },[modelRows,search,itemFilter]);
+
+  const counts = useMemo(()=>{
+    const available = baseFiltered.filter(r=>(bomCounts.get(r.model)||0)>0).length;
+    return { available, missing: baseFiltered.length-available, all: baseFiltered.length };
+  },[baseFiltered,bomCounts]);
+
+  // Group by Item -> Model -> Size, in the order items/models first appear.
+  const grouped = useMemo(()=>{
+    const filtered = baseFiltered.filter(r=>{
+      if(showMode==="all") return true;
+      const has = (bomCounts.get(r.model)||0) > 0;
+      return showMode==="available" ? has : !has;
+    });
     const items=[]; const itemMap=new Map();
     filtered.forEach(r=>{
       const itemKey = r.item||"(no item)";
@@ -4520,17 +4597,15 @@ function ReportsScreen({ user }) {
       ig.modelMap.get(modelKey).sizes.push({ size:r.size||"—", count: bomCounts.get(r.model)||0 });
     });
     return items;
-  },[modelRows,bomCounts,search,itemFilter]);
-
-  const totalCombos = modelRows.length;
-  const availableCombos = modelRows.filter(r=>(bomCounts.get(r.model)||0)>0).length;
-  const missingCombos = totalCombos - availableCombos;
+  },[baseFiltered,bomCounts,showMode]);
 
   const toggleItem = (item)=> setItemFilter(prev=>{
     const next = new Set(prev);
     if(next.has(item)) next.delete(item); else next.add(item);
     return next;
   });
+
+  const modeLabel = showMode==="available" ? "Available" : showMode==="missing" ? "Not Set" : "All";
 
   const exportExcel = ()=>{
     const rows=[["Item","Model","Size","Components","Status"]];
@@ -4540,22 +4615,21 @@ function ReportsScreen({ user }) {
     const ws = XLSX.utils.aoa_to_sheet(rows);
     ws["!cols"] = [{wch:22},{wch:26},{wch:12},{wch:12},{wch:16}];
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Available BOM");
-    XLSX.writeFile(wb, "available_bom_report.xlsx");
+    XLSX.utils.book_append_sheet(wb, ws, "BOM Coverage");
+    XLSX.writeFile(wb, "bom_coverage_"+modeLabel.toLowerCase().replace(/\s+/g,"_")+".xlsx");
   };
   const exportPDF = ()=>{
-    const rows=[];
+    const items=[];
     grouped.forEach(ig=>ig.models.forEach(mg=>mg.sizes.forEach(s=>{
-      rows.push([ig.item, mg.model, s.size, String(s.count), s.count>0?"BOM available":"Not set up"]);
+      items.push({ item:ig.item, sub:mg.model+"  ·  "+s.size+"  ·  "+(s.count>0?s.count+" comp.":"Not set up") });
     })));
-    generatePDF({ title:"Available BOM", refNumber:"", description:"", createdBy:user.username, createdAt:Date.now(),
-      headers:["Item","Model","Size","Components","Status"], rows, filename:"available_bom_report.pdf" });
+    generateMultiColumnListPDF({ title:"BOM Coverage — "+modeLabel, subtitle:items.length+" model+size combinations", items, columnsCount:3, createdBy:user.username, filename:"bom_coverage_"+modeLabel.toLowerCase().replace(/\s+/g,"_")+".pdf" });
   };
 
   return h("div",{style:{padding:"20px 24px",position:"relative"}},
     h(Watermark,{user}),
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
-      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Available BOM"),
+      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"BOM Coverage"),
       h("div",{style:{display:"flex",gap:8,alignItems:"flex-start"}},
         h("div",{style:{position:"relative"}},
           h("div",{onClick:()=>setItemPickerOpen(o=>!o),style:{border:"1px solid "+(itemFilter.size>0?"#1c8c75":colors.border),borderRadius:6,padding:"9px 11px",fontSize:12,width:180,background:itemFilter.size>0?"#eaf9f4":"#fff",color:itemFilter.size>0?"#085041":colors.text,fontWeight:itemFilter.size>0?600:400,display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}},
@@ -4571,12 +4645,19 @@ function ReportsScreen({ user }) {
           )
         ),
         h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search item, model, size…",style:{...inputStyle,width:220}}),
-        user.role==="super_admin"
+        canExport
           ? h(React.Fragment,null,
               h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel"),
               h("button",{onClick:exportPDF,style:btnSecondary},"Export PDF")
             )
-          : h("span",{title:"Master data exports are limited to Super Admin",style:{fontSize:11,color:colors.mutedLight,alignSelf:"center"}},"Export: Super Admin only")
+          : h("span",{title:"Reports export is limited to Admin and Super Admin",style:{fontSize:11,color:colors.mutedLight,alignSelf:"center"}},"Export: Admin only")
+      )
+    ),
+    h("div",{style:{display:"flex",gap:4,marginBottom:14}},
+      [["available","Available"],["missing","Not Set"],["all","All"]].map(([key,label])=>
+        h("div",{key,onClick:()=>setShowMode(key),style:{padding:"6px 14px",fontSize:12,borderRadius:4,cursor:"pointer",background:showMode===key?colors.dark:"#f4f2ea",color:showMode===key?"#fff":colors.muted,fontWeight:showMode===key?600:400}},
+          label+" ",h("span",{style:{opacity:0.7}},"("+counts[key]+")")
+        )
       )
     ),
     loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
@@ -4597,11 +4678,7 @@ function ReportsScreen({ user }) {
           ))
         ))
       )),
-      grouped.length===0 && h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No models found."),
-      h("div",{style:{display:"flex",gap:20,marginTop:14,fontSize:11.5,color:colors.muted}},
-        h("span",null,"✓ "+availableCombos+" model+size combinations with BOM"),
-        h("span",null,"⚠ "+missingCombos+" missing")
-      )
+      grouped.length===0 && h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No models in this view.")
     )
   );
 }
@@ -4826,9 +4903,12 @@ function StaleRatesReport({ user }){
   },[]);
   useEffect(()=>{ load(); },[load]);
 
-  // A row with no recorded date is pinned to a fixed 100-day-old baseline so
-  // it surfaces as stale immediately, rather than being silently excluded.
-  const effectiveDate = (r)=> r.created_at ? new Date(r.created_at) : new Date(Date.now()-BASELINE_DAYS*86400000);
+  // Rows with no recorded date should have been fixed by the backfill SQL
+  // (which writes a real "100 days ago" date into them). If one still has no
+  // date for any reason, treat it as very old rather than freezing it at a
+  // fixed offset from "now" — a fixed offset from now never actually ages,
+  // which was the bug: a 100-day-old row could never cross a 101-day threshold.
+  const effectiveDate = (r)=> r.created_at ? new Date(r.created_at) : new Date(0);
 
   const cutoff = useMemo(()=> Date.now() - Number(days||0)*86400000, [days]);
   const stale = useMemo(()=> rows
