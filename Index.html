@@ -450,8 +450,7 @@ function MenuTabs({ user, active, onChange }) {
       {key:"calcs",label:"Engineering Calcs"},
     ]},
     { label:"Reports", tabs:[
-      {key:"reports",label:"Available BOM"},
-      {key:"reports_missing",label:"Not Set BOM"},
+      {key:"reports",label:"BOM Coverage"},
       {key:"reports_activity",label:"Activity by User"},
       {key:"reports_quotes",label:"Quotes"},
       ...(isAdmin?[{key:"reports_masters",label:"Stale Rates"},{key:"reports_audit",label:"Masters Audit"}]:[]),
@@ -4541,14 +4540,15 @@ function CalcHistoryViewer({ user }) {
 
 
 /* ---- REPORTS ---- */
-function ReportsScreen({ user, mode }) {
-  const showMode = mode || "available"; // "available" | "missing"
+function ReportsScreen({ user }) {
+  const [showMode,setShowMode]=useState("available"); // "available" | "missing" | "all"
   const [loading,setLoading]=useState(true);
   const [modelRows,setModelRows]=useState([]); // {item,model,size} from model_tbl
   const [bomCounts,setBomCounts]=useState(new Map()); // model -> component count
   const [search,setSearch]=useState("");
   const [itemFilter,setItemFilter]=useState(new Set()); // empty = all items
   const [itemPickerOpen,setItemPickerOpen]=useState(false);
+  const canExport = user.role==="admin" || user.role==="super_admin";
 
   const load = useCallback(async()=>{
     setLoading(true);
@@ -4566,14 +4566,24 @@ function ReportsScreen({ user, mode }) {
 
   const allItems = useMemo(()=> Array.from(new Set(modelRows.map(r=>r.item).filter(Boolean))).sort(), [modelRows]);
 
-  // Group by Item -> Model -> Size, in the order items/models first appear.
-  // Only sizes matching the current mode (has BOM vs. missing BOM) are kept;
-  // any item/model left with zero sizes after that is dropped entirely.
-  const grouped = useMemo(()=>{
+  // Base filter (search + item picker) applied before the Available/Not Set/All
+  // split, so the three tab counts are always comparable against each other.
+  const baseFiltered = useMemo(()=>{
     const s = search.trim().toLowerCase();
     let filtered = itemFilter.size>0 ? modelRows.filter(r=>itemFilter.has(r.item)) : modelRows;
     if(s) filtered = filtered.filter(r=>(r.item||"").toLowerCase().includes(s)||(r.model||"").toLowerCase().includes(s)||(r.size||"").toLowerCase().includes(s));
-    filtered = filtered.filter(r=>{
+    return filtered;
+  },[modelRows,search,itemFilter]);
+
+  const counts = useMemo(()=>{
+    const available = baseFiltered.filter(r=>(bomCounts.get(r.model)||0)>0).length;
+    return { available, missing: baseFiltered.length-available, all: baseFiltered.length };
+  },[baseFiltered,bomCounts]);
+
+  // Group by Item -> Model -> Size, in the order items/models first appear.
+  const grouped = useMemo(()=>{
+    const filtered = baseFiltered.filter(r=>{
+      if(showMode==="all") return true;
       const has = (bomCounts.get(r.model)||0) > 0;
       return showMode==="available" ? has : !has;
     });
@@ -4587,11 +4597,7 @@ function ReportsScreen({ user, mode }) {
       ig.modelMap.get(modelKey).sizes.push({ size:r.size||"—", count: bomCounts.get(r.model)||0 });
     });
     return items;
-  },[modelRows,bomCounts,search,itemFilter,showMode]);
-
-  const totalCombos = modelRows.length;
-  const availableCombos = modelRows.filter(r=>(bomCounts.get(r.model)||0)>0).length;
-  const missingCombos = totalCombos - availableCombos;
+  },[baseFiltered,bomCounts,showMode]);
 
   const toggleItem = (item)=> setItemFilter(prev=>{
     const next = new Set(prev);
@@ -4599,7 +4605,7 @@ function ReportsScreen({ user, mode }) {
     return next;
   });
 
-  const title = showMode==="available" ? "Available BOM" : "Not Set BOM";
+  const modeLabel = showMode==="available" ? "Available" : showMode==="missing" ? "Not Set" : "All";
 
   const exportExcel = ()=>{
     const rows=[["Item","Model","Size","Components","Status"]];
@@ -4609,21 +4615,21 @@ function ReportsScreen({ user, mode }) {
     const ws = XLSX.utils.aoa_to_sheet(rows);
     ws["!cols"] = [{wch:22},{wch:26},{wch:12},{wch:12},{wch:16}];
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, title);
-    XLSX.writeFile(wb, title.replace(/\s+/g,"_").toLowerCase()+"_report.xlsx");
+    XLSX.utils.book_append_sheet(wb, ws, "BOM Coverage");
+    XLSX.writeFile(wb, "bom_coverage_"+modeLabel.toLowerCase().replace(/\s+/g,"_")+".xlsx");
   };
   const exportPDF = ()=>{
     const items=[];
     grouped.forEach(ig=>ig.models.forEach(mg=>mg.sizes.forEach(s=>{
-      items.push({ item:ig.item, sub:mg.model+"  ·  "+s.size+(showMode==="available"?"  ·  "+s.count+" comp.":"") });
+      items.push({ item:ig.item, sub:mg.model+"  ·  "+s.size+"  ·  "+(s.count>0?s.count+" comp.":"Not set up") });
     })));
-    generateMultiColumnListPDF({ title, subtitle:items.length+" model+size combinations", items, columnsCount:3, createdBy:user.username, filename:title.replace(/\s+/g,"_").toLowerCase()+"_report.pdf" });
+    generateMultiColumnListPDF({ title:"BOM Coverage — "+modeLabel, subtitle:items.length+" model+size combinations", items, columnsCount:3, createdBy:user.username, filename:"bom_coverage_"+modeLabel.toLowerCase().replace(/\s+/g,"_")+".pdf" });
   };
 
   return h("div",{style:{padding:"20px 24px",position:"relative"}},
     h(Watermark,{user}),
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
-      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},title),
+      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"BOM Coverage"),
       h("div",{style:{display:"flex",gap:8,alignItems:"flex-start"}},
         h("div",{style:{position:"relative"}},
           h("div",{onClick:()=>setItemPickerOpen(o=>!o),style:{border:"1px solid "+(itemFilter.size>0?"#1c8c75":colors.border),borderRadius:6,padding:"9px 11px",fontSize:12,width:180,background:itemFilter.size>0?"#eaf9f4":"#fff",color:itemFilter.size>0?"#085041":colors.text,fontWeight:itemFilter.size>0?600:400,display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}},
@@ -4639,12 +4645,19 @@ function ReportsScreen({ user, mode }) {
           )
         ),
         h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search item, model, size…",style:{...inputStyle,width:220}}),
-        user.role==="super_admin"
+        canExport
           ? h(React.Fragment,null,
               h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel"),
               h("button",{onClick:exportPDF,style:btnSecondary},"Export PDF")
             )
-          : h("span",{title:"Master data exports are limited to Super Admin",style:{fontSize:11,color:colors.mutedLight,alignSelf:"center"}},"Export: Super Admin only")
+          : h("span",{title:"Reports export is limited to Admin and Super Admin",style:{fontSize:11,color:colors.mutedLight,alignSelf:"center"}},"Export: Admin only")
+      )
+    ),
+    h("div",{style:{display:"flex",gap:4,marginBottom:14}},
+      [["available","Available"],["missing","Not Set"],["all","All"]].map(([key,label])=>
+        h("div",{key,onClick:()=>setShowMode(key),style:{padding:"6px 14px",fontSize:12,borderRadius:4,cursor:"pointer",background:showMode===key?colors.dark:"#f4f2ea",color:showMode===key?"#fff":colors.muted,fontWeight:showMode===key?600:400}},
+          label+" ",h("span",{style:{opacity:0.7}},"("+counts[key]+")")
+        )
       )
     ),
     loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
@@ -4665,11 +4678,7 @@ function ReportsScreen({ user, mode }) {
           ))
         ))
       )),
-      grouped.length===0 && h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No models found."),
-      h("div",{style:{display:"flex",gap:20,marginTop:14,fontSize:11.5,color:colors.muted}},
-        h("span",null,"✓ "+availableCombos+" model+size combinations with BOM"),
-        h("span",null,"⚠ "+missingCombos+" missing")
-      )
+      grouped.length===0 && h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No models in this view.")
     )
   );
 }
@@ -4882,13 +4891,15 @@ function QuoteReports({ user }){
 function StaleRatesReport({ user }){
   const [days,setDays]=useState(90);
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
+  const [loadError,setLoadError]=useState("");
   const [editing,setEditing]=useState({}); // id -> {newRate}
   const isSuperAdmin = user.role==="super_admin";
   const BASELINE_DAYS = 100; // rows saved before this feature had no date at all — treat them as this old
 
   const load = useCallback(async()=>{
-    setLoading(true);
-    const data = await fetchAll("material_rates","id,material_spec,material_grade,rate,uom,created_at,created_by");
+    setLoading(true); setLoadError("");
+    const { data, error:err } = await sb.from("material_rates").select("id,material_spec,material_grade,rate,uom,created_at,created_by").limit(5000);
+    if(err){ setLoadError(err.message); setRows([]); setLoading(false); return; }
     setRows(data||[]);
     setLoading(false);
   },[]);
@@ -4944,6 +4955,9 @@ function StaleRatesReport({ user }){
       h("span",{style:{color:colors.muted}},"Show rates older than"),
       h("input",{type:"number",value:days,onChange:e=>setDays(e.target.value),style:{...inputStyle,width:80}}),
       h("span",{style:{color:colors.muted}},"days")
+    ),
+    loadError && h("div",{style:{background:"#fde8e8",border:"1px solid #e5484d",borderRadius:6,padding:"10px 14px",marginBottom:14,fontSize:12.5,color:"#b8472f"}},
+      "Couldn't load material rates: "+loadError+" — this usually means the SQL migration (add created_at/created_by to material_rates) hasn't been run yet."
     ),
     loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
     h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflowX:"auto"}},
@@ -5050,8 +5064,7 @@ function App() {
     h(MenuTabs,{user,active:tab,onChange:setTab}),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}})),
     tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null)}):
-    tab==="reports"?h(ReportsScreen,{user,mode:"available"}):
-    tab==="reports_missing"?h(ReportsScreen,{user,mode:"missing"}):
+    tab==="reports"?h(ReportsScreen,{user}):
     tab==="reports_activity"?h(ActivityByUserReport,{user}):
     tab==="reports_quotes"?h(QuoteReports,{user}):
     tab==="reports_masters"?h(StaleRatesReport,{user}):
