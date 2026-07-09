@@ -324,6 +324,65 @@ function generatePDF({ title, refNumber, description, createdBy, createdAt, head
   doc.save(filename||"export.pdf");
 }
 
+// Newspaper-style multi-column PDF for long, simple item/subtitle lists (e.g.
+// "Not Set BOM") — fills a landscape page in side-by-side columns instead of
+// one long single-column list, so fewer pages are needed.
+function generateMultiColumnListPDF({ title, subtitle, items, columnsCount, createdBy, filename }){
+  const cols = columnsCount || 3;
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation:"landscape", unit:"mm", format:"a4" });
+  const W = doc.internal.pageSize.getWidth(); const H = doc.internal.pageSize.getHeight();
+  const dark = [28,31,26]; const margin = 12; const colGap = 8;
+  const colWidth = (W - margin*2 - colGap*(cols-1)) / cols;
+  const colXs = Array.from({length:cols},(_,i)=>margin+i*(colWidth+colGap));
+
+  const drawHeader = ()=>{
+    try{ doc.addImage(COMPANY_LOGO,"PNG",margin,4,32,16); }catch(e){}
+    doc.setFontSize(10); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+    doc.text(COMPANY_NAME, W-margin, 8, {align:"right"});
+    doc.setFontSize(7); doc.setFont(undefined,"normal"); doc.setTextColor(100,100,100);
+    doc.text(COMPANY_ADDRESS, W-margin, 13, {align:"right"});
+    doc.setFontSize(8.5); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+    doc.text(title.toUpperCase(), W-margin, 19, {align:"right"});
+    if(subtitle){ doc.setFontSize(8); doc.setFont(undefined,"normal"); doc.text(subtitle, margin, 19); }
+    doc.setDrawColor(180,177,165); doc.setLineWidth(0.4);
+    doc.line(margin, 22, W-margin, 22);
+  };
+  const startY = 28; const bottomLimit = H-14;
+  const colHeaderRow = (col,y)=>{
+    doc.setFontSize(8.5); doc.setFont(undefined,"bold"); doc.setTextColor(...dark);
+    doc.text("Item / Model / Size", colXs[col], y);
+    doc.setDrawColor(120,120,120); doc.setLineWidth(0.3);
+    doc.line(colXs[col], y+1.5, colXs[col]+colWidth, y+1.5);
+  };
+
+  drawHeader();
+  let col=0, y=startY;
+  colHeaderRow(col,y); y+=6;
+  items.forEach(it=>{
+    if(y+9 > bottomLimit){
+      col++;
+      if(col>=cols){ doc.addPage(); drawHeader(); col=0; y=startY; }
+      else y=startY;
+      colHeaderRow(col,y); y+=6;
+    }
+    doc.setFont(undefined,"bold"); doc.setFontSize(8); doc.setTextColor(...dark);
+    doc.text(it.item, colXs[col], y);
+    y+=3.8;
+    doc.setFont(undefined,"normal"); doc.setFontSize(7.5); doc.setTextColor(100,100,100);
+    doc.text(it.sub, colXs[col], y);
+    y+=5.5;
+  });
+  const pageCount = doc.internal.getNumberOfPages();
+  for(let i=1;i<=pageCount;i++){
+    doc.setPage(i); doc.setFontSize(7); doc.setTextColor(150);
+    doc.text("Page "+i+" of "+pageCount, W-margin, H-6, {align:"right"});
+    doc.setTextColor(...dark);
+    doc.text(COMPANY_NAME+" | "+title, margin, H-6);
+  }
+  doc.save(filename||"report.pdf");
+}
+
 /* ---- LOGIN ---- */
 function LoginScreen({ onLogin }) {
   const [username, setUsername] = useState(""); const [password, setPassword] = useState("");
@@ -392,6 +451,7 @@ function MenuTabs({ user, active, onChange }) {
     ]},
     { label:"Reports", tabs:[
       {key:"reports",label:"Available BOM"},
+      {key:"reports_missing",label:"Not Set BOM"},
       {key:"reports_activity",label:"Activity by User"},
       {key:"reports_quotes",label:"Quotes"},
       ...(isAdmin?[{key:"reports_masters",label:"Stale Rates"},{key:"reports_audit",label:"Masters Audit"}]:[]),
@@ -715,6 +775,7 @@ function MasterEditor({ tableKey, user }) {
   const saveEdit = async()=>{
     const payload={};
     tableDef.columns.forEach(c=>{ let v=editDraft[c]; if(NUMERIC_COLS.has(c)) v=v===""||v===null?null:Number(v); payload[c]=v; });
+    if(tableKey==="material_rates"){ payload.created_at = new Date().toISOString(); payload.created_by = user?.username||"unknown"; }
     const { error:err } = await sb.from(tableKey).update(payload).eq("id",editingId);
     if(err) { alert("Save failed: "+err.message); return; }
     setEditingId(null); setEditDraft({}); load();
@@ -762,6 +823,7 @@ function MasterEditor({ tableKey, user }) {
   const saveAdd = async()=>{
     const payload={};
     tableDef.columns.forEach(c=>{ let v=addDraft[c]; if(NUMERIC_COLS.has(c)) v=v===""||v===undefined?0:Number(v); payload[c]=v===undefined?"":v; });
+    if(tableKey==="material_rates") payload.created_by = user?.username||"unknown";
     const { data, error:err } = await sb.from(tableKey).insert(payload).select().single();
     if(err) { alert("Add failed: "+err.message); return; }
     if(data && data.id!==undefined) setFreshIds(prev=>new Set(prev).add(data.id));
@@ -4479,7 +4541,8 @@ function CalcHistoryViewer({ user }) {
 
 
 /* ---- REPORTS ---- */
-function ReportsScreen({ user }) {
+function ReportsScreen({ user, mode }) {
+  const showMode = mode || "available"; // "available" | "missing"
   const [loading,setLoading]=useState(true);
   const [modelRows,setModelRows]=useState([]); // {item,model,size} from model_tbl
   const [bomCounts,setBomCounts]=useState(new Map()); // model -> component count
@@ -4504,10 +4567,16 @@ function ReportsScreen({ user }) {
   const allItems = useMemo(()=> Array.from(new Set(modelRows.map(r=>r.item).filter(Boolean))).sort(), [modelRows]);
 
   // Group by Item -> Model -> Size, in the order items/models first appear.
+  // Only sizes matching the current mode (has BOM vs. missing BOM) are kept;
+  // any item/model left with zero sizes after that is dropped entirely.
   const grouped = useMemo(()=>{
     const s = search.trim().toLowerCase();
     let filtered = itemFilter.size>0 ? modelRows.filter(r=>itemFilter.has(r.item)) : modelRows;
     if(s) filtered = filtered.filter(r=>(r.item||"").toLowerCase().includes(s)||(r.model||"").toLowerCase().includes(s)||(r.size||"").toLowerCase().includes(s));
+    filtered = filtered.filter(r=>{
+      const has = (bomCounts.get(r.model)||0) > 0;
+      return showMode==="available" ? has : !has;
+    });
     const items=[]; const itemMap=new Map();
     filtered.forEach(r=>{
       const itemKey = r.item||"(no item)";
@@ -4518,7 +4587,7 @@ function ReportsScreen({ user }) {
       ig.modelMap.get(modelKey).sizes.push({ size:r.size||"—", count: bomCounts.get(r.model)||0 });
     });
     return items;
-  },[modelRows,bomCounts,search,itemFilter]);
+  },[modelRows,bomCounts,search,itemFilter,showMode]);
 
   const totalCombos = modelRows.length;
   const availableCombos = modelRows.filter(r=>(bomCounts.get(r.model)||0)>0).length;
@@ -4530,6 +4599,8 @@ function ReportsScreen({ user }) {
     return next;
   });
 
+  const title = showMode==="available" ? "Available BOM" : "Not Set BOM";
+
   const exportExcel = ()=>{
     const rows=[["Item","Model","Size","Components","Status"]];
     grouped.forEach(ig=>ig.models.forEach(mg=>mg.sizes.forEach(s=>{
@@ -4538,14 +4609,21 @@ function ReportsScreen({ user }) {
     const ws = XLSX.utils.aoa_to_sheet(rows);
     ws["!cols"] = [{wch:22},{wch:26},{wch:12},{wch:12},{wch:16}];
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Available BOM");
-    XLSX.writeFile(wb, "available_bom_report.xlsx");
+    XLSX.utils.book_append_sheet(wb, ws, title);
+    XLSX.writeFile(wb, title.replace(/\s+/g,"_").toLowerCase()+"_report.xlsx");
+  };
+  const exportPDF = ()=>{
+    const items=[];
+    grouped.forEach(ig=>ig.models.forEach(mg=>mg.sizes.forEach(s=>{
+      items.push({ item:ig.item, sub:mg.model+"  ·  "+s.size+(showMode==="available"?"  ·  "+s.count+" comp.":"") });
+    })));
+    generateMultiColumnListPDF({ title, subtitle:items.length+" model+size combinations", items, columnsCount:3, createdBy:user.username, filename:title.replace(/\s+/g,"_").toLowerCase()+"_report.pdf" });
   };
 
   return h("div",{style:{padding:"20px 24px",position:"relative"}},
     h(Watermark,{user}),
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
-      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Available BOM"),
+      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},title),
       h("div",{style:{display:"flex",gap:8,alignItems:"flex-start"}},
         h("div",{style:{position:"relative"}},
           h("div",{onClick:()=>setItemPickerOpen(o=>!o),style:{border:"1px solid "+(itemFilter.size>0?"#1c8c75":colors.border),borderRadius:6,padding:"9px 11px",fontSize:12,width:180,background:itemFilter.size>0?"#eaf9f4":"#fff",color:itemFilter.size>0?"#085041":colors.text,fontWeight:itemFilter.size>0?600:400,display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}},
@@ -4562,7 +4640,10 @@ function ReportsScreen({ user }) {
         ),
         h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search item, model, size…",style:{...inputStyle,width:220}}),
         user.role==="super_admin"
-          ? h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel")
+          ? h(React.Fragment,null,
+              h("button",{onClick:exportExcel,style:btnSecondary},"Export Excel"),
+              h("button",{onClick:exportPDF,style:btnSecondary},"Export PDF")
+            )
           : h("span",{title:"Master data exports are limited to Super Admin",style:{fontSize:11,color:colors.mutedLight,alignSelf:"center"}},"Export: Super Admin only")
       )
     ),
@@ -4803,18 +4884,28 @@ function StaleRatesReport({ user }){
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
   const [editing,setEditing]=useState({}); // id -> {newRate}
   const isSuperAdmin = user.role==="super_admin";
+  const BASELINE_DAYS = 100; // rows saved before this feature had no date at all — treat them as this old
 
   const load = useCallback(async()=>{
     setLoading(true);
-    const data = await fetchAll("material_rates","id,material_spec,material_grade,rate,uom,created_at");
+    const data = await fetchAll("material_rates","id,material_spec,material_grade,rate,uom,created_at,created_by");
     setRows(data||[]);
     setLoading(false);
   },[]);
   useEffect(()=>{ load(); },[load]);
 
+  // Rows with no recorded date should have been fixed by the backfill SQL
+  // (which writes a real "100 days ago" date into them). If one still has no
+  // date for any reason, treat it as very old rather than freezing it at a
+  // fixed offset from "now" — a fixed offset from now never actually ages,
+  // which was the bug: a 100-day-old row could never cross a 101-day threshold.
+  const effectiveDate = (r)=> r.created_at ? new Date(r.created_at) : new Date(0);
+
   const cutoff = useMemo(()=> Date.now() - Number(days||0)*86400000, [days]);
-  const stale = useMemo(()=> rows.filter(r=>r.created_at && new Date(r.created_at).getTime() < cutoff)
-    .map(r=>({...r, daysOld: Math.floor((Date.now()-new Date(r.created_at).getTime())/86400000)}))
+  const stale = useMemo(()=> rows
+    .map(r=>({...r, _date: effectiveDate(r), _estimated: !r.created_at}))
+    .filter(r=>r._date.getTime() < cutoff)
+    .map(r=>({...r, daysOld: Math.floor((Date.now()-r._date.getTime())/86400000)}))
     .sort((a,b)=>b.daysOld-a.daysOld), [rows,cutoff]);
 
   const applyNewRate = async(row)=>{
@@ -4822,7 +4913,7 @@ function StaleRatesReport({ user }){
     if(!draft || !draft.newRate) return;
     const newRate = Number(draft.newRate);
     if(isNaN(newRate)){ alert("Enter a valid number."); return; }
-    const { error:err } = await sb.from("material_rates").update({ rate:newRate, created_at:new Date().toISOString() }).eq("id",row.id);
+    const { error:err } = await sb.from("material_rates").update({ rate:newRate, created_at:new Date().toISOString(), created_by:user.username }).eq("id",row.id);
     if(err){ alert("Update failed: "+err.message); return; }
     await logAudit("UPDATE","material_rates",row.id,row.material_spec+" — "+row.material_grade,user.username,{rate:row.rate},{rate:newRate});
     setEditing(e=>{ const n={...e}; delete n[row.id]; return n; });
@@ -4830,16 +4921,16 @@ function StaleRatesReport({ user }){
   };
 
   const exportExcel = ()=>{
-    const headerRow = ["Material spec","Grade","Current rate","UOM","Days since update","Last updated"];
-    const dataRows = stale.map(r=>[r.material_spec,r.material_grade,r2(r.rate),r.uom,r.daysOld,new Date(r.created_at).toLocaleDateString()]);
+    const headerRow = ["Material spec","Grade","Current rate","UOM","Days since update","Last updated","Created by"];
+    const dataRows = stale.map(r=>[r.material_spec,r.material_grade,r2(r.rate),r.uom,r.daysOld,r._date.toLocaleDateString()+(r._estimated?" (estimated)":""),r.created_by||"—"]);
     const ws = XLSX.utils.aoa_to_sheet([headerRow,...dataRows]);
     const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "Stale rates");
     XLSX.writeFile(wb, "stale_material_rates.xlsx");
   };
   const exportPDF = ()=>{
     generatePDF({ title:"Stale material rates", refNumber:"Older than "+days+" days", description:"", createdBy:user.username, createdAt:Date.now(),
-      headers:["Material spec","Grade","Rate","UOM","Days old","Last updated"],
-      rows:stale.map(r=>[r.material_spec,r.material_grade,fmt(r.rate),r.uom,String(r.daysOld),new Date(r.created_at).toLocaleDateString()]),
+      headers:["Material spec","Grade","Rate","UOM","Days old","Last updated","Created by"],
+      rows:stale.map(r=>[r.material_spec,r.material_grade,fmt(r.rate),r.uom,String(r.daysOld),r._date.toLocaleDateString()+(r._estimated?" (est.)":""),r.created_by||"—"]),
       filename:"stale_material_rates.pdf" });
   };
 
@@ -4856,25 +4947,30 @@ function StaleRatesReport({ user }){
     ),
     loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
     h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflowX:"auto"}},
-      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",minWidth:700}},
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",minWidth:800}},
         h("thead",null,h("tr",{style:{background:"#f4f2ea"}},
-          ["Material spec","Grade","Current rate","UOM","Days since update","Last updated","New rate","New rate date",""].map(hh=>h("th",{key:hh,style:{padding:"7px 9px",textAlign:"left"}},hh))
+          ["Material spec","Grade","Current rate","UOM","Days since update","Last updated","Created by","New rate","",""].map(hh=>h("th",{key:hh,style:{padding:"7px 9px",textAlign:"left"}},hh))
         )),
-        h("tbody",null, stale.length===0 ? h("tr",null,h("td",{colSpan:9,style:{padding:16,color:colors.mutedLight}},"No rates older than "+days+" days.")) :
+        h("tbody",null, stale.length===0 ? h("tr",null,h("td",{colSpan:10,style:{padding:16,color:colors.mutedLight}},"No rates older than "+days+" days.")) :
           stale.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #f0efe8"}},
             h("td",{style:{padding:"6px 9px"}},r.material_spec),
             h("td",{style:{padding:"6px 9px"}},r.material_grade),
             h("td",{style:{padding:"6px 9px"}},fmt(r.rate)),
             h("td",{style:{padding:"6px 9px"}},r.uom),
             h("td",{style:{padding:"6px 9px",color:"#b8472f",fontWeight:600}},r.daysOld),
-            h("td",{style:{padding:"6px 9px",color:colors.muted}},new Date(r.created_at).toLocaleDateString()),
+            h("td",{style:{padding:"6px 9px",color:colors.muted}},
+              r._date.toLocaleDateString(),
+              r._estimated && h("div",{style:{fontSize:9.5,color:"#c9a04a",fontStyle:"italic"}},"estimated — no original date on record")
+            ),
+            h("td",{style:{padding:"6px 9px",color:r.created_by?colors.text:colors.mutedLight}},r.created_by||"—"),
             h("td",{style:{padding:"6px 9px"}},h("input",{value:(editing[r.id]&&editing[r.id].newRate)||"",onChange:e=>setEditing(ed=>({...ed,[r.id]:{newRate:e.target.value}})),placeholder:"New rate",style:{...inputStyle,width:100,padding:"5px 7px",fontSize:12}})),
             h("td",{style:{padding:"6px 9px",color:colors.muted,fontSize:11}}, editing[r.id]&&editing[r.id].newRate ? new Date().toLocaleDateString() : "—"),
             h("td",{style:{padding:"6px 9px"}}, editing[r.id]&&editing[r.id].newRate ? h("button",{onClick:()=>applyNewRate(r),style:{...btnSmall,color:"#085041"}},"Save") : null)
           ))
         )
       )
-    )
+    ),
+    h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:8}},"Rows with no original date on record are pinned to a "+BASELINE_DAYS+"-day-old baseline so they surface as stale immediately. Any rate saved from now on gets a real date and the user who set it.")
   );
 }
 
@@ -4954,7 +5050,8 @@ function App() {
     h(MenuTabs,{user,active:tab,onChange:setTab}),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}})),
     tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null)}):
-    tab==="reports"?h(ReportsScreen,{user}):
+    tab==="reports"?h(ReportsScreen,{user,mode:"available"}):
+    tab==="reports_missing"?h(ReportsScreen,{user,mode:"missing"}):
     tab==="reports_activity"?h(ActivityByUserReport,{user}):
     tab==="reports_quotes"?h(QuoteReports,{user}):
     tab==="reports_masters"?h(StaleRatesReport,{user}):
