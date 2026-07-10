@@ -2648,6 +2648,11 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [savingLine,setSavingLine]=useState({}); // {refNum-slNo: true} — saving in progress
   const [quoteExportRef,setQuoteExportRef]=useState(""); const [exportingQuote,setExportingQuote]=useState("");
   const [includeSalesPrice,setIncludeSalesPrice]=useState(true);
+  const isAdmin = user?.role==="admin" || user?.role==="super_admin";
+  const [deletingSlNo,setDeletingSlNo]=useState(null); // id of estimate row being deleted
+  const [showDeleteQuoteModal,setShowDeleteQuoteModal]=useState(false);
+  const [deleteQuoteConfirmText,setDeleteQuoteConfirmText]=useState("");
+  const [deletingQuote,setDeletingQuote]=useState(false);
 
   const setLineEdit=(refNum,slNo,field,value,extraFields)=>{
     const key=refNum+"-"+slNo;
@@ -2851,6 +2856,48 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     await sb.from("estimate_lines").delete().eq("reference_number",refNumber).eq("item_sl_no",itemSlNo).eq("sl_no",slNo);
     await logAudit("DELETE","estimate_lines",refNumber+"-"+itemSlNo+"-"+slNo,"Quote#: "+refNumber+" Sl: "+itemSlNo+" Line: "+slNo+(rowData?.component?" — "+rowData.component:""),user?.username||"unknown",rowData,null);
     setOpenLines(l=>l.filter(x=>!(x.reference_number===refNumber&&x.item_sl_no===itemSlNo&&x.sl_no===slNo)));
+  };
+
+  // Delete one whole Sl No (a card in the left list = one line item of a quote):
+  // removes the estimates row and every estimate_lines row under it.
+  const deleteSlNo=async(ref)=>{
+    if(!isAdmin){ alert("Only Admins can delete quotes."); return; }
+    const ok=confirm("Delete "+ref.reference_number+" \u00b7 Sl No "+ref.item_sl_no+(ref.model?" (\u201c"+ref.model+"\u201d)":"")+"?\n\nThis removes this Sl No and all of its BOM lines. This cannot be undone.");
+    if(!ok) return;
+    setDeletingSlNo(ref.id);
+    try {
+      const{data:linesData}=await sb.from("estimate_lines").select("*").eq("reference_number",ref.reference_number).eq("item_sl_no",ref.item_sl_no);
+      await sb.from("estimate_lines").delete().eq("reference_number",ref.reference_number).eq("item_sl_no",ref.item_sl_no);
+      await sb.from("estimates").delete().eq("id",ref.id);
+      await logAudit("DELETE","estimates",ref.reference_number+"-"+ref.item_sl_no,"Quote#: "+ref.reference_number+" Sl No: "+ref.item_sl_no+" ("+(linesData?.length||0)+" BOM lines)"+(ref.model?" \u2014 "+ref.model:""),user?.username||"unknown",{...ref,lines:linesData},null);
+      setRefs(rs=>rs.filter(r=>r.id!==ref.id));
+      if(openRef&&openRef.id===ref.id){ setOpenRef(null); setOpenLines([]); }
+    } catch(e){ console.error("Delete Sl No failed",e); alert("Delete failed: "+e.message); }
+    finally { setDeletingSlNo(null); }
+  };
+
+  // Delete an entire quote (every Sl No under a Quote# and all their BOM lines).
+  // Gated behind Admin+ and a typed confirmation of the Quote# since it's the
+  // most destructive action on this screen.
+  const openDeleteQuote=()=>{
+    if(!isAdmin){ alert("Only Admins can delete quotes."); return; }
+    if(!refFilter) return;
+    setDeleteQuoteConfirmText(""); setShowDeleteQuoteModal(true);
+  };
+  const confirmDeleteQuote=async()=>{
+    if(deleteQuoteConfirmText.trim()!==refFilter) return;
+    setDeletingQuote(true);
+    try {
+      const{data:linesData}=await sb.from("estimate_lines").select("*").eq("reference_number",refFilter);
+      const slRows=refs.filter(r=>r.reference_number===refFilter);
+      await sb.from("estimate_lines").delete().eq("reference_number",refFilter);
+      await sb.from("estimates").delete().eq("reference_number",refFilter);
+      await logAudit("DELETE","estimates",refFilter,"Deleted entire quote "+refFilter+" ("+slRows.length+" Sl Nos, "+(linesData?.length||0)+" BOM lines total)",user?.username||"unknown",{slRows,lines:linesData},null);
+      setRefs(rs=>rs.filter(r=>r.reference_number!==refFilter));
+      if(openRef&&openRef.reference_number===refFilter){ setOpenRef(null); setOpenLines([]); }
+      setShowDeleteQuoteModal(false); setRefFilter(""); setSlNoFilter("");
+    } catch(e){ console.error("Delete quote failed",e); alert("Delete failed: "+e.message); }
+    finally { setDeletingQuote(false); }
   };
 
   const [orderQty,setOrderQty]=useState(1);
@@ -3418,7 +3465,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
             h("option",{value:""},"Sl No"),
             slNoOptions.map(sn=>h("option",{key:sn,value:sn},sn))
           ),
-          h("input",{value:descSearch,onChange:e=>setDescSearch(e.target.value),placeholder:"Search description…",style:{...inputStyle,width:200}})
+          h("input",{value:descSearch,onChange:e=>setDescSearch(e.target.value),placeholder:"Search description…",style:{...inputStyle,width:200}}),
+          isAdmin && refFilter && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete entire quote")
         )
       ),
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
@@ -3463,11 +3511,19 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         h("div",{style:{width:300,flexShrink:0}},
           loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
           h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,maxHeight:520,overflowY:"auto"}},
-            filtered.map(r=>h("div",{key:r.id,onClick:()=>openEstimate(r),style:{padding:"10px 12px",cursor:"pointer",borderBottom:"1px solid #eceae0",background:openRef&&openRef.id===r.id?colors.dark:"#fff",color:openRef&&openRef.id===r.id?"#fff":colors.text}},
-              h("div",{style:{fontWeight:600,fontSize:13}},r.reference_number+"  ·  Sl "+r.item_sl_no),
-              r.description&&h("div",{style:{fontSize:11,opacity:0.8}},r.description),
-              h("div",{style:{fontSize:10.5,opacity:0.6,marginTop:2}},(r.created_by||"")+" · "+new Date(r.created_at).toLocaleDateString())
-            )),
+            filtered.map(r=>{ const active=openRef&&openRef.id===r.id; return h("div",{key:r.id,onClick:()=>openEstimate(r),style:{padding:"10px 12px",cursor:"pointer",borderBottom:"1px solid #eceae0",background:active?colors.dark:"#fff",color:active?"#fff":colors.text,display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:6}},
+              h("div",{style:{minWidth:0}},
+                h("div",{style:{fontWeight:600,fontSize:13}},r.reference_number+"  ·  Sl "+r.item_sl_no),
+                r.description&&h("div",{style:{fontSize:11,opacity:0.8}},r.description),
+                h("div",{style:{fontSize:10.5,opacity:0.6,marginTop:2}},(r.created_by||"")+" · "+new Date(r.created_at).toLocaleDateString())
+              ),
+              isAdmin && h("button",{
+                "aria-label":"Delete Sl No "+r.item_sl_no,
+                onClick:(e)=>{ e.stopPropagation(); deleteSlNo(r); },
+                disabled:deletingSlNo===r.id,
+                style:{border:"none",background:"transparent",color:active?"#f0997b":colors.danger,cursor:"pointer",fontSize:15,padding:2,flexShrink:0,opacity:deletingSlNo===r.id?0.5:1}
+              },deletingSlNo===r.id?"…":"\u2715")
+            );}),
             filtered.length===0&&h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No quotes yet.")
           )
         ),
@@ -3504,7 +3560,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
                   ?h(React.Fragment,null,h("button",{onClick:exportSummaryXlsxSaved,style:btnSecondary},"Summary Excel"),h("button",{onClick:exportSummaryPDFSaved,style:btnSecondary},"Summary PDF"))
                   :h(React.Fragment,null,h("button",{onClick:exportXlsx,style:btnSecondary},"Excel"),h("button",{onClick:exportPDF,style:btnSecondary},"PDF")),
                 h("button",{onClick:()=>setShowDatasheet(true),style:btnSecondary},"Datasheet"),
-                h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line")
+                h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line"),
+                isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No")
               )
             ),
             !showSummarySaved&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,padding:"8px 12px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:6,flexWrap:"wrap"}},
@@ -3740,7 +3797,20 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         )
       )
     ),
-    showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>setShowDatasheet(false) })
+    showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>setShowDatasheet(false) }),
+    showDeleteQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Delete entire quote "+refFilter+"?"),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},
+          "This removes all "+refs.filter(r=>r.reference_number===refFilter).length+" Sl No(s) under "+refFilter+" and every BOM line beneath them. This cannot be undone. Type the quote number to confirm."
+        ),
+        h("input",{value:deleteQuoteConfirmText,onChange:e=>setDeleteQuoteConfirmText(e.target.value),placeholder:refFilter,style:{...inputStyle,marginBottom:14}}),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setShowDeleteQuoteModal(false),style:btnSecondary},"Cancel"),
+          h("button",{onClick:confirmDeleteQuote,disabled:deletingQuote||deleteQuoteConfirmText.trim()!==refFilter,style:{...btnPrimary,background:colors.danger,opacity:(deletingQuote||deleteQuoteConfirmText.trim()!==refFilter)?0.5:1}},deletingQuote?"Deleting…":"Delete quote")
+        )
+      )
+    )
   );
 }
 
