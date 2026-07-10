@@ -238,6 +238,19 @@ function fmt(n) {
 }
 function colLabel(c) { return c.replace(/_/g," ").replace(/\b\w/g,m=>m.toUpperCase()); }
 
+// Shared browser-level preference (not per-user, not per-quote) for whether
+// Cutting Plan reports show cost. Same checkbox everywhere it appears —
+// Estimator, Quotes (single Sl No), Quotes (whole quote export) — all read
+// and write this one localStorage key, so ticking it in any one place is
+// remembered the next time any of them is opened.
+const CUTTING_PLAN_COST_KEY = "flometriq_cutting_plan_include_cost";
+function getCuttingPlanIncludeCostPref(){
+  try { return localStorage.getItem(CUTTING_PLAN_COST_KEY)==="1"; } catch(e){ return false; }
+}
+function setCuttingPlanIncludeCostPref(val){
+  try { localStorage.setItem(CUTTING_PLAN_COST_KEY, val?"1":"0"); } catch(e){}
+}
+
 async function fetchAll(table, cols) {
   let all=[], from=0;
   while(true) {
@@ -1203,6 +1216,10 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   const totalSalesPrice=useMemo(()=>computedLines.reduce((s,l)=>s+(l.salesPrice||0),0),[computedLines]);
   const pendingCount=computedLines.filter(l=>l.hasSpec&&!l.selGrade&&overrides[l.id]?.rate===undefined).length;
   const [showSummary,setShowSummary]=useState(false);
+  const [showCuttingPlan,setShowCuttingPlan]=useState(false);
+  const [summaryBasis,setSummaryBasis]=useState("reqd"); // "reqd" | "cutting"
+  const [cuttingPlanIncludeCost,setCuttingPlanIncludeCostState]=useState(getCuttingPlanIncludeCostPref);
+  const setCuttingPlanIncludeCost=(v)=>{ setCuttingPlanIncludeCostState(v); setCuttingPlanIncludeCostPref(v); };
 
   // Summary: group by shape + material_spec + grade, sort by shape then spec alphabetically
   const summaryRows = useMemo(()=>{
@@ -1212,14 +1229,33 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
       const key = shape + "|||" + (l.material_spec||"(no spec)") + "|||" + (l.selGrade||"(no grade)");
       if(!map.has(key)) map.set(key,{ shape, spec:l.material_spec||"(no spec)", grade:l.selGrade||"", uom:l.uom||l.rateUom||"", rate:l.rate||0, totalQty:0, totalCost:0, totalSales:0, lineCount:0 });
       const g=map.get(key);
-      g.totalQty += l.qty||0;
-      g.totalCost += l.cost||0;
-      g.totalSales += l.salesPrice||0;
+      const baseQty = summaryBasis==="cutting" ? (Number(l.cutting_plan_qty)||0) : (l.qty||0);
+      g.totalQty += baseQty;
+      g.totalCost += baseQty*(l.rate||0);
+      g.totalSales += baseQty*(l.rate||0)*(l.sf||3.1);
       g.lineCount += 1;
     });
     return Array.from(map.values())
       .sort((a,b)=> a.shape.localeCompare(b.shape) || a.spec.localeCompare(b.spec));
+  },[computedLines,summaryBasis]);
+
+  // Cutting Plan report (session, pre-save) — never shows Sf or Sales Price;
+  // cost is opt-in. Grouped by spec + grade + cutting plan text.
+  const cuttingPlanRows = useMemo(()=>{
+    const map = new Map();
+    computedLines.forEach(l=>{
+      const cuttingPlan = l.cutting_plan_layout_size||"(none)";
+      const key = (l.material_spec||"(no spec)")+"|||"+(l.selGrade||"(no grade)")+"|||"+cuttingPlan;
+      if(!map.has(key)) map.set(key,{spec:l.material_spec||"(no spec)",grade:l.selGrade||"",cuttingPlan,uom:l.cutting_plan_uom||"",rate:l.rate||0,totalQty:0,totalCost:0,lineCount:0});
+      const g=map.get(key);
+      const qty=Number(l.cutting_plan_qty)||0;
+      g.totalQty += qty;
+      g.totalCost += qty*(l.rate||0);
+      g.lineCount += 1;
+    });
+    return Array.from(map.values()).sort((a,b)=>a.spec.localeCompare(b.spec)||a.grade.localeCompare(b.grade));
   },[computedLines]);
+
 
   const exportXlsx = ()=>{
     const headers=["Sl No","Component","Sub Assembly","Material Spec","Grade","Qty","UOM","Rate","Cost","Sf","Sales Price"];
@@ -1404,6 +1440,84 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
       doc.text(COMPANY_NAME+" | Summary BOM | "+today,12,doc.internal.pageSize.getHeight()-5);
     }
     doc.save("summary_"+selectedModel+".pdf");
+  };
+
+  const exportCuttingPlanXlsx = ()=>{
+    const headers=["#","Material spec","Grade","Cutting plan","Total cutting qty","UOM","Lines"];
+    if(cuttingPlanIncludeCost){ headers.splice(6,0,"Rate"); headers.push("Total cost"); }
+    let idx=0; const rows=[];
+    cuttingPlanRows.forEach(r=>{
+      idx++;
+      const row=[idx,r.spec,r.grade||"(no grade)",r.cuttingPlan,Number(r.totalQty.toFixed(3)),r.uom,r.lineCount];
+      if(cuttingPlanIncludeCost){ row.splice(6,0,Number(r.rate.toFixed(2))); row.push(Number(r.totalCost.toFixed(2))); }
+      rows.push(row);
+    });
+    if(cuttingPlanIncludeCost){
+      const totalCostCP=cuttingPlanRows.reduce((s,r)=>s+r.totalCost,0);
+      rows.push(["","TOTAL","","","","","","",Number(totalCostCP.toFixed(2))]);
+    }
+    const ws=XLSX.utils.aoa_to_sheet([headers].concat(rows));
+    const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"Cutting Plan");
+    XLSX.writeFile(wb,"cutting_plan_"+selectedModel+".xlsx");
+  };
+
+  const exportCuttingPlanPDF = ()=>{
+    const today = new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation:"landscape", unit:"mm", format:"a4" });
+    const W = doc.internal.pageSize.getWidth();
+    const dark = [28,31,26]; const neutral = [244,242,234];
+    const drawLetterhead = ()=>{
+      try { doc.addImage(COMPANY_LOGO,"PNG",10,4,40,20); } catch(e){}
+      doc.setFontSize(11); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+      doc.text(COMPANY_NAME,W-14,8,{align:"right"});
+      doc.setFontSize(7); doc.setFont(undefined,"normal"); doc.setTextColor(100,100,100);
+      doc.text(COMPANY_ADDRESS,W-14,13,{align:"right"});
+      doc.text(COMPANY_WEBSITE+"   |   "+COMPANY_EMAIL,W-14,17.5,{align:"right"});
+      doc.setFontSize(8.5); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+      doc.text("CUTTING PLAN",W-14,23,{align:"right"});
+      doc.setDrawColor(200,197,185); doc.setLineWidth(0.4);
+      doc.line(10,27,W-10,27);
+    };
+    drawLetterhead();
+    doc.setTextColor(...dark); doc.setFontSize(9); let y=34;
+    const lbl=(l,v)=>{ doc.setFont(undefined,"bold"); doc.text(l+":",12,y); doc.setFont(undefined,"normal"); doc.text(String(v||""),42,y); y+=6; };
+    lbl("Model",selectedModel);
+    if(refNumber) lbl("Quote#",refNumber+(itemSlNo?" — Sl No "+itemSlNo:""));
+    if(refDesc) lbl("Description",refDesc);
+    lbl("Date",today);
+    lbl("Prepared by",user.username);
+    const tableHead=[cuttingPlanIncludeCost?["#","Material spec","Grade","Cutting plan","Total cutting qty","UOM","Rate","Total cost"]:["#","Material spec","Grade","Cutting plan","Total cutting qty","UOM"]];
+    let idx=0;
+    const tableBody=cuttingPlanRows.map(r=>{
+      idx++;
+      const row=[idx,r.spec,r.grade||"(no grade)",r.cuttingPlan,r.totalQty%1===0?String(r.totalQty):r.totalQty.toFixed(3),r.uom];
+      if(cuttingPlanIncludeCost) row.push(fmt(r.rate),fmt(r.totalCost));
+      return row;
+    });
+    const foot=[["","","","TOTAL — "+cuttingPlanRows.length+" groups from "+computedLines.length+" lines","","",]];
+    if(cuttingPlanIncludeCost){
+      const totalCostCP=cuttingPlanRows.reduce((s,r)=>s+r.totalCost,0);
+      foot[0].push("",fmt(totalCostCP));
+    }
+    doc.autoTable({
+      startY:y+2, head:tableHead, body:tableBody, foot,
+      theme:"grid",
+      headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8,lineColor:[216,212,197],lineWidth:0.2},
+      footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8},
+      bodyStyles:{fontSize:7.5,textColor:dark},
+      alternateRowStyles:{fillColor:[250,249,245]},
+      margin:{top:32,left:10,right:10,bottom:15},
+      didDrawPage:drawLetterhead,
+    });
+    const pageCount=doc.internal.getNumberOfPages();
+    for(let i=1;i<=pageCount;i++){
+      doc.setPage(i); doc.setFontSize(7); doc.setTextColor(150);
+      doc.text("Page "+i+" of "+pageCount,W-12,doc.internal.pageSize.getHeight()-5,{align:"right"});
+      doc.setTextColor(...dark);
+      doc.text(COMPANY_NAME+" | Cutting Plan | "+today,12,doc.internal.pageSize.getHeight()-5);
+    }
+    doc.save("cutting_plan_"+selectedModel+".pdf");
   };
 
   const addCurrentModelToCart = ()=>{
@@ -1648,15 +1762,30 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
               h("div",{style:{fontSize:10,letterSpacing:"0.06em",color:colors.mutedLight}},"TOTAL SALES PRICE"),
               h("div",{style:{fontSize:18,fontWeight:700,color:colors.accent}},"₹ "+fmt(totalSalesPrice))
             ),
-            // Detail / Summary toggle
+            // Detail / Summary / Cutting Plan toggle
             h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
-              h("button",{onClick:()=>setShowSummary(false),style:{padding:"6px 14px",fontSize:12,border:"none",cursor:"pointer",background:!showSummary?colors.dark:"#fff",color:!showSummary?"#fff":colors.muted,fontFamily:"inherit"}},"Detail"),
-              h("button",{onClick:()=>setShowSummary(true),style:{padding:"6px 14px",fontSize:12,border:"none",cursor:"pointer",background:showSummary?"#1c8c75":"#fff",color:showSummary?"#fff":colors.muted,fontFamily:"inherit"}},"Summary")
+              h("button",{onClick:()=>{setShowSummary(false);setShowCuttingPlan(false);},style:{padding:"6px 14px",fontSize:12,border:"none",cursor:"pointer",background:(!showSummary&&!showCuttingPlan)?colors.dark:"#fff",color:(!showSummary&&!showCuttingPlan)?"#fff":colors.muted,fontFamily:"inherit"}},"Detail"),
+              h("button",{onClick:()=>{setShowSummary(true);setShowCuttingPlan(false);},style:{padding:"6px 14px",fontSize:12,border:"none",cursor:"pointer",background:showSummary?"#1c8c75":"#fff",color:showSummary?"#fff":colors.muted,fontFamily:"inherit"}},"Summary"),
+              h("button",{onClick:()=>{setShowCuttingPlan(true);setShowSummary(false);},style:{padding:"6px 14px",fontSize:12,border:"none",cursor:"pointer",background:showCuttingPlan?"#0f6e56":"#fff",color:showCuttingPlan?"#fff":colors.muted,fontFamily:"inherit"}},"Cutting Plan")
             )
           )
         ),
+        showSummary&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8}},
+          h("span",{style:{fontSize:11,color:colors.muted,fontWeight:600}},"Basis:"),
+          h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden"}},
+            h("button",{onClick:()=>setSummaryBasis("reqd"),style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:summaryBasis==="reqd"?colors.dark:"#fff",color:summaryBasis==="reqd"?"#fff":colors.text,fontFamily:"inherit"}},"By reqd qty"),
+            h("button",{onClick:()=>setSummaryBasis("cutting"),style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:summaryBasis==="cutting"?colors.dark:"#fff",color:summaryBasis==="cutting"?"#fff":colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"By cutting plan qty")
+          )
+        ),
+        showCuttingPlan&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8}},
+          h("span",{style:{fontSize:11,color:colors.muted,fontWeight:600}},"Cost:"),
+          h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden"}},
+            h("button",{onClick:()=>setCuttingPlanIncludeCost(true),style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:cuttingPlanIncludeCost?colors.dark:"#fff",color:cuttingPlanIncludeCost?"#fff":colors.text,fontFamily:"inherit"}},"With cost"),
+            h("button",{onClick:()=>setCuttingPlanIncludeCost(false),style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:!cuttingPlanIncludeCost?colors.dark:"#fff",color:!cuttingPlanIncludeCost?"#fff":colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Without cost")
+          )
+        ),
         // MOC toggle header bar
-        !showSummary&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,padding:"8px 12px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:6,flexWrap:"wrap"}},
+        !showSummary&&!showCuttingPlan&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,padding:"8px 12px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:6,flexWrap:"wrap"}},
           h("span",{style:{fontSize:11,color:colors.muted,fontWeight:600}},"Show in MOC:"),
           h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden"}},
             h("button",{onClick:()=>{ const o={...overrides}; computedLines.forEach(l=>{o[l.id]={...o[l.id],show_in_moc:true};}); setOverrides(o); },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,fontFamily:"inherit"}},"Select all"),
@@ -1665,10 +1794,10 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
           h("button",{onClick:()=>{ const o={...overrides}; computedLines.forEach(l=>{o[l.id]={...o[l.id],show_in_moc:false};}); setOverrides(o); },style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"Reset to No"),
           h("span",{style:{fontSize:10,color:colors.mutedLight}},computedLines.filter(l=>l.showInMoc).length+" of "+computedLines.length+" ticked")
         ),
-        pendingCount>0&&!showSummary&&h("div",{style:{fontSize:12,color:colors.danger,margin:"6px 0"}},pendingCount+" item(s) need a grade."),
+        pendingCount>0&&!showSummary&&!showCuttingPlan&&h("div",{style:{fontSize:12,color:colors.danger,margin:"6px 0"}},pendingCount+" item(s) need a grade."),
 
         // DETAIL VIEW
-        !showSummary&&h("div",{style:{overflowX:"auto",overflowY:"hidden",marginTop:10,border:"1px solid "+colors.border,borderRadius:6}},
+        !showSummary&&!showCuttingPlan&&h("div",{style:{overflowX:"auto",overflowY:"hidden",marginTop:10,border:"1px solid "+colors.border,borderRadius:6}},
           h("table",{style:{fontSize:12,minWidth:1420,width:"100%"}},
             h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left",background:"#faf9f4"}},
               ["Sl","Component","Material spec","Grade (MOC)","Cutting Plan","Cut Plan Qty","Cutting UOM","Qty Reqd Per Item","UOM","Rate","Cost","Sf","Sales price","Show in MOC",""].map(c=>h("th",{key:c,style:{padding:"8px 10px",textAlign:["Cut Plan Qty","Qty Reqd Per Item","Rate","Cost","Sales price"].includes(c)?"right":"left"}},c))
@@ -1754,9 +1883,58 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
             )
           )
         ),
+        showCuttingPlan&&h("div",{style:{marginTop:10}},
+          h("div",{style:{padding:"12px 16px",background:"#1c2b28",borderRadius:"8px 8px 0 0",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
+            h("div",null,
+              h("div",{style:{fontWeight:700,fontSize:15,color:"#fff",letterSpacing:"0.01em"}},"Cutting Plan"),
+              h("div",{style:{fontSize:12,color:"#6fa99a",marginTop:2}},selectedModel),
+              refNumber&&h("div",{style:{fontSize:11,color:colors.accent,marginTop:2}},"Ref: "+refNumber),
+              refDesc&&h("div",{style:{fontSize:11,color:"#8ab8ad",fontStyle:"italic",marginTop:1}},refDesc)
+            ),
+            h("div",{style:{textAlign:"right"}},
+              h("div",{style:{fontSize:10,color:"#9a9d8f"}},new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"})),
+              h("div",{style:{fontSize:10,color:"#9a9d8f",marginTop:2}},"Prepared by: "+user.username),
+              h("div",{style:{fontSize:10,color:"#9a9d8f",marginTop:2}},cuttingPlanRows.length+" groups · "+computedLines.length+" lines")
+            )
+          ),
+          h("div",{style:{overflowX:"auto",border:"1px solid "+colors.border,borderTop:"none",borderRadius:"0 0 8px 8px"}},
+            h("table",{style:{fontSize:12.5,minWidth:640,width:"100%"}},
+              h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left",background:"#faf9f4"}},
+                (cuttingPlanIncludeCost?["#","Material spec","Grade","Cutting plan","Total cutting qty","UOM","Rate","Total cost","Lines"]:["#","Material spec","Grade","Cutting plan","Total cutting qty","UOM","Lines"]).map(c=>h("th",{key:c,style:{padding:"8px 10px",whiteSpace:"nowrap",textAlign:["Total cutting qty","Rate","Total cost"].includes(c)?"right":"left",fontSize:10.5,letterSpacing:"0.03em"}},c))
+              )),
+              h("tbody",null,(()=>{
+                const rows=[];
+                cuttingPlanRows.forEach((r,i)=>{
+                  rows.push(h("tr",{key:i,style:{borderBottom:"1px solid #eceae0"}},
+                    h("td",{style:{padding:"8px 10px",color:colors.mutedLight,fontSize:11}},i+1),
+                    h("td",{style:{padding:"8px 10px",fontWeight:600}},r.spec),
+                    h("td",{style:{padding:"8px 10px"}},r.grade?h("span",{style:{background:"#e1f5ee",color:"#085041",fontSize:11,padding:"2px 8px",borderRadius:10}},r.grade):h("span",{style:{color:colors.mutedLight,fontSize:11}},"(no grade)")),
+                    h("td",{style:{padding:"8px 10px"}},r.cuttingPlan),
+                    h("td",{style:{padding:"8px 10px",textAlign:"right",fontWeight:500}},r.totalQty%1===0?r.totalQty:r.totalQty.toFixed(3)),
+                    h("td",{style:{padding:"8px 10px",color:colors.muted}},r.uom),
+                    cuttingPlanIncludeCost&&h("td",{style:{padding:"8px 10px",textAlign:"right"}},fmt(r.rate)),
+                    cuttingPlanIncludeCost&&h("td",{style:{padding:"8px 10px",textAlign:"right",fontWeight:700}},fmt(r.totalCost)),
+                    h("td",{style:{padding:"8px 10px",fontSize:11,color:colors.muted}},r.lineCount+" line"+(r.lineCount!==1?"s":""))
+                  ));
+                });
+                rows.push(h("tr",{key:"total",style:{background:colors.dark}},
+                  h("td",{colSpan:cuttingPlanIncludeCost?6:4,style:{padding:"9px 10px",color:"#9a9d8f",fontSize:11}},"TOTAL — "+cuttingPlanRows.length+" groups from "+computedLines.length+" lines"),
+                  cuttingPlanIncludeCost&&h("td",{style:{padding:"9px 10px",textAlign:"right",fontWeight:700,color:"#fff"}},fmt(cuttingPlanRows.reduce((s,r)=>s+r.totalCost,0))),
+                  h("td",null)
+                ));
+                return rows;
+              })())
+            )
+          )
+        ),
         h("datalist",{id:"spec-list-est"},allSpecs.map(s=>h("option",{key:s,value:s}))),
         h("div",{style:{marginTop:14,display:"flex",gap:8,flexWrap:"wrap"}},
-          showSummary
+          showCuttingPlan
+            ? h(React.Fragment,null,
+                h("button",{onClick:exportCuttingPlanXlsx,style:btnSecondary},"Cutting Plan Excel"),
+                h("button",{onClick:exportCuttingPlanPDF,style:btnSecondary},"Cutting Plan PDF")
+              )
+            : showSummary
             ? h(React.Fragment,null,
                 h("button",{onClick:exportSummaryXlsx,style:btnSecondary},"Export summary Excel"),
                 h("button",{onClick:exportSummaryPDF,style:btnSecondary},"Export summary PDF"),
@@ -2662,7 +2840,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [savingLine,setSavingLine]=useState({}); // {refNum-slNo: true} — saving in progress
   const [quoteExportRef,setQuoteExportRef]=useState(""); const [exportingQuote,setExportingQuote]=useState("");
   const [includeSalesPrice,setIncludeSalesPrice]=useState(true);
-  const [quoteCuttingPlanIncludeCost,setQuoteCuttingPlanIncludeCost]=useState(false);
+  const [quoteCuttingPlanIncludeCost,setQuoteCuttingPlanIncludeCostState]=useState(getCuttingPlanIncludeCostPref);
+  const setQuoteCuttingPlanIncludeCost=(v)=>{ setQuoteCuttingPlanIncludeCostState(v); setCuttingPlanIncludeCostPref(v); };
   const isAdmin = user?.role==="admin" || user?.role==="super_admin";
   const [deletingSlNo,setDeletingSlNo]=useState(null); // id of estimate row being deleted
   const [showDeleteQuoteModal,setShowDeleteQuoteModal]=useState(false);
@@ -2940,7 +3119,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [showSummarySaved,setShowSummarySaved]=useState(false);
   const [showCuttingPlan,setShowCuttingPlan]=useState(false);
   const [summaryBasis,setSummaryBasis]=useState("reqd"); // "reqd" | "cutting"
-  const [cuttingPlanIncludeCost,setCuttingPlanIncludeCost]=useState(false);
+  const [cuttingPlanIncludeCost,setCuttingPlanIncludeCostState]=useState(getCuttingPlanIncludeCostPref);
+  const setCuttingPlanIncludeCost=(v)=>{ setCuttingPlanIncludeCostState(v); setCuttingPlanIncludeCostPref(v); };
   const savedSummaryRows=useMemo(()=>{
     const map=new Map();
     openLines.forEach(l=>{
@@ -3715,9 +3895,9 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           ),
           h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
             h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Cutting Plan ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(whole quote)")),
-            h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:colors.muted,marginBottom:6,cursor:"pointer"}},
-              h("input",{type:"checkbox",checked:quoteCuttingPlanIncludeCost,onChange:e=>setQuoteCuttingPlanIncludeCost(e.target.checked)}),
-              "Include cost"
+            h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden",marginBottom:6,width:"fit-content"}},
+              h("button",{onClick:()=>setQuoteCuttingPlanIncludeCost(true),style:{padding:"3px 10px",fontSize:10.5,border:"none",cursor:"pointer",background:quoteCuttingPlanIncludeCost?colors.dark:"#fff",color:quoteCuttingPlanIncludeCost?"#fff":colors.text,fontFamily:"inherit"}},"With cost"),
+              h("button",{onClick:()=>setQuoteCuttingPlanIncludeCost(false),style:{padding:"3px 10px",fontSize:10.5,border:"none",cursor:"pointer",background:!quoteCuttingPlanIncludeCost?colors.dark:"#fff",color:!quoteCuttingPlanIncludeCost?"#fff":colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Without cost")
             ),
             h("div",{style:{display:"flex",gap:6}},
               h("button",{onClick:()=>exportQuoteCuttingPlanExcel(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-xlsx"?"Working…":"Excel"),
@@ -3794,11 +3974,11 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
               )
             ),
             showCuttingPlan&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8}},
-              h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:11.5,color:colors.muted,cursor:"pointer"}},
-                h("input",{type:"checkbox",checked:cuttingPlanIncludeCost,onChange:e=>setCuttingPlanIncludeCost(e.target.checked)}),
-                "Include cost"
-              ),
-              h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"Sf and sales price are never shown in Cutting Plan reports")
+              h("span",{style:{fontSize:11,color:colors.muted,fontWeight:600}},"Cost:"),
+              h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden"}},
+                h("button",{onClick:()=>setCuttingPlanIncludeCost(true),style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:cuttingPlanIncludeCost?colors.dark:"#fff",color:cuttingPlanIncludeCost?"#fff":colors.text,fontFamily:"inherit"}},"With cost"),
+                h("button",{onClick:()=>setCuttingPlanIncludeCost(false),style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:!cuttingPlanIncludeCost?colors.dark:"#fff",color:!cuttingPlanIncludeCost?"#fff":colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Without cost")
+              )
             ),
             !showSummarySaved&&!showCuttingPlan&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,padding:"8px 12px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:6,flexWrap:"wrap"}},
               h("span",{style:{fontSize:11,color:colors.muted,fontWeight:600}},"Show in MOC:"),
