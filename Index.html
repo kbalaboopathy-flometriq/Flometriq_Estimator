@@ -54,6 +54,20 @@ const MASTER_TABLES = [
   { key: "uom_tbl", label: "UOM", columns: ["uom"], addLabel:"New UOM", freeText:["uom"] },
   { key: "material_rates", label: "Material rates", columns: ["material_spec","material_grade","material_shape","rate","uom","spec_grade"], addLabel:"New rate", cascade:[{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"uom",from:"uom_tbl",field:"uom"}], freeText:["material_grade","rate","spec_grade"] },
   { key: "bom", label: "BOM", columns: ["item","size","model","sub_assembly","component","material_shape","cutting_plan_layout_size","cutting_plan_qty","cutting_plan_uom","material_spec","qty_required","uom","spec_grade","rate","cost","sf","sales_price"], addLabel:"New BOM line", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"size",from:"size_tbl",field:"size"},{col:"model",from:"model_tbl",field:"model"},{col:"component",from:"component_item_tbl",field:"component"},{col:"sub_assembly",from:"subassembly_tbl",field:"sub_assembly"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"uom",from:"uom_tbl",field:"uom"},{col:"cutting_plan_uom",from:"uom_tbl",field:"uom"}], freeText:["cutting_plan_layout_size","cutting_plan_qty","spec_grade","qty_required","rate","cost","sf","sales_price"] },
+  { key: "quote_status_tbl", label: "Quote Status", columns: ["status"], addLabel:"New status", freeText:["status"] },
+  { key: "payment_terms_tbl", label: "Payment Terms", columns: ["value"], addLabel:"New payment term", freeText:["value"] },
+  { key: "delivery_terms_tbl", label: "Delivery Terms", columns: ["value"], addLabel:"New delivery term", freeText:["value"] },
+  { key: "packing_forwarding_tbl", label: "Packing and Forwarding", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "insurance_terms_tbl", label: "Insurance Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "price_basis_tbl", label: "Price Basis", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "guarantee_terms_tbl", label: "Guarantee Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "dispatch_through_tbl", label: "Dispatch Through", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "freight_terms_tbl", label: "Freight Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "dispatch_to_tbl", label: "Dispatch To", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "tax_terms_tbl", label: "Tax Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "jurisdiction_tbl", label: "Jurisdiction", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "companies", label: "Companies", columns: ["company_name","account_type","industry","rating","website","phone","billing_city","billing_country","gst_tax_id","account_owner","source"], addLabel:"New company", freeText:["company_name","account_type","industry","rating","website","phone","billing_city","billing_country","gst_tax_id","account_owner","source"] },
+  { key: "contacts", label: "Contacts", columns: ["company_name","contact_name","designation","email","phone","department","is_primary"], addLabel:"New contact", cascade:[{col:"company_name",from:"companies",field:"company_name"}], freeText:["contact_name","designation","email","phone","department","is_primary"] },
 ];
 const NUMERIC_COLS = new Set(["rate","cost","sf","sales_price","qty_required","cutting_plan_qty"]);
 
@@ -472,7 +486,9 @@ function MenuTabs({ user, active, onChange }) {
   if(isAdmin) {
     groups.push({ label:"Master Data", tabs:[
       {key:"bom_form",label:"BOM Entry Form"},
-      ...MASTER_TABLES.map(t=>({key:t.key,label:t.label})),
+      {key:"customers",label:"Customers"},
+      ...MASTER_TABLES.filter(t=>t.key!=="companies"&&t.key!=="contacts").map(t=>({key:t.key,label:t.label})),
+      {key:"customer_bulk_upload",label:"Customer Bulk Upload"},
       {key:"allowable_stress",label:"Allowable Stress"},
       {key:"datasheet_master",label:"Datasheet Master"},
     ]});
@@ -2834,6 +2850,57 @@ function DatasheetMasterEditor({ onGoToTab }){
   );
 }
 
+// Reusable "Can't find it? Add" slide-over. Opens on top of whatever screen
+// called it, adds a row to the given single-column master table, and hands
+// the new value back via onAdded — the caller re-selects it, nothing the
+// user was filling in elsewhere gets lost or navigated away from.
+function AddToMasterPanel({ table, fieldLabel, valueCol, onClose, onAdded }){
+  const col = valueCol || "value";
+  const [val,setVal] = useState("");
+  const [saving,setSaving] = useState(false);
+  const [err,setErr] = useState("");
+  const save = async()=>{
+    const trimmed = val.trim();
+    if(!trimmed){ setErr("Enter a value."); return; }
+    setSaving(true); setErr("");
+    try {
+      const { error } = await sb.from(table).insert({ [col]: trimmed });
+      if(error){
+        if(String(error.message||"").toLowerCase().includes("duplicate")){ onAdded(trimmed); onClose(); return; }
+        throw error;
+      }
+      onAdded(trimmed); onClose();
+    } catch(e){ setErr(e.message||"Could not save."); }
+    finally { setSaving(false); }
+  };
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.35)",zIndex:1200,display:"flex",justifyContent:"flex-end"}},
+    h("div",{style:{width:340,maxWidth:"90vw",height:"100%",background:"#fff",boxShadow:"-2px 0 12px rgba(0,0,0,0.15)",padding:"20px 22px",display:"flex",flexDirection:"column"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Add to "+(fieldLabel||table)),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"This adds a new option to the "+(fieldLabel||table)+" master. It'll be available here and everywhere else this field is used."),
+      h("input",{value:val,onChange:e=>setVal(e.target.value),autoFocus:true,style:{...inputStyle,padding:"9px 11px",fontSize:13,marginBottom:8},placeholder:"New "+(fieldLabel||"value").toLowerCase(),onKeyDown:e=>{ if(e.key==="Enter") save(); }}),
+      err&&h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},err),
+      h("div",{style:{marginTop:"auto",display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save and use")
+      )
+    )
+  );
+}
+
+// A strict dropdown paired with a "Can't find it? Add" link that opens
+// AddToMasterPanel and re-selects the newly added value on save.
+function MasterSelect({ value, onChange, options, table, fieldLabel, placeholder, style }){
+  const [showAdd,setShowAdd] = useState(false);
+  return h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
+    h("select",{value:value||"",onChange:e=>onChange(e.target.value),style:{...inputStyle,flex:1,...(style||{})}},
+      h("option",{value:""},placeholder||"Select…"),
+      (options||[]).map(o=>h("option",{key:o,value:o},o))
+    ),
+    h("button",{onClick:()=>setShowAdd(true),type:"button",style:{border:"1px solid "+colors.border,background:"#fff",color:"#1c8c75",fontSize:10.5,padding:"6px 8px",borderRadius:5,cursor:"pointer",whiteSpace:"nowrap"}},"+ Add"),
+    showAdd && h(AddToMasterPanel,{table,fieldLabel,onClose:()=>setShowAdd(false),onAdded:(newVal)=>onChange(newVal)})
+  );
+}
+
 function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [refs,setRefs]=useState([]); const [loading,setLoading]=useState(true);
   const [refFilter,setRefFilter]=useState(""); const [slNoFilter,setSlNoFilter]=useState(""); const [descSearch,setDescSearch]=useState(""); const [openRef,setOpenRef]=useState(null);
@@ -2845,6 +2912,35 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [includeSalesPrice,setIncludeSalesPrice]=useState(true);
   const [quoteCuttingPlanIncludeCost,setQuoteCuttingPlanIncludeCostState]=useState(getCuttingPlanIncludeCostPref);
   const setQuoteCuttingPlanIncludeCost=(v)=>{ setQuoteCuttingPlanIncludeCostState(v); setCuttingPlanIncludeCostPref(v); };
+  const [showCommercialTerms,setShowCommercialTerms]=useState(false);
+  const [ctData,setCtData]=useState(null);
+  const [ctLoading,setCtLoading]=useState(false);
+  const [ctSaving,setCtSaving]=useState(false);
+  const CT_DEFAULTS = {
+    force_majeure:"In the event of any act of God like earthquake, Flood, Cyclone, Hurricane, Fire etc. and in the event of war, riot, crime epidemic, sudden legal changes would mean we would be absolved from contractual obligations and the terms of contact will be re-written by mutual agreement by both parties after the vent",
+    order_cancellation_charges:"20% of the PO value after submission of Technical Documents, 40% of PO value after receipt of Manufacturing Clearance, 60% of the PO Value after receipt of raw materials"
+  };
+  const openCommercialTerms=async()=>{
+    if(!quoteExportRef) return;
+    setCtLoading(true); setShowCommercialTerms(true);
+    try {
+      const{data}=await sb.from("quote_commercial_terms").select("*").eq("reference_number",quoteExportRef).maybeSingle();
+      setCtData(data||{reference_number:quoteExportRef,validity:"",payment_term:"",delivery_term:"",packing_forwarding:"",insurance:"",price_basis:"",guarantee:"",dispatch_through:"",freight:"",dispatch_to:"",tax:"",jurisdiction:"",force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges});
+    } catch(e){ console.error("Load commercial terms failed",e); setCtData({reference_number:quoteExportRef,force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges}); }
+    finally { setCtLoading(false); }
+  };
+  const saveCommercialTerms=async()=>{
+    setCtSaving(true);
+    try {
+      const payload={...ctData,reference_number:quoteExportRef,updated_by:user?.username||"unknown",updated_at:new Date().toISOString()};
+      delete payload.id;
+      const{error}=await sb.from("quote_commercial_terms").upsert(payload,{onConflict:"reference_number"});
+      if(error) throw error;
+      setShowCommercialTerms(false);
+    } catch(e){ console.error("Save commercial terms failed",e); alert("Save failed: "+e.message); }
+    finally { setCtSaving(false); }
+  };
+  const [generatingQuotePdf,setGeneratingQuotePdf]=useState(false);
   const isAdmin = user?.role==="admin" || user?.role==="super_admin";
   const [deletingSlNo,setDeletingSlNo]=useState(null); // id of estimate row being deleted
   const [showDeleteQuoteModal,setShowDeleteQuoteModal]=useState(false);
@@ -2926,6 +3022,25 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [modelItemMap,setModelItemMap]=useState(new Map());
   const [headerModel,setHeaderModel]=useState("");
   const [fixingModel,setFixingModel]=useState(false);
+  const [quoteStatuses,setQuoteStatuses]=useState([]);
+  const CT_MASTER_TABLES = {
+    payment_term:"payment_terms_tbl", delivery_term:"delivery_terms_tbl", packing_forwarding:"packing_forwarding_tbl",
+    insurance:"insurance_terms_tbl", price_basis:"price_basis_tbl", guarantee:"guarantee_terms_tbl",
+    dispatch_through:"dispatch_through_tbl", freight:"freight_terms_tbl", dispatch_to:"dispatch_to_tbl",
+    tax:"tax_terms_tbl", jurisdiction:"jurisdiction_tbl"
+  };
+  const [ctMasters,setCtMasters]=useState({});
+  const loadCtMasters=useCallback(async()=>{
+    const entries = await Promise.all(Object.entries(CT_MASTER_TABLES).map(async([field,table])=>{
+      const rows = await fetchAll(table,"value");
+      return [field, rows.map(r=>r.value).filter(Boolean).sort()];
+    }));
+    setCtMasters(Object.fromEntries(entries));
+  },[]);
+  useEffect(()=>{
+    loadCtMasters();
+    fetchAll("quote_status_tbl","status").then(rows=>setQuoteStatuses(rows.map(r=>r.status).filter(Boolean)));
+  },[loadCtMasters]);
 
   useEffect(()=>{
     fetchAll("model_tbl","item,model").then(rows=>{
@@ -3590,6 +3705,187 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     return list;
   };
 
+  // The one-click "Generate Quote PDF": cover letter, index (with real page
+  // numbers filled in after the rest of the document exists), commercial
+  // terms, a per-Sl-No price summary, then every Sl No's datasheet — all in
+  // a single file, matching the section layout of the reference template.
+  const generateQuotePdf = async()=>{
+    if(!quoteExportRef) return;
+    setGeneratingQuotePdf(true);
+    try {
+      const {estimatesRows, linesRows, datasheetsRows} = await fetchQuoteBundle(quoteExportRef);
+      if(!estimatesRows.length){ alert("No Sl Nos found under "+quoteExportRef+"."); return; }
+      const {data:termsRow} = await sb.from("quote_commercial_terms").select("*").eq("reference_number",quoteExportRef).maybeSingle();
+      const terms = termsRow || {};
+      const forceMaj = terms.force_majeure || CT_DEFAULTS.force_majeure;
+      const cancelCharges = terms.order_cancellation_charges || CT_DEFAULTS.order_cancellation_charges;
+      const first = estimatesRows[0];
+      const customerName = first.description || quoteExportRef;
+      const today = new Date().toLocaleDateString("en-GB");
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
+      const W = doc.internal.pageSize.getWidth();
+      const dark=[28,31,26]; const neutral=[244,242,234];
+
+      const letterhead = (title)=>{
+        try{ doc.addImage(COMPANY_LOGO,"PNG",10,4,36,18); }catch(e){}
+        doc.setFontSize(10); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+        doc.text(COMPANY_NAME,W-14,8,{align:"right"});
+        doc.setFontSize(7); doc.setFont(undefined,"normal"); doc.setTextColor(100,100,100);
+        doc.text(COMPANY_ADDRESS,W-14,13,{align:"right"});
+        doc.text(COMPANY_WEBSITE+"   |   "+COMPANY_EMAIL,W-14,17.5,{align:"right"});
+        doc.setFontSize(9); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+        doc.text(title,W-14,23,{align:"right"});
+        doc.setDrawColor(200,197,185); doc.setLineWidth(0.4);
+        doc.line(10,27,W-10,27);
+      };
+
+      // ---- Page 1: Cover letter ----
+      letterhead("QUOTATION");
+      let y=36;
+      doc.setFontSize(9); doc.setTextColor(...dark);
+      doc.setFont(undefined,"bold"); doc.text("Customer Name:",12,y); doc.setFont(undefined,"normal"); doc.text(String(customerName),50,y); y+=8;
+      doc.setFont(undefined,"bold"); doc.text("Quote No:",12,y); doc.setFont(undefined,"normal"); doc.text(quoteExportRef,50,y);
+      doc.setFont(undefined,"bold"); doc.text("Quote Date:",120,y); doc.setFont(undefined,"normal"); doc.text(today,150,y); y+=14;
+      doc.setFont(undefined,"normal"); doc.text("Dear Sir,",12,y); y+=8;
+      doc.text("Sub: Our Techno Commercial offer for the above",12,y); y+=14;
+      const totalSalesAll = linesRows.reduce((s,l)=>{
+        const est=estimatesRows.find(e=>e.item_sl_no===l.item_sl_no);
+        return s+(Number(l.sales_price)||0)*((est&&est.order_qty)||1);
+      },0);
+      doc.autoTable({
+        startY:y,
+        body:[
+          ["Delivery", terms.delivery_term||"—"],
+          ["Validity", terms.validity||"—"],
+          ["Total Basic Price", (first.currency||"INR")+" "+fmt(totalSalesAll)]
+        ],
+        theme:"grid",
+        styles:{font:"times",fontSize:9,textColor:dark,cellPadding:4},
+        columnStyles:{0:{cellWidth:45,fontStyle:"bold"},1:{cellWidth:"auto"}},
+        margin:{left:12,right:12}
+      });
+      y = doc.lastAutoTable.finalY + 16;
+      doc.setFont(undefined,"normal"); doc.text("Thanking You,",12,y); y+=6;
+      doc.text("Yours Truly,",12,y); y+=6;
+      doc.setFont(undefined,"bold"); doc.text(COMPANY_NAME,12,y); y+=6;
+      doc.setFont(undefined,"normal"); doc.text(user?.username||"",12,y);
+
+      // ---- Page 2: reserved for the Index — filled in last, once every
+      // other section's real page number is known ----
+      doc.addPage();
+      const indexPage = doc.internal.getNumberOfPages();
+
+      // ---- Commercial Terms ----
+      doc.addPage();
+      letterhead("ANNEXURE - I  COMMERCIAL TERMS");
+      const termsStartPage = doc.internal.getNumberOfPages();
+      doc.autoTable({
+        startY:34,
+        body:[
+          ["Validity", terms.validity||"—"],
+          ["Payment Term", terms.payment_term||"—"],
+          ["Delivery Term", terms.delivery_term||"—"],
+          ["Packing and Forwarding", terms.packing_forwarding||"—"],
+          ["Insurance", terms.insurance||"—"],
+          ["Price Basis", terms.price_basis||"—"],
+          ["Guarantee", terms.guarantee||"—"],
+          ["Dispatch Through", terms.dispatch_through||"—"],
+          ["Freight", terms.freight||"—"],
+          ["Dispatch To", terms.dispatch_to||"—"],
+          ["Tax", terms.tax||"—"],
+          ["Jurisdiction", terms.jurisdiction||"—"],
+          ["Force Majeure", forceMaj],
+          ["Order Cancellation Charges", cancelCharges],
+        ],
+        theme:"plain",
+        styles:{font:"times",fontSize:8.5,textColor:dark,cellPadding:{top:2.5,bottom:2.5,left:2,right:4}},
+        columnStyles:{0:{cellWidth:50,fontStyle:"bold"},1:{cellWidth:"auto"}},
+        margin:{top:32,left:12,right:12,bottom:16},
+        didDrawPage:()=>letterhead("ANNEXURE - I  COMMERCIAL TERMS")
+      });
+      const termsEndPage = doc.internal.getNumberOfPages();
+
+      // ---- Price Summary — one row per Sl No ----
+      doc.addPage();
+      const summaryStartPage = doc.internal.getNumberOfPages();
+      const summaryRows = estimatesRows.map(est=>{
+        const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+        const unitPrice = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+        const qty = est.order_qty||1;
+        return [est.item_sl_no, modelItemMap.get(est.model)||est.model||"—", est.description||"—", fmt(unitPrice), qty, fmt(unitPrice*qty)];
+      });
+      const grandTotal = summaryRows.reduce((s,r)=>s+Number(String(r[5]).replace(/,/g,"")),0);
+      doc.autoTable({
+        startY:34,
+        head:[["S.No","Item","Description","Unit price","Qty","Total"]],
+        body: summaryRows,
+        foot:[["","","","","Total Price:", fmt(grandTotal)]],
+        theme:"grid",
+        headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8,font:"times"},
+        footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.5,font:"times"},
+        bodyStyles:{font:"times",fontSize:8,textColor:dark},
+        margin:{top:32,left:12,right:12,bottom:16},
+        didDrawPage:()=>letterhead("ANNEXURE II - PRICE SUMMARY")
+      });
+      const summaryEndPage = doc.internal.getNumberOfPages();
+
+      // ---- Datasheets, one per Sl No ----
+      const dsList = await buildQuoteDatasheetsBySlNo(estimatesRows, linesRows, datasheetsRows);
+      doc.addPage();
+      const dsStartPage = doc.internal.getNumberOfPages();
+      dsList.forEach((inst,idx)=>{
+        if(idx>0) doc.addPage();
+        letterhead("ANNEXURE III - TECHNICAL DATA SHEET");
+        let yy=34;
+        doc.setFontSize(9); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+        doc.text("Sl No "+inst.slNo+" — "+inst.itemName,12,yy);
+        const body=[];
+        inst.sectionsRows.forEach(sec=>{
+          if(!sec.rows.length) return;
+          body.push([{content:sec.title,colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
+          sec.rows.forEach(r=>body.push([r.label, r.value]));
+        });
+        doc.autoTable({
+          startY:yy+6, body, theme:"plain",
+          styles:{font:"helvetica",fontSize:8.5,textColor:dark,cellPadding:{top:1,right:5,bottom:1,left:5}},
+          columnStyles:{0:{cellWidth:60},1:{cellWidth:"auto"}},
+          margin:{top:32,left:12,right:12,bottom:16},
+          didDrawPage:()=>letterhead("ANNEXURE III - TECHNICAL DATA SHEET")
+        });
+      });
+      const dsEndPage = doc.internal.getNumberOfPages();
+
+      // ---- Go back and fill in the Index now that every page number is known ----
+      doc.setPage(indexPage);
+      letterhead("INDEX");
+      doc.autoTable({
+        startY:36,
+        head:[["S.No","Annexures","Description","Page Nos"]],
+        body:[
+          ["1","","Cover Page","1"],
+          ["2","","Index","2"],
+          ["3","Annexure-I","Commercial Terms", termsStartPage===termsEndPage?String(termsStartPage):termsStartPage+"-"+termsEndPage],
+          ["4","Annexure-II","Price Summary", summaryStartPage===summaryEndPage?String(summaryStartPage):summaryStartPage+"-"+summaryEndPage],
+          ["5","Annexure-III","Technical Data Sheet", dsStartPage===dsEndPage?String(dsStartPage):dsStartPage+"-"+dsEndPage],
+        ],
+        theme:"grid",
+        headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:9,font:"times"},
+        bodyStyles:{font:"times",fontSize:9,textColor:dark},
+        columnStyles:{0:{cellWidth:20,halign:"center"},1:{cellWidth:35},2:{cellWidth:"auto"},3:{cellWidth:25,halign:"center"}},
+        margin:{top:32,left:12,right:12},
+        didDrawPage:()=>letterhead("INDEX")
+      });
+
+      numberQuotePages(doc, W);
+      doc.save(quoteExportRef.replace(/\s+/g,"_")+"_Quote.pdf");
+      await logAudit("EXPORT","estimates",quoteExportRef,"Generated compiled quote PDF for "+quoteExportRef,user?.username||"unknown",null,null);
+    } catch(e){
+      console.error("Generate quote PDF failed", e);
+      alert("Could not generate the PDF: "+e.message);
+    } finally { setGeneratingQuotePdf(false); }
+  };
+
   const exportQuoteDatasheetsExcel = async()=>{
     if(!quoteExportRef) return;
     setExportingQuote("ds-xlsx");
@@ -3907,6 +4203,16 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
               h("button",{onClick:()=>exportQuoteCuttingPlanExcel(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-xlsx"?"Working…":"Excel"),
               h("button",{onClick:()=>exportQuoteCuttingPlanPDF(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-pdf"?"Working…":"PDF")
             )
+          ),
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Commercial Terms"),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"One set per quote"),
+            h("button",{onClick:openCommercialTerms,disabled:!quoteExportRef,style:{...btnSmall,width:"100%"}},"Edit terms")
+          ),
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.dark,textTransform:"uppercase",marginBottom:6}},"Generate Quote PDF"),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Cover + index + summary + terms + datasheets"),
+            h("button",{onClick:generateQuotePdf,disabled:!quoteExportRef||generatingQuotePdf,style:{...btnPrimary,width:"100%",fontSize:12,padding:"7px 10px"}},generatingQuotePdf?"Generating…":"Generate PDF")
           )
         )
       ),
@@ -3954,6 +4260,17 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
                   h("label",{style:{fontSize:11,color:"#0f6e56",fontWeight:600,whiteSpace:"nowrap"}},"Order Qty (units):"),
                   h("input",{type:"number",value:orderQty,min:1,onChange:e=>updateOrderQty(e.target.value),style:{width:70,padding:"5px 8px",fontSize:14,fontWeight:700,textAlign:"center",border:"0.5px solid #1c8c75",borderRadius:6,color:"#085041",background:"#fff",fontFamily:"inherit"}}),
                   h("span",{style:{fontSize:10,color:"#0f6e56"}},`→ Qty by Order/Quote updates live`)
+                ),
+                h("div",{style:{display:"flex",alignItems:"center",gap:8,padding:"6px 12px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:8}},
+                  h("label",{style:{fontSize:11,color:colors.muted,fontWeight:600,whiteSpace:"nowrap"}},"Quote Status:"),
+                  h("select",{value:openRef.quote_status||"Draft",onChange:async e=>{
+                    const v=e.target.value;
+                    await sb.from("estimates").update({quote_status:v}).eq("id",openRef.id);
+                    setOpenRef(r=>({...r,quote_status:v}));
+                    setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,quote_status:v}:r));
+                  },style:{padding:"5px 8px",fontSize:12,fontWeight:600,border:"0.5px solid "+colors.border,borderRadius:6,color:colors.text,background:"#fff",fontFamily:"inherit"}},
+                    quoteStatuses.map(s=>h("option",{key:s,value:s},s))
+                  )
                 ),
                 h("button",{onClick:()=>setShowDatasheet(true),style:btnSecondary},"Datasheet"),
                 h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line"),
@@ -4302,6 +4619,60 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           h("button",{onClick:confirmDeleteQuote,disabled:deletingQuote||deleteQuoteConfirmText.trim()!==refFilter,style:{...btnPrimary,background:colors.danger,opacity:(deletingQuote||deleteQuoteConfirmText.trim()!==refFilter)?0.5:1}},deletingQuote?"Deleting…":"Delete quote")
         )
       )
+    ),
+    showCommercialTerms && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:640,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Commercial Terms — "+quoteExportRef),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"One set of terms per quote, applied to every Sl No in it."),
+        ctLoading || !ctData ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"Loading…") :
+        h(React.Fragment,null,
+          h("div",{style:{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap"}},
+            fld("Validity",null,h("input",{value:ctData.validity||"",onChange:e=>setCtData(d=>({...d,validity:e.target.value})),style:{...inputStyle,padding:"7px 9px",fontSize:12},placeholder:"e.g. 30 days from quote date"})),
+            fld("Payment term",null,h(React.Fragment,null,
+              h("input",{list:"ct-payment-terms",value:ctData.payment_term||"",onChange:e=>setCtData(d=>({...d,payment_term:e.target.value})),style:{...inputStyle,padding:"7px 9px",fontSize:12},placeholder:"Type or pick from list"}),
+              h("datalist",{id:"ct-payment-terms"},(ctMasters.payment_term||[]).map(v=>h("option",{key:v,value:v})))
+            ))
+          ),
+          h("div",{style:{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap"}},
+            fld("Delivery term",null,h(MasterSelect,{value:ctData.delivery_term,onChange:v=>setCtData(d=>({...d,delivery_term:v})),options:ctMasters.delivery_term,table:"delivery_terms_tbl",fieldLabel:"Delivery Terms",placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
+            fld("Price basis",null,h(MasterSelect,{value:ctData.price_basis,onChange:v=>setCtData(d=>({...d,price_basis:v})),options:ctMasters.price_basis,table:"price_basis_tbl",fieldLabel:"Price Basis",placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+          ),
+          h("div",{style:{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap"}},
+            fld("Packing and forwarding",null,h(MasterSelect,{value:ctData.packing_forwarding,onChange:v=>setCtData(d=>({...d,packing_forwarding:v})),options:ctMasters.packing_forwarding,table:"packing_forwarding_tbl",fieldLabel:"Packing and Forwarding",placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
+            fld("Insurance",null,h(MasterSelect,{value:ctData.insurance,onChange:v=>setCtData(d=>({...d,insurance:v})),options:ctMasters.insurance,table:"insurance_terms_tbl",fieldLabel:"Insurance",placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+          ),
+          h("div",{style:{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap"}},
+            fld("Guarantee",null,h(MasterSelect,{value:ctData.guarantee,onChange:v=>setCtData(d=>({...d,guarantee:v})),options:ctMasters.guarantee,table:"guarantee_terms_tbl",fieldLabel:"Guarantee",placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
+            fld("Dispatch through",null,h(MasterSelect,{value:ctData.dispatch_through,onChange:v=>setCtData(d=>({...d,dispatch_through:v})),options:ctMasters.dispatch_through,table:"dispatch_through_tbl",fieldLabel:"Dispatch Through",placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+          ),
+          h("div",{style:{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap"}},
+            fld("Freight",null,h(MasterSelect,{value:ctData.freight,onChange:v=>setCtData(d=>({...d,freight:v})),options:ctMasters.freight,table:"freight_terms_tbl",fieldLabel:"Freight",placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
+            fld("Dispatch to",null,h(MasterSelect,{value:ctData.dispatch_to,onChange:v=>setCtData(d=>({...d,dispatch_to:v})),options:ctMasters.dispatch_to,table:"dispatch_to_tbl",fieldLabel:"Dispatch To",placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+          ),
+          h("div",{style:{display:"flex",gap:12,marginBottom:16,flexWrap:"wrap"}},
+            fld("Tax",null,h(MasterSelect,{value:ctData.tax,onChange:v=>setCtData(d=>({...d,tax:v})),options:ctMasters.tax,table:"tax_terms_tbl",fieldLabel:"Tax",placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
+            fld("Jurisdiction",null,h(MasterSelect,{value:ctData.jurisdiction,onChange:v=>setCtData(d=>({...d,jurisdiction:v})),options:ctMasters.jurisdiction,table:"jurisdiction_tbl",fieldLabel:"Jurisdiction",placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+          ),
+          h("div",{style:{marginBottom:14}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:10,color:colors.muted}},"Force majeure"),
+              h("button",{onClick:()=>setCtData(d=>({...d,force_majeure:CT_DEFAULTS.force_majeure})),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Restore default")
+            ),
+            h("textarea",{value:ctData.force_majeure||"",onChange:e=>setCtData(d=>({...d,force_majeure:e.target.value})),style:{...inputStyle,padding:"8px 9px",fontSize:12,width:"100%",height:70,fontFamily:"inherit",resize:"vertical"}})
+          ),
+          h("div",{style:{marginBottom:4}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:10,color:colors.muted}},"Order cancellation charges"),
+              h("button",{onClick:()=>setCtData(d=>({...d,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges})),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Restore default")
+            ),
+            h("textarea",{value:ctData.order_cancellation_charges||"",onChange:e=>setCtData(d=>({...d,order_cancellation_charges:e.target.value})),style:{...inputStyle,padding:"8px 9px",fontSize:12,width:"100%",height:70,fontFamily:"inherit",resize:"vertical"}})
+          )
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16,borderTop:"1px solid "+colors.border,paddingTop:14}},
+          h("button",{onClick:()=>setShowCommercialTerms(false),style:btnSecondary},"Cancel"),
+          h("button",{onClick:saveCommercialTerms,disabled:ctSaving||ctLoading,style:{...btnPrimary,opacity:ctSaving?0.6:1}},ctSaving?"Saving…":"Save terms")
+        )
+      )
     )
   );
 }
@@ -4329,6 +4700,361 @@ async function verifyAndConsumeDeletionCode(code, username){
   if(new Date(row.expires_at) < new Date()) return { ok:false, reason:"That code has expired." };
   await sb.from("deletion_codes").update({ used:true, used_by:username, used_at:new Date().toISOString() }).eq("id",row.id);
   return { ok:true };
+}
+
+// Bulk upload / periodic refresh for Companies + Contacts, from a two-sheet
+// Excel workbook ("Companies" and "Contacts" tabs). Company is the primary
+// record in this B2B setup — dedupe on Companies is by company_name alone;
+// dedupe on Contacts is company_name + contact_name, and a contact that
+// matches on name but brings NEW info (like an email that was blank before)
+// is flagged for review instead of being silently skipped or duplicated.
+// Company is the primary record in this B2B setup — this screen shows a
+// company as one card with its Contacts nested underneath, instead of two
+// separate flat master tables.
+function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
+  const [f,setF] = useState(initial || {company_name:"",account_type:"",industry:"",rating:"",website:"",phone:"",billing_street:"",billing_city:"",billing_state:"",billing_country:"",billing_pin:"",shipping_street:"",shipping_city:"",shipping_state:"",shipping_country:"",shipping_pin:"",gst_tax_id:"",account_owner:"",source:"",notes:""});
+  const [saving,setSaving] = useState(false);
+  const set = (k,v)=>setF(d=>({...d,[k]:v}));
+  const save = async()=>{
+    if(!f.company_name.trim()){ alert("Company name is required."); return; }
+    setSaving(true);
+    try {
+      if(f.id){
+        const {id,...rest} = f;
+        await sb.from("companies").update(rest).eq("id",id);
+      } else {
+        await sb.from("companies").insert({...f,created_by:user?.username||"unknown"});
+      }
+      onSaved();
+    } catch(e){ console.error("Save company failed",e); alert("Save failed: "+e.message); }
+    finally { setSaving(false); }
+  };
+  const row2 = (l1,k1,l2,k2)=>h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+    h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},l1), h("input",{value:f[k1]||"",onChange:e=>set(k1,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+    h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},l2), h("input",{value:f[k2]||"",onChange:e=>set(k2,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
+  );
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:14}},f.id?"Edit company":"New company"),
+      row2("Company name","company_name","Account type","account_type"),
+      row2("Industry","industry","Rating","rating"),
+      row2("Website","website","Phone","phone"),
+      h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,margin:"10px 0 6px"}},"BILLING ADDRESS"),
+      row2("Street","billing_street","City","billing_city"),
+      row2("State","billing_state","Country","billing_country"),
+      row2("PIN / Zip","billing_pin","GST / Tax ID","gst_tax_id"),
+      h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,margin:"10px 0 6px"}},"SHIPPING ADDRESS"),
+      row2("Street","shipping_street","City","shipping_city"),
+      row2("State","shipping_state","Country","shipping_country"),
+      row2("PIN / Zip","shipping_pin","Source","source"),
+      row2("Account owner","account_owner","Notes","notes"),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
+        h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save company")
+      )
+    )
+  );
+}
+
+function CustomerContactForm({ companyName, initial, onCancel, onSaved, user }){
+  const [f,setF] = useState(initial || {contact_name:"",designation:"",email:"",phone:"",department:"",is_primary:"No"});
+  const [saving,setSaving] = useState(false);
+  const set=(k,v)=>setF(d=>({...d,[k]:v}));
+  const save = async()=>{
+    if(!f.contact_name.trim()){ alert("Contact name is required."); return; }
+    setSaving(true);
+    try {
+      if(f.id){
+        const {id,...rest} = f;
+        await sb.from("contacts").update(rest).eq("id",id);
+      } else {
+        await sb.from("contacts").insert({...f,company_name:companyName,created_by:user?.username||"unknown"});
+      }
+      onSaved();
+    } catch(e){ console.error("Save contact failed",e); alert("Save failed: "+e.message); }
+    finally { setSaving(false); }
+  };
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:420,maxWidth:"100%"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},f.id?"Edit contact":"New contact"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},companyName),
+      h("div",{style:{marginBottom:8}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Contact name"), h("input",{value:f.contact_name,onChange:e=>set("contact_name",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Designation"), h("input",{value:f.designation,onChange:e=>set("designation",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+        h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Department"), h("input",{value:f.department,onChange:e=>set("department",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
+      ),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Email"), h("input",{value:f.email,onChange:e=>set("email",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+        h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Phone"), h("input",{value:f.phone,onChange:e=>set("phone",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
+      ),
+      h("label",{style:{display:"flex",alignItems:"center",gap:6,fontSize:12,color:colors.text,marginBottom:14,cursor:"pointer"}},
+        h("input",{type:"checkbox",checked:f.is_primary==="Yes",onChange:e=>set("is_primary",e.target.checked?"Yes":"No")}),
+        "Primary contact for this company"
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save contact")
+      )
+    )
+  );
+}
+
+function CustomersScreen({ user }){
+  const [companies,setCompanies] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [search,setSearch] = useState("");
+  const [selected,setSelected] = useState(null);
+  const [contacts,setContacts] = useState([]);
+  const [loadingContacts,setLoadingContacts] = useState(false);
+  const [companyFormOpen,setCompanyFormOpen] = useState(null); // null | "new" | company obj
+  const [contactFormOpen,setContactFormOpen] = useState(null); // null | "new" | contact obj
+
+  const loadCompanies = useCallback(async()=>{
+    setLoading(true);
+    const {data} = await sb.from("companies").select("*").order("company_name");
+    setCompanies(data||[]);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ loadCompanies(); },[loadCompanies]);
+
+  const loadContacts = useCallback(async(companyName)=>{
+    if(!companyName) { setContacts([]); return; }
+    setLoadingContacts(true);
+    const {data} = await sb.from("contacts").select("*").eq("company_name",companyName).order("is_primary",{ascending:false}).order("contact_name");
+    setContacts(data||[]);
+    setLoadingContacts(false);
+  },[]);
+  useEffect(()=>{ if(selected) loadContacts(selected.company_name); },[selected,loadContacts]);
+
+  const filtered = companies.filter(c=>!search||(c.company_name||"").toLowerCase().includes(search.toLowerCase()));
+
+  const removeContact = async(contact)=>{
+    if(!confirm("Remove "+contact.contact_name+" from "+selected.company_name+"?")) return;
+    await sb.from("contacts").delete().eq("id",contact.id);
+    loadContacts(selected.company_name);
+  };
+
+  return h("div",{style:{display:"flex",minHeight:"calc(100vh - 100px)"}},
+    h("div",{style:{width:260,flexShrink:0,borderRight:"1px solid "+colors.border,padding:"20px 16px",overflowY:"auto"}},
+      h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search companies…",style:{...inputStyle,padding:"7px 9px",fontSize:11.5,marginBottom:8}}),
+      h("button",{onClick:()=>setCompanyFormOpen("new"),style:{...btnSecondary,width:"100%",fontSize:11,marginBottom:10}},"+ New company"),
+      loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+      h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+        filtered.map(c=>h("div",{key:c.id,onClick:()=>setSelected(c),style:{padding:"9px 12px",cursor:"pointer",fontSize:12,fontWeight:selected&&selected.id===c.id?600:400,background:selected&&selected.id===c.id?colors.dark:"#fff",color:selected&&selected.id===c.id?"#fff":colors.text,borderBottom:"1px solid #eceae0"}},c.company_name)),
+        filtered.length===0&&h("div",{style:{padding:12,fontSize:11.5,color:colors.mutedLight}},"No companies yet.")
+      )
+    ),
+    h("div",{style:{flex:1,padding:"20px 24px",minWidth:0}},
+      !selected?h("div",{style:{color:colors.mutedLight,fontSize:14,marginTop:30}},"Select a company from the left, or add a new one."):
+      h(React.Fragment,null,
+        h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px",background:"#fff",marginBottom:16}},
+          h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}},
+            h("div",{style:{fontWeight:700,fontSize:16}},selected.company_name),
+            h("button",{onClick:()=>setCompanyFormOpen(selected),style:btnSmall},"Edit company")
+          ),
+          h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"4px 20px",fontSize:11.5,color:colors.muted}},
+            h("div",null,"Type: ",h("span",{style:{color:colors.text}},selected.account_type||"—")),
+            h("div",null,"Industry: ",h("span",{style:{color:colors.text}},selected.industry||"—")),
+            h("div",null,"Billing: ",h("span",{style:{color:colors.text}},[selected.billing_city,selected.billing_country].filter(Boolean).join(", ")||"—")),
+            h("div",null,"Website: ",h("span",{style:{color:colors.text}},selected.website||"—")),
+            h("div",null,"GST/Tax ID: ",h("span",{style:{color:colors.text}},selected.gst_tax_id||"—")),
+            h("div",null,"Account owner: ",h("span",{style:{color:colors.text}},selected.account_owner||"—"))
+          )
+        ),
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}},
+          h("div",{style:{fontWeight:700,fontSize:13}},"Contacts ("+contacts.length+")"),
+          h("button",{onClick:()=>setContactFormOpen("new"),style:btnSmall},"+ Add contact")
+        ),
+        loadingContacts?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+        contacts.length===0?h("div",{style:{fontSize:12,color:colors.mutedLight,padding:"10px 0"}},"No contacts yet for this company."):
+        contacts.map(ct=>h("div",{key:ct.id,style:{border:"1px solid #eceae0",borderRadius:6,padding:"10px 12px",marginBottom:8,background:"#fff",display:"flex",justifyContent:"space-between",alignItems:"center"}},
+          h("div",null,
+            h("div",{style:{fontWeight:600,fontSize:12.5}},ct.contact_name,ct.is_primary==="Yes"&&h("span",{style:{background:"#e1f5ee",color:"#085041",fontSize:9.5,padding:"1px 7px",borderRadius:8,marginLeft:7}},"Primary")),
+            h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:1}},[ct.designation,ct.email,ct.phone].filter(Boolean).join(" · ")||"—")
+          ),
+          h("div",{style:{display:"flex",gap:6}},
+            h("button",{onClick:()=>setContactFormOpen(ct),style:{...btnSmall,fontSize:10.5,padding:"4px 9px"}},"Edit"),
+            h("button",{onClick:()=>removeContact(ct),style:{...btnSmall,fontSize:10.5,padding:"4px 9px",border:"1px solid #f0b8b8",color:colors.danger}},"Remove")
+          )
+        ))
+      )
+    ),
+    companyFormOpen && h(CustomerCompanyForm,{
+      initial: companyFormOpen==="new"?null:companyFormOpen, user,
+      onCancel:()=>setCompanyFormOpen(null),
+      onSaved: async()=>{ setCompanyFormOpen(null); await loadCompanies(); }
+    }),
+    contactFormOpen && selected && h(CustomerContactForm,{
+      companyName: selected.company_name,
+      initial: contactFormOpen==="new"?null:contactFormOpen, user,
+      onCancel:()=>setContactFormOpen(null),
+      onSaved:()=>{ setContactFormOpen(null); loadContacts(selected.company_name); }
+    })
+  );
+}
+
+function CustomerBulkUpload({ user }){
+  const [file,setFile] = useState(null);
+  const [analyzing,setAnalyzing] = useState(false);
+  const [result,setResult] = useState(null); // {newCompanies, existingCompanies, newContacts, dupContacts, reviewContacts}
+  const [resolutions,setResolutions] = useState({}); // {idx: "update"|"keep"|"new"}
+  const [committing,setCommitting] = useState(false);
+  const [committed,setCommitted] = useState(null);
+  const norm = s => (s||"").toString().trim().toLowerCase();
+
+  const analyze = async()=>{
+    if(!file) return;
+    setAnalyzing(true); setResult(null); setCommitted(null); setResolutions({});
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, {type:"array"});
+      const companySheet = wb.Sheets["Companies"] || wb.Sheets[wb.SheetNames[0]];
+      const contactSheet = wb.Sheets["Contacts"] || wb.Sheets[wb.SheetNames[1]];
+      const companyRows = companySheet ? XLSX.utils.sheet_to_json(companySheet, {defval:""}) : [];
+      const contactRows = contactSheet ? XLSX.utils.sheet_to_json(contactSheet, {defval:""}) : [];
+
+      const { data: existingCompanies } = await sb.from("companies").select("*");
+      const { data: existingContacts } = await sb.from("contacts").select("*");
+      const existingCoByName = new Map((existingCompanies||[]).map(c=>[norm(c.company_name),c]));
+      const existingCtByKey = new Map((existingContacts||[]).map(c=>[norm(c.company_name)+"|||"+norm(c.contact_name),c]));
+
+      const newCompanies=[], existingCompaniesFound=[];
+      const seenCoNames = new Set();
+      companyRows.forEach(row=>{
+        const name = (row.company_name||row["Company Name"]||"").toString().trim();
+        if(!name) return;
+        const key = norm(name);
+        if(existingCoByName.has(key) || seenCoNames.has(key)){ existingCompaniesFound.push({...row, company_name:name}); return; }
+        seenCoNames.add(key);
+        newCompanies.push({
+          company_name:name,
+          account_type:row.account_type||row["Account Type"]||"",
+          industry:row.industry||row["Industry"]||"",
+          rating:row.rating||row["Rating"]||"",
+          website:row.website||row["Website"]||"",
+          phone:row.phone||row["Phone"]||"",
+          billing_street:row.billing_street||row["Billing Street"]||"",
+          billing_city:row.billing_city||row["Billing City"]||"",
+          billing_state:row.billing_state||row["Billing State"]||"",
+          billing_country:row.billing_country||row["Billing Country"]||"",
+          billing_pin:row.billing_pin||row["Billing PIN"]||"",
+          shipping_street:row.shipping_street||row["Shipping Street"]||"",
+          shipping_city:row.shipping_city||row["Shipping City"]||"",
+          shipping_state:row.shipping_state||row["Shipping State"]||"",
+          shipping_country:row.shipping_country||row["Shipping Country"]||"",
+          shipping_pin:row.shipping_pin||row["Shipping PIN"]||"",
+          gst_tax_id:row.gst_tax_id||row["GST/Tax ID"]||"",
+          account_owner:row.account_owner||row["Account Owner"]||"",
+          source:row.source||row["Source"]||"",
+          notes:row.notes||row["Notes"]||"",
+          created_by:user?.username||"bulk_upload"
+        });
+      });
+
+      const newContacts=[], dupContacts=[], reviewContacts=[];
+      contactRows.forEach((row,idx)=>{
+        const companyName = (row.company_name||row["Company Name"]||"").toString().trim();
+        const contactName = (row.contact_name||row["Contact Name"]||"").toString().trim();
+        if(!companyName || !contactName) return;
+        const email = (row.email||row["Email"]||"").toString().trim();
+        const rec = {
+          company_name:companyName, contact_name:contactName,
+          designation:row.designation||row["Designation"]||"",
+          email, phone:row.phone||row["Phone"]||"",
+          department:row.department||row["Department"]||"",
+          is_primary:row.is_primary||row["Is Primary"]||"No",
+          created_by:user?.username||"bulk_upload"
+        };
+        const key = norm(companyName)+"|||"+norm(contactName);
+        const existing = existingCtByKey.get(key);
+        if(!existing){ newContacts.push(rec); return; }
+        const existingEmail = (existing.email||"").trim();
+        if(norm(existingEmail)===norm(email)){ dupContacts.push(rec); return; }
+        // Same person, different (or newly-added) info — flag instead of guessing.
+        reviewContacts.push({ ...rec, _idx:idx, existing, newValue:email, existingValue:existingEmail });
+      });
+
+      setResult({ newCompanies, existingCompaniesFound, newContacts, dupContacts, reviewContacts, companyRowCount:companyRows.length, contactRowCount:contactRows.length });
+    } catch(e){ console.error("Analyze failed",e); alert("Could not read that file: "+e.message); }
+    finally { setAnalyzing(false); }
+  };
+
+  const commit = async()=>{
+    if(!result) return;
+    setCommitting(true);
+    try {
+      if(result.newCompanies.length) await sb.from("companies").insert(result.newCompanies);
+      if(result.newContacts.length) await sb.from("contacts").insert(result.newContacts);
+      for(const rc of result.reviewContacts){
+        const action = resolutions[rc._idx] || "keep";
+        if(action==="update"){
+          await sb.from("contacts").update({email:rc.newValue}).eq("id",rc.existing.id);
+        } else if(action==="new"){
+          await sb.from("contacts").insert({company_name:rc.company_name,contact_name:rc.contact_name,designation:rc.designation,email:rc.email,phone:rc.phone,department:rc.department,is_primary:rc.is_primary,created_by:user?.username||"bulk_upload"});
+        }
+        // "keep" = do nothing
+      }
+      await logAudit("BULK_UPLOAD","companies/contacts",file.name,"Added "+result.newCompanies.length+" companies, "+result.newContacts.length+" contacts, resolved "+result.reviewContacts.length+" review items",user?.username||"unknown",null,null);
+      setCommitted({companies:result.newCompanies.length, contacts:result.newContacts.length, resolved:result.reviewContacts.length});
+      setResult(null); setFile(null);
+    } catch(e){ console.error("Commit failed",e); alert("Could not save: "+e.message); }
+    finally { setCommitting(false); }
+  };
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:820}},
+    h("h2",{style:{margin:"0 0 6px",fontSize:19,fontWeight:700}},"Customer Bulk Upload"),
+    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},"Upload an Excel workbook with a Companies sheet and a Contacts sheet (Contacts needs a Company Name column matching a row in Companies). Use this for the first import or a periodic refresh — existing customers are never overwritten without your say-so."),
+    h("div",{style:{display:"flex",gap:10,alignItems:"center",marginBottom:16}},
+      h("input",{type:"file",accept:".xlsx,.xls",onChange:e=>setFile(e.target.files[0]||null)}),
+      h("button",{onClick:analyze,disabled:!file||analyzing,style:{...btnPrimary,opacity:(!file||analyzing)?0.6:1}},analyzing?"Reading…":"Analyze file")
+    ),
+    committed && h("div",{style:{padding:"12px 16px",background:"#eaf9f4",border:"1px solid #8fd0bf",borderRadius:8,marginBottom:16,fontSize:13,color:"#085041"}},
+      "Added "+committed.companies+" new companies, "+committed.contacts+" new contacts, resolved "+committed.resolved+" review items."
+    ),
+    result && h(React.Fragment,null,
+      h("div",{style:{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}},
+        h("div",{style:{flex:1,minWidth:140,background:"#eaf9f4",borderRadius:8,padding:"10px 14px",textAlign:"center"}},
+          h("div",{style:{fontSize:20,fontWeight:700,color:"#085041"}},result.newCompanies.length),
+          h("div",{style:{fontSize:10.5,color:"#4a8d78"}},"New companies")
+        ),
+        h("div",{style:{flex:1,minWidth:140,background:"#faf9f4",borderRadius:8,padding:"10px 14px",textAlign:"center"}},
+          h("div",{style:{fontSize:20,fontWeight:700,color:colors.muted}},result.existingCompaniesFound.length),
+          h("div",{style:{fontSize:10.5,color:colors.mutedLight}},"Companies already exist")
+        ),
+        h("div",{style:{flex:1,minWidth:140,background:"#eaf9f4",borderRadius:8,padding:"10px 14px",textAlign:"center"}},
+          h("div",{style:{fontSize:20,fontWeight:700,color:"#085041"}},result.newContacts.length),
+          h("div",{style:{fontSize:10.5,color:"#4a8d78"}},"New contacts")
+        ),
+        h("div",{style:{flex:1,minWidth:140,background:"#faf9f4",borderRadius:8,padding:"10px 14px",textAlign:"center"}},
+          h("div",{style:{fontSize:20,fontWeight:700,color:colors.muted}},result.dupContacts.length),
+          h("div",{style:{fontSize:10.5,color:colors.mutedLight}},"Contacts already exist")
+        ),
+        h("div",{style:{flex:1,minWidth:140,background:"#fdf4e8",borderRadius:8,padding:"10px 14px",textAlign:"center"}},
+          h("div",{style:{fontSize:20,fontWeight:700,color:"#854f0b"}},result.reviewContacts.length),
+          h("div",{style:{fontSize:10.5,color:"#a3701a"}},"Needs your review")
+        )
+      ),
+      result.reviewContacts.length>0 && h("div",{style:{marginBottom:16}},
+        h("div",{style:{fontWeight:700,fontSize:12.5,color:"#854f0b",marginBottom:8}},"Needs your review ("+result.reviewContacts.length+")"),
+        result.reviewContacts.map(rc=>h("div",{key:rc._idx,style:{border:"1px solid #f0d9a8",borderRadius:6,padding:"10px 12px",marginBottom:8,background:"#fffaf0"}},
+          h("div",{style:{fontWeight:600,fontSize:12}},rc.contact_name+" — "+rc.company_name),
+          h("div",{style:{display:"flex",gap:16,fontSize:11,margin:"4px 0 8px",color:colors.muted}},
+            h("div",null,"Existing: email — "+(rc.existingValue||"blank")),
+            h("div",null,"New row: email — "+(rc.newValue||"blank"))
+          ),
+          h("div",{style:{display:"flex",gap:6}},
+            h("button",{onClick:()=>setResolutions(r=>({...r,[rc._idx]:"update"})),style:{...btnSmall,background:resolutions[rc._idx]==="update"?colors.dark:"#fff",color:resolutions[rc._idx]==="update"?"#fff":colors.text}},"Update existing"),
+            h("button",{onClick:()=>setResolutions(r=>({...r,[rc._idx]:"keep"})),style:{...btnSmall,background:(!resolutions[rc._idx]||resolutions[rc._idx]==="keep")?colors.dark:"#fff",color:(!resolutions[rc._idx]||resolutions[rc._idx]==="keep")?"#fff":colors.text}},"Keep existing"),
+            h("button",{onClick:()=>setResolutions(r=>({...r,[rc._idx]:"new"})),style:{...btnSmall,background:resolutions[rc._idx]==="new"?colors.dark:"#fff",color:resolutions[rc._idx]==="new"?"#fff":colors.text}},"Add as new anyway")
+          )
+        ))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:()=>{setResult(null);setFile(null);},style:btnSecondary},"Cancel"),
+        h("button",{onClick:commit,disabled:committing,style:{...btnPrimary,opacity:committing?0.6:1}},committing?"Saving…":"Add "+result.newCompanies.length+" companies + "+result.newContacts.length+" contacts")
+      )
+    )
+  );
 }
 
 function DeletionCodesScreen({ user }){
@@ -5756,6 +6482,8 @@ function App() {
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab}):
+    tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
+    tab==="customers"?h(CustomersScreen,{user}):
     tab==="allowable_stress"?h(AllowableStressEditor,null):
     tab==="datasheet_master"?h(DatasheetMasterEditor,{onGoToTab:setTab}):
     tab==="users"?h(UsersEditor,{user}):
