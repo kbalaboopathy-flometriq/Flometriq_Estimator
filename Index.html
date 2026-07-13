@@ -61,11 +61,11 @@ const MASTER_TABLES = [
   { key: "insurance_terms_tbl", label: "Insurance Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
   { key: "price_basis_tbl", label: "Price Basis", columns: ["value"], addLabel:"New entry", freeText:["value"] },
   { key: "guarantee_terms_tbl", label: "Guarantee Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
-  { key: "dispatch_through_tbl", label: "Dispatch Through", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "dispatch_through_tbl", label: "Transport Through", columns: ["value"], addLabel:"New entry", freeText:["value"] },
   { key: "freight_terms_tbl", label: "Freight Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
-  { key: "dispatch_to_tbl", label: "Dispatch To", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "incoterms_tbl", label: "Inco Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
   { key: "tax_terms_tbl", label: "Tax Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
-  { key: "jurisdiction_tbl", label: "Jurisdiction", columns: ["value"], addLabel:"New entry", freeText:["value"] },
+  { key: "warranty_coverage_tbl", label: "Warranty Coverage", columns: ["value"], addLabel:"New entry", freeText:["value"] },
   { key: "companies", label: "Companies", columns: ["company_name","account_type","industry","rating","website","phone","billing_city","billing_country","gst_tax_id","account_owner","source"], addLabel:"New company", freeText:["company_name","account_type","industry","rating","website","phone","billing_city","billing_country","gst_tax_id","account_owner","source"] },
   { key: "contacts", label: "Contacts", columns: ["company_name","contact_name","designation","email","phone","department","is_primary"], addLabel:"New contact", cascade:[{col:"company_name",from:"companies",field:"company_name"}], freeText:["contact_name","designation","email","phone","department","is_primary"] },
 ];
@@ -251,6 +251,40 @@ function fmt(n) {
   return n.toLocaleString("en-IN", { minimumFractionDigits:2, maximumFractionDigits:2 });
 }
 function colLabel(c) { return c.replace(/_/g," ").replace(/\b\w/g,m=>m.toUpperCase()); }
+
+// Pulls a canonical Incoterm code out of free-form text like "Ex-Works Our
+// Factory Chennai" or "DDP - Delivered Duty Paid", so Price Basis and Inco
+// Terms can be cross-checked for consistency. Returns null if no known code
+// is recognizable in the text (so unrelated wording never false-positives).
+function detectIncotermCode(text){
+  if(!text) return null;
+  const t = String(text).toLowerCase();
+  const patterns = [
+    ["EXW", /\bex[\s-]?works\b|\bexw\b/],
+    ["FCA", /\bfca\b|free carrier/],
+    ["FOB", /\bfob\b|free on board/],
+    ["FOR", /\bf\.?\s*o\.?\s*r\.?\s*destination/],
+    ["CIF", /\bcif\b|\bc\.i\.f\b/],
+    ["CFR", /\bc\s*&\s*f\b|\bcfr\b|cost and freight/],
+    ["CPT", /\bcpt\b|carriage paid to/],
+    ["CIP", /\bcip\b|carriage and insurance paid to/],
+    ["DDP", /\bddp\b|delivered duty paid/],
+    ["DDU", /\bddu\b|delivered duty unpaid/],
+    ["DAP", /\bdap\b|delivered at place/],
+  ];
+  for(const [code, re] of patterns){ if(re.test(t)) return code; }
+  return null;
+}
+
+// Every field on the Commercial Terms form — all mandatory before a quote
+// can be marked ready.
+const CT_REQUIRED_FIELDS = [
+  ["validity","Validity"], ["payment_term","Payment Term"], ["delivery_term","Delivery Term"],
+  ["packing_forwarding","Packing and Forwarding"], ["insurance","Insurance"], ["price_basis","Price Basis"],
+  ["incoterms","Inco Terms"], ["guarantee","Guarantee"], ["warranty_coverage","Warranty Coverage"],
+  ["dispatch_through","Transport Through"], ["freight","Freight"], ["tax","Tax"],
+  ["jurisdiction","Jurisdiction"], ["force_majeure","Force Majeure"], ["order_cancellation_charges","Order Cancellation Charges"],
+];
 
 // Shared browser-level preference (not per-user, not per-quote) for whether
 // Cutting Plan reports show cost. Same checkbox everywhere it appears —
@@ -480,7 +514,7 @@ function MenuTabs({ user, active, onChange }) {
   },[]);
 
   const bomSetupKeys = ["model_tbl","item_tbl","size_tbl","component_item_tbl","subassembly_tbl","materials_shape","material_spec","uom_tbl","material_rates","bom"];
-  const ctKeys = ["quote_status_tbl","payment_terms_tbl","delivery_terms_tbl","packing_forwarding_tbl","insurance_terms_tbl","price_basis_tbl","guarantee_terms_tbl","dispatch_through_tbl","freight_terms_tbl","dispatch_to_tbl","tax_terms_tbl","jurisdiction_tbl"];
+  const ctKeys = ["quote_status_tbl","payment_terms_tbl","delivery_terms_tbl","packing_forwarding_tbl","insurance_terms_tbl","price_basis_tbl","guarantee_terms_tbl","dispatch_through_tbl","incoterms_tbl","freight_terms_tbl","tax_terms_tbl","warranty_coverage_tbl"];
   const byKeys = keys => MASTER_TABLES.filter(t=>keys.includes(t.key)).map(t=>({key:t.key,label:t.label}));
 
   const groups = [
@@ -2579,6 +2613,20 @@ function buildMasterRowsFromParse(item, sections, helperFields){
     sec.fields.forEach((e,i2)=>labelPosition.set(normalizeItemName(e.label),[secno,i2]));
   });
 
+  // field_key is unique per item across the WHOLE datasheet, not just within
+  // a section — two fields with the same (or same-slugifying) label in
+  // different sections, like "Notes" appearing twice, would otherwise both
+  // resolve to the same key and fail the save with a duplicate-key error.
+  // Disambiguate any repeats here, in parse order, before they ever reach
+  // the database.
+  const keyCounts = new Map();
+  finalSections.forEach(sec=>sec.fields.forEach(f=>{
+    const base = f.key;
+    const n = (keyCounts.get(base)||0)+1;
+    keyCounts.set(base, n);
+    if(n>1) f.key = base+"_"+n;
+  }));
+
   const rows=[]; let order=0;
   finalSections.forEach(sec=>{
     sec.fields.forEach(f=>{
@@ -2720,6 +2768,18 @@ function DatasheetMasterEditor({ onGoToTab }){
     return itemMasterList.find(i=>normalizeItemName(i.item)===norm) || null;
   },[previewItem, itemMasterList]);
 
+  // We standardize on plural item names ("Y strainers", not "Y Strainer").
+  // If the typed name doesn't exactly match the Items master but looks like
+  // a singular/plural variant of something that's already there, flag it
+  // instead of quietly letting a near-duplicate item get created.
+  const stripTrailingS = s => s.trim().toLowerCase().replace(/s$/,"");
+  const nearDuplicateItem = useMemo(()=>{
+    if(!previewItem.trim() || matchedMasterItem) return null;
+    const stripped = stripTrailingS(previewItem);
+    return itemMasterList.find(i=>stripTrailingS(i.item)===stripped) || null;
+  },[previewItem, matchedMasterItem, itemMasterList]);
+  const looksSingular = !/s\s*$/i.test(previewItem.trim()) && previewItem.trim().length>0;
+
   const addItemToMaster = async()=>{
     const name = previewItem.trim();
     if(!name) return;
@@ -2803,8 +2863,14 @@ function DatasheetMasterEditor({ onGoToTab }){
       ),
       matchedMasterItem
         ? h("div",{style:{fontSize:11.5,color:"#1c8c56",marginBottom:12}},"✓ Matches \""+matchedMasterItem.item+"\" in your Items master.")
+        : nearDuplicateItem
+        ? h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:12,padding:"8px 10px",background:"#fdf4e0",border:"1px solid #d9a441",borderRadius:6,flexWrap:"wrap"}},
+            h("span",{style:{fontSize:11.5,color:"#7a5a1f"}},"\""+previewItem+"\" looks like a singular/plural variant of \""+nearDuplicateItem.item+"\", which is already in your Items master. We standardize on the plural — use the existing item instead of creating a near-duplicate?"),
+            h("button",{onClick:()=>setPreviewItem(nearDuplicateItem.item),style:btnPrimary},"Use \""+nearDuplicateItem.item+"\"")
+          )
         : h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:12,padding:"8px 10px",background:"#fde8e8",border:"1px solid #e5484d",borderRadius:6,flexWrap:"wrap"}},
-            h("span",{style:{fontSize:11.5,color:"#7a1f1f"}},"\""+(previewItem||"(blank)")+"\" isn't in your Items master yet — add it there first so estimates and this datasheet stay linked to the same item."),
+            h("span",{style:{fontSize:11.5,color:"#7a1f1f"}},"\""+(previewItem||"(blank)")+"\" isn't in your Items master yet — add it below so estimates and this datasheet stay linked to the same item."),
+            looksSingular && h("span",{style:{fontSize:11,color:"#a3701a",fontWeight:600}},"This looks singular — item names should be plural (e.g. \"Strainers\", not \"Strainer\")."),
             h("input",{placeholder:"HSN code (optional)",value:newItemHsn,onChange:e=>setNewItemHsn(e.target.value),style:{...inputStyle,width:140}}),
             h("button",{onClick:addItemToMaster,disabled:addingItem||!previewItem.trim(),style:btnPrimary},addingItem?"Adding…":"Add \""+previewItem+"\" to Items master")
           ),
@@ -2969,18 +3035,34 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [ctData,setCtData]=useState(null);
   const [ctLoading,setCtLoading]=useState(false);
   const [ctSaving,setCtSaving]=useState(false);
+  const [showCtMissingModal,setShowCtMissingModal]=useState(false);
+  const [ctMissingFields,setCtMissingFields]=useState([]);
+  const [ctAllowMismatch,setCtAllowMismatch]=useState(false);
+  const [ctMismatchBlocked,setCtMismatchBlocked]=useState(false);
+  const isAdmin = user?.role==="admin" || user?.role==="super_admin";
   const CT_DEFAULTS = {
-    force_majeure:"In the event of any act of God like earthquake, Flood, Cyclone, Hurricane, Fire etc. and in the event of war, riot, crime epidemic, sudden legal changes would mean we would be absolved from contractual obligations and the terms of contact will be re-written by mutual agreement by both parties after the vent",
-    order_cancellation_charges:"20% of the PO value after submission of Technical Documents, 40% of PO value after receipt of Manufacturing Clearance, 60% of the PO Value after receipt of raw materials"
+    force_majeure:"1. Neither party shall be liable for delay or failure in performance due to events beyond reasonable control such as natural disasters, war, government actions, strikes, transport disruptions, or supply shortages.\n2. The affected party shall notify the other party promptly.\n3. Delivery timelines shall be extended for the duration of such event.\n4. If the event continues beyond 60 days, both parties may mutually review or cancel the pending portion without liability.",
+    order_cancellation_charges:"Cancellation of order will not be accepted once order acceptance is sent by us and Engineering/Production clearance is received from customer.",
+    jurisdiction:"Any dispute arising out of or relating to this Purchase Order / Contract shall be subject to the exclusive jurisdiction of the competent courts in Chennai, Tamil Nadu, India only."
   };
   const openCommercialTerms=async()=>{
     if(!quoteExportRef) return;
-    setCtLoading(true); setShowCommercialTerms(true);
+    setCtLoading(true); setShowCommercialTerms(true); setCtAllowMismatch(false); setCtMismatchBlocked(false);
     try {
       const{data}=await sb.from("quote_commercial_terms").select("*").eq("reference_number",quoteExportRef).maybeSingle();
-      setCtData(data||{reference_number:quoteExportRef,validity:"",payment_term:"",delivery_term:"",packing_forwarding:"",insurance:"",price_basis:"",guarantee:"",dispatch_through:"",freight:"",dispatch_to:"",tax:"",jurisdiction:"",force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges});
-    } catch(e){ console.error("Load commercial terms failed",e); setCtData({reference_number:quoteExportRef,force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges}); }
+      setCtData(data||{reference_number:quoteExportRef,validity:"",payment_term:"",delivery_term:"",packing_forwarding:"",insurance:"",price_basis:"",guarantee:"",dispatch_through:"",incoterms:"",freight:"",tax:"",warranty_coverage:"",jurisdiction:CT_DEFAULTS.jurisdiction,force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges});
+    } catch(e){ console.error("Load commercial terms failed",e); setCtData({reference_number:quoteExportRef,jurisdiction:CT_DEFAULTS.jurisdiction,force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges}); }
     finally { setCtLoading(false); }
+  };
+  const ctPriceBasisCode = ctData ? detectIncotermCode(ctData.price_basis) : null;
+  const ctIncotermsCode = ctData ? detectIncotermCode(ctData.incoterms) : null;
+  const ctMismatch = !!(ctPriceBasisCode && ctIncotermsCode && ctPriceBasisCode!==ctIncotermsCode);
+  const attemptSaveCommercialTerms=()=>{
+    const missing = CT_REQUIRED_FIELDS.filter(([key])=>!String(ctData?.[key]||"").trim()).map(([,label])=>label);
+    if(missing.length){ setCtMissingFields(missing); setShowCtMissingModal(true); return; }
+    if(ctMismatch && !(isAdmin && ctAllowMismatch)){ setCtMismatchBlocked(true); return; }
+    setCtMismatchBlocked(false);
+    saveCommercialTerms();
   };
   const saveCommercialTerms=async()=>{
     setCtSaving(true);
@@ -2990,11 +3072,39 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const{error}=await sb.from("quote_commercial_terms").upsert(payload,{onConflict:"reference_number"});
       if(error) throw error;
       setShowCommercialTerms(false);
+      if(openRef && openRef.reference_number===quoteExportRef) refreshReadiness(quoteExportRef);
     } catch(e){ console.error("Save commercial terms failed",e); alert("Save failed: "+e.message); }
     finally { setCtSaving(false); }
   };
   const [generatingQuotePdf,setGeneratingQuotePdf]=useState(false);
-  const isAdmin = user?.role==="admin" || user?.role==="super_admin";
+
+  // Computed live — never a stale stored flag. "Ready to go" means every
+  // Commercial Terms field is filled in AND every Sl No under the quote has
+  // a datasheet on file.
+  const checkQuoteReadiness = useCallback(async(refNumber)=>{
+    const missing = [];
+    const {data:terms} = await sb.from("quote_commercial_terms").select("*").eq("reference_number",refNumber).maybeSingle();
+    if(!terms){ missing.push({section:"Commercial Terms", items:["Not created yet"]}); }
+    else {
+      const missingCt = CT_REQUIRED_FIELDS.filter(([key])=>!String(terms[key]||"").trim()).map(([,label])=>label);
+      if(missingCt.length) missing.push({section:"Commercial Terms", items:missingCt});
+    }
+    const {estimatesRows, datasheetsRows} = await fetchQuoteBundle(refNumber);
+    const dsBySl = new Set(datasheetsRows.map(d=>d.item_sl_no));
+    estimatesRows.forEach(est=>{
+      if(!dsBySl.has(est.item_sl_no)) missing.push({section:"Sl No "+est.item_sl_no, items:["Datasheet not created"]});
+    });
+    return { ready: missing.length===0, missing };
+  },[]);
+  const [readiness,setReadiness]=useState({ready:false,missing:[],loading:true});
+  const refreshReadiness=useCallback(async(refNumber)=>{
+    if(!refNumber){ setReadiness({ready:false,missing:[],loading:false}); return; }
+    setReadiness(r=>({...r,loading:true}));
+    const result = await checkQuoteReadiness(refNumber);
+    setReadiness({...result,loading:false});
+  },[checkQuoteReadiness]);
+  useEffect(()=>{ if(openRef) refreshReadiness(openRef.reference_number); },[openRef&&openRef.reference_number]);
+
   const [deletingSlNo,setDeletingSlNo]=useState(null); // id of estimate row being deleted
   const [showDeleteQuoteModal,setShowDeleteQuoteModal]=useState(false);
   const [deleteQuoteConfirmText,setDeleteQuoteConfirmText]=useState("");
@@ -3079,8 +3189,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const CT_MASTER_TABLES = {
     payment_term:"payment_terms_tbl", delivery_term:"delivery_terms_tbl", packing_forwarding:"packing_forwarding_tbl",
     insurance:"insurance_terms_tbl", price_basis:"price_basis_tbl", guarantee:"guarantee_terms_tbl",
-    dispatch_through:"dispatch_through_tbl", freight:"freight_terms_tbl", dispatch_to:"dispatch_to_tbl",
-    tax:"tax_terms_tbl", jurisdiction:"jurisdiction_tbl"
+    dispatch_through:"dispatch_through_tbl", incoterms:"incoterms_tbl", freight:"freight_terms_tbl",
+    tax:"tax_terms_tbl", warranty_coverage:"warranty_coverage_tbl"
   };
   const [ctMasters,setCtMasters]=useState({});
   const loadCtMasters=useCallback(async()=>{
@@ -3766,6 +3876,11 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     if(!quoteExportRef) return;
     setGeneratingQuotePdf(true);
     try {
+      const readinessCheck = await checkQuoteReadiness(quoteExportRef);
+      if(!readinessCheck.ready){
+        alert("Can't generate yet — "+quoteExportRef+" isn't ready:\n\n"+readinessCheck.missing.map(m=>m.section+": "+m.items.join(", ")).join("\n"));
+        return;
+      }
       const {estimatesRows, linesRows, datasheetsRows} = await fetchQuoteBundle(quoteExportRef);
       if(!estimatesRows.length){ alert("No Sl Nos found under "+quoteExportRef+"."); return; }
       const {data:termsRow} = await sb.from("quote_commercial_terms").select("*").eq("reference_number",quoteExportRef).maybeSingle();
@@ -3842,12 +3957,13 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           ["Packing and Forwarding", terms.packing_forwarding||"—"],
           ["Insurance", terms.insurance||"—"],
           ["Price Basis", terms.price_basis||"—"],
+          ["Inco Terms", terms.incoterms||"—"],
           ["Guarantee", terms.guarantee||"—"],
-          ["Dispatch Through", terms.dispatch_through||"—"],
+          ["Warranty Coverage", terms.warranty_coverage||"—"],
+          ["Transport Through", terms.dispatch_through||"—"],
           ["Freight", terms.freight||"—"],
-          ["Dispatch To", terms.dispatch_to||"—"],
           ["Tax", terms.tax||"—"],
-          ["Jurisdiction", terms.jurisdiction||"—"],
+          ["Jurisdiction", terms.jurisdiction||CT_DEFAULTS.jurisdiction],
           ["Force Majeure", forceMaj],
           ["Order Cancellation Charges", cancelCharges],
         ],
@@ -4325,6 +4441,14 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
                     quoteStatuses.map(s=>h("option",{key:s,value:s},s))
                   )
                 ),
+                h("div",{onClick:()=>{ if(!readiness.loading&&!readiness.ready) alert(readiness.missing.map(m=>m.section+": "+m.items.join(", ")).join("\n")); },
+                  title: readiness.ready?"Every commercial term is filled in and every Sl No has a datasheet.":"Click to see what's missing.",
+                  style:{display:"flex",alignItems:"center",gap:6,padding:"6px 12px",borderRadius:8,cursor:readiness.ready?"default":"pointer",
+                    background: readiness.loading?"#faf9f4":readiness.ready?"#eaf9f4":"#fffaf0",
+                    border:"1px solid "+(readiness.loading?colors.border:readiness.ready?"#8fd0bf":"#f0d9a8")}},
+                  h("span",{style:{fontSize:12,fontWeight:700,color:readiness.loading?colors.mutedLight:readiness.ready?"#085041":"#854f0b"}},
+                    readiness.loading?"Checking…":readiness.ready?"✓ Ready to go":"Not ready — "+readiness.missing.reduce((s,m)=>s+m.items.length,0)+" items")
+                ),
                 h("button",{onClick:()=>setShowDatasheet(true),style:btnSecondary},"Datasheet"),
                 h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line"),
                 isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No")
@@ -4696,15 +4820,31 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           ),
           h("div",{style:{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap"}},
             fld("Guarantee",null,h(MasterSelect,{value:ctData.guarantee,onChange:v=>setCtData(d=>({...d,guarantee:v})),options:ctMasters.guarantee,table:"guarantee_terms_tbl",fieldLabel:"Guarantee",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
-            fld("Dispatch through",null,h(MasterSelect,{value:ctData.dispatch_through,onChange:v=>setCtData(d=>({...d,dispatch_through:v})),options:ctMasters.dispatch_through,table:"dispatch_through_tbl",fieldLabel:"Dispatch Through",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+            fld("Warranty coverage",null,h(MasterSelect,{value:ctData.warranty_coverage,onChange:v=>setCtData(d=>({...d,warranty_coverage:v})),options:ctMasters.warranty_coverage,table:"warranty_coverage_tbl",fieldLabel:"Warranty Coverage",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
           ),
           h("div",{style:{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap"}},
-            fld("Freight",null,h(MasterSelect,{value:ctData.freight,onChange:v=>setCtData(d=>({...d,freight:v})),options:ctMasters.freight,table:"freight_terms_tbl",fieldLabel:"Freight",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
-            fld("Dispatch to",null,h(MasterSelect,{value:ctData.dispatch_to,onChange:v=>setCtData(d=>({...d,dispatch_to:v})),options:ctMasters.dispatch_to,table:"dispatch_to_tbl",fieldLabel:"Dispatch To",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+            fld("Transport through",null,h(MasterSelect,{value:ctData.dispatch_through,onChange:v=>setCtData(d=>({...d,dispatch_through:v})),options:ctMasters.dispatch_through,table:"dispatch_through_tbl",fieldLabel:"Transport Through",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
+            fld("Inco terms",null,h(MasterSelect,{value:ctData.incoterms,onChange:v=>setCtData(d=>({...d,incoterms:v})),options:ctMasters.incoterms,table:"incoterms_tbl",fieldLabel:"Inco Terms",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+          ),
+          ctMismatch && h("div",{style:{background:"#faece7",border:"1px solid #f0997b",borderRadius:6,padding:"9px 11px",marginBottom:12,fontSize:11.5,color:"#993c1d"}},
+            h("div",null,"Price Basis says "+ctPriceBasisCode+" but Inco Terms says "+ctIncotermsCode+" — these don't match."),
+            isAdmin
+              ? h("label",{style:{display:"flex",alignItems:"center",gap:6,marginTop:6,cursor:"pointer",fontWeight:600}},
+                  h("input",{type:"checkbox",checked:ctAllowMismatch,onChange:e=>{setCtAllowMismatch(e.target.checked);setCtMismatchBlocked(false);}}),
+                  "Continue anyway (admin override)"
+                )
+              : h("div",{style:{marginTop:4,fontSize:11}},"Pick consistent values — only an Admin can save with a mismatch.")
           ),
           h("div",{style:{display:"flex",gap:12,marginBottom:16,flexWrap:"wrap"}},
-            fld("Tax",null,h(MasterSelect,{value:ctData.tax,onChange:v=>setCtData(d=>({...d,tax:v})),options:ctMasters.tax,table:"tax_terms_tbl",fieldLabel:"Tax",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
-            fld("Jurisdiction",null,h(MasterSelect,{value:ctData.jurisdiction,onChange:v=>setCtData(d=>({...d,jurisdiction:v})),options:ctMasters.jurisdiction,table:"jurisdiction_tbl",fieldLabel:"Jurisdiction",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+            fld("Freight",null,h(MasterSelect,{value:ctData.freight,onChange:v=>setCtData(d=>({...d,freight:v})),options:ctMasters.freight,table:"freight_terms_tbl",fieldLabel:"Freight",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
+            fld("Tax",null,h(MasterSelect,{value:ctData.tax,onChange:v=>setCtData(d=>({...d,tax:v})),options:ctMasters.tax,table:"tax_terms_tbl",fieldLabel:"Tax",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+          ),
+          h("div",{style:{marginBottom:14}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:10,color:colors.muted}},"Jurisdiction"),
+              h("button",{onClick:()=>setCtData(d=>({...d,jurisdiction:CT_DEFAULTS.jurisdiction})),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Restore default")
+            ),
+            h("textarea",{value:ctData.jurisdiction||"",onChange:e=>setCtData(d=>({...d,jurisdiction:e.target.value})),style:{...inputStyle,padding:"8px 9px",fontSize:12,width:"100%",height:50,fontFamily:"inherit",resize:"vertical"}})
           ),
           h("div",{style:{marginBottom:14}},
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
@@ -4721,9 +4861,23 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
             h("textarea",{value:ctData.order_cancellation_charges||"",onChange:e=>setCtData(d=>({...d,order_cancellation_charges:e.target.value})),style:{...inputStyle,padding:"8px 9px",fontSize:12,width:"100%",height:70,fontFamily:"inherit",resize:"vertical"}})
           )
         ),
+        ctMismatchBlocked && h("div",{style:{background:"#faece7",border:"1px solid #f0997b",borderRadius:6,padding:"9px 11px",marginTop:4,fontSize:11.5,color:"#993c1d"}},
+          isAdmin ? "Check \"Continue anyway\" above the Inco Terms field to save with this mismatch." : "Can't save — Price Basis and Inco Terms don't match. Only an Admin can override this."
+        ),
         h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16,borderTop:"1px solid "+colors.border,paddingTop:14}},
           h("button",{onClick:()=>setShowCommercialTerms(false),style:btnSecondary},"Cancel"),
-          h("button",{onClick:saveCommercialTerms,disabled:ctSaving||ctLoading,style:{...btnPrimary,opacity:ctSaving?0.6:1}},ctSaving?"Saving…":"Save terms")
+          h("button",{onClick:attemptSaveCommercialTerms,disabled:ctSaving||ctLoading,style:{...btnPrimary,opacity:ctSaving?0.6:1}},ctSaving?"Saving…":"Save terms")
+        )
+      )
+    ),
+    showCtMissingModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1100,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:400,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},ctMissingFields.length+" field"+(ctMissingFields.length!==1?"s":"")+" still need"+(ctMissingFields.length===1?"s":"")+" an entry"),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:10}},"Every commercial term is required before this quote can be marked ready."),
+        h("ul",{style:{margin:"0 0 16px",paddingLeft:18,fontSize:11.5,color:colors.danger}}, ctMissingFields.map(f=>h("li",{key:f},f))),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>{ setShowCtMissingModal(false); setShowCommercialTerms(false); },style:btnSecondary},"Cancel (discard changes)"),
+          h("button",{onClick:()=>setShowCtMissingModal(false),style:btnPrimary},"Go back and fill them in")
         )
       )
     )
