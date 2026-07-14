@@ -121,18 +121,26 @@ function fmt2(n){ const x=r2(n); return x.toLocaleString("en-IN",{minimumFractio
 // Rate is the per-unit sales price (total sales value across all of this
 // Sl No's BOM lines, divided by its order qty); Total Price is that value
 // back out again (Rate x Qty), shown as an explicit check figure.
-function buildPriceDataSection(currency, orderQty, totalSalesValue){
+function buildPriceDataSection(currency, orderQty, totalSalesValue, conversionRate){
   const cur = currency || "INR";
+  const isInr = cur === "INR";
+  const fx = Number(conversionRate)||1;
   const qty = r2(orderQty)||0;
-  const rate = qty>0 ? r2(totalSalesValue/qty) : r2(totalSalesValue);
-  return {
-    title: "Price Data",
-    rows: [
-      { key:"price-rate", label:"Rate - "+cur, value: fmt2(rate) },
-      { key:"price-qty", label:"Qty", value: fmt2(qty)+" Nos" },
-      { key:"price-total", label:"Total Price - "+cur, value: fmt2(rate*qty) }
-    ]
-  };
+  const rateInr = qty>0 ? r2(totalSalesValue/qty) : r2(totalSalesValue);
+  const rows = [
+    { key:"price-rate-inr", label:"Rate - INR", value: fmt2(rateInr) }
+  ];
+  if(!isInr){
+    const rateFx = fx>0 ? r2(rateInr/fx) : 0;
+    rows.push({ key:"price-rate-fx", label:"Rate - "+cur, value: fmt2(rateFx) });
+  }
+  rows.push({ key:"price-qty", label:"Qty", value: fmt2(qty)+" Nos" });
+  rows.push({ key:"price-total-inr", label:"Total Price - INR", value: fmt2(rateInr*qty) });
+  if(!isInr){
+    const rateFx = fx>0 ? r2(rateInr/fx) : 0;
+    rows.push({ key:"price-total-fx", label:"Total Price - "+cur, value: fmt2(rateFx*qty) });
+  }
+  return { title: "Price Data", rows };
 }
 // Inserts a blank spacer row between every row in an array (not around the
 // whole array) — used to put breathing room between every BOM/datasheet line
@@ -1149,6 +1157,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   const [enquiryNumber,setEnquiryNumber]=useState(""); const [enquiryDate,setEnquiryDate]=useState("");
   const [quoteDate,setQuoteDate]=useState("");
   const [currency,setCurrency]=useState("INR");
+  const [conversionRate,setConversionRate]=useState("1"); // 1 <currency> = ? INR; always 1 when currency is INR
   const [existingQuoteHeader,setExistingQuoteHeader]=useState(null); // header fields + used Sl Nos, once refNumber matches a saved quote
   const [quoteOptions,setQuoteOptions]=useState([]); // distinct saved quotes for the Quote# combo box
   const [quoteDecision,setQuoteDecision]=useState(null); // {ref, rows:[{item_sl_no,model,...}]} — shown when an existing Quote# is picked
@@ -1634,7 +1643,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   const cartTotalCost=useMemo(()=>cart.reduce((s,l)=>s+(l.cost||0),0),[cart]);
   const cartTotalSales=useMemo(()=>cart.reduce((s,l)=>s+(l.sales_price||0),0),[cart]);
 
-  const clearEstimate = ()=>{ if(!confirm("Clear the current estimate and all cart items?")) return; setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setCurrency("INR");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg(""); };
+  const clearEstimate = ()=>{ if(!confirm("Clear the current estimate and all cart items?")) return; setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setCurrency("INR");setConversionRate("1");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg(""); };
 
   // Populate the Quote# combo box with every saved quote + its customer, so the
   // person can either pick an existing one or type a brand new Quote#.
@@ -1651,7 +1660,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   const lookupQuoteHeader = async()=>{
     const ref = refNumber.trim();
     if(!ref){ setExistingQuoteHeader(null); return; }
-    const { data } = await sb.from("estimates").select("item_sl_no,model,enquiry_number,enquiry_date,quote_date,description,currency").eq("reference_number",ref).order("item_sl_no");
+    const { data } = await sb.from("estimates").select("item_sl_no,model,enquiry_number,enquiry_date,quote_date,description,currency,conversion_rate").eq("reference_number",ref).order("item_sl_no");
     if(data && data.length>0){
       setQuoteDecision({ ref, rows: data });
       setSlNoPickerValue(String(data[0].item_sl_no));
@@ -1663,7 +1672,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
   const chooseAddLineItem = ()=>{
     const head = quoteDecision.rows[0];
     setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
-    setCurrency(head.currency||"INR");
+    setCurrency(head.currency||"INR"); setConversionRate(String(head.conversion_rate||1));
     if(!refDesc) setRefDesc(head.description||"");
     setExistingQuoteHeader({ usedSlNos: quoteDecision.rows.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
     setItemSlNo("");
@@ -1707,7 +1716,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
     try {
       const headerModel = (cart[0]&&cart[0].model) || selectedModel || "";
       const {data:existing}=await sb.from("estimates").select("id").eq("reference_number",ref).eq("item_sl_no",slNo).limit(1);
-      const headerPayload={description:refDesc,model:headerModel,enquiry_number:enquiryNumber.trim(),enquiry_date:enquiryDate||null,quote_date:quoteDate||null,currency:currency||"INR",updated_at:new Date().toISOString()};
+      const headerPayload={description:refDesc,model:headerModel,enquiry_number:enquiryNumber.trim(),enquiry_date:enquiryDate||null,quote_date:quoteDate||null,currency:currency||"INR",conversion_rate:(currency==="INR")?1:(Number(conversionRate)||1),updated_at:new Date().toISOString()};
       if(existing&&existing.length>0){
         estimateId=existing[0].id;
         await sb.from("estimates").update(headerPayload).eq("id",estimateId);
@@ -1720,7 +1729,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
       const rows=cart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,show_in_moc:l.show_in_moc===true,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||""}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
       setSaveMsg("Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).");
-      setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setExistingQuoteHeader(null); setShowSave(false);
+      setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setConversionRate("1"); setExistingQuoteHeader(null); setShowSave(false);
     } catch(e){
       // If the lines insert is what failed, don't leave a header behind with
       // no lines under it — that's how "dirty" quotes with no sub-form data
@@ -2096,11 +2105,17 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
             h("input",{type:"date",value:quoteDate,onChange:e=>setQuoteDate(e.target.value),disabled:!!existingQuoteHeader,style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
           ),
           h("div",{style:{width:100}},
-            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Currency"),
-            h("select",{value:currency,onChange:e=>setCurrency(e.target.value),disabled:!!existingQuoteHeader,style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Currency required"),
+            h("select",{value:currency,onChange:e=>{ const v=e.target.value; setCurrency(v); if(v==="INR") setConversionRate("1"); },disabled:!!existingQuoteHeader,style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}},
               h("option",{value:"INR"},"INR"),
-              h("option",{value:"USD"},"USD")
+              h("option",{value:"USD"},"USD"),
+              h("option",{value:"EUR"},"EUR"),
+              h("option",{value:"GBP"},"GBP")
             )
+          ),
+          h("div",{style:{width:140}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}}, currency==="INR" ? "Conversion rate" : ("1 "+currency+" = ? INR")),
+            h("input",{type:"number",step:"0.0001",value:conversionRate,onChange:e=>setConversionRate(e.target.value),disabled:currency==="INR"||!!existingQuoteHeader,placeholder:"e.g. 83.5000",style:{...inputStyle,background:(currency==="INR"||existingQuoteHeader)?"#f4f2ea":"#fff"}})
           ),
           h("div",{style:{flex:2,minWidth:200}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Description (optional)"),
@@ -2332,7 +2347,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       rows.push([]);
     });
     const totalSalesValue = (openLines||[]).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
-    const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue);
+    const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate);
     rows.push([priceSection.title]);
     priceSection.rows.forEach(row=>rows.push([row.label, row.value, "", ""]));
     const ws = XLSX.utils.aoa_to_sheet(rows);
@@ -2380,7 +2395,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       filledRows.forEach(row=>body.push([row.label, row.value]));
     });
     const totalSalesValue = (openLines||[]).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
-    const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue);
+    const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate);
     body.push([{content:priceSection.title, colSpan:2, styles:{fontStyle:"bold", font:"times", fontSize:11}}]);
     priceSection.rows.forEach(row=>body.push([row.label, row.value]));
     doc.autoTable({
@@ -2452,7 +2467,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
         }),
         (()=>{
           const totalSalesValue = (openLines||[]).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
-          const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue);
+          const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate);
           return h("div",{style:{marginBottom:10,border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
             h("div",{style:{background:"#1c8c75",color:"#fff",padding:"6px 14px",fontSize:12,fontWeight:700}},"Price Data"),
             priceSection.rows.map(row=>h("div",{key:row.key,style:{display:"flex",alignItems:"center",gap:8,padding:"6px 14px",fontSize:12.5,borderTop:"1px solid #f0efe8"}},
@@ -3870,7 +3885,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const allSections = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocLines, est.model, est.item_sl_no);
       const sectionsRows = allSections.filter(sec=>sec.rows.some(r=>r.value!==undefined && r.value!==null && String(r.value).trim()!==""));
       const totalSalesValue = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
-      sectionsRows.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue));
+      sectionsRows.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
       list.push({ slNo: est.item_sl_no, model: est.model||"", itemName, sectionsRows });
     }
     list.sort((a,b)=>a.slNo-b.slNo);
@@ -3930,13 +3945,18 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         const est=estimatesRows.find(e=>e.item_sl_no===l.item_sl_no);
         return s+(Number(l.sales_price)||0)*((est&&est.order_qty)||1);
       },0);
+      const quoteCurrency = first.currency||"INR";
+      const quoteIsInr = quoteCurrency==="INR";
+      const quoteFx = Number(first.conversion_rate)||1;
+      const coverLetterBody = [
+        ["Delivery", terms.delivery_term||"—"],
+        ["Validity", terms.validity||"—"],
+        ["Total Basic Price - INR", "INR "+fmt(totalSalesAll)]
+      ];
+      if(!quoteIsInr) coverLetterBody.push(["Total Basic Price - "+quoteCurrency, quoteCurrency+" "+fmt(totalSalesAll/quoteFx)]);
       doc.autoTable({
         startY:y,
-        body:[
-          ["Delivery", terms.delivery_term||"—"],
-          ["Validity", terms.validity||"—"],
-          ["Total Basic Price", (first.currency||"INR")+" "+fmt(totalSalesAll)]
-        ],
+        body: coverLetterBody,
         theme:"grid",
         styles:{font:"times",fontSize:9,textColor:dark,cellPadding:4},
         columnStyles:{0:{cellWidth:45,fontStyle:"bold"},1:{cellWidth:"auto"}},
@@ -3989,16 +4009,31 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const summaryStartPage = doc.internal.getNumberOfPages();
       const summaryRows = estimatesRows.map(est=>{
         const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
-        const unitPrice = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+        const unitPriceInr = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
         const qty = est.order_qty||1;
-        return [est.item_sl_no, modelItemMap.get(est.model)||est.model||"—", est.description||"—", fmt(unitPrice), qty, fmt(unitPrice*qty)];
+        const totalInr = unitPriceInr*qty;
+        const row = [est.item_sl_no, modelItemMap.get(est.model)||est.model||"—", est.description||"—", fmt(unitPriceInr)];
+        if(!quoteIsInr) row.push(fmt(unitPriceInr/quoteFx));
+        row.push(qty, fmt(totalInr));
+        if(!quoteIsInr) row.push(fmt(totalInr/quoteFx));
+        return row;
       });
-      const grandTotal = summaryRows.reduce((s,r)=>s+Number(String(r[5]).replace(/,/g,"")),0);
+      const grandTotalInr = estimatesRows.reduce((s,est)=>{
+        const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+        const unitPriceInr = slLines.reduce((ss,l)=>ss+(Number(l.sales_price)||0),0);
+        return s+unitPriceInr*(est.order_qty||1);
+      },0);
+      const summaryHead = quoteIsInr
+        ? ["S.No","Item","Description","Unit price","Qty","Total"]
+        : ["S.No","Item","Description","Unit price (INR)","Unit price ("+quoteCurrency+")","Qty","Total (INR)","Total ("+quoteCurrency+")"];
+      const summaryFoot = quoteIsInr
+        ? [["","","","","Total Price:", fmt(grandTotalInr)]]
+        : [["","","","","","Total Price:", fmt(grandTotalInr), fmt(grandTotalInr/quoteFx)]];
       doc.autoTable({
         startY:34,
-        head:[["S.No","Item","Description","Unit price","Qty","Total"]],
+        head:[summaryHead],
         body: summaryRows,
-        foot:[["","","","","Total Price:", fmt(grandTotal)]],
+        foot: summaryFoot,
         theme:"grid",
         headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8,font:"times"},
         footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.5,font:"times"},
