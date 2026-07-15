@@ -6883,6 +6883,8 @@ function DescriptionMasterEditor({ user, initialItem, onClose }){
   const [loading,setLoading] = useState(false);
   const [saving,setSaving] = useState(false);
   const [existingRowId,setExistingRowId] = useState(null);
+  const [bomComponents,setBomComponents] = useState([]); // distinct Component values from this item's actual BOM
+  const [bomSubAssemblies,setBomSubAssemblies] = useState([]); // distinct Sub Assembly values from this item's actual BOM
 
   useEffect(()=>{
     (async()=>{
@@ -6891,14 +6893,24 @@ function DescriptionMasterEditor({ user, initialItem, onClose }){
     })();
   },[]);
 
+  const loadBomValues = useCallback(async(item)=>{
+    if(!item){ setBomComponents([]); setBomSubAssemblies([]); return; }
+    const { data } = await sb.from("bom").select("component,sub_assembly").eq("item",item);
+    setBomComponents(Array.from(new Set((data||[]).map(r=>r.component).filter(Boolean))).sort());
+    setBomSubAssemblies(Array.from(new Set((data||[]).map(r=>r.sub_assembly).filter(Boolean))).sort());
+  },[]);
+
   const loadForItem = useCallback(async(item)=>{
     if(!item){ setParameters([]); setExistingRowId(null); return; }
     setLoading(true);
-    const { data } = await sb.from("description_master").select("*").eq("item",item).maybeSingle();
+    const [{ data }] = await Promise.all([
+      sb.from("description_master").select("*").eq("item",item).maybeSingle(),
+      loadBomValues(item)
+    ]);
     setParameters(data?data.parameters||[]:[]);
     setExistingRowId(data?data.id:null);
     setLoading(false);
-  },[]);
+  },[loadBomValues]);
   useEffect(()=>{ if(initialItem) loadForItem(initialItem); },[initialItem, loadForItem]);
 
   const addParam = ()=> setParameters(p=>[...p,{label:"",match_field:"component",match_value:"",value_source:"grade"}]);
@@ -6946,8 +6958,14 @@ function DescriptionMasterEditor({ user, initialItem, onClose }){
         h("tbody",null,
           parameters.map((p,idx)=>h("tr",{key:idx,style:{borderTop:"1px solid #eceae0"}},
             h("td",{style:{padding:"6px 9px"}},h("input",{value:p.label,onChange:e=>updateParam(idx,{label:e.target.value}),placeholder:"e.g. Flanges",style:{...inputStyle,padding:"5px 7px",fontSize:12}})),
-            h("td",{style:{padding:"6px 9px"}},h("select",{value:p.match_field,onChange:e=>updateParam(idx,{match_field:e.target.value}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:"component"},"Component"),h("option",{value:"sub_assembly"},"Sub Assembly"))),
-            h("td",{style:{padding:"6px 9px"}},h("input",{value:p.match_value,onChange:e=>updateParam(idx,{match_value:e.target.value}),placeholder:"e.g. Flange",style:{...inputStyle,padding:"5px 7px",fontSize:12}})),
+            h("td",{style:{padding:"6px 9px"}},h("select",{value:p.match_field,onChange:e=>updateParam(idx,{match_field:e.target.value,match_value:""}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:"component"},"Component"),h("option",{value:"sub_assembly"},"Sub Assembly"))),
+            h("td",{style:{padding:"6px 9px"}},
+              h("select",{value:p.match_value,onChange:e=>updateParam(idx,{match_value:e.target.value}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},
+                h("option",{value:""},"Select…"),
+                (p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents).map(v=>h("option",{key:v,value:v},v))
+              ),
+              (p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents).length===0 && h("div",{style:{fontSize:9.5,color:colors.danger,marginTop:2}},"No "+(p.match_field==="sub_assembly"?"Sub Assembly":"Component")+" values found in this item's BOM.")
+            ),
             h("td",{style:{padding:"6px 9px"}},
               h("label",{style:{marginRight:10,fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="grade",onChange:()=>updateParam(idx,{value_source:"grade"}),style:{marginRight:4}}),"Grade"),
               h("label",{style:{fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="spec",onChange:()=>updateParam(idx,{value_source:"spec"}),style:{marginRight:4}}),"Spec")
