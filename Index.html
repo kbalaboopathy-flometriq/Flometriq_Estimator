@@ -636,6 +636,7 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports_activity",label:"Activity by User"},
         {key:"reports_quotes",label:"Quotes"},
         {key:"reports_item_coverage",label:"Item Coverage"},
+        {key:"reports_quote_status",label:"Quotes by Status"},
       ]},
       ...(isAdmin?[{ label:"Admin only", tabs:[
         {key:"reports_masters",label:"Material Rates"},
@@ -3532,6 +3533,31 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [authGate,setAuthGate]=useState(null); // {requiredType, action} — shared by every gated save/delete in this screen
   const [editingDescSlNo,setEditingDescSlNo]=useState(false);
   const [descDraft,setDescDraft]=useState("");
+  const [descMasterRowForItem,setDescMasterRowForItem]=useState(null); // the description_master row for openRef's item, or null if none
+  useEffect(()=>{
+    (async()=>{
+      const item = openLines[0]?.item || "";
+      if(!item){ setDescMasterRowForItem(null); return; }
+      const { data } = await sb.from("description_master").select("*").eq("item",item).maybeSingle();
+      setDescMasterRowForItem(data||null);
+    })();
+  },[openLines]);
+  const rebuildDescriptionFromBom = ()=>{
+    if(!descMasterRowForItem) return;
+    if(!confirm("This replaces the current description with the auto-generated one built from this item's Description Master rule. This can't be undone. Continue?")) return;
+    const doRebuild = async()=>{
+      const item = openLines[0]?.item || "";
+      const size = openLines[0]?.size || "";
+      const built = buildAutoDescription(descMasterRowForItem, openLines, item, size);
+      if(!built){ alert("Couldn't build a description from the current BOM lines."); return; }
+      await sb.from("estimates").update({description:built}).eq("id",openRef.id);
+      setOpenRef(r=>({...r,description:built}));
+      setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:built}:r));
+      refreshReadiness(refFilter);
+    };
+    if(isQuoteLocked(openRef.quote_status,user)){ setAuthGate({requiredType:"edit",action:doRebuild}); return; }
+    doRebuild();
+  };
   const quoteAnyNonDraft = ()=> refs.some(r=>r.reference_number===refFilter && r.quote_status && r.quote_status!=="Draft");
   const doSaveQuoteHeader = async()=>{
     if(!refFilter) return;
@@ -5198,31 +5224,35 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
               h("div",null,
                 h("h3",{style:{margin:0}},openRef.reference_number+"  ·  Sl No "+openRef.item_sl_no),
-                !editingDescSlNo
-                  ? h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
-                      openRef.description
-                        ? h("div",{style:{fontSize:12,color:colors.muted}},openRef.description)
-                        : h("div",{style:{fontSize:11.5,color:colors.danger}},"Description is missing for this Sl No — required for the quote to be \"ready to go\"."),
-                      h("button",{onClick:()=>{ setDescDraft(openRef.description||""); setEditingDescSlNo(true); },style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Edit")
+                h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
+                  openRef.description
+                    ? h("div",{style:{fontSize:12,color:colors.muted}},openRef.description)
+                    : h("div",{style:{fontSize:11.5,color:colors.danger}},"Description is missing for this Sl No — required for the quote to be \"ready to go\"."),
+                  h("button",{onClick:()=>{ setDescDraft(openRef.description||""); setEditingDescSlNo(true); },style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Edit"),
+                  descMasterRowForItem && h("button",{onClick:rebuildDescriptionFromBom,style:{...btnSmall,fontSize:10.5,padding:"3px 9px",color:"#8a6d1f",borderColor:colors.accent}},"Rebuilt From BOM")
+                ),
+                editingDescSlNo && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1260,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+                  h("div",{style:{background:"#fff",borderRadius:12,padding:"24px 28px",width:600,maxWidth:"92vw"}},
+                    h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Edit Description — "+openRef.reference_number+" · Sl No "+openRef.item_sl_no),
+                    h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:14}},"Plenty of room to actually read and edit the full text."),
+                    h("textarea",{value:descDraft,onChange:e=>setDescDraft(e.target.value),rows:6,style:{...inputStyle,fontSize:14,lineHeight:1.6,resize:"vertical",fontFamily:"inherit",padding:"12px 14px"}}),
+                    h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
+                      h("button",{onClick:()=>setEditingDescSlNo(false),style:btnSecondary},"Cancel"),
+                      h("button",{onClick:()=>{
+                        if(!descDraft.trim()){ alert("Description is required."); return; }
+                        const doSave = async()=>{
+                          await sb.from("estimates").update({description:descDraft.trim()}).eq("id",openRef.id);
+                          setOpenRef(r=>({...r,description:descDraft.trim()}));
+                          setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:descDraft.trim()}:r));
+                          refreshReadiness(refFilter);
+                          setEditingDescSlNo(false);
+                        };
+                        if(isQuoteLocked(openRef.quote_status,user)){ setAuthGate({requiredType:"edit",action:doSave}); return; }
+                        doSave();
+                      },style:btnPrimary},"Save")
                     )
-                  : h("div",{style:{marginTop:4,background:"#faf8f0",border:"1px solid "+colors.accent,borderRadius:6,padding:"8px 10px"}},
-                      h("textarea",{value:descDraft,onChange:e=>setDescDraft(e.target.value),rows:2,style:{...inputStyle,fontSize:12,resize:"vertical",fontFamily:"inherit",marginBottom:6}}),
-                      h("div",{style:{display:"flex",gap:6}},
-                        h("button",{onClick:()=>{
-                          if(!descDraft.trim()){ alert("Description is required."); return; }
-                          const doSave = async()=>{
-                            await sb.from("estimates").update({description:descDraft.trim()}).eq("id",openRef.id);
-                            setOpenRef(r=>({...r,description:descDraft.trim()}));
-                            setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:descDraft.trim()}:r));
-                            refreshReadiness(refFilter);
-                            setEditingDescSlNo(false);
-                          };
-                          if(isQuoteLocked(openRef.quote_status,user)){ setAuthGate({requiredType:"edit",action:doSave}); return; }
-                          doSave();
-                        },style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Save"),
-                        h("button",{onClick:()=>setEditingDescSlNo(false),style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Cancel")
-                      )
-                    ),
+                  )
+                ),
                 h("div",{style:{display:"flex",flexWrap:"wrap",gap:12,marginTop:4}},
                   h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry#: "+(openRef.enquiry_number||"—")),
                   h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry date: "+(openRef.enquiry_date||"—")),
@@ -7662,6 +7692,110 @@ function ItemCoverageReport(){
   );
 }
 
+function QuoteStatusReport(){
+  const [statuses,setStatuses] = useState([]);
+  const [selectedStatus,setSelectedStatus] = useState("Draft");
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(false);
+
+  useEffect(()=>{
+    (async()=>{
+      const { data } = await sb.from("quote_status_tbl").select("status").order("status");
+      setStatuses((data||[]).map(r=>r.status).filter(Boolean));
+    })();
+  },[]);
+
+  const load = useCallback(async(status)=>{
+    setLoading(true);
+    const { data: estimatesRows } = await sb.from("estimates").select("*").eq("quote_status",status).order("reference_number");
+    const refNums = Array.from(new Set((estimatesRows||[]).map(r=>r.reference_number)));
+    const { data: linesRows } = refNums.length
+      ? await sb.from("estimate_lines").select("reference_number,item_sl_no,sales_price").in("reference_number",refNums)
+      : { data: [] };
+    const out = (estimatesRows||[]).map(est=>{
+      // Total Value is always INR — sales_price is stored in INR regardless
+      // of the quote's display currency, so no conversion happens here.
+      const totalValue = (linesRows||[])
+        .filter(l=>l.reference_number===est.reference_number && l.item_sl_no===est.item_sl_no)
+        .reduce((s,l)=>s+(Number(l.sales_price)||0)*(est.order_qty||1),0);
+      return {
+        reference_number: est.reference_number, item_sl_no: est.item_sl_no,
+        customer_name: est.customer_name||"—", description: est.description||"—",
+        quote_date: est.quote_date||"—", totalValue
+      };
+    });
+    setRows(out);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(selectedStatus); },[]);
+
+  const downloadExcel = ()=>{
+    const data = rows.map(r=>({"Quote#":r.reference_number,"Sl No":r.item_sl_no,Customer:r.customer_name,Description:r.description,"Quote date":r.quote_date,"Total Value (INR)":fmtR(r.totalValue)}));
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,selectedStatus);
+    XLSX.writeFile(wb,"Quotes_"+selectedStatus.replace(/\s+/g,"_")+".xlsx");
+  };
+  const downloadPdf = ()=>{
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
+    doc.setFontSize(13); doc.text("Quotes — Status: "+selectedStatus,12,14);
+    const grandTotal = rows.reduce((s,r)=>s+r.totalValue,0);
+    doc.autoTable({
+      startY:20,
+      head:[["Quote#","Sl No","Customer","Description","Quote date","Total Value (INR)"]],
+      body: rows.map(r=>[r.reference_number,r.item_sl_no,r.customer_name,r.description,r.quote_date,"INR "+fmtR(r.totalValue)]),
+      foot:[["","","","","Grand Total","INR "+fmtR(grandTotal)]],
+      styles:{fontSize:8},
+      headStyles:{fillColor:[28,31,26]}
+    });
+    doc.save("Quotes_"+selectedStatus.replace(/\s+/g,"_")+".pdf");
+  };
+
+  const grandTotal = rows.reduce((s,r)=>s+r.totalValue,0);
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:960}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:4}},"Quotes by Status"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Defaults to Draft — pick any status to see matching Sl Nos. Total Value is always shown in INR, regardless of the quote's display currency."),
+    h("div",{style:{display:"flex",gap:10,alignItems:"center",marginBottom:14,flexWrap:"wrap"}},
+      h("select",{value:selectedStatus,onChange:e=>{ setSelectedStatus(e.target.value); },style:{...inputStyle,width:180}},
+        statuses.map(s=>h("option",{key:s,value:s},s))
+      ),
+      h("button",{onClick:()=>load(selectedStatus),style:btnSecondary},"Apply"),
+      h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
+        h("button",{onClick:downloadExcel,disabled:rows.length===0,style:btnSecondary},"Download Excel"),
+        h("button",{onClick:downloadPdf,disabled:rows.length===0,style:btnSecondary},"Download PDF")
+      )
+    ),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+      h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Quote#"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Sl No"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Customer"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Description"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Quote date"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5,textAlign:"right"}},"Total Value (INR)")
+      )),
+      h("tbody",null,
+        rows.map((r,i)=>h("tr",{key:i,style:{borderTop:"1px solid #eceae0"}},
+          h("td",{style:{padding:"7px 9px",fontWeight:600}},r.reference_number),
+          h("td",{style:{padding:"7px 9px"}},r.item_sl_no),
+          h("td",{style:{padding:"7px 9px"}},r.customer_name),
+          h("td",{style:{padding:"7px 9px",color:colors.muted}},r.description),
+          h("td",{style:{padding:"7px 9px"}},r.quote_date),
+          h("td",{style:{padding:"7px 9px",textAlign:"right"}},"INR "+fmtR(r.totalValue))
+        )),
+        rows.length===0 && h("tr",null,h("td",{colSpan:6,style:{padding:14,fontSize:12,color:colors.mutedLight}},"No Sl Nos with this status.")),
+        rows.length>0 && h("tr",{style:{borderTop:"2px solid "+colors.dark,fontWeight:700}},
+          h("td",{colSpan:5,style:{padding:"8px 9px",textAlign:"right"}},"Grand Total"),
+          h("td",{style:{padding:"8px 9px",textAlign:"right"}},"INR "+fmtR(grandTotal))
+        )
+      )
+    )
+  );
+}
+
 function DeletionCodesScreen({ user }){
   const [codes,setCodes]=useState([]); const [loading,setLoading]=useState(true);
   const [generating,setGenerating]=useState(false); const [justGenerated,setJustGenerated]=useState(null);
@@ -9132,6 +9266,7 @@ function App() {
     tab==="reports_missing_rates"?h(MissingRatesReport,{user}):
     tab==="reports_audit"?h(MastersAuditReport,{user}):
     tab==="reports_item_coverage"?h(ItemCoverageReport,null):
+    tab==="reports_quote_status"?h(QuoteStatusReport,null):
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="authorization_codes"?h(AuthorizationCodesScreen,{user}):
     tab==="delete_activity_report"?h(DeleteActivityReportScreen,{user}):
