@@ -2278,20 +2278,20 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
           ),
           h("div",{style:{flex:1,minWidth:180}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Customer"),
-            h("input",{list:"customer-name-list",value:customerName,onChange:e=>{ setCustomerName(e.target.value); applyCustomerMatch(e.target.value); },placeholder:"Type or pick a company…",style:inputStyle}),
+            h("input",{list:"customer-name-list",value:customerName,disabled:!!existingQuoteHeader,onChange:e=>{ setCustomerName(e.target.value); applyCustomerMatch(e.target.value); },placeholder:"Type or pick a company…",style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}}),
             h("datalist",{id:"customer-name-list"},customerOptions.slice().sort((a,b)=>a.company_name.localeCompare(b.company_name)).map(c=>h("option",{key:c.company_name,value:c.company_name})))
           ),
           h("div",{style:{flex:1,minWidth:180}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Address"),
-            h("input",{value:customerAddress,onChange:e=>setCustomerAddress(e.target.value),placeholder:"Auto-fills from Customer, editable",style:inputStyle})
+            h("input",{value:customerAddress,disabled:!!existingQuoteHeader,onChange:e=>setCustomerAddress(e.target.value),placeholder:"Auto-fills from Customer, editable",style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
           ),
           h("div",{style:{width:170}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Attention — Contact"),
-            h("input",{value:contactName,onChange:e=>setContactName(e.target.value),placeholder:"Contact name",style:inputStyle})
+            h("input",{value:contactName,disabled:!!existingQuoteHeader,onChange:e=>setContactName(e.target.value),placeholder:"Contact name",style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
           ),
           h("div",{style:{width:150}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Attention — Designation"),
-            h("input",{value:contactDesignation,onChange:e=>setContactDesignation(e.target.value),placeholder:"Designation",style:inputStyle})
+            h("input",{value:contactDesignation,disabled:!!existingQuoteHeader,onChange:e=>setContactDesignation(e.target.value),placeholder:"Designation",style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
           ),
           h("div",{style:{flex:2,minWidth:200}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Description (optional)"),
@@ -3261,6 +3261,65 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [lineEdits,setLineEdits]=useState({}); // {refNum-slNo: {field:value}} — pending unsaved edits
   const [savingLine,setSavingLine]=useState({}); // {refNum-slNo: true} — saving in progress
   const [quoteExportRef,setQuoteExportRef]=useState(""); const [exportingQuote,setExportingQuote]=useState("");
+  const [headerEditOpen,setHeaderEditOpen]=useState(false);
+  const [headerDraft,setHeaderDraft]=useState({});
+  const [savingHeader,setSavingHeader]=useState(false);
+  const [headerCustomerOptions,setHeaderCustomerOptions]=useState([]);
+  useEffect(()=>{
+    (async()=>{
+      const { data: cos } = await sb.from("companies").select("company_name,billing_city,billing_country");
+      const { data: cts } = await sb.from("contacts").select("company_name,contact_name,designation,is_primary");
+      const byCompany = new Map();
+      (cos||[]).forEach(c=>byCompany.set(c.company_name,{...c,contacts:[]}));
+      (cts||[]).forEach(ct=>{ const e=byCompany.get(ct.company_name); if(e) e.contacts.push(ct); });
+      setHeaderCustomerOptions(Array.from(byCompany.values()));
+    })();
+  },[]);
+  // The row currently backing the shared quote-level fields — any Sl No under
+  // this Quote# works, they're kept identical across all of them.
+  const quoteHeaderRow = useMemo(()=> refs.find(r=>r.reference_number===refFilter) || null, [refs,refFilter]);
+  const openHeaderEdit = ()=>{
+    if(!quoteHeaderRow) return;
+    setHeaderDraft({
+      enquiry_number: quoteHeaderRow.enquiry_number||"", enquiry_date: quoteHeaderRow.enquiry_date||"",
+      quote_date: quoteHeaderRow.quote_date||"", currency: quoteHeaderRow.currency||"INR",
+      conversion_rate: String(quoteHeaderRow.conversion_rate||1),
+      customer_name: quoteHeaderRow.customer_name||"", customer_address: quoteHeaderRow.customer_address||"",
+      contact_name: quoteHeaderRow.contact_name||"", contact_designation: quoteHeaderRow.contact_designation||""
+    });
+    setHeaderEditOpen(true);
+  };
+  const applyHeaderCustomerMatch = (name)=>{
+    const match = headerCustomerOptions.find(c=>c.company_name.toLowerCase()===name.trim().toLowerCase());
+    if(!match) return;
+    const primary = match.contacts.find(ct=>ct.is_primary==="Yes") || match.contacts[0];
+    setHeaderDraft(d=>({...d,
+      customer_address:[match.billing_city,match.billing_country].filter(Boolean).join(", "),
+      contact_name: primary?primary.contact_name||"":d.contact_name,
+      contact_designation: primary?primary.designation||"":d.contact_designation
+    }));
+  };
+  const saveQuoteHeader = async()=>{
+    if(!refFilter) return;
+    setSavingHeader(true);
+    try{
+      const payload = {
+        enquiry_number: headerDraft.enquiry_number.trim(), enquiry_date: headerDraft.enquiry_date||null,
+        quote_date: headerDraft.quote_date||null, currency: headerDraft.currency||"INR",
+        conversion_rate: headerDraft.currency==="INR"?1:(Number(headerDraft.conversion_rate)||1),
+        customer_name: headerDraft.customer_name.trim(), customer_address: headerDraft.customer_address.trim(),
+        contact_name: headerDraft.contact_name.trim(), contact_designation: headerDraft.contact_designation.trim(),
+        updated_at: new Date().toISOString()
+      };
+      const { error } = await sb.from("estimates").update(payload).eq("reference_number",refFilter);
+      if(error) throw error;
+      await logAudit("UPDATE","estimates",refFilter,"Quote header fields updated for "+refFilter+" (applied to all Sl Nos)",user?.username||"unknown",null,payload);
+      setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,...payload}:r));
+      if(openRef && openRef.reference_number===refFilter) setOpenRef(r=>({...r,...payload}));
+      setHeaderEditOpen(false);
+    } catch(e){ alert("Save failed: "+(e.message||e)); }
+    finally{ setSavingHeader(false); }
+  };
   const [includeSalesPrice,setIncludeSalesPrice]=useState(true);
   const [quoteCuttingPlanIncludeCost,setQuoteCuttingPlanIncludeCostState]=useState(getCuttingPlanIncludeCostPref);
   const setQuoteCuttingPlanIncludeCost=(v)=>{ setQuoteCuttingPlanIncludeCostState(v); setCuttingPlanIncludeCostPref(v); };
@@ -4652,6 +4711,50 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           ),
           isAdmin && refFilter && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete entire quote")
         )
+      ),
+      refFilter && quoteHeaderRow && h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+          h("div",{style:{fontSize:12.5,fontWeight:700}},"Quote Header — "+refFilter),
+          !headerEditOpen && h("button",{onClick:openHeaderEdit,style:btnSmall},"Edit")
+        ),
+        h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:10}},"Shared across all Sl Nos in this quote — saving here updates every one at once."),
+        !headerEditOpen
+          ? h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"4px 20px",fontSize:12}},
+              h("div",null,h("span",{style:{color:colors.muted}},"Enquiry number: "),h("span",{style:!quoteHeaderRow.enquiry_number?{color:colors.danger}:{}},quoteHeaderRow.enquiry_number||"— not set")),
+              h("div",null,h("span",{style:{color:colors.muted}},"Enquiry date: "),quoteHeaderRow.enquiry_date||"—"),
+              h("div",null,h("span",{style:{color:colors.muted}},"Quote date: "),quoteHeaderRow.quote_date||"—"),
+              h("div",null,h("span",{style:{color:colors.muted}},"Currency: "),quoteHeaderRow.currency||"INR"),
+              h("div",null,h("span",{style:{color:colors.muted}},"Conversion rate: "),quoteHeaderRow.conversion_rate||1),
+              h("div",null,h("span",{style:{color:colors.muted}},"Customer: "),h("span",{style:!quoteHeaderRow.customer_name?{color:colors.danger}:{}},quoteHeaderRow.customer_name||"— not set")),
+              h("div",null,h("span",{style:{color:colors.muted}},"Address: "),h("span",{style:!quoteHeaderRow.customer_address?{color:colors.danger}:{}},quoteHeaderRow.customer_address||"— not set")),
+              h("div",null,h("span",{style:{color:colors.muted}},"Attention: "),h("span",{style:!quoteHeaderRow.contact_name?{color:colors.danger}:{}},quoteHeaderRow.contact_name?(quoteHeaderRow.contact_name+(quoteHeaderRow.contact_designation?", "+quoteHeaderRow.contact_designation:"")):"— not set"))
+            )
+          : h("div",null,
+              h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}},
+                h("div",{style:{width:150}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Enquiry number"),h("input",{value:headerDraft.enquiry_number,onChange:e=>setHeaderDraft(d=>({...d,enquiry_number:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
+                h("div",{style:{width:130}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Enquiry date"),h("input",{type:"date",value:headerDraft.enquiry_date,onChange:e=>setHeaderDraft(d=>({...d,enquiry_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
+                h("div",{style:{width:130}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Quote date"),h("input",{type:"date",value:headerDraft.quote_date,onChange:e=>setHeaderDraft(d=>({...d,quote_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
+                h("div",{style:{width:90}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Currency"),
+                  h("select",{value:headerDraft.currency,onChange:e=>{ const v=e.target.value; setHeaderDraft(d=>({...d,currency:v,conversion_rate:v==="INR"?"1":d.conversion_rate})); },style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+                    h("option",{value:"INR"},"INR"),h("option",{value:"USD"},"USD"),h("option",{value:"EUR"},"EUR"),h("option",{value:"AED"},"AED")
+                  )
+                ),
+                h("div",{style:{width:110}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},headerDraft.currency==="INR"?"Conversion rate":("1 "+headerDraft.currency+" = ? INR")),h("input",{type:"number",step:"0.0001",value:headerDraft.conversion_rate,disabled:headerDraft.currency==="INR",onChange:e=>setHeaderDraft(d=>({...d,conversion_rate:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12,background:headerDraft.currency==="INR"?"#f4f2ea":"#fff"}}))
+              ),
+              h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}},
+                h("div",{style:{width:180,position:"relative"}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Customer"),
+                  h("input",{list:"header-customer-list",value:headerDraft.customer_name,onChange:e=>{ setHeaderDraft(d=>({...d,customer_name:e.target.value})); applyHeaderCustomerMatch(e.target.value); },placeholder:"Type or pick a company…",style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+                  h("datalist",{id:"header-customer-list"},headerCustomerOptions.slice().sort((a,b)=>a.company_name.localeCompare(b.company_name)).map(c=>h("option",{key:c.company_name,value:c.company_name})))
+                ),
+                h("div",{style:{width:180}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Address"),h("input",{value:headerDraft.customer_address,onChange:e=>setHeaderDraft(d=>({...d,customer_address:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
+                h("div",{style:{width:140}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Attention — Contact"),h("input",{value:headerDraft.contact_name,onChange:e=>setHeaderDraft(d=>({...d,contact_name:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
+                h("div",{style:{width:130}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Attention — Designation"),h("input",{value:headerDraft.contact_designation,onChange:e=>setHeaderDraft(d=>({...d,contact_designation:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}}))
+              ),
+              h("div",{style:{display:"flex",gap:8}},
+                h("button",{onClick:saveQuoteHeader,disabled:savingHeader,style:{...btnPrimary,fontSize:12}},savingHeader?"Saving…":"Save (applies to all Sl Nos)"),
+                h("button",{onClick:()=>setHeaderEditOpen(false),style:{...btnSecondary,fontSize:12}},"Cancel")
+              )
+            )
       ),
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
         h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},"Export full quote"),
