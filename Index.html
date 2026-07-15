@@ -474,7 +474,7 @@ function LoginScreen({ onLogin }) {
         status: success?"success":"failed"
       });
       if(!success) { setError("Incorrect username or password."); setLoading(false); return; }
-      onLogin({ username:data[0].username, role:data[0].role });
+      onLogin({ username:data[0].username, role:data[0].role, company_id:data[0].company_id||null });
     } catch(e2) { setError("Cannot reach database."); } finally { setLoading(false); }
   };
   return h("div",{style:{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}},
@@ -496,8 +496,48 @@ function LoginScreen({ onLogin }) {
   );
 }
 
+// Super Admin may issue quotes under different companies depending on
+// context, so unlike regular users (whose company is fixed by Super Admin
+// in User Management), they pick which one applies for this session right
+// after logging in — switchable again later from the top bar.
+function CompanySessionPicker({ onPicked }){
+  const [companies,setCompanies] = useState([]);
+  const [value,setValue] = useState("");
+  const [loading,setLoading] = useState(true);
+  useEffect(()=>{
+    (async()=>{
+      const { data } = await sb.from("company_master").select("id,company_name").order("company_name");
+      setCompanies(data||[]);
+      setLoading(false);
+    })();
+  },[]);
+  return h("div",{style:{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}},
+    h("div",{style:{width:360,maxWidth:"90vw",padding:"2rem 1.75rem",background:colors.panel,border:"1px solid "+colors.border,borderRadius:10}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Which company for this session?"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"You're a Super Admin — this decides which company appears on any quote you create until you switch it again."),
+      loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+      companies.length===0?h("div",{style:{fontSize:12,color:colors.danger}},"No companies set up yet. Add one in Master Data → Company Master first."):
+      h(React.Fragment,null,
+        h("select",{value,onChange:e=>setValue(e.target.value),style:{...inputStyle,marginBottom:14}},
+          h("option",{value:""},"Select…"),
+          companies.map(c=>h("option",{key:c.id,value:c.id},c.company_name))
+        ),
+        h("button",{onClick:()=>{ if(!value){ alert("Pick a company first."); return; } onPicked(Number(value)); },style:{...btnPrimary,width:"100%"}},"Continue")
+      )
+    )
+  );
+}
+
 /* ---- TOP BAR ---- */
-function TopBar({ user, onLogout }) {
+function TopBar({ user, sessionCompanyId, onChangeCompany, onLogout }) {
+  const [sessionCompanyName,setSessionCompanyName] = useState("");
+  useEffect(()=>{
+    if(!sessionCompanyId){ setSessionCompanyName(""); return; }
+    (async()=>{
+      const { data } = await sb.from("company_master").select("company_name").eq("id",sessionCompanyId).maybeSingle();
+      setSessionCompanyName(data?data.company_name:"");
+    })();
+  },[sessionCompanyId]);
   return h("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 20px",background:colors.dark,color:"#fff"}},
     h("div",{style:{display:"flex",alignItems:"center",gap:14}},
       h("img",{src:COMPANY_LOGO,alt:"Flometriq",style:{height:36,width:"auto",objectFit:"contain",borderRadius:3}}),
@@ -507,6 +547,10 @@ function TopBar({ user, onLogout }) {
       )
     ),
     h("div",{className:"topbar-user",style:{display:"flex",alignItems:"center",gap:14}},
+      onChangeCompany && h("div",{style:{display:"flex",alignItems:"center",gap:6}},
+        h("span",{style:{fontSize:11,color:"#9a9d8f"}},"Session company: "+(sessionCompanyName||"—")),
+        h("button",{onClick:onChangeCompany,style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"4px 9px",fontSize:11,cursor:"pointer",borderRadius:6}},"Switch")
+      ),
       h("span",{style:{fontSize:12,color:"#9a9d8f"}},user.username+" ("+user.role+")"),
       h("button",{onClick:onLogout,style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 12px",fontSize:12,cursor:"pointer",borderRadius:6}},"Sign out")
     )
@@ -555,6 +599,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Commercial terms", tabs: byKeys(ctKeys) },
       { label:"Customers", tabs:[{key:"customers",label:"Customers"},{key:"customer_bulk_upload",label:"Customer Bulk Upload"}] },
       { label:"Engineering", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"}] },
+      { label:"Company", tabs:[{key:"company_master",label:"Company Master"}] },
     ]});
     groups.push({ label:"Admin", subgroups:[
       { label:"Access control", tabs:[
@@ -1104,13 +1149,20 @@ function MasterEditor({ tableKey, user }) {
 }
 
 /* ---- USERS ---- */
-function UsersEditor() {
+function UsersEditor({ user }) {
+  const isSuperAdmin = user?.role==="super_admin";
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
   const [adding,setAdding]=useState(false); const [draft,setDraft]=useState({username:"",password:"",role:"user"});
+  const [companies,setCompanies]=useState([]);
   const load = useCallback(async()=>{ setLoading(true); const {data}=await sb.from("app_users").select("*").order("id"); setRows(data||[]); setLoading(false); },[]);
   useEffect(()=>{load();},[load]);
+  useEffect(()=>{ (async()=>{ const {data}=await sb.from("company_master").select("id,company_name").order("company_name"); setCompanies(data||[]); })(); },[]);
   const addUser=async()=>{ if(!draft.username.trim()||!draft.password.trim()){alert("Username and password required.");return;} const{error:err}=await sb.from("app_users").insert({username:draft.username.trim(),password:draft.password,role:draft.role}); if(err){alert("Failed: "+err.message);return;} setAdding(false);setDraft({username:"",password:"",role:"user"});load(); };
   const deleteUser=async(id,username)=>{ if(username==="Babu"){alert("Cannot delete primary admin.");return;} if(!confirm("Delete user "+username+"?"))return; await sb.from("app_users").delete().eq("id",id); load(); };
+  const setUserCompany=async(id,companyId)=>{
+    await sb.from("app_users").update({company_id:companyId?Number(companyId):null}).eq("id",id);
+    setRows(rs=>rs.map(r=>r.id===id?{...r,company_id:companyId?Number(companyId):null}:r));
+  };
   return h("div",{style:{padding:"20px 24px"}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
       h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Users"),
@@ -1123,10 +1175,23 @@ function UsersEditor() {
       h("button",{onClick:addUser,style:btnSecondary},"Save"),h("button",{onClick:()=>setAdding(false),style:btnSecondary},"Cancel")
     ),
     loading?h("div",{style:{color:colors.mutedLight}},"Loading…"):
-    h("table",{style:{fontSize:13,maxWidth:500}},
-      h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left"}},h("th",{style:{padding:"8px 10px"}},"Username"),h("th",{style:{padding:"8px 10px"}},"Role"),h("th",{style:{padding:"8px 10px"}},""  ))),
-      h("tbody",null,rows.map(r=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},h("td",{style:{padding:"8px 10px"}},r.username),h("td",{style:{padding:"8px 10px"}},r.role),h("td",{style:{padding:"8px 10px"}},h("button",{onClick:()=>deleteUser(r.id,r.username),style:btnDanger},"Delete")))))
-    )
+    h("table",{style:{fontSize:13,maxWidth:650}},
+      h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left"}},h("th",{style:{padding:"8px 10px"}},"Username"),h("th",{style:{padding:"8px 10px"}},"Role"),h("th",{style:{padding:"8px 10px"}},"Company (used on their PDFs)"),h("th",{style:{padding:"8px 10px"}},""  ))),
+      h("tbody",null,rows.map(r=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
+        h("td",{style:{padding:"8px 10px"}},r.username),
+        h("td",{style:{padding:"8px 10px"}},r.role),
+        h("td",{style:{padding:"8px 10px"}},
+          isSuperAdmin
+            ? h("select",{value:r.company_id||"",onChange:e=>setUserCompany(r.id,e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12}},
+                h("option",{value:""},"— none —"),
+                companies.map(c=>h("option",{key:c.id,value:c.id},c.company_name))
+              )
+            : h("span",{style:{fontSize:12,color:colors.muted}},(companies.find(c=>c.id===r.company_id)||{}).company_name || "— none —")
+        ),
+        h("td",{style:{padding:"8px 10px"}},h("button",{onClick:()=>deleteUser(r.id,r.username),style:btnDanger},"Delete"))
+      )))
+    ),
+    !isSuperAdmin && h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:10}},"Only a Super Admin can change which company is assigned to a user.")
   );
 }
 
@@ -1163,7 +1228,7 @@ async function loadMasterData(setMasterData) {
 }
 
 /* ---- ESTIMATOR ---- */
-function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
+function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote }) {
   const { models, gradesBySpec, rateBySpecGrade, allSpecs, uoms, allComponents, subAssembliesByComponent, loadingMaster } = masterData;
   const [modelFilter,setModelFilter]=useState(""); const [selectedModel,setSelectedModel]=useState(null);
   const [lines,setLines]=useState([]); const [overrides,setOverrides]=useState({});
@@ -1788,7 +1853,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
     // means adding a brand-new Sl No alongside it, or overwriting one that's
     // already there. A fresh Quote# (no siblings at all) needs no prompt.
     setSavingRef(true);
-    const { data: siblingRows } = await sb.from("estimates").select("item_sl_no").eq("reference_number",ref);
+    const { data: siblingRows } = await sb.from("estimates").select("item_sl_no,company_id").eq("reference_number",ref);
     if(siblingRows && siblingRows.length>0){
       const usedSlNos = siblingRows.map(r=>r.item_sl_no);
       const isOverwrite = usedSlNos.includes(slNo);
@@ -1797,6 +1862,13 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
         : "Quote# \""+ref+"\" already exists. This will add a new line item as Sl No "+slNo+" alongside its existing Sl No(s) ("+usedSlNos.join(", ")+"). Proceed?";
       if(!confirm(msg)) { setSavingRef(false); return; }
     }
+    // Which company this quote is issued under is resolved once, at the
+    // moment the Quote# is FIRST created, and never changes afterward —
+    // even if a different Super Admin later edits or re-saves it. If the
+    // quote already exists, reuse whatever its siblings already have.
+    const resolvedCompanyId = (siblingRows && siblingRows.length>0)
+      ? (siblingRows.find(r=>r.company_id)||{}).company_id || null
+      : (user.role==="super_admin" ? sessionCompanyId : (user.company_id||null));
     let estimateId, createdNewHeader=false;
     try {
       const headerModel = (cart[0]&&cart[0].model) || selectedModel || "";
@@ -1807,7 +1879,7 @@ function Estimator({ user, masterData, onRefresh, onOpenQuote }) {
         await sb.from("estimates").update(headerPayload).eq("id",estimateId);
         await sb.from("estimate_lines").delete().eq("reference_number",ref).eq("item_sl_no",slNo);
       } else {
-        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,created_by:user.username}).select().single();
+        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,company_id:resolvedCompanyId,created_by:user.username}).select().single();
         if(err) throw err;
         estimateId=created.id; createdNewHeader=true;
       }
@@ -3333,6 +3405,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const [savingLine,setSavingLine]=useState({}); // {refNum-slNo: true} — saving in progress
   const [quoteExportRef,setQuoteExportRef]=useState(""); const [exportingQuote,setExportingQuote]=useState("");
   const [headerEditOpen,setHeaderEditOpen]=useState(false);
+  const [historyOpen,setHistoryOpen]=useState(false);
   const [headerDraft,setHeaderDraft]=useState({});
   const [savingHeader,setSavingHeader]=useState(false);
   // The row currently backing the shared quote-level fields — any Sl No under
@@ -4286,6 +4359,17 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const forceMaj = terms.force_majeure || CT_DEFAULTS.force_majeure;
       const cancelCharges = terms.order_cancellation_charges || CT_DEFAULTS.order_cancellation_charges;
       const first = estimatesRows[0];
+      if(!first.company_id){
+        alert("Can't generate PDF — this quote has no Company resolved.\n\nIt was created by \""+(first.created_by||"unknown")+"\", whose account has no Company assigned. Ask your Super Admin to assign one in Admin \u2192 User Management (or, if the creator is a Super Admin, they need to pick a company at login) before this PDF can be generated.");
+        return;
+      }
+      const { data: issuingCompany } = await sb.from("company_master").select("*").eq("id",first.company_id).maybeSingle();
+      if(!issuingCompany){
+        alert("Can't generate PDF — the company this quote is linked to no longer exists in Company Master.");
+        return;
+      }
+      const issuingAddress = [issuingCompany.street,issuingCompany.city,issuingCompany.state,issuingCompany.pin,issuingCompany.country].filter(Boolean).join(", ");
+      const issuingContactLine = [issuingCompany.website,issuingCompany.email].filter(Boolean).join("   |   ");
       const customerName = first.customer_name || quoteExportRef;
       const customerAddress = first.customer_address || "";
       const attnName = first.contact_name || "";
@@ -4299,12 +4383,12 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const dark=[28,31,26]; const neutral=[244,242,234];
 
       const letterhead = (title)=>{
-        try{ doc.addImage(COMPANY_LOGO,"PNG",10,4,36,18); }catch(e){}
+        try{ doc.addImage(issuingCompany.logo_data||COMPANY_LOGO,"PNG",10,4,36,18); }catch(e){}
         doc.setFontSize(10); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
-        doc.text(COMPANY_NAME,W-14,8,{align:"right"});
+        doc.text(issuingCompany.company_name||COMPANY_NAME,W-14,8,{align:"right"});
         doc.setFontSize(7); doc.setFont(undefined,"normal"); doc.setTextColor(100,100,100);
-        doc.text(COMPANY_ADDRESS,W-14,13,{align:"right"});
-        doc.text(COMPANY_WEBSITE+"   |   "+COMPANY_EMAIL,W-14,17.5,{align:"right"});
+        doc.text(issuingAddress||COMPANY_ADDRESS,W-14,13,{align:"right"});
+        doc.text(issuingContactLine||(COMPANY_WEBSITE+"   |   "+COMPANY_EMAIL),W-14,17.5,{align:"right"});
         doc.setFontSize(9); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
         doc.text(title,W-14,23,{align:"right"});
         doc.setDrawColor(200,197,185); doc.setLineWidth(0.4);
@@ -4363,7 +4447,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const closeY = Math.max(doc.lastAutoTable.finalY+16, H-45);
       doc.setFont(undefined,"normal"); doc.text("Thanking You,",12,closeY); 
       doc.text("Yours Truly,",12,closeY+6);
-      doc.setFont(undefined,"bold"); doc.text(COMPANY_NAME,12,closeY+12);
+      doc.setFont(undefined,"bold"); doc.text(issuingCompany.company_name||COMPANY_NAME,12,closeY+12);
       // Extra gap here on purpose — room for a physical signature/stamp
       // before the printed name, instead of the raw login username.
       doc.setFont(undefined,"normal");
@@ -4787,6 +4871,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
             h("input",{type:"number",step:"0.1",value:globalSfInput,onChange:e=>setGlobalSfInput(e.target.value),placeholder:"New Sf",style:{...inputStyle,width:80}}),
             h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf to all lines")
           ),
+          refFilter && h("button",{onClick:()=>setHistoryOpen(true),style:btnSmall},"History"),
           isAdmin && refFilter && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete entire quote")
         )
       ),
@@ -5312,6 +5397,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       )
     ),
     showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>setShowDatasheet(false) }),
+    historyOpen && refFilter && h(QuoteHistoryPanel,{ referenceNumber:refFilter, onClose:()=>setHistoryOpen(false) }),
     showDeleteQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Delete entire quote "+refFilter+"?"),
@@ -6407,6 +6493,96 @@ function VersionHistoryScreen(){
   );
 }
 
+function CompanyMasterEditor({ user }){
+  const [companies,setCompanies] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [editing,setEditing] = useState(null); // null | "new" | company obj
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("company_master").select("*").order("company_name");
+    setCompanies(data||[]);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+  return h("div",{style:{padding:"20px 24px",maxWidth:820}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
+      h("div",{style:{fontWeight:700,fontSize:16}},"Company Master"),
+      h("button",{onClick:()=>setEditing("new"),style:btnPrimary},"+ Add company")
+    ),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Each company here can be assigned to a user (Admin → User Management) or picked by a Super Admin at login. Whichever company a quote's creator resolves to is what appears on that quote's generated PDF."),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    h("table",{style:{width:"100%",fontSize:12.5,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+      h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+        h("th",{style:{padding:"8px 10px",fontSize:10.5,color:colors.muted}},"Logo"),
+        h("th",{style:{padding:"8px 10px",fontSize:10.5,color:colors.muted}},"Company name"),
+        h("th",{style:{padding:"8px 10px",fontSize:10.5,color:colors.muted}},"City"),
+        h("th",{style:{padding:"8px 10px",fontSize:10.5,color:colors.muted}},"")
+      )),
+      h("tbody",null,
+        companies.map(c=>h("tr",{key:c.id,style:{borderTop:"1px solid #eceae0"}},
+          h("td",{style:{padding:"8px 10px"}},c.logo_data?h("img",{src:c.logo_data,style:{height:22,width:"auto",objectFit:"contain"}}):h("span",{style:{color:colors.mutedLight,fontSize:10.5}},"no logo")),
+          h("td",{style:{padding:"8px 10px",fontWeight:600}},c.company_name),
+          h("td",{style:{padding:"8px 10px"}},c.city||"—"),
+          h("td",{style:{padding:"8px 10px"}},h("button",{onClick:()=>setEditing(c),style:btnSmall},"Edit"))
+        )),
+        companies.length===0 && h("tr",null,h("td",{colSpan:4,style:{padding:14,fontSize:12,color:colors.mutedLight}},"No companies yet — add one to get started."))
+      )
+    ),
+    editing && h(CompanyMasterForm,{initial:editing==="new"?null:editing,user,onCancel:()=>setEditing(null),onSaved:async()=>{ setEditing(null); await load(); }})
+  );
+}
+
+function CompanyMasterForm({ initial, onCancel, onSaved, user }){
+  const [f,setF] = useState(initial || {company_name:"",street:"",city:"",state:"",pin:"",country:"",website:"",email:"",phone:"",logo_data:""});
+  const [saving,setSaving] = useState(false);
+  const handleLogoFile = (e)=>{
+    const file = e.target.files && e.target.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = ()=> setF(d=>({...d,logo_data:reader.result}));
+    reader.readAsDataURL(file);
+  };
+  const save = async()=>{
+    if(!f.company_name.trim()){ alert("Company name is required."); return; }
+    setSaving(true);
+    try{
+      if(f.id){
+        const {id,...rest} = f;
+        await sb.from("company_master").update(rest).eq("id",id);
+      } else {
+        await sb.from("company_master").insert({...f,created_by:user?.username||"unknown"});
+      }
+      onSaved();
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally{ setSaving(false); }
+  };
+  const fld = (key,label)=>h("div",{style:{marginBottom:10}},
+    h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},label),
+    h("input",{value:f[key]||"",onChange:e=>setF(d=>({...d,[key]:e.target.value})),style:{...inputStyle,padding:"8px 10px"}})
+  );
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.35)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"22px 26px",width:460,maxWidth:"100%",maxHeight:"88vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:14}},initial?"Edit company":"Add company"),
+      h("div",{style:{display:"flex",gap:14,alignItems:"center",marginBottom:14}},
+        f.logo_data?h("img",{src:f.logo_data,style:{height:36,width:"auto",objectFit:"contain",border:"1px solid "+colors.border,borderRadius:4,padding:4}}):h("div",{style:{fontSize:11,color:colors.mutedLight}},"No logo yet"),
+        h("label",{style:{...btnSecondary,cursor:"pointer",display:"inline-block"}},"Upload logo",h("input",{type:"file",accept:"image/*",onChange:handleLogoFile,style:{display:"none"}}))
+      ),
+      fld("company_name","Company name"),
+      h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 12px"}},
+        fld("website","Website"), fld("email","Email"), fld("phone","Phone")
+      ),
+      h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,margin:"6px 0"}},"ADDRESS"),
+      h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 12px"}},
+        fld("street","Street"), fld("city","City"), fld("state","State"), fld("pin","PIN / Zip"), fld("country","Country")
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:10}},
+        h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save")
+      )
+    )
+  );
+}
+
 function UserManualScreen(){
   const [activeKey,setActiveKey] = useState(MANUAL_SECTIONS[0].articles[0].key);
   const [search,setSearch] = useState("");
@@ -7019,6 +7195,47 @@ function LoginHistoryViewer() {
 }
 
 /* ---- AUDIT LOG VIEWER ---- */
+// Per-quote History — reuses the same audit_log table every save/export
+// already writes to (record_id = reference_number), so no new logging was
+// needed, just a filtered view of what's already there.
+function QuoteHistoryPanel({ referenceNumber, onClose }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  useEffect(()=>{
+    (async()=>{
+      setLoading(true);
+      const { data } = await sb.from("audit_log").select("*").eq("record_id",referenceNumber).order("performed_at",{ascending:false});
+      setRows(data||[]);
+      setLoading(false);
+    })();
+  },[referenceNumber]);
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.35)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:640,maxWidth:"100%",maxHeight:"80vh",overflowY:"auto"}},
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+        h("div",{style:{fontWeight:700,fontSize:15}},"History — "+referenceNumber),
+        h("button",{onClick:onClose,style:btnSecondary},"Close")
+      ),
+      h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:14}},"Every create, edit, and PDF/export action logged against this quote, most recent first."),
+      loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+      rows.length===0?h("div",{style:{fontSize:12,color:colors.mutedLight}},"No history recorded yet for this quote."):
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse"}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"When"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Action"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"By"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Details")
+        )),
+        h("tbody",null,rows.map((r,i)=>h("tr",{key:i,style:{borderTop:"1px solid #eceae0"}},
+          h("td",{style:{padding:"7px 9px",whiteSpace:"nowrap",verticalAlign:"top"}},new Date(r.performed_at).toLocaleString()),
+          h("td",{style:{padding:"7px 9px",verticalAlign:"top"}},h("span",{style:{fontSize:10.5,fontWeight:600,padding:"2px 7px",borderRadius:8,background:r.action==="EXPORT"?"#e1f5ee":r.action==="SAVE"||r.action==="INSERT"?"#eaf3fc":r.action==="DELETE"?"#fdecea":"#faf6ea",color:r.action==="EXPORT"?"#085041":r.action==="SAVE"||r.action==="INSERT"?"#0b4c8c":r.action==="DELETE"?"#a3312a":"#8a6d1f"}},r.action)),
+          h("td",{style:{padding:"7px 9px",verticalAlign:"top",fontWeight:600}},r.performed_by||"—"),
+          h("td",{style:{padding:"7px 9px",verticalAlign:"top",color:colors.muted}},r.record_summary||"—")
+        )))
+      )
+    )
+  );
+}
+
 function AuditLogViewer() {
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
   const [filter,setFilter]=useState(""); const [actionFilter,setActionFilter]=useState("");
@@ -8231,6 +8448,7 @@ function MastersAuditReport({ user }){
 
 function App() {
   const [user,setUser]=useState(null); const [tab,setTab]=useState("estimator");
+  const [sessionCompanyId,setSessionCompanyId]=useState(null); // Super Admin's chosen company for this session
   const [masterData,setMasterData]=useState({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],uoms:[],allComponents:[],subAssembliesByComponent:new Map(),loadingMaster:true});
   const [quoteToOpen,setQuoteToOpen]=useState(null); // {reference_number,item_sl_no} bridge from Estimator's save popup to Quotes
 
@@ -8238,11 +8456,12 @@ function App() {
   const refresh=useCallback(()=>{ setMasterData(m=>({...m,loadingMaster:true})); loadMasterData(setMasterData); },[]);
 
   if(!user) return h(LoginScreen,{onLogin:setUser});
+  if(user.role==="super_admin" && !sessionCompanyId) return h(CompanySessionPicker,{onPicked:setSessionCompanyId});
 
   return h("div",{style:{minHeight:"100vh"}},
-    h(TopBar,{user,onLogout:()=>{setUser(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
+    h(TopBar,{user,sessionCompanyId,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyId(null)):null,onLogout:()=>{setUser(null);setSessionCompanyId(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
     h(MenuTabs,{user,active:tab,onChange:setTab}),
-    h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}})),
+    h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}})),
     tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null)}):
     tab==="reports"?h(ReportsScreen,{user}):
     tab==="reports_activity"?h(ActivityByUserReport,{user}):
@@ -8261,6 +8480,7 @@ function App() {
     tab==="version_history"?h(VersionHistoryScreen,null):
     tab==="allowable_stress"?h(AllowableStressEditor,null):
     tab==="datasheet_master"?h(DatasheetMasterEditor,{onGoToTab:setTab}):
+    tab==="company_master"?h(CompanyMasterEditor,{user}):
     tab==="users"?h(UsersEditor,{user}):
     tab==="permissions"?h(PermissionsEditor,null):
     tab==="login_history"?h(LoginHistoryViewer,null):
