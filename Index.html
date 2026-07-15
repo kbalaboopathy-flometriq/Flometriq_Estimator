@@ -635,6 +635,7 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports",label:"BOM Coverage"},
         {key:"reports_activity",label:"Activity by User"},
         {key:"reports_quotes",label:"Quotes"},
+        {key:"reports_item_coverage",label:"Item Coverage"},
       ]},
       ...(isAdmin?[{ label:"Admin only", tabs:[
         {key:"reports_masters",label:"Material Rates"},
@@ -648,7 +649,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"BOM setup", tabs:[{key:"bom_form",label:"BOM Entry Form"}, ...byKeys(bomSetupKeys)] },
       { label:"Commercial terms", tabs: byKeys(ctKeys) },
       { label:"Customers", tabs:[{key:"customers",label:"Customers"},{key:"customer_bulk_upload",label:"Customer Bulk Upload"}] },
-      { label:"Engineering", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"}] },
+      { label:"Engineering", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"},{key:"description_master",label:"Description Master"}] },
       { label:"Company", tabs:[{key:"company_master",label:"Company Master"}] },
     ]});
     groups.push({ label:"Admin", subgroups:[
@@ -656,10 +657,12 @@ function MenuTabs({ user, active, onChange }) {
         {key:"users",label:"Users"},
         {key:"permissions",label:"Permissions"},
         ...(isSuperAdmin?[{key:"deletion_codes",label:"Deletion Codes"}]:[]),
+        {key:"authorization_codes",label:"Authorization Codes"},
       ]},
       { label:"Logs", tabs:[
         {key:"login_history",label:"Login History"},
         {key:"audit_log",label:"Audit Log"},
+        ...(isSuperAdmin?[{key:"delete_activity_report",label:"Delete Activity Report"}]:[]),
       ]},
     ]});
   }
@@ -1208,7 +1211,7 @@ function UsersEditor({ user }) {
   useEffect(()=>{load();},[load]);
   useEffect(()=>{ (async()=>{ const {data}=await sb.from("company_master").select("id,company_name").order("company_name"); setCompanies(data||[]); })(); },[]);
   const addUser=async()=>{ if(!draft.username.trim()||!draft.password.trim()){alert("Username and password required.");return;} const{error:err}=await sb.from("app_users").insert({username:draft.username.trim(),password:draft.password,role:draft.role}); if(err){alert("Failed: "+err.message);return;} setAdding(false);setDraft({username:"",password:"",role:"user"});load(); };
-  const deleteUser=async(id,username)=>{ if(username==="Babu"){alert("Cannot delete primary admin.");return;} if(!confirm("Delete user "+username+"?"))return; await sb.from("app_users").delete().eq("id",id); load(); };
+  const deleteUser=async(id,username)=>{ if(username==="Babu"){alert("Cannot delete primary admin.");return;} if(!confirm("Delete user "+username+"?"))return; await sb.from("app_users").delete().eq("id",id); await logAudit("DELETE","app_users",String(id),"Deleted user \""+username+"\"",user?.username||"unknown",{username},null); load(); };
   const setUserCompany=async(id,companyId)=>{
     await sb.from("app_users").update({company_id:companyId?Number(companyId):null}).eq("id",id);
     setRows(rs=>rs.map(r=>r.id===id?{...r,company_id:companyId?Number(companyId):null}:r));
@@ -1286,6 +1289,9 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
   const [cart,setCart]=useState([]); const [showSave,setShowSave]=useState(false);
   const [saveMaximised,setSaveMaximised]=useState(false);
   const [refNumber,setRefNumber]=useState(""); const [refDesc,setRefDesc]=useState("");
+  const [descMasterPrompt,setDescMasterPrompt]=useState(null); // item name once we've decided to prompt for it
+  const [descMasterBuilderItem,setDescMasterBuilderItem]=useState(null); // item name while the inline builder modal is open
+  const [descMasterDismissedItems,setDescMasterDismissedItems]=useState(new Set()); // don't re-prompt for the same item twice in one session
   const [customerName,setCustomerName]=useState(""); const [customerAddress,setCustomerAddress]=useState("");
   const [contactName,setContactName]=useState(""); const [contactDesignation,setContactDesignation]=useState("");
   const [signatoryName,setSignatoryName]=useState(""); const [signatoryDesignation,setSignatoryDesignation]=useState("");
@@ -1500,6 +1506,22 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
   const total=useMemo(()=>computedLines.reduce((s,l)=>s+(l.cost||0),0),[computedLines]);
   const totalSalesPrice=useMemo(()=>computedLines.reduce((s,l)=>s+(l.salesPrice||0),0),[computedLines]);
   const pendingCount=computedLines.filter(l=>l.hasSpec&&!l.selGrade&&overrides[l.id]?.rate===undefined).length;
+  const isAdminOrSuper = user.role==="admin" || user.role==="super_admin";
+  useEffect(()=>{
+    if(!lines.length || refDesc.trim()) return; // don't run with nothing to build from, and never clobber a description the user already has
+    const itemName = lines[0]?.item || "";
+    const sizeText = lines[0]?.size || "";
+    if(!itemName) return;
+    (async()=>{
+      const { data } = await sb.from("description_master").select("*").eq("item",itemName).maybeSingle();
+      if(data){
+        const built = buildAutoDescription(data, computedLines, itemName, sizeText);
+        if(built) setRefDesc(built);
+      } else if(isAdminOrSuper && !descMasterDismissedItems.has(itemName)){
+        setDescMasterPrompt(itemName);
+      }
+    })();
+  },[lines]);
   const [showSummary,setShowSummary]=useState(false);
   const [showCuttingPlan,setShowCuttingPlan]=useState(false);
   const [detailWithCuttingPlan,setDetailWithCuttingPlan]=useState(true);
@@ -2328,6 +2350,30 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
         )
       )
     ),
+
+    // Description Master — missing-rule prompt (Admin/Super Admin only)
+    descMasterPrompt && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.35)",zIndex:1250,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 24px",width:420,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},"No Description Master for \""+descMasterPrompt+"\" yet"),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:16,lineHeight:1.6}},"You can build a rule now so this fills in automatically every time this item is used, or skip and type it manually just for this quote."),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:()=>{ setDescMasterBuilderItem(descMasterPrompt); setDescMasterPrompt(null); },style:btnPrimary},"Build it now"),
+          h("button",{onClick:()=>{ setDescMasterDismissedItems(s=>new Set([...s,descMasterPrompt])); setDescMasterPrompt(null); },style:btnSecondary},"No, I'll type it manually")
+        )
+      )
+    ),
+    descMasterBuilderItem && h(DescriptionMasterEditor,{user,initialItem:descMasterBuilderItem,onClose:()=>{
+      // After building the rule, try auto-filling right away using it.
+      (async()=>{
+        const item = descMasterBuilderItem;
+        setDescMasterBuilderItem(null);
+        const { data } = await sb.from("description_master").select("*").eq("item",item).maybeSingle();
+        if(data && !refDesc.trim()){
+          const built = buildAutoDescription(data, computedLines, item, lines[0]?.size||"");
+          if(built) setRefDesc(built);
+        }
+      })();
+    }}),
 
     // Save Estimate Popup Modal
     showSave&&h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
@@ -3483,7 +3529,11 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     });
     setHeaderEditOpen(true);
   };
-  const saveQuoteHeader = async()=>{
+  const [authGate,setAuthGate]=useState(null); // {requiredType, action} — shared by every gated save/delete in this screen
+  const [editingDescSlNo,setEditingDescSlNo]=useState(false);
+  const [descDraft,setDescDraft]=useState("");
+  const quoteAnyNonDraft = ()=> refs.some(r=>r.reference_number===refFilter && r.quote_status && r.quote_status!=="Draft");
+  const doSaveQuoteHeader = async()=>{
     if(!refFilter) return;
     setSavingHeader(true);
     try{
@@ -3504,6 +3554,10 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       setHeaderEditOpen(false);
     } catch(e){ alert("Save failed: "+(e.message||e)); }
     finally{ setSavingHeader(false); }
+  };
+  const saveQuoteHeader = ()=>{
+    if(isQuoteLocked(quoteAnyNonDraft()?"Locked":"Draft",user)){ setAuthGate({requiredType:"edit",action:doSaveQuoteHeader}); return; }
+    doSaveQuoteHeader();
   };
   const [includeSalesPrice,setIncludeSalesPrice]=useState(true);
   const [quoteCuttingPlanIncludeCost,setQuoteCuttingPlanIncludeCostState]=useState(getCuttingPlanIncludeCostPref);
@@ -3746,6 +3800,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
 
   const openEstimate=async(ref)=>{
     setOpenRef(ref); setLoadingLines(true); setOrderQty(ref.order_qty||1); setLineEdits({}); setSavingLine({});
+    setEditingDescSlNo(false);
     const{data}=await sb.from("estimate_lines").select("*").eq("reference_number",ref.reference_number).eq("item_sl_no",ref.item_sl_no).order("sl_no");
     setOpenLines(data||[]); setLoadingLines(false);
     // Header Model: the estimates row is the authoritative "main form" value.
@@ -3858,10 +3913,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
 
   // Delete one whole Sl No (a card in the left list = one line item of a quote):
   // removes the estimates row and every estimate_lines row under it.
-  const deleteSlNo=async(ref)=>{
-    if(!isAdmin){ alert("Only Admins can delete quotes."); return; }
-    const ok=confirm("Delete "+ref.reference_number+" \u00b7 Sl No "+ref.item_sl_no+(ref.model?" (\u201c"+ref.model+"\u201d)":"")+"?\n\nThis removes this Sl No and all of its BOM lines. This cannot be undone.");
-    if(!ok) return;
+  const doDeleteSlNo=async(ref)=>{
     setDeletingSlNo(ref.id);
     try {
       const{data:linesData}=await sb.from("estimate_lines").select("*").eq("reference_number",ref.reference_number).eq("item_sl_no",ref.item_sl_no);
@@ -3873,6 +3925,18 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     } catch(e){ console.error("Delete Sl No failed",e); alert("Delete failed: "+e.message); }
     finally { setDeletingSlNo(null); }
   };
+  const deleteSlNo=async(ref)=>{
+    if(!isAdmin){ alert("Only Admins can delete quotes."); return; }
+    const ok=confirm("Delete "+ref.reference_number+" \u00b7 Sl No "+ref.item_sl_no+(ref.model?" (\u201c"+ref.model+"\u201d)":"")+"?\n\nThis removes this Sl No and all of its BOM lines. This cannot be undone.");
+    if(!ok) return;
+    // Once a Sl No isn't Draft, deleting it needs a Super-Admin-issued delete
+    // code — being an Admin alone is no longer enough (stricter than edits).
+    if(ref.quote_status && ref.quote_status!=="Draft" && user.role!=="super_admin"){
+      setAuthGate({requiredType:"delete",action:()=>doDeleteSlNo(ref)});
+      return;
+    }
+    doDeleteSlNo(ref);
+  };
 
   // Delete an entire quote (every Sl No under a Quote# and all their BOM lines).
   // Gated behind Admin+ and a typed confirmation of the Quote# since it's the
@@ -3882,8 +3946,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     if(!refFilter) return;
     setDeleteQuoteConfirmText(""); setShowDeleteQuoteModal(true);
   };
-  const confirmDeleteQuote=async()=>{
-    if(deleteQuoteConfirmText.trim()!==refFilter) return;
+  const doConfirmDeleteQuote=async()=>{
     setDeletingQuote(true);
     try {
       const{data:linesData}=await sb.from("estimate_lines").select("*").eq("reference_number",refFilter);
@@ -3896,6 +3959,16 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       setShowDeleteQuoteModal(false); setRefFilter(""); setSlNoFilter("");
     } catch(e){ console.error("Delete quote failed",e); alert("Delete failed: "+e.message); }
     finally { setDeletingQuote(false); }
+  };
+  const confirmDeleteQuote=async()=>{
+    if(deleteQuoteConfirmText.trim()!==refFilter) return;
+    // Once any Sl No under this quote isn't Draft, the whole-quote delete
+    // needs a Super-Admin-issued delete code too.
+    if(quoteAnyNonDraft() && user.role!=="super_admin"){
+      setAuthGate({requiredType:"delete",action:doConfirmDeleteQuote});
+      return;
+    }
+    doConfirmDeleteQuote();
   };
 
   const [orderQty,setOrderQty]=useState(1);
@@ -5091,19 +5164,30 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
               h("div",null,
                 h("h3",{style:{margin:0}},openRef.reference_number+"  ·  Sl No "+openRef.item_sl_no),
-                openRef.description
-                  ? h("div",{style:{fontSize:12,color:colors.muted}},openRef.description)
-                  : h("div",{style:{marginTop:4,background:"#fdeee9",border:"1px solid #f0b8b8",borderRadius:6,padding:"6px 10px",display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
-                      h("span",{style:{fontSize:11.5,color:colors.danger}},"Description is missing for this Sl No — required for the quote to be \"ready to go\"."),
-                      h("input",{id:"retroDescInput",placeholder:"Enter description…",style:{...inputStyle,padding:"4px 7px",fontSize:11.5,width:220}}),
-                      h("button",{onClick:async()=>{
-                        const val=(document.getElementById("retroDescInput")||{}).value||"";
-                        if(!val.trim()){ alert("Enter a description first."); return; }
-                        await sb.from("estimates").update({description:val.trim()}).eq("id",openRef.id);
-                        setOpenRef(r=>({...r,description:val.trim()}));
-                        setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:val.trim()}:r));
-                        refreshReadiness(refFilter);
-                      },style:{...btnSmall,fontSize:11,padding:"4px 9px"}},"Save")
+                !editingDescSlNo
+                  ? h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
+                      openRef.description
+                        ? h("div",{style:{fontSize:12,color:colors.muted}},openRef.description)
+                        : h("div",{style:{fontSize:11.5,color:colors.danger}},"Description is missing for this Sl No — required for the quote to be \"ready to go\"."),
+                      h("button",{onClick:()=>{ setDescDraft(openRef.description||""); setEditingDescSlNo(true); },style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Edit")
+                    )
+                  : h("div",{style:{marginTop:4,background:"#faf8f0",border:"1px solid "+colors.accent,borderRadius:6,padding:"8px 10px"}},
+                      h("textarea",{value:descDraft,onChange:e=>setDescDraft(e.target.value),rows:2,style:{...inputStyle,fontSize:12,resize:"vertical",fontFamily:"inherit",marginBottom:6}}),
+                      h("div",{style:{display:"flex",gap:6}},
+                        h("button",{onClick:()=>{
+                          if(!descDraft.trim()){ alert("Description is required."); return; }
+                          const doSave = async()=>{
+                            await sb.from("estimates").update({description:descDraft.trim()}).eq("id",openRef.id);
+                            setOpenRef(r=>({...r,description:descDraft.trim()}));
+                            setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:descDraft.trim()}:r));
+                            refreshReadiness(refFilter);
+                            setEditingDescSlNo(false);
+                          };
+                          if(isQuoteLocked(openRef.quote_status,user)){ setAuthGate({requiredType:"edit",action:doSave}); return; }
+                          doSave();
+                        },style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Save"),
+                        h("button",{onClick:()=>setEditingDescSlNo(false),style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Cancel")
+                      )
                     ),
                 h("div",{style:{display:"flex",flexWrap:"wrap",gap:12,marginTop:4}},
                   h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry#: "+(openRef.enquiry_number||"—")),
@@ -5478,6 +5562,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     ),
     showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>setShowDatasheet(false) }),
     historyOpen && refFilter && h(QuoteHistoryPanel,{ referenceNumber:refFilter, onClose:()=>setHistoryOpen(false) }),
+    authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action }),
     showDeleteQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Delete entire quote "+refFilter+"?"),
@@ -5601,6 +5686,65 @@ async function verifyAndConsumeDeletionCode(code, username){
   if(new Date(row.expires_at) < new Date()) return { ok:false, reason:"That code has expired." };
   await sb.from("deletion_codes").update({ used:true, used_by:username, used_at:new Date().toISOString() }).eq("id",row.id);
   return { ok:true };
+}
+
+// Non-Draft quotes: editing anything (except BOM line items themselves)
+// requires a one-time code from an Admin/Super Admin — Admins/Super Admins
+// themselves save straight through with no code. Deleting anything on a
+// non-Draft quote is stricter — requires a 'delete' code, generated only by
+// a Super Admin. requiredType 'edit' accepts either 'edit' or 'delete' codes
+// (a Super Admin's stricter code can also authorize an edit); requiredType
+// 'delete' requires 'delete' specifically.
+async function verifyAndConsumeAuthCode(code, username, requiredType){
+  const trimmed = (code||"").trim();
+  if(!trimmed) return { ok:false, reason:"Enter the code." };
+  const { data, error } = await sb.from("authorization_codes").select("*").eq("code",trimmed).eq("used",false).limit(1);
+  if(error) return { ok:false, reason:"Could not verify code." };
+  if(!data || data.length===0) return { ok:false, reason:"Invalid or already-used code." };
+  const row = data[0];
+  if(row.expires_at && new Date(row.expires_at) < new Date()) return { ok:false, reason:"That code has expired." };
+  if(requiredType==="delete" && row.code_type!=="delete") return { ok:false, reason:"This action needs a Super Admin delete code, not an edit code." };
+  await sb.from("authorization_codes").update({ used:true, used_by:username, used_at:new Date().toISOString() }).eq("id",row.id);
+  return { ok:true };
+}
+// A field is locked once its quote's Sl No isn't "Draft" — except the
+// person editing is themselves an Admin/Super Admin, who can always save
+// directly with no code.
+function isQuoteLocked(quoteStatus, user){
+  if(user && (user.role==="admin" || user.role==="super_admin")) return false;
+  return !!quoteStatus && quoteStatus!=="Draft";
+}
+// Shared modal: prompts for a code, verifies it, and only then runs the
+// caller's actual save/delete. Used everywhere a non-Draft edit/delete needs
+// gating, so the rule and its wording stay consistent across the app.
+function AuthCodeGate({ requiredType, onClose, onAuthorized, user }){
+  const [code,setCode] = useState("");
+  const [busy,setBusy] = useState(false);
+  const [err,setErr] = useState("");
+  const submit = async()=>{
+    setBusy(true); setErr("");
+    const result = await verifyAndConsumeAuthCode(code, user?.username||"unknown", requiredType);
+    if(!result.ok){ setErr(result.reason); setBusy(false); return; }
+    setBusy(false);
+    onClose();
+    await onAuthorized();
+  };
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.4)",zIndex:1300,display:"flex",alignItems:"center",justifyContent:"center"}},
+    h("div",{style:{background:"#fff",borderRadius:10,padding:"22px 26px",width:380,maxWidth:"92vw"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},"Authorization required"),
+      h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14,lineHeight:1.6}},
+        requiredType==="delete"
+          ? "This quote is no longer Draft. Deleting anything on it needs a one-time code from a Super Admin specifically."
+          : "This quote is no longer Draft. Ask an Admin or Super Admin for a one-time code to save this change."
+      ),
+      h("input",{value:code,onChange:e=>setCode(e.target.value),placeholder:"Enter authorization code",style:{...inputStyle,marginBottom:8}}),
+      err && h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},err),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
+        h("button",{onClick:submit,disabled:busy,style:{...btnPrimary,opacity:busy?0.6:1}},busy?"Checking…":"Confirm")
+      )
+    )
+  );
 }
 
 // Bulk upload / periodic refresh for Companies + Contacts, from a two-sheet
@@ -5742,6 +5886,7 @@ function CustomersScreen({ user }){
   const removeContact = async(contact)=>{
     if(!confirm("Remove "+contact.contact_name+" from "+selected.company_name+"?")) return;
     await sb.from("contacts").delete().eq("id",contact.id);
+    await logAudit("DELETE","contacts",String(contact.id),"Removed "+contact.contact_name+" from "+selected.company_name,user?.username||"unknown",contact,null);
     loadContacts(selected.company_name);
   };
 
@@ -6663,6 +6808,118 @@ function CompanyMasterForm({ initial, onCancel, onSaved, user }){
   );
 }
 
+function DescriptionMasterEditor({ user, initialItem, onClose }){
+  const [itemMasterList,setItemMasterList] = useState([]);
+  const [selectedItem,setSelectedItem] = useState(initialItem||"");
+  const [parameters,setParameters] = useState([]); // [{label, match_field, match_value, value_source}]
+  const [loading,setLoading] = useState(false);
+  const [saving,setSaving] = useState(false);
+  const [existingRowId,setExistingRowId] = useState(null);
+
+  useEffect(()=>{
+    (async()=>{
+      const { data } = await sb.from("item_tbl").select("item").order("item");
+      setItemMasterList((data||[]).map(r=>r.item));
+    })();
+  },[]);
+
+  const loadForItem = useCallback(async(item)=>{
+    if(!item){ setParameters([]); setExistingRowId(null); return; }
+    setLoading(true);
+    const { data } = await sb.from("description_master").select("*").eq("item",item).maybeSingle();
+    setParameters(data?data.parameters||[]:[]);
+    setExistingRowId(data?data.id:null);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ if(initialItem) loadForItem(initialItem); },[initialItem, loadForItem]);
+
+  const addParam = ()=> setParameters(p=>[...p,{label:"",match_field:"component",match_value:"",value_source:"grade"}]);
+  const updateParam = (idx,patch)=> setParameters(p=>p.map((row,i)=>i===idx?{...row,...patch}:row));
+  const removeParam = (idx)=> setParameters(p=>p.filter((_,i)=>i!==idx));
+
+  const save = async()=>{
+    if(!selectedItem){ alert("Pick an item first."); return; }
+    if(parameters.some(p=>!p.label.trim()||!p.match_value.trim())){ alert("Every parameter needs a label and a matched component/sub-assembly value."); return; }
+    setSaving(true);
+    try{
+      const payload = { item:selectedItem, parameters, updated_at:new Date().toISOString() };
+      if(existingRowId){
+        await sb.from("description_master").update(payload).eq("id",existingRowId);
+      } else {
+        const { data } = await sb.from("description_master").insert({...payload,created_by:user?.username||"unknown"}).select().single();
+        setExistingRowId(data.id);
+      }
+      alert("Saved.");
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally{ setSaving(false); }
+  };
+
+  const content = h("div",{style:{padding:onClose?"22px 26px":"20px 24px",maxWidth:900}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+      h("div",{style:{fontWeight:700,fontSize:16}},"Description Master"),
+      onClose && h("button",{onClick:onClose,style:btnSecondary},"Close")
+    ),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"One rule set per item — defines how the Estimator auto-builds a quote's description. Always starts with Size + Item name, then each parameter below, comma-joined. If more than one BOM line matches a parameter, their values combine with \" / \"."),
+    !initialItem && h("select",{value:selectedItem,onChange:e=>{ setSelectedItem(e.target.value); loadForItem(e.target.value); },style:{...inputStyle,width:260,marginBottom:16}},
+      h("option",{value:""},"Select an item…"),
+      itemMasterList.map(it=>h("option",{key:it,value:it},it))
+    ),
+    initialItem && h("div",{style:{fontSize:13,fontWeight:600,marginBottom:14}},"Item: "+initialItem),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    selectedItem && h(React.Fragment,null,
+      h("table",{style:{width:"100%",fontSize:12.5,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden",marginBottom:10}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Label"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Match on"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Matched value"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Value from"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"")
+        )),
+        h("tbody",null,
+          parameters.map((p,idx)=>h("tr",{key:idx,style:{borderTop:"1px solid #eceae0"}},
+            h("td",{style:{padding:"6px 9px"}},h("input",{value:p.label,onChange:e=>updateParam(idx,{label:e.target.value}),placeholder:"e.g. Flanges",style:{...inputStyle,padding:"5px 7px",fontSize:12}})),
+            h("td",{style:{padding:"6px 9px"}},h("select",{value:p.match_field,onChange:e=>updateParam(idx,{match_field:e.target.value}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:"component"},"Component"),h("option",{value:"sub_assembly"},"Sub Assembly"))),
+            h("td",{style:{padding:"6px 9px"}},h("input",{value:p.match_value,onChange:e=>updateParam(idx,{match_value:e.target.value}),placeholder:"e.g. Flange",style:{...inputStyle,padding:"5px 7px",fontSize:12}})),
+            h("td",{style:{padding:"6px 9px"}},
+              h("label",{style:{marginRight:10,fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="grade",onChange:()=>updateParam(idx,{value_source:"grade"}),style:{marginRight:4}}),"Grade"),
+              h("label",{style:{fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="spec",onChange:()=>updateParam(idx,{value_source:"spec"}),style:{marginRight:4}}),"Spec")
+            ),
+            h("td",{style:{padding:"6px 9px"}},h("button",{onClick:()=>removeParam(idx),style:{...btnSmall,fontSize:10.5,padding:"3px 8px",color:colors.danger}},"Remove"))
+          ))
+        )
+      ),
+      h("div",{style:{display:"flex",gap:8}},
+        h("button",{onClick:addParam,style:btnSecondary},"+ Add parameter"),
+        h("button",{onClick:async()=>{ await save(); if(onClose) onClose(); },disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save rule")
+      )
+    )
+  );
+  if(!onClose) return content;
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.4)",zIndex:1300,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:10,maxHeight:"85vh",overflowY:"auto",width:760,maxWidth:"100%"}},content)
+  );
+}
+
+// Builds a description string from a description_master row's parameter
+// rules against a model's actual BOM lines. "Size + Item name" is always the
+// fixed opening; each parameter appends "Label value1 / value2" (combined
+// with " / " when more than one line matches), comma-joined between
+// parameters. Returns "" if there's not enough to build anything meaningful.
+function buildAutoDescription(masterRow, lines, itemName, sizeText){
+  if(!masterRow || !lines || lines.length===0) return "";
+  const prefix = [sizeText,itemName].filter(Boolean).join(" ");
+  const parts = (masterRow.parameters||[]).map(p=>{
+    const matches = lines.filter(l=> (p.match_field==="sub_assembly" ? l.sub_assembly : l.component) === p.match_value);
+    if(matches.length===0) return null;
+    const vals = matches.map(l=> p.value_source==="spec" ? (l.material_spec||"") : (l.grade||l.selGrade||"")).filter(Boolean);
+    if(vals.length===0) return null;
+    const uniqueVals = Array.from(new Set(vals));
+    return (p.label||"")+" "+uniqueVals.join(" / ");
+  }).filter(Boolean);
+  if(parts.length===0) return prefix;
+  return prefix+" "+parts.join(", ");
+}
+
 function UserManualScreen(){
   const [activeKey,setActiveKey] = useState(MANUAL_SECTIONS[0].articles[0].key);
   const [search,setSearch] = useState("");
@@ -7084,6 +7341,289 @@ function CustomerBulkUpload({ user }){
   );
 }
 
+function AuthorizationCodesScreen({ user }){
+  const isSuperAdmin = user.role==="super_admin";
+  const [codes,setCodes]=useState([]); const [loading,setLoading]=useState(true);
+  const [generating,setGenerating]=useState(false); const [justGenerated,setJustGenerated]=useState(null);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("authorization_codes").select("*").order("generated_at",{ascending:false}).limit(50);
+    setCodes(data||[]); setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const generate = async(codeType)=>{
+    setGenerating(true);
+    const code = String(Math.floor(100000+Math.random()*900000));
+    const expires_at = new Date(Date.now()+15*60*1000).toISOString();
+    const { data, error:err } = await sb.from("authorization_codes").insert({ code, code_type:codeType, generated_by:user.username, expires_at }).select().single();
+    setGenerating(false);
+    if(err){ alert("Could not generate code: "+err.message); return; }
+    setJustGenerated(data);
+    load();
+  };
+
+  const statusOf = (c)=>{
+    if(c.used) return { label:"Used", color:"#6b6f60" };
+    if(c.expires_at && new Date(c.expires_at) < new Date()) return { label:"Expired", color:"#b8472f" };
+    return { label:"Active", color:"#085041" };
+  };
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("h2",{style:{margin:"0 0 6px",fontSize:18,fontWeight:700}},"Authorization Codes"),
+    h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},"Once a quote's Sl No isn't Draft, a regular user needs one of these codes to save a change; deleting anything needs a Delete code from a Super Admin specifically."),
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:16,marginBottom:16,display:"flex",gap:10}},
+      h("button",{onClick:()=>generate("edit"),disabled:generating,style:btnPrimary},generating?"Generating…":"Generate Edit code"),
+      isSuperAdmin && h("button",{onClick:()=>generate("delete"),disabled:generating,style:{...btnPrimary,background:colors.danger}},generating?"Generating…":"Generate Delete code")
+    ),
+    justGenerated && h("div",{style:{marginBottom:16,padding:"14px 18px",background:justGenerated.code_type==="delete"?"#fdecea":"#eaf9f4",border:"1px solid "+(justGenerated.code_type==="delete"?"#f0b8b8":"#8fd0bf"),borderRadius:6,display:"inline-block"}},
+      h("div",{style:{fontSize:11,color:justGenerated.code_type==="delete"?"#a3312a":"#4a8d78",marginBottom:4}},(justGenerated.code_type==="delete"?"Delete":"Edit")+" code — expires "+new Date(justGenerated.expires_at).toLocaleTimeString()),
+      h("div",{style:{fontSize:28,fontWeight:700,letterSpacing:4,color:justGenerated.code_type==="delete"?"#a3312a":"#085041"}},justGenerated.code)
+    ),
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",overflow:"hidden"}},
+      h("div",{style:{padding:"9px 14px",fontWeight:700,fontSize:12.5,background:colors.dark,color:"#fff"}},"Recent codes"),
+      loading ? h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"Loading…") :
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse"}},
+        h("thead",null,h("tr",{style:{background:"#f4f2ea"}},
+          ["Code","Type","Generated by","Generated at","Status","Used by"].map(hd=>h("th",{key:hd,style:{textAlign:"left",padding:"7px 10px",fontWeight:700}},hd))
+        )),
+        h("tbody",null,codes.map(c=>{ const st=statusOf(c); return h("tr",{key:c.id,style:{borderTop:"1px solid #f0efe8"}},
+          h("td",{style:{padding:"6px 10px",fontFamily:"monospace"}},c.code),
+          h("td",{style:{padding:"6px 10px",fontWeight:600,color:c.code_type==="delete"?colors.danger:colors.text}},c.code_type),
+          h("td",{style:{padding:"6px 10px"}},c.generated_by),
+          h("td",{style:{padding:"6px 10px",color:colors.muted}},new Date(c.generated_at).toLocaleString()),
+          h("td",{style:{padding:"6px 10px",color:st.color,fontWeight:600}},st.label),
+          h("td",{style:{padding:"6px 10px",color:colors.muted}},c.used_by||"—")
+        );}))
+      )
+    )
+  );
+}
+
+function DeleteActivityReportScreen({ user }){
+  const today = new Date().toISOString().slice(0,10);
+  const monthAgo = new Date(Date.now()-30*24*60*60*1000).toISOString().slice(0,10);
+  const [from,setFrom] = useState(monthAgo);
+  const [to,setTo] = useState(today);
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(false);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("audit_log").select("*").eq("action","DELETE")
+      .gte("performed_at",from+"T00:00:00").lte("performed_at",to+"T23:59:59")
+      .order("performed_at",{ascending:false});
+    setRows(data||[]);
+    setLoading(false);
+  },[from,to]);
+  useEffect(()=>{ load(); },[load]);
+
+  const downloadExcel = ()=>{
+    const data = rows.map(r=>({When:new Date(r.performed_at).toLocaleString(),Table:r.table_name,"Deleted by":r.performed_by,Details:r.record_summary}));
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,"Deletes");
+    XLSX.writeFile(wb,"Delete_Activity_"+from+"_to_"+to+".xlsx");
+  };
+  const downloadPdf = ()=>{
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
+    doc.setFontSize(13); doc.text("Delete Activity Report — "+from+" to "+to,12,14);
+    doc.autoTable({
+      startY:20,
+      head:[["When","Table","Deleted by","Details"]],
+      body: rows.map(r=>[new Date(r.performed_at).toLocaleString(),r.table_name,r.performed_by,r.record_summary||"—"]),
+      styles:{fontSize:8},
+      headStyles:{fillColor:[28,31,26]}
+    });
+    doc.save("Delete_Activity_"+from+"_to_"+to+".pdf");
+  };
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:960}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:4}},"Delete Activity Report"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Built from the same audit log every delete already writes to — filter by date range and download."),
+    h("div",{style:{display:"flex",gap:10,alignItems:"flex-end",marginBottom:14,flexWrap:"wrap"}},
+      h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"From"),h("input",{type:"date",value:from,onChange:e=>setFrom(e.target.value),style:inputStyle})),
+      h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"To"),h("input",{type:"date",value:to,onChange:e=>setTo(e.target.value),style:inputStyle})),
+      h("button",{onClick:load,style:btnSecondary},"Apply"),
+      h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
+        h("button",{onClick:downloadExcel,disabled:rows.length===0,style:btnSecondary},"Download Excel"),
+        h("button",{onClick:downloadPdf,disabled:rows.length===0,style:btnSecondary},"Download PDF")
+      )
+    ),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+      h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"When"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Table"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Deleted by"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Details")
+      )),
+      h("tbody",null,
+        rows.map((r,i)=>h("tr",{key:i,style:{borderTop:"1px solid #eceae0"}},
+          h("td",{style:{padding:"7px 9px",whiteSpace:"nowrap",verticalAlign:"top"}},new Date(r.performed_at).toLocaleString()),
+          h("td",{style:{padding:"7px 9px",verticalAlign:"top"}},r.table_name),
+          h("td",{style:{padding:"7px 9px",verticalAlign:"top",fontWeight:600}},r.performed_by||"—"),
+          h("td",{style:{padding:"7px 9px",verticalAlign:"top",color:colors.muted}},r.record_summary||"—")
+        )),
+        rows.length===0 && h("tr",null,h("td",{colSpan:4,style:{padding:14,fontSize:12,color:colors.mutedLight}},"No deletes in this range."))
+      )
+    ),
+    h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:8}},rows.length+" delete(s) in this range.")
+  );
+}
+
+// Shown to Super Admin on login on/after the 2nd of the month, offering to
+// archive last month's deletes as a PDF and optionally purge them from the
+// live audit_log to keep it small. Tracked per Super Admin per month so it
+// doesn't reprompt every login once handled.
+function MonthlyArchivePrompt({ user, onDone }){
+  const now = new Date();
+  const showThisSession = now.getDate() >= 2;
+  const lastMonthDate = new Date(now.getFullYear(), now.getMonth()-1, 1);
+  const yearMonth = lastMonthDate.getFullYear()+"-"+String(lastMonthDate.getMonth()+1).padStart(2,"0");
+  const monthLabel = lastMonthDate.toLocaleDateString("en-US",{month:"long",year:"numeric"});
+  const rangeStart = yearMonth+"-01T00:00:00";
+  const rangeEndDate = new Date(lastMonthDate.getFullYear(), lastMonthDate.getMonth()+1, 0);
+  const rangeEnd = rangeEndDate.toISOString().slice(0,10)+"T23:59:59";
+
+  const [checked,setChecked] = useState(false);
+  const [visible,setVisible] = useState(false);
+  const [rows,setRows] = useState([]);
+  const [downloaded,setDownloaded] = useState(false);
+
+  useEffect(()=>{
+    if(!showThisSession){ setChecked(true); return; }
+    (async()=>{
+      const { data: already } = await sb.from("monthly_archive_prompts").select("id").eq("username",user.username).eq("year_month",yearMonth).maybeSingle();
+      if(already){ setChecked(true); return; }
+      const { data: deleteRows } = await sb.from("audit_log").select("*").eq("action","DELETE").gte("performed_at",rangeStart).lte("performed_at",rangeEnd);
+      setRows(deleteRows||[]);
+      setVisible((deleteRows||[]).length>0 ? true : false);
+      if((deleteRows||[]).length===0){
+        // nothing to archive — mark handled so we don't keep checking every login
+        await sb.from("monthly_archive_prompts").insert({username:user.username,year_month:yearMonth,action_taken:"dismissed"});
+      }
+      setChecked(true);
+    })();
+  },[]);
+
+  const downloadPdf = ()=>{
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
+    doc.setFontSize(13); doc.text("Delete Log Archive — "+monthLabel,12,14);
+    doc.autoTable({
+      startY:20,
+      head:[["When","Table","Deleted by","Details"]],
+      body: rows.map(r=>[new Date(r.performed_at).toLocaleString(),r.table_name,r.performed_by,r.record_summary||"—"]),
+      styles:{fontSize:8},
+      headStyles:{fillColor:[28,31,26]}
+    });
+    doc.save(monthLabel.replace(" ","_")+"_Delete_Log.pdf");
+    setDownloaded(true);
+  };
+  const clearFromLog = async()=>{
+    if(!confirm("Remove these "+rows.length+" archived entries from the audit log? The PDF you downloaded is the only record afterward.")) return;
+    await sb.from("audit_log").delete().eq("action","DELETE").gte("performed_at",rangeStart).lte("performed_at",rangeEnd);
+    await sb.from("monthly_archive_prompts").insert({username:user.username,year_month:yearMonth,action_taken:"downloaded_and_purged"});
+    setVisible(false);
+    onDone();
+  };
+  const dismissForMonth = async()=>{
+    await sb.from("monthly_archive_prompts").insert({username:user.username,year_month:yearMonth,action_taken:downloaded?"downloaded_only":"dismissed"});
+    setVisible(false);
+    onDone();
+  };
+  const remindNextLogin = ()=>{
+    setVisible(false); // no row inserted — will show again next login
+    onDone();
+  };
+
+  if(!checked || !visible) { if(checked && !visible) onDone(); return null; }
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.4)",zIndex:1400,display:"flex",alignItems:"center",justifyContent:"center"}},
+    h("div",{style:{background:"#fff",borderRadius:12,padding:"24px 28px",width:440,maxWidth:"92vw"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:6}},"Monthly delete log ready"),
+      h("div",{style:{fontSize:12,color:colors.muted,lineHeight:1.6,marginBottom:16}},
+        h("b",null,monthLabel)," had ",h("b",null,rows.length+" delete action(s)")," recorded across the app. Archiving old entries as a PDF keeps the live log fast — you can download it now, and optionally clear these entries from the log afterward."
+      ),
+      h("div",{style:{display:"flex",gap:8,marginBottom:6}},
+        h("button",{onClick:downloadPdf,style:{...btnPrimary,flex:1}},"Download PDF"),
+        h("button",{onClick:clearFromLog,disabled:!downloaded,style:{...btnSecondary,flex:1,opacity:downloaded?1:0.5,cursor:downloaded?"pointer":"not-allowed"}},"Clear from log")
+      ),
+      h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginBottom:14}},downloaded?"PDF downloaded — you can now safely clear these entries from the live log.":"Download it first to enable clearing — the PDF is your only copy once these are removed from the log."),
+      h("div",{style:{display:"flex",justifyContent:"space-between",fontSize:11.5}},
+        h("span",{onClick:remindNextLogin,style:{color:colors.accent,cursor:"pointer",textDecoration:"underline"}},"Remind me next login instead"),
+        h("span",{onClick:dismissForMonth,style:{color:colors.muted,cursor:"pointer",textDecoration:"underline"}},"Dismiss for this month")
+      )
+    )
+  );
+}
+
+function ItemCoverageReport(){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [filter,setFilter] = useState("all"); // all | missing_datasheet_master | missing_description_master
+
+  useEffect(()=>{
+    (async()=>{
+      setLoading(true);
+      const [{data:items},{data:dsFields},{data:descRows},{data:dsBuilt}] = await Promise.all([
+        sb.from("item_tbl").select("item").order("item"),
+        sb.from("datasheet_master_fields").select("item"),
+        sb.from("description_master").select("item"),
+        sb.from("datasheets").select("template_key"),
+      ]);
+      const dsFieldItems = new Set((dsFields||[]).map(r=>r.item));
+      const descItems = new Set((descRows||[]).map(r=>r.item));
+      const builtCount = new Map();
+      (dsBuilt||[]).forEach(r=>{ builtCount.set(r.template_key,(builtCount.get(r.template_key)||0)+1); });
+      const out = (items||[]).map(r=>({
+        item:r.item,
+        hasDatasheetMaster: dsFieldItems.has(r.item),
+        hasDescriptionMaster: descItems.has(r.item),
+        datasheetsBuiltCount: builtCount.get(normalizeItemName(r.item))||0
+      }));
+      setRows(out);
+      setLoading(false);
+    })();
+  },[]);
+
+  const filtered = rows.filter(r=>{
+    if(filter==="missing_datasheet_master") return !r.hasDatasheetMaster;
+    if(filter==="missing_description_master") return !r.hasDescriptionMaster;
+    return true;
+  });
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:820}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:4}},"Item Coverage Report"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Per item: whether Datasheet Master and Description Master are set up, and how many actual datasheets have been built so far."),
+    h("div",{style:{display:"flex",gap:8,marginBottom:14}},
+      h("button",{onClick:()=>setFilter("all"),style:{...btnSmall,background:filter==="all"?colors.dark:"#fff",color:filter==="all"?"#fff":colors.text}},"All items"),
+      h("button",{onClick:()=>setFilter("missing_datasheet_master"),style:{...btnSmall,background:filter==="missing_datasheet_master"?colors.dark:"#fff",color:filter==="missing_datasheet_master"?"#fff":colors.text}},"Missing Datasheet Master"),
+      h("button",{onClick:()=>setFilter("missing_description_master"),style:{...btnSmall,background:filter==="missing_description_master"?colors.dark:"#fff",color:filter==="missing_description_master"?"#fff":colors.text}},"Missing Description Master")
+    ),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    h("table",{style:{width:"100%",fontSize:12.5,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+      h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Item"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Datasheet Master"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Description Master"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Datasheets built")
+      )),
+      h("tbody",null,
+        filtered.map(r=>h("tr",{key:r.item,style:{borderTop:"1px solid #eceae0"}},
+          h("td",{style:{padding:"7px 9px",fontWeight:600}},r.item),
+          h("td",{style:{padding:"7px 9px"}},r.hasDatasheetMaster?h("span",{style:{color:"#085041",fontWeight:600}},"Built"):h("span",{style:{color:colors.danger}},"Not built")),
+          h("td",{style:{padding:"7px 9px"}},r.hasDescriptionMaster?h("span",{style:{color:"#085041",fontWeight:600}},"Built"):h("span",{style:{color:colors.danger}},"Not built")),
+          h("td",{style:{padding:"7px 9px"}},r.datasheetsBuiltCount)
+        )),
+        filtered.length===0 && h("tr",null,h("td",{colSpan:4,style:{padding:14,fontSize:12,color:colors.mutedLight}},"No items match this filter."))
+      )
+    )
+  );
+}
+
 function DeletionCodesScreen({ user }){
   const [codes,setCodes]=useState([]); const [loading,setLoading]=useState(true);
   const [generating,setGenerating]=useState(false); const [justGenerated,setJustGenerated]=useState(null);
@@ -7361,7 +7901,7 @@ function AuditLogViewer() {
 }
 
 /* ---- ALLOWABLE STRESS EDITOR ---- */
-function AllowableStressEditor() {
+function AllowableStressEditor({ user }) {
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
   const [search,setSearch]=useState(""); const [editingId,setEditingId]=useState(null);
   const [editDraft,setEditDraft]=useState({}); const [adding,setAdding]=useState(false);
@@ -7388,7 +7928,9 @@ function AllowableStressEditor() {
   };
   const deleteRow=async(id,spec,grade)=>{
     if(!confirm("Delete stress values for "+spec+" "+grade+"?")) return;
-    await sb.from("allowable_stress").delete().eq("id",id); load();
+    await sb.from("allowable_stress").delete().eq("id",id);
+    await logAudit("DELETE","allowable_stress",String(id),"Deleted stress values for "+spec+" "+grade,user?.username||"unknown",{material_spec:spec,grade},null);
+    load();
   };
 
   const filtered=useMemo(()=>{
@@ -8531,6 +9073,7 @@ function App() {
   const [sessionCompanyId,setSessionCompanyId]=useState(null); // Super Admin's chosen company for this session
   const [masterData,setMasterData]=useState({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],uoms:[],allComponents:[],subAssembliesByComponent:new Map(),loadingMaster:true});
   const [quoteToOpen,setQuoteToOpen]=useState(null); // {reference_number,item_sl_no} bridge from Estimator's save popup to Quotes
+  const [monthlyArchiveDone,setMonthlyArchiveDone]=useState(false);
 
   useEffect(()=>{ if(user) loadMasterData(setMasterData); },[user]);
   const refresh=useCallback(()=>{ setMasterData(m=>({...m,loadingMaster:true})); loadMasterData(setMasterData); },[]);
@@ -8539,6 +9082,7 @@ function App() {
   if(user.role==="super_admin" && !sessionCompanyId) return h(CompanySessionPicker,{user,onPicked:setSessionCompanyId});
 
   return h("div",{style:{minHeight:"100vh"}},
+    user.role==="super_admin" && !monthlyArchiveDone && h(MonthlyArchivePrompt,{user,onDone:()=>setMonthlyArchiveDone(true)}),
     h(TopBar,{user,sessionCompanyId,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyId(null)):null,onLogout:()=>{setUser(null);setSessionCompanyId(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
     h(MenuTabs,{user,active:tab,onChange:setTab}),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}})),
@@ -8549,7 +9093,10 @@ function App() {
     tab==="reports_masters"?h(MaterialRatesReport,{user}):
     tab==="reports_missing_rates"?h(MissingRatesReport,{user}):
     tab==="reports_audit"?h(MastersAuditReport,{user}):
+    tab==="reports_item_coverage"?h(ItemCoverageReport,null):
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
+    tab==="authorization_codes"?h(AuthorizationCodesScreen,{user}):
+    tab==="delete_activity_report"?h(DeleteActivityReportScreen,{user}):
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
@@ -8558,9 +9105,10 @@ function App() {
     tab==="tour"?h(TourScreen,null):
     tab==="faq"?h(FaqScreen,null):
     tab==="version_history"?h(VersionHistoryScreen,null):
-    tab==="allowable_stress"?h(AllowableStressEditor,null):
+    tab==="allowable_stress"?h(AllowableStressEditor,{user}):
     tab==="datasheet_master"?h(DatasheetMasterEditor,{onGoToTab:setTab}):
     tab==="company_master"?h(CompanyMasterEditor,{user}):
+    tab==="description_master"?h(DescriptionMasterEditor,{user}):
     tab==="users"?h(UsersEditor,{user}):
     tab==="permissions"?h(PermissionsEditor,null):
     tab==="login_history"?h(LoginHistoryViewer,null):
