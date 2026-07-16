@@ -31,6 +31,19 @@ table { width: 100%; border-collapse: collapse; }
 <script>
 const { useState, useMemo, useCallback, useRef, useEffect, createElement: h } = React;
 
+// Lightweight, app-wide "you have unsaved changes" guard. Any editing screen
+// calls setUnsavedGuard(true/false) as it opens/closes an edit session; both
+// browser-level navigation (closing the tab/refreshing) and in-app tab
+// switching check this before letting the user leave.
+window.__unsavedGuard = { dirty:false, message:"" };
+function setUnsavedGuard(dirty, message){
+  window.__unsavedGuard = { dirty:!!dirty, message: message||"You have unsaved changes. Leave anyway?" };
+}
+function confirmLeaveIfDirty(){
+  if(!window.__unsavedGuard.dirty) return true;
+  return confirm(window.__unsavedGuard.message);
+}
+
 const SUPABASE_URL = "https://afqioawxgcgssktdzyql.supabase.co";
 const SUPABASE_KEY = "sb_publishable_3vYQANajyTU0wBhGjmfmgQ_eMReC9pl";
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -670,7 +683,7 @@ function MenuTabs({ user, active, onChange }) {
 
   const allTabsOf = g => g.tabs || g.subgroups.flatMap(sg=>sg.tabs);
   const groupIsActive = g => allTabsOf(g).some(t=>t.key===active);
-  const pick = key => { onChange(key); setOpenGroup(null); };
+  const pick = key => { if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false); onChange(key); setOpenGroup(null); };
 
   const itemStyle = t => ({
     padding:"5px 8px", fontSize:11.5, borderRadius:4, cursor:"pointer", textAlign:"left", border:"none",
@@ -3529,8 +3542,10 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       signatory_name: quoteHeaderRow.signatory_name||"", signatory_designation: quoteHeaderRow.signatory_designation||""
     });
     setHeaderEditOpen(true);
+    setUnsavedGuard(true,"You have unsaved Quote Header changes. Leave anyway?");
   };
   const [authGate,setAuthGate]=useState(null); // {requiredType, action} — shared by every gated save/delete in this screen
+  const [pdfPreview,setPdfPreview]=useState(null); // {doc, filename} — Quote/BOM PDFs preview before download
   const [editingDescSlNo,setEditingDescSlNo]=useState(false);
   const [descDraft,setDescDraft]=useState("");
   const [descMasterRowForItem,setDescMasterRowForItem]=useState(null); // the description_master row for openRef's item, or null if none
@@ -3578,6 +3593,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,...payload}:r));
       if(openRef && openRef.reference_number===refFilter) setOpenRef(r=>({...r,...payload}));
       setHeaderEditOpen(false);
+      setUnsavedGuard(false);
     } catch(e){ alert("Save failed: "+(e.message||e)); }
     finally{ setSavingHeader(false); }
   };
@@ -3827,6 +3843,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   const openEstimate=async(ref)=>{
     setOpenRef(ref); setLoadingLines(true); setOrderQty(ref.order_qty||1); setLineEdits({}); setSavingLine({});
     setEditingDescSlNo(false);
+    setUnsavedGuard(false);
     const{data}=await sb.from("estimate_lines").select("*").eq("reference_number",ref.reference_number).eq("item_sl_no",ref.item_sl_no).order("sl_no");
     setOpenLines(data||[]); setLoadingLines(false);
     // Header Model: the estimates row is the authoritative "main form" value.
@@ -4504,7 +4521,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
         });
       });
       numberQuotePages(doc,W);
-      doc.save(quoteExportRef.replace(/\s+/g,"_")+"_BOM"+(withSales?"":"_cost")+".pdf");
+      setPdfPreview({doc, filename:quoteExportRef.replace(/\s+/g,"_")+"_BOM"+(withSales?"":"_cost")+".pdf"});
     } finally { setExportingQuote(""); }
   };
 
@@ -4772,7 +4789,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       });
 
       numberQuotePages(doc, W);
-      doc.save(quoteExportRef.replace(/\s+/g,"_")+"_Quote.pdf");
+      setPdfPreview({doc, filename:quoteExportRef.replace(/\s+/g,"_")+"_Quote.pdf"});
       await logAudit("EXPORT","estimates",quoteExportRef,"Generated compiled quote PDF for "+quoteExportRef,user?.username||"unknown",null,null);
     } catch(e){
       console.error("Generate quote PDF failed", e);
@@ -5132,7 +5149,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
               ),
               h("div",{style:{display:"flex",gap:8}},
                 h("button",{onClick:saveQuoteHeader,disabled:savingHeader,style:{...btnPrimary,fontSize:12}},savingHeader?"Saving…":"Save (applies to all Sl Nos)"),
-                h("button",{onClick:()=>setHeaderEditOpen(false),style:{...btnSecondary,fontSize:12}},"Cancel")
+                h("button",{onClick:()=>{ setHeaderEditOpen(false); setUnsavedGuard(false); },style:{...btnSecondary,fontSize:12}},"Cancel")
               )
             )
       ),
@@ -5224,11 +5241,12 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
               h("div",null,
                 h("h3",{style:{margin:0}},openRef.reference_number+"  ·  Sl No "+openRef.item_sl_no),
+                h("div",{style:{fontSize:10.5,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginTop:6,marginBottom:2}},"Description"),
                 h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
                   openRef.description
-                    ? h("div",{style:{fontSize:12,color:colors.muted}},openRef.description)
+                    ? h("div",{style:{fontSize:13,fontWeight:700,color:colors.text}},openRef.description)
                     : h("div",{style:{fontSize:11.5,color:colors.danger}},"Description is missing for this Sl No — required for the quote to be \"ready to go\"."),
-                  h("button",{onClick:()=>{ setDescDraft(openRef.description||""); setEditingDescSlNo(true); },style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Edit"),
+                  h("button",{onClick:()=>{ setDescDraft(openRef.description||""); setEditingDescSlNo(true); setUnsavedGuard(true,"You have an unsaved description edit. Leave anyway?"); },style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Edit"),
                   descMasterRowForItem && h("button",{onClick:rebuildDescriptionFromBom,style:{...btnSmall,fontSize:10.5,padding:"3px 9px",color:"#8a6d1f",borderColor:colors.accent}},"Rebuilt From BOM")
                 ),
                 editingDescSlNo && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1260,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
@@ -5237,7 +5255,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
                     h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:14}},"Plenty of room to actually read and edit the full text."),
                     h("textarea",{value:descDraft,onChange:e=>setDescDraft(e.target.value),rows:6,style:{...inputStyle,fontSize:14,lineHeight:1.6,resize:"vertical",fontFamily:"inherit",padding:"12px 14px"}}),
                     h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
-                      h("button",{onClick:()=>setEditingDescSlNo(false),style:btnSecondary},"Cancel"),
+                      h("button",{onClick:()=>{ setEditingDescSlNo(false); setUnsavedGuard(false); },style:btnSecondary},"Cancel"),
                       h("button",{onClick:()=>{
                         if(!descDraft.trim()){ alert("Description is required."); return; }
                         const doSave = async()=>{
@@ -5246,6 +5264,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
                           setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:descDraft.trim()}:r));
                           refreshReadiness(refFilter);
                           setEditingDescSlNo(false);
+                          setUnsavedGuard(false);
                         };
                         if(isQuoteLocked(openRef.quote_status,user)){ setAuthGate({requiredType:"edit",action:doSave}); return; }
                         doSave();
@@ -5631,6 +5650,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>setShowDatasheet(false) }),
     historyOpen && refFilter && h(QuoteHistoryPanel,{ referenceNumber:refFilter, onClose:()=>setHistoryOpen(false) }),
     authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action }),
+    pdfPreview && h(PdfPreviewModal,{ doc:pdfPreview.doc, filename:pdfPreview.filename, onClose:()=>setPdfPreview(null) }),
     showDeleteQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Delete entire quote "+refFilter+"?"),
@@ -5744,6 +5764,33 @@ async function logAudit(action, tableName, recordId, recordSummary, performedBy,
 
 // Checks a deletion-approval code: must exist, be unused, and not expired.
 // Consumes it (marks used) on success so it can never be reused.
+// Shown before a Quote or BOM PDF actually downloads — renders the already-
+// built jsPDF doc as a blob in an iframe, with Download/Cancel. Other PDFs
+// in the app (reports, User Manual, audit exports) skip this and save
+// directly, per current scope.
+function PdfPreviewModal({ doc, filename, onClose }){
+  const [blobUrl,setBlobUrl] = useState(null);
+  useEffect(()=>{
+    const url = URL.createObjectURL(doc.output("blob"));
+    setBlobUrl(url);
+    return ()=>URL.revokeObjectURL(url);
+  },[doc]);
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1500,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 22px",width:820,maxWidth:"96vw",height:"88vh",display:"flex",flexDirection:"column"}},
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
+        h("div",{style:{fontWeight:700,fontSize:14}},"Preview — "+filename),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
+          h("button",{onClick:()=>{ doc.save(filename); onClose(); },style:btnPrimary},"Download")
+        )
+      ),
+      blobUrl
+        ? h("iframe",{src:blobUrl,style:{flex:1,border:"1px solid "+colors.border,borderRadius:6}})
+        : h("div",{style:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",color:colors.mutedLight,fontSize:12}},"Rendering preview…")
+    )
+  );
+}
+
 async function verifyAndConsumeDeletionCode(code, username){
   const trimmed = (code||"").trim();
   if(!trimmed) return { ok:false, reason:"Enter the code." };
@@ -6911,11 +6958,54 @@ function DescriptionMasterEditor({ user, initialItem, onClose }){
     setExistingRowId(data?data.id:null);
     setLoading(false);
   },[loadBomValues]);
-  useEffect(()=>{ if(initialItem) loadForItem(initialItem); },[initialItem, loadForItem]);
+  const [viewMode,setViewMode]=useState("table"); // "table" | "cards"
+  const [dragIdx,setDragIdx]=useState(null);
+  const [showCopyPanel,setShowCopyPanel]=useState(false);
+  const [copyTargets,setCopyTargets]=useState(new Set());
+  const [copying,setCopying]=useState(false);
+  const [copyWarnings,setCopyWarnings]=useState([]); // [{item, label}] — parameters that didn't match on a target item's BOM
 
-  const addParam = ()=> setParameters(p=>[...p,{label:"",match_field:"component",match_value:"",value_source:"grade"}]);
-  const updateParam = (idx,patch)=> setParameters(p=>p.map((row,i)=>i===idx?{...row,...patch}:row));
-  const removeParam = (idx)=> setParameters(p=>p.filter((_,i)=>i!==idx));
+  const reorder = (fromIdx, toIdx)=>{
+    setUnsavedGuard(true,"You have unsaved Description Master changes. Leave anyway?");
+    setParameters(p=>{
+      const next = p.slice();
+      const [moved] = next.splice(fromIdx,1);
+      next.splice(toIdx,0,moved);
+      return next;
+    });
+  };
+
+  const copyRuleToItems = async()=>{
+    if(copyTargets.size===0){ alert("Pick at least one item to copy to."); return; }
+    setCopying(true);
+    const warnings = [];
+    try{
+      for(const targetItem of copyTargets){
+        const { data: targetBom } = await sb.from("bom").select("component,sub_assembly").eq("item",targetItem);
+        const targetComponents = new Set((targetBom||[]).map(r=>r.component).filter(Boolean));
+        const targetSubAssemblies = new Set((targetBom||[]).map(r=>r.sub_assembly).filter(Boolean));
+        parameters.forEach(p=>{
+          const pool = p.match_field==="sub_assembly" ? targetSubAssemblies : targetComponents;
+          if(p.match_value && !pool.has(p.match_value)) warnings.push({item:targetItem,label:p.label||"(unlabeled)"});
+        });
+        const { data: existing } = await sb.from("description_master").select("id").eq("item",targetItem).maybeSingle();
+        if(existing){
+          await sb.from("description_master").update({parameters,updated_at:new Date().toISOString()}).eq("id",existing.id);
+        } else {
+          await sb.from("description_master").insert({item:targetItem,parameters,created_by:user?.username||"unknown"});
+        }
+      }
+      setCopyWarnings(warnings);
+      setShowCopyPanel(false);
+      setCopyTargets(new Set());
+      if(warnings.length===0) alert("Rule copied to "+copyTargets.size+" item(s).");
+    } catch(e){ alert("Copy failed: "+e.message); }
+    finally{ setCopying(false); }
+  };
+
+  const addParam = ()=> { setUnsavedGuard(true,"You have unsaved Description Master changes. Leave anyway?"); setParameters(p=>[...p,{label:"",match_field:"component",match_value:"",value_source:"grade"}]); };
+  const updateParam = (idx,patch)=> { setUnsavedGuard(true,"You have unsaved Description Master changes. Leave anyway?"); setParameters(p=>p.map((row,i)=>i===idx?{...row,...patch}:row)); };
+  const removeParam = (idx)=> { setUnsavedGuard(true,"You have unsaved Description Master changes. Leave anyway?"); setParameters(p=>p.filter((_,i)=>i!==idx)); };
 
   const save = async()=>{
     if(!selectedItem){ alert("Pick an item first."); return; }
@@ -6930,6 +7020,7 @@ function DescriptionMasterEditor({ user, initialItem, onClose }){
         setExistingRowId(data.id);
       }
       alert("Saved.");
+      setUnsavedGuard(false);
     } catch(e){ alert("Save failed: "+e.message); }
     finally{ setSaving(false); }
   };
@@ -6937,46 +7028,97 @@ function DescriptionMasterEditor({ user, initialItem, onClose }){
   const content = h("div",{style:{padding:onClose?"22px 26px":"20px 24px",maxWidth:900}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
       h("div",{style:{fontWeight:700,fontSize:16}},"Description Master"),
-      onClose && h("button",{onClick:onClose,style:btnSecondary},"Close")
+      onClose && h("button",{onClick:()=>{ if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false); onClose(); },style:btnSecondary},"Close")
     ),
     h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"One rule set per item — defines how the Estimator auto-builds a quote's description. Always starts with Size + Item name, then each parameter below, comma-joined. If more than one BOM line matches a parameter, their values combine with \" / \"."),
-    !initialItem && h("select",{value:selectedItem,onChange:e=>{ setSelectedItem(e.target.value); loadForItem(e.target.value); },style:{...inputStyle,width:260,marginBottom:16}},
+    !initialItem && h("select",{value:selectedItem,onChange:e=>{ if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false); setSelectedItem(e.target.value); loadForItem(e.target.value); },style:{...inputStyle,width:260,marginBottom:16}},
       h("option",{value:""},"Select an item…"),
       itemMasterList.map(it=>h("option",{key:it,value:it},it))
     ),
     initialItem && h("div",{style:{fontSize:13,fontWeight:600,marginBottom:14}},"Item: "+initialItem),
+    copyWarnings.length>0 && h("div",{style:{background:"#fdf6e3",border:"1px solid #f0d896",borderRadius:6,padding:"8px 10px",fontSize:11,color:"#8a6d1f",marginBottom:12}},
+      copyWarnings.map((w,i)=>h("div",{key:i},"⚠ \""+w.label+"\" wasn't found on "+w.item+"'s BOM — copied over but will show empty until fixed there."))
+    ),
     loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
     selectedItem && h(React.Fragment,null,
-      h("table",{style:{width:"100%",fontSize:12.5,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden",marginBottom:10}},
-        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
-          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Label"),
-          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Match on"),
-          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Matched value"),
-          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Value from"),
-          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"")
-        )),
-        h("tbody",null,
-          parameters.map((p,idx)=>h("tr",{key:idx,style:{borderTop:"1px solid #eceae0"}},
-            h("td",{style:{padding:"6px 9px"}},h("input",{value:p.label,onChange:e=>updateParam(idx,{label:e.target.value}),placeholder:"e.g. Flanges",style:{...inputStyle,padding:"5px 7px",fontSize:12}})),
-            h("td",{style:{padding:"6px 9px"}},h("select",{value:p.match_field,onChange:e=>updateParam(idx,{match_field:e.target.value,match_value:""}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:"component"},"Component"),h("option",{value:"sub_assembly"},"Sub Assembly"))),
-            h("td",{style:{padding:"6px 9px"}},
-              h("select",{value:p.match_value,onChange:e=>updateParam(idx,{match_value:e.target.value}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},
-                h("option",{value:""},"Select…"),
-                (p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents).map(v=>h("option",{key:v,value:v},v))
-              ),
-              (p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents).length===0 && h("div",{style:{fontSize:9.5,color:colors.danger,marginTop:2}},"No "+(p.match_field==="sub_assembly"?"Sub Assembly":"Component")+" values found in this item's BOM.")
-            ),
-            h("td",{style:{padding:"6px 9px"}},
-              h("label",{style:{marginRight:10,fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="grade",onChange:()=>updateParam(idx,{value_source:"grade"}),style:{marginRight:4}}),"Grade"),
-              h("label",{style:{fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="spec",onChange:()=>updateParam(idx,{value_source:"spec"}),style:{marginRight:4}}),"Spec")
-            ),
-            h("td",{style:{padding:"6px 9px"}},h("button",{onClick:()=>removeParam(idx),style:{...btnSmall,fontSize:10.5,padding:"3px 8px",color:colors.danger}},"Remove"))
-          ))
-        )
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginBottom:10}},
+        h("button",{onClick:()=>setViewMode(v=>v==="table"?"cards":"table"),style:btnSecondary},viewMode==="table"?"Switch to card view":"Switch to table view"),
+        h("button",{onClick:()=>setShowCopyPanel(true),style:btnSecondary},"Copy to other items")
       ),
+      viewMode==="table"
+        ? h("table",{style:{width:"100%",fontSize:12.5,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden",marginBottom:10}},
+            h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"#"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Label"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Match on"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Matched value"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Value from"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"")
+            )),
+            h("tbody",null,
+              parameters.map((p,idx)=>h("tr",{key:idx,style:{borderTop:"1px solid #eceae0"}},
+                h("td",{style:{padding:"6px 9px",color:colors.mutedLight}},idx+1),
+                h("td",{style:{padding:"6px 9px"}},h("input",{value:p.label,onChange:e=>updateParam(idx,{label:e.target.value}),placeholder:"e.g. Flanges",style:{...inputStyle,padding:"5px 7px",fontSize:12}})),
+                h("td",{style:{padding:"6px 9px"}},h("select",{value:p.match_field,onChange:e=>updateParam(idx,{match_field:e.target.value,match_value:""}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:"component"},"Component"),h("option",{value:"sub_assembly"},"Sub Assembly"))),
+                h("td",{style:{padding:"6px 9px"}},
+                  h("select",{value:p.match_value,onChange:e=>updateParam(idx,{match_value:e.target.value}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},
+                    h("option",{value:""},"Select…"),
+                    (p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents).map(v=>h("option",{key:v,value:v},v))
+                  ),
+                  (p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents).length===0 && h("div",{style:{fontSize:9.5,color:colors.danger,marginTop:2}},"No "+(p.match_field==="sub_assembly"?"Sub Assembly":"Component")+" values found in this item's BOM.")
+                ),
+                h("td",{style:{padding:"6px 9px"}},
+                  h("label",{style:{marginRight:10,fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="grade",onChange:()=>updateParam(idx,{value_source:"grade"}),style:{marginRight:4}}),"Grade"),
+                  h("label",{style:{fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="spec",onChange:()=>updateParam(idx,{value_source:"spec"}),style:{marginRight:4}}),"Spec")
+                ),
+                h("td",{style:{padding:"6px 9px"}},h("button",{onClick:()=>removeParam(idx),style:{...btnSmall,fontSize:10.5,padding:"3px 8px",color:colors.danger}},"Remove"))
+              ))
+            )
+          )
+        : h("div",{style:{background:"#f4f2ea",borderRadius:8,padding:12,display:"flex",flexDirection:"column",gap:8,marginBottom:10}},
+            parameters.map((p,idx)=>h("div",{
+              key:idx, draggable:true,
+              onDragStart:()=>setDragIdx(idx),
+              onDragOver:e=>e.preventDefault(),
+              onDrop:()=>{ if(dragIdx!==null && dragIdx!==idx) reorder(dragIdx,idx); setDragIdx(null); },
+              style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"grab",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}
+            },
+              h("div",{style:{display:"flex",alignItems:"center",gap:10}},
+                h("span",{style:{color:colors.mutedLight,fontSize:14}},"⠿"),
+                h("div",null,
+                  h("div",{style:{fontWeight:600,fontSize:12.5}},(idx+1)+". "+(p.label||"(unlabeled)")),
+                  h("div",{style:{fontSize:11,color:colors.muted}},(p.match_field==="sub_assembly"?"Sub Assembly":"Component")+" = "+(p.match_value||"—")+" · from "+(p.value_source==="spec"?"Spec":"Grade"))
+                )
+              ),
+              h("div",{style:{display:"flex",gap:4}},
+                h("button",{onClick:()=>idx>0&&reorder(idx,idx-1),disabled:idx===0,style:{...btnSmall,fontSize:11,padding:"3px 8px"}},"↑"),
+                h("button",{onClick:()=>idx<parameters.length-1&&reorder(idx,idx+1),disabled:idx===parameters.length-1,style:{...btnSmall,fontSize:11,padding:"3px 8px"}},"↓"),
+                h("button",{onClick:()=>removeParam(idx),style:{...btnSmall,fontSize:11,padding:"3px 8px",color:colors.danger}},"Remove")
+              )
+            )),
+            parameters.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight,padding:8}},"No parameters yet.")
+          ),
       h("div",{style:{display:"flex",gap:8}},
         h("button",{onClick:addParam,style:btnSecondary},"+ Add parameter"),
         h("button",{onClick:async()=>{ await save(); if(onClose) onClose(); },disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save rule")
+      )
+    ),
+    showCopyPanel && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.4)",zIndex:1310,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 24px",width:420,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},"Copy this rule to other items"),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:12}},"Applies these "+parameters.length+" parameter(s) to whichever items you check below. Overwrites any existing rule those items already have."),
+        h("div",{style:{maxHeight:180,overflowY:"auto",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",marginBottom:12}},
+          itemMasterList.filter(it=>it!==selectedItem).map(it=>h("label",{key:it,style:{display:"block",fontSize:12,marginBottom:4}},
+            h("input",{type:"checkbox",checked:copyTargets.has(it),onChange:e=>{
+              setCopyTargets(s=>{ const next=new Set(s); if(e.target.checked) next.add(it); else next.delete(it); return next; });
+            },style:{marginRight:6}}),
+            it
+          ))
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>{ setShowCopyPanel(false); setCopyTargets(new Set()); },style:btnSecondary},"Cancel"),
+          h("button",{onClick:copyRuleToItems,disabled:copying,style:{...btnPrimary,opacity:copying?0.6:1}},copying?"Copying…":"Copy to "+copyTargets.size+" item(s)")
+        )
       )
     )
   );
@@ -7557,6 +7699,68 @@ function DeleteActivityReportScreen({ user }){
       )
     ),
     h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:8}},rows.length+" delete(s) in this range.")
+  );
+}
+
+// Shown to any user on login — lists every Sl No still marked Draft app-wide,
+// in case an offer was actually sent but the status was never updated.
+function DraftOfferReminder({ user, onDone }){
+  const [rows,setRows] = useState([]);
+  const [statuses,setStatuses] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [saving,setSaving] = useState({});
+
+  useEffect(()=>{
+    (async()=>{
+      const [{data:draftRows},{data:statusRows}] = await Promise.all([
+        sb.from("estimates").select("id,reference_number,item_sl_no,customer_name,quote_status").eq("quote_status","Draft").order("reference_number"),
+        sb.from("quote_status_tbl").select("status").order("status")
+      ]);
+      setRows(draftRows||[]);
+      setStatuses((statusRows||[]).map(r=>r.status).filter(Boolean));
+      setLoading(false);
+    })();
+  },[]);
+
+  const changeStatus = async(row,newStatus)=>{
+    setSaving(s=>({...s,[row.id]:true}));
+    await sb.from("estimates").update({quote_status:newStatus}).eq("id",row.id);
+    await logAudit("UPDATE","estimates",row.reference_number+"-"+row.item_sl_no,"Status changed from Draft to "+newStatus+" via login reminder",user?.username||"unknown",{quote_status:"Draft"},{quote_status:newStatus});
+    setRows(rs=>rs.filter(r=>r.id!==row.id));
+    setSaving(s=>({...s,[row.id]:false}));
+  };
+
+  if(loading) return null;
+  if(rows.length===0){ onDone(); return null; }
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.4)",zIndex:1350,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:12,padding:"22px 26px",width:600,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Still in Draft"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"These offers are still marked Draft — if any were already sent, update the status now."),
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse"}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Quote#"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Sl No"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Customer"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Status")
+        )),
+        h("tbody",null,rows.map(row=>h("tr",{key:row.id,style:{borderTop:"1px solid #eceae0"}},
+          h("td",{style:{padding:"6px 8px",fontWeight:600}},row.reference_number),
+          h("td",{style:{padding:"6px 8px"}},row.item_sl_no),
+          h("td",{style:{padding:"6px 8px"}},row.customer_name||"—"),
+          h("td",{style:{padding:"6px 8px"}},
+            h("select",{value:"Draft",disabled:saving[row.id],onChange:e=>changeStatus(row,e.target.value),style:{...inputStyle,padding:"4px 6px",fontSize:11.5}},
+              h("option",{value:"Draft"},"Draft"),
+              statuses.filter(s=>s!=="Draft").map(s=>h("option",{key:s,value:s},s))
+            )
+          )
+        )))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
+        h("button",{onClick:onDone,style:btnSecondary},"Remind me next login"),
+        h("button",{onClick:onDone,style:btnPrimary},"Done")
+      )
+    )
   );
 }
 
@@ -9264,15 +9468,23 @@ function App() {
   const [masterData,setMasterData]=useState({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],uoms:[],allComponents:[],subAssembliesByComponent:new Map(),loadingMaster:true});
   const [quoteToOpen,setQuoteToOpen]=useState(null); // {reference_number,item_sl_no} bridge from Estimator's save popup to Quotes
   const [monthlyArchiveDone,setMonthlyArchiveDone]=useState(false);
+  const [draftReminderDone,setDraftReminderDone]=useState(false);
 
   useEffect(()=>{ if(user) loadMasterData(setMasterData); },[user]);
   const refresh=useCallback(()=>{ setMasterData(m=>({...m,loadingMaster:true})); loadMasterData(setMasterData); },[]);
+
+  useEffect(()=>{
+    const handler = (e)=>{ if(window.__unsavedGuard.dirty){ e.preventDefault(); e.returnValue=""; } };
+    window.addEventListener("beforeunload",handler);
+    return ()=>window.removeEventListener("beforeunload",handler);
+  },[]);
 
   if(!user) return h(LoginScreen,{onLogin:setUser});
   if(user.role==="super_admin" && !sessionCompanyId) return h(CompanySessionPicker,{user,onPicked:setSessionCompanyId});
 
   return h("div",{style:{minHeight:"100vh"}},
     user.role==="super_admin" && !monthlyArchiveDone && h(MonthlyArchivePrompt,{user,onDone:()=>setMonthlyArchiveDone(true)}),
+    (user.role!=="super_admin" || monthlyArchiveDone) && !draftReminderDone && h(DraftOfferReminder,{user,onDone:()=>setDraftReminderDone(true)}),
     h(TopBar,{user,sessionCompanyId,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyId(null)):null,onLogout:()=>{setUser(null);setSessionCompanyId(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
     h(MenuTabs,{user,active:tab,onChange:setTab}),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}})),
