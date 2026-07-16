@@ -643,6 +643,9 @@ function MenuTabs({ user, active, onChange }) {
         {key:"calcs",label:"Engineering Calcs"},
       ]},
     ]},
+    { label:"CRM", tabs:[
+      {key:"crm_funnel",label:"Funnel"},
+    ]},
     { label:"Reports", subgroups:[
       { label:"General", tabs:[
         {key:"reports",label:"BOM Coverage"},
@@ -650,6 +653,7 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports_quotes",label:"Quotes"},
         {key:"reports_item_coverage",label:"Item Coverage"},
         {key:"reports_quote_status",label:"Quotes by Status"},
+        {key:"reports_status_history",label:"Status Change History"},
       ]},
       ...(isAdmin?[{ label:"Admin only", tabs:[
         {key:"reports_masters",label:"Material Rates"},
@@ -7724,8 +7728,10 @@ function DraftOfferReminder({ user, onDone }){
 
   const changeStatus = async(row,newStatus)=>{
     setSaving(s=>({...s,[row.id]:true}));
-    await sb.from("estimates").update({quote_status:newStatus}).eq("id",row.id);
-    await logAudit("UPDATE","estimates",row.reference_number+"-"+row.item_sl_no,"Status changed from Draft to "+newStatus+" via login reminder",user?.username||"unknown",{quote_status:"Draft"},{quote_status:newStatus});
+    const now = new Date().toISOString();
+    const by = user?.username||"unknown";
+    await sb.from("estimates").update({quote_status:newStatus,status_changed_by:by,status_changed_at:now}).eq("id",row.id);
+    await logAudit("UPDATE","estimates",row.reference_number+"-"+row.item_sl_no,"Status changed from Draft to "+newStatus+" via login reminder",by,{quote_status:"Draft"},{quote_status:newStatus});
     setRows(rs=>rs.filter(r=>r.id!==row.id));
     setSaving(s=>({...s,[row.id]:false}));
   };
@@ -7911,6 +7917,185 @@ function ItemCoverageReport(){
         filtered.length===0 && h("tr",null,h("td",{colSpan:4,style:{padding:14,fontSize:12,color:colors.mutedLight}},"No items match this filter."))
       )
     )
+  );
+}
+
+// Trello-style CRM funnel — one column per quote status, one card per Sl No.
+// Dragging a card to a new column changes that Sl No's status, going through
+// the same non-Draft authorization rule as everywhere else in the app.
+function StatusChangeHistoryReport(){
+  const today = new Date().toISOString().slice(0,10);
+  const monthAgo = new Date(Date.now()-30*24*60*60*1000).toISOString().slice(0,10);
+  const [from,setFrom] = useState(monthAgo);
+  const [to,setTo] = useState(today);
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(false);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("audit_log").select("*")
+      .eq("table_name","estimates").eq("action","UPDATE")
+      .like("record_summary","Status changed from%")
+      .gte("performed_at",from+"T00:00:00").lte("performed_at",to+"T23:59:59")
+      .order("performed_at",{ascending:false});
+    setRows((data||[]).map(r=>({
+      when: r.performed_at, by: r.performed_by,
+      recordId: r.record_id,
+      from: (r.old_data&&r.old_data.quote_status)||"—",
+      to: (r.new_data&&r.new_data.quote_status)||"—",
+    })));
+    setLoading(false);
+  },[from,to]);
+  useEffect(()=>{ load(); },[]);
+
+  const downloadExcel = ()=>{
+    const data = rows.map(r=>({Quote:r.recordId,From:r.from,To:r.to,By:r.by,When:new Date(r.when).toLocaleString()}));
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,"Status changes");
+    XLSX.writeFile(wb,"Status_Change_History_"+from+"_to_"+to+".xlsx");
+  };
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:900}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:4}},"Status Change History"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Every status move — from the CRM Funnel board or the login Draft reminder — with who moved it and when."),
+    h("div",{style:{display:"flex",gap:10,alignItems:"flex-end",marginBottom:14,flexWrap:"wrap"}},
+      h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"From"),h("input",{type:"date",value:from,onChange:e=>setFrom(e.target.value),style:inputStyle})),
+      h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"To"),h("input",{type:"date",value:to,onChange:e=>setTo(e.target.value),style:inputStyle})),
+      h("button",{onClick:load,style:btnSecondary},"Apply"),
+      h("button",{onClick:downloadExcel,disabled:rows.length===0,style:{...btnSecondary,marginLeft:"auto"}},"Download Excel")
+    ),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+      h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Quote (Sl No)"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"From"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"To"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Moved by"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"When")
+      )),
+      h("tbody",null,
+        rows.map((r,i)=>h("tr",{key:i,style:{borderTop:"1px solid #eceae0"}},
+          h("td",{style:{padding:"7px 9px",fontWeight:600}},r.recordId),
+          h("td",{style:{padding:"7px 9px"}},r.from),
+          h("td",{style:{padding:"7px 9px"}},r.to),
+          h("td",{style:{padding:"7px 9px",fontWeight:600}},r.by),
+          h("td",{style:{padding:"7px 9px",color:colors.muted}},new Date(r.when).toLocaleString())
+        )),
+        rows.length===0 && h("tr",null,h("td",{colSpan:5,style:{padding:14,fontSize:12,color:colors.mutedLight}},"No status changes in this range."))
+      )
+    )
+  );
+}
+
+function CrmFunnelKanban({ user }){
+  const [statuses,setStatuses] = useState([]);
+  const [cards,setCards] = useState([]); // [{id, reference_number, item_sl_no, customer_name, description, quote_status, totalValue, status_changed_by, status_changed_at}]
+  const [loading,setLoading] = useState(true);
+  const [dragCard,setDragCard] = useState(null);
+  const [authGate,setAuthGate] = useState(null); // {requiredType, action}
+  const [viewMode,setViewMode] = useState("board"); // "board" | "table"
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const [{data:statusRows},{data:estimatesRows}] = await Promise.all([
+      sb.from("quote_status_tbl").select("status").order("status"),
+      sb.from("estimates").select("id,reference_number,item_sl_no,customer_name,description,quote_status,order_qty,status_changed_by,status_changed_at")
+    ]);
+    const refNums = Array.from(new Set((estimatesRows||[]).map(r=>r.reference_number)));
+    const { data: linesRows } = refNums.length
+      ? await sb.from("estimate_lines").select("reference_number,item_sl_no,sales_price").in("reference_number",refNums)
+      : { data: [] };
+    const out = (estimatesRows||[]).map(est=>{
+      const totalValue = (linesRows||[])
+        .filter(l=>l.reference_number===est.reference_number && l.item_sl_no===est.item_sl_no)
+        .reduce((s,l)=>s+(Number(l.sales_price)||0)*(est.order_qty||1),0);
+      return { ...est, totalValue };
+    });
+    setStatuses((statusRows||[]).map(r=>r.status).filter(Boolean));
+    setCards(out);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const doMoveCard = async(card, newStatus)=>{
+    const now = new Date().toISOString();
+    const by = user?.username||"unknown";
+    await sb.from("estimates").update({quote_status:newStatus,status_changed_by:by,status_changed_at:now}).eq("id",card.id);
+    await logAudit("UPDATE","estimates",card.reference_number+"-"+card.item_sl_no,"Status changed from "+card.quote_status+" to "+newStatus+" via CRM funnel board",by,{quote_status:card.quote_status},{quote_status:newStatus});
+    setCards(cs=>cs.map(c=>c.id===card.id?{...c,quote_status:newStatus,status_changed_by:by,status_changed_at:now}:c));
+  };
+  const moveCard = (card, newStatus)=>{
+    if(card.quote_status===newStatus) return;
+    if(isQuoteLocked(card.quote_status,user)){ setAuthGate({requiredType:"edit",action:()=>doMoveCard(card,newStatus)}); return; }
+    doMoveCard(card,newStatus);
+  };
+
+  const fmtInr = (n)=> "INR "+fmtR(n);
+  const fmtMoved = (c)=> c.status_changed_by ? ("Moved by "+c.status_changed_by+" on "+new Date(c.status_changed_at).toLocaleDateString()) : "Not moved yet";
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+      h("div",{style:{fontWeight:700,fontSize:16}},"CRM Funnel"),
+      h("button",{onClick:()=>setViewMode(v=>v==="board"?"table":"board"),style:btnSecondary},viewMode==="board"?"Switch to table view":"Switch to board view")
+    ),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Drag a card to a new column to change that Sl No's status. Each column total is the sum of its cards, always in INR."),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    viewMode==="table"
+      ? h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+          h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+            h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Status"),
+            h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Quote#"),
+            h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Sl No"),
+            h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Customer"),
+            h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Description"),
+            h("th",{style:{padding:"7px 9px",fontSize:10.5,textAlign:"right"}},"Total Value (INR)"),
+            h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Last moved")
+          )),
+          h("tbody",null,
+            cards.map(c=>h("tr",{key:c.id,style:{borderTop:"1px solid #eceae0"}},
+              h("td",{style:{padding:"7px 9px",fontWeight:600}},c.quote_status),
+              h("td",{style:{padding:"7px 9px"}},c.reference_number),
+              h("td",{style:{padding:"7px 9px"}},c.item_sl_no),
+              h("td",{style:{padding:"7px 9px"}},c.customer_name||"—"),
+              h("td",{style:{padding:"7px 9px",color:colors.muted}},c.description||"—"),
+              h("td",{style:{padding:"7px 9px",textAlign:"right"}},fmtInr(c.totalValue)),
+              h("td",{style:{padding:"7px 9px",color:colors.mutedLight,fontSize:11}},fmtMoved(c))
+            )),
+            cards.length===0 && h("tr",null,h("td",{colSpan:7,style:{padding:14,fontSize:12,color:colors.mutedLight}},"No quotes yet."))
+          )
+        )
+      : h("div",{style:{display:"flex",gap:12,overflowX:"auto",paddingBottom:10}},
+      statuses.map(status=>{
+        const colCards = cards.filter(c=>c.quote_status===status);
+        const total = colCards.reduce((s,c)=>s+c.totalValue,0);
+        return h("div",{
+          key:status,
+          onDragOver:e=>e.preventDefault(),
+          onDrop:()=>{ if(dragCard) moveCard(dragCard,status); setDragCard(null); },
+          style:{flex:"0 0 230px",background:"#f4f2ea",borderRadius:10,padding:10,display:"flex",flexDirection:"column",gap:8,minHeight:120}
+        },
+          h("div",{style:{padding:"2px 4px 6px",borderBottom:"1px solid "+colors.border}},
+            h("div",{style:{fontSize:12.5,fontWeight:700}},status+" ("+colCards.length+")"),
+            h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},fmtInr(total))
+          ),
+          colCards.map(c=>h("div",{
+            key:c.id, draggable:true,
+            onDragStart:()=>setDragCard(c),
+            onDragEnd:()=>setDragCard(null),
+            style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"9px 11px",cursor:"grab"}
+          },
+            h("div",{style:{fontWeight:600,fontSize:12.5}},c.customer_name||"—"),
+            h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},c.reference_number+" · Sl "+c.item_sl_no),
+            h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},c.description||"—"),
+            h("div",{style:{fontSize:12.5,fontWeight:600,marginTop:5}},fmtInr(c.totalValue)),
+            h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginTop:5,borderTop:"1px solid #f0efe8",paddingTop:4}},fmtMoved(c))
+          )),
+          colCards.length===0 && h("div",{style:{fontSize:11,color:colors.mutedLight,padding:6}},"No cards.")
+        );
+      })
+    ),
+    authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action })
   );
 }
 
@@ -9497,10 +9682,12 @@ function App() {
     tab==="reports_audit"?h(MastersAuditReport,{user}):
     tab==="reports_item_coverage"?h(ItemCoverageReport,null):
     tab==="reports_quote_status"?h(QuoteStatusReport,null):
+    tab==="reports_status_history"?h(StatusChangeHistoryReport,null):
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="authorization_codes"?h(AuthorizationCodesScreen,{user}):
     tab==="delete_activity_report"?h(DeleteActivityReportScreen,{user}):
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
+    tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
     tab==="customers"?h(CustomersScreen,{user}):
