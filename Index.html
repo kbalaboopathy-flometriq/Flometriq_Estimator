@@ -4601,6 +4601,12 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const signatoryName = first.signatory_name || "";
       const signatoryDesignation = first.signatory_designation || "";
       const today = new Date().toLocaleDateString("en-GB");
+      // Wrapped so the PDF preview can regenerate it live with small overrides
+      // (Customer Name, Delivery, Validity) without re-fetching from the DB.
+      const buildDoc = async (overrides={})=>{
+      const effCustomerName = overrides.customerName!==undefined ? overrides.customerName : customerName;
+      const effDelivery = overrides.delivery!==undefined ? overrides.delivery : (terms.delivery_term||"—");
+      const effValidity = overrides.validity!==undefined ? overrides.validity : (terms.validity||"—");
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
       const W = doc.internal.pageSize.getWidth(); const H = doc.internal.pageSize.getHeight();
@@ -4623,7 +4629,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       letterhead("QUOTATION");
       let y=36;
       doc.setFontSize(9); doc.setTextColor(...dark);
-      doc.setFont(undefined,"bold"); doc.text("Customer Name:",12,y); doc.setFont(undefined,"normal"); doc.text(String(customerName),50,y); y+=6;
+      doc.setFont(undefined,"bold"); doc.text("Customer Name:",12,y); doc.setFont(undefined,"normal"); doc.text(String(effCustomerName),50,y); y+=6;
       if(customerAddress){
         const addrLines = String(customerAddress).split("\n").map(s=>s.trim()).filter(Boolean);
         doc.setFont(undefined,"bold"); doc.text("Address:",12,y); doc.setFont(undefined,"normal");
@@ -4651,8 +4657,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const quoteIsInr = quoteCurrency==="INR";
       const quoteFx = Number(first.conversion_rate)||1;
       const coverLetterBody = [
-        ["Delivery", terms.delivery_term||"—"],
-        ["Validity", terms.validity||"—"],
+        ["Delivery", effDelivery],
+        ["Validity", effValidity],
         ["Total Basic Price - INR", "INR "+fmtR(totalSalesAll)]
       ];
       if(!quoteIsInr) coverLetterBody.push(["Total Basic Price - "+quoteCurrency, quoteCurrency+" "+fmtR(totalSalesAll/quoteFx)]);
@@ -4805,7 +4811,15 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       });
 
       numberQuotePages(doc, W);
-      setPdfPreview({doc, filename:quoteExportRef.replace(/\s+/g,"_")+"_Quote.pdf"});
+      return doc;
+      }; // end buildDoc
+
+      const doc = await buildDoc({});
+      setPdfPreview({
+        doc, filename:quoteExportRef.replace(/\s+/g,"_")+"_Quote.pdf",
+        buildDoc,
+        quickEditDefaults: { customerName, delivery: terms.delivery_term||"—", validity: terms.validity||"—" }
+      });
       await logAudit("EXPORT","estimates",quoteExportRef,"Generated compiled quote PDF for "+quoteExportRef,user?.username||"unknown",null,null);
     } catch(e){
       console.error("Generate quote PDF failed", e);
@@ -5666,7 +5680,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
     showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>setShowDatasheet(false) }),
     historyOpen && refFilter && h(QuoteHistoryPanel,{ referenceNumber:refFilter, onClose:()=>setHistoryOpen(false) }),
     authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action }),
-    pdfPreview && h(PdfPreviewModal,{ doc:pdfPreview.doc, filename:pdfPreview.filename, onClose:()=>setPdfPreview(null) }),
+    pdfPreview && h(PdfPreviewModal,{ doc:pdfPreview.doc, filename:pdfPreview.filename, buildDoc:pdfPreview.buildDoc, quickEditDefaults:pdfPreview.quickEditDefaults, onClose:()=>setPdfPreview(null) }),
     showDeleteQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Delete entire quote "+refFilter+"?"),
@@ -5784,25 +5798,56 @@ async function logAudit(action, tableName, recordId, recordSummary, performedBy,
 // built jsPDF doc as a blob in an iframe, with Download/Cancel. Other PDFs
 // in the app (reports, User Manual, audit exports) skip this and save
 // directly, per current scope.
-function PdfPreviewModal({ doc, filename, onClose }){
+function PdfPreviewModal({ doc:initialDoc, filename, onClose, buildDoc, quickEditDefaults }){
+  const [doc,setDoc] = useState(initialDoc);
   const [blobUrl,setBlobUrl] = useState(null);
+  const [rendering,setRendering] = useState(false);
+  const [edits,setEdits] = useState(quickEditDefaults||{});
+  const debounceRef = useRef(null);
+
   useEffect(()=>{
     const url = URL.createObjectURL(doc.output("blob"));
     setBlobUrl(url);
     return ()=>URL.revokeObjectURL(url);
   },[doc]);
+
+  const onEditField = (key,value)=>{
+    const next = {...edits,[key]:value};
+    setEdits(next);
+    if(!buildDoc) return;
+    if(debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async()=>{
+      setRendering(true);
+      const rebuilt = await buildDoc(next);
+      setDoc(rebuilt);
+      setRendering(false);
+    },400);
+  };
+
   return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1500,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
-    h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 22px",width:820,maxWidth:"96vw",height:"88vh",display:"flex",flexDirection:"column"}},
+    h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 22px",width:buildDoc?1020:820,maxWidth:"96vw",height:"88vh",display:"flex",flexDirection:"column"}},
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
-        h("div",{style:{fontWeight:700,fontSize:14}},"Preview — "+filename),
+        h("div",{style:{fontWeight:700,fontSize:14}},"Preview — "+filename+(rendering?" (updating…)":"")),
         h("div",{style:{display:"flex",gap:8}},
           h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
           h("button",{onClick:()=>{ doc.save(filename); onClose(); },style:btnPrimary},"Download")
         )
       ),
-      blobUrl
-        ? h("iframe",{src:blobUrl,style:{flex:1,border:"1px solid "+colors.border,borderRadius:6}})
-        : h("div",{style:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",color:colors.mutedLight,fontSize:12}},"Rendering preview…")
+      h("div",{style:{flex:1,display:"flex",gap:14,minHeight:0}},
+        buildDoc && h("div",{style:{width:220,flexShrink:0,borderRight:"1px solid "+colors.border,paddingRight:14,overflowY:"auto"}},
+          h("div",{style:{fontSize:10.5,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:8}},"Quick edits"),
+          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Customer Name"),
+          h("input",{value:edits.customerName||"",onChange:e=>onEditField("customerName",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,marginBottom:10}}),
+          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Delivery"),
+          h("input",{value:edits.delivery||"",onChange:e=>onEditField("delivery",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,marginBottom:10}}),
+          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Validity"),
+          h("input",{value:edits.validity||"",onChange:e=>onEditField("validity",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,marginBottom:10}}),
+          h("div",{style:{fontSize:10,color:colors.mutedLight,marginTop:10,lineHeight:1.5}},"Only these fields are quick-editable here. For anything else — line items, pricing, specs — edit the actual quote, then re-open this preview. The Commercial Terms annexure page always shows the saved values, not these overrides.")
+        ),
+        blobUrl
+          ? h("iframe",{src:blobUrl,style:{flex:1,border:"1px solid "+colors.border,borderRadius:6}})
+          : h("div",{style:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",color:colors.mutedLight,fontSize:12}},"Rendering preview…")
+      )
     )
   );
 }
