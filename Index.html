@@ -95,6 +95,24 @@ const NUMERIC_COLS = new Set(["rate","cost","sf","sales_price","qty_required","c
    popup form. */
 function normalizeItemName(s){ return (s||"").replace(/\s+/g," ").trim().toLowerCase(); }
 
+// Casting vs Fabricated classifier for a model, per Flometriq's naming convention.
+// Checked in order — first match wins. Item-based rules (always Fabricated regardless
+// of model prefix) come first, then model-prefix rules. Returns null if nothing matches,
+// meaning it needs a manual look.
+function classifyModelCategory(item, model){
+  const it = (item||"").toLowerCase();
+  const m = (model||"").toUpperCase().trim();
+  if(it.includes("air vessel")||it.includes("separator")||it.includes("hydro cyclone")||it.includes("hydrocyclone")) return "Fabricated";
+  if(it.includes("conical")&&it.includes("temporary")&&it.includes("strainer")) return "Fabricated";
+  if(!m) return null;
+  if(m.startsWith("DB-FA")) return "Fabricated";
+  if(m.startsWith("T-CASTING")) return "Casting";
+  if(m.startsWith("T")) return "Fabricated";
+  if(m.startsWith("BCE")||m.startsWith("YCE")||m.startsWith("YCP")) return "Casting";
+  if(m.startsWith("BFS")||m.startsWith("YFS")||m.startsWith("YFP")) return "Fabricated";
+  return null;
+}
+
 async function loadDatasheetMaster(item){
   if(!item) return null;
   const target = normalizeItemName(item);
@@ -1001,6 +1019,26 @@ function MasterEditor({ tableKey, user }) {
   const [dupSource,setDupSource]=useState(""); const [dupTarget,setDupTarget]=useState("");
   const [dupBusy,setDupBusy]=useState(false); const [dupMsg,setDupMsg]=useState("");
 
+  // Download all models (Models table only) — every row, not just the current page,
+  // with the auto-classified Casting/Fabricated category alongside.
+  const [modelsExportBusy,setModelsExportBusy]=useState(false);
+  const downloadAllModels = async()=>{
+    setModelsExportBusy(true);
+    try{
+      const all = await fetchAll("model_tbl","item,model,size");
+      const rowsOut=[["Item","Model","Size","Category"]];
+      all.forEach(r=>{
+        const cat = classifyModelCategory(r.item,r.model);
+        rowsOut.push([r.item||"",r.model||"",r.size||"",cat||"Check manually"]);
+      });
+      const ws = XLSX.utils.aoa_to_sheet(rowsOut);
+      ws["!cols"]=[{wch:26},{wch:20},{wch:12},{wch:16}];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Models");
+      XLSX.writeFile(wb,"all_models_with_category.xlsx");
+    } finally { setModelsExportBusy(false); }
+  };
+
   useEffect(()=>{ if(tableKey==="bom") fetchAll("bom","model").then(d=>setAllModels(Array.from(new Set(d.map(r=>r.model).filter(Boolean))).sort())); },[tableKey]);
 
   // Load cascade options for all cascade fields
@@ -1140,6 +1178,7 @@ function MasterEditor({ tableKey, user }) {
         selectedIds.size>0 && h("button",{onClick:deleteSelected,style:btnDanger},"Delete "+selectedIds.size+" selected"),
         h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search…",style:{...inputStyle,width:200}}),
         tableKey==="bom"&&h("button",{onClick:()=>{setShowDup(v=>!v);setDupMsg("");},style:btnSecondary},"Duplicate model"),
+        tableKey==="model_tbl"&&h("button",{onClick:downloadAllModels,disabled:modelsExportBusy,style:btnSecondary},modelsExportBusy?"Preparing…":"Download all models"),
         h("button",{onClick:()=>{setAdding(v=>!v);setAddDraft({});},style:btnPrimary},"+ "+addLabel)
       )
     ),
