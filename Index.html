@@ -57,7 +57,8 @@ const COMPANY_LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAABlCAYA
 
 
 const MASTER_TABLES = [
-  { key: "model_tbl", label: "Models", columns: ["item","model","size"], addLabel:"New model", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"size",from:"size_tbl",field:"size"}], freeText:["model"] },
+  { key: "model_tbl", label: "Models", columns: ["item","model","size","category"], addLabel:"New model", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"size",from:"size_tbl",field:"size"},{col:"category",from:"category_tbl",field:"category"}], freeText:["model"] },
+  { key: "category_tbl", label: "Categories", columns: ["category"], addLabel:"New category", freeText:["category"] },
   { key: "item_tbl", label: "Items", columns: ["item","hsn_code"], addLabel:"New item", freeText:["item","hsn_code"] },
   { key: "size_tbl", label: "Sizes", columns: ["size"], addLabel:"New size", freeText:["size"] },
   { key: "component_item_tbl", label: "Components by item", columns: ["component","item"], addLabel:"New component", cascade:[{col:"item",from:"item_tbl",field:"item"}], freeText:["component"] },
@@ -106,11 +107,23 @@ function classifyModelCategory(item, model){
   if(it.includes("conical")&&it.includes("temporary")&&it.includes("strainer")) return "Fabricated";
   if(!m) return null;
   if(m.startsWith("DB-FA")) return "Fabricated";
-  if(m.startsWith("T-CASTING")) return "Casting";
+  if(m.includes("CASTING")) return "Casting"; // covers "T-CASTING…" and "T STRAINER-CASTING SERIES…"
+  if(m.startsWith("TCE")) return "Casting";
   if(m.startsWith("T")) return "Fabricated";
   if(m.startsWith("BCE")||m.startsWith("YCE")||m.startsWith("YCP")) return "Casting";
   if(m.startsWith("BFS")||m.startsWith("YFS")||m.startsWith("YFP")) return "Fabricated";
   return null;
+}
+const CATEGORY_TAG_COLORS = {
+  "Casting": { bg:"#eaf9f4", color:"#0f6e56" },
+  "Fabricated": { bg:"#fff8e1", color:"#7a5000" },
+  "Barstock": { bg:"#eef2fb", color:"#2b4a9e" },
+  "Investment Casting": { bg:"#f3ecfb", color:"#5c2d91" },
+  "Forging": { bg:"#fdeeee", color:"#9e2b2b" },
+};
+function categoryTagStyle(cat){
+  const c = CATEGORY_TAG_COLORS[cat] || { bg:"#f0efe8", color:colors.muted };
+  return { background:c.bg, color:c.color, fontSize:11, padding:"2px 8px", borderRadius:4, fontWeight:600 };
 }
 
 async function loadDatasheetMaster(item){
@@ -647,7 +660,7 @@ function MenuTabs({ user, active, onChange }) {
     return ()=>document.removeEventListener("mousedown", onDocClick);
   },[]);
 
-  const bomSetupKeys = ["model_tbl","item_tbl","size_tbl","component_item_tbl","subassembly_tbl","materials_shape","material_spec","uom_tbl","material_rates","bom"];
+  const bomSetupKeys = ["model_tbl","category_tbl","item_tbl","size_tbl","component_item_tbl","subassembly_tbl","materials_shape","material_spec","uom_tbl","material_rates","bom"];
   const ctKeys = ["quote_status_tbl","payment_terms_tbl","delivery_terms_tbl","packing_forwarding_tbl","insurance_terms_tbl","price_basis_tbl","guarantee_terms_tbl","dispatch_through_tbl","incoterms_tbl","freight_terms_tbl","tax_terms_tbl","warranty_coverage_tbl"];
   const byKeys = keys => MASTER_TABLES.filter(t=>keys.includes(t.key)).map(t=>({key:t.key,label:t.label}));
 
@@ -1025,11 +1038,11 @@ function MasterEditor({ tableKey, user }) {
   const downloadAllModels = async()=>{
     setModelsExportBusy(true);
     try{
-      const all = await fetchAll("model_tbl","item,model,size");
+      const all = await fetchAll("model_tbl","item,model,size,category");
       const rowsOut=[["Item","Model","Size","Category"]];
       all.forEach(r=>{
-        const cat = classifyModelCategory(r.item,r.model);
-        rowsOut.push([r.item||"",r.model||"",r.size||"",cat||"Check manually"]);
+        const cat = r.category || classifyModelCategory(r.item,r.model) || "Check manually";
+        rowsOut.push([r.item||"",r.model||"",r.size||"",cat]);
       });
       const ws = XLSX.utils.aoa_to_sheet(rowsOut);
       ws["!cols"]=[{wch:26},{wch:20},{wch:12},{wch:16}];
@@ -1343,7 +1356,7 @@ async function loadMasterData(setMasterData) {
 }
 
 /* ---- ESTIMATOR ---- */
-function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote }) {
+function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote, initialModel, onConsumedInitialModel }) {
   const { models, gradesBySpec, rateBySpecGrade, allSpecs, uoms, allComponents, subAssembliesByComponent, loadingMaster } = masterData;
   const [modelFilter,setModelFilter]=useState(""); const [selectedModel,setSelectedModel]=useState(null);
   const [lines,setLines]=useState([]); const [overrides,setOverrides]=useState({});
@@ -1463,6 +1476,11 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
     setMocLines(loadedLines);
     setShowMOC(true);
   };
+
+  // Bridge from Reports > BOM Coverage's "Open BOM" button: jump straight to a model.
+  useEffect(()=>{
+    if(initialModel){ selectModel(initialModel); onConsumedInitialModel && onConsumedInitialModel(); }
+  },[initialModel]);
 
   // Manual line item: cascades the same way Master Data does (Component -> Sub Assembly,
   // Material spec -> Grade), then appends to `lines` + `overrides` using the exact shape
@@ -6822,7 +6840,7 @@ const MANUAL_SECTIONS = [
           {
             "type": "bullets",
             "items": [
-              "BOM Coverage \u2014 Available / Not Set / All, grouped by Item, Model, Size, with counts and search.",
+              "BOM Coverage \u2014 Available / Not Set / All, grouped by Item, Category (Casting/Fabricated/Barstock/Investment Casting/Forging), Model, and Size, with counts, search, and an \u201cOpen BOM\u201d button per size that jumps straight into the Estimator with that model loaded.",
               "Activity by User \u2014 day/week/month/quarter/year presets or a custom range, pivoted by user.",
               "Quotes \u2014 summary by client, currency exposure, and most-quoted models."
             ]
@@ -7317,6 +7335,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026", summary:"New Categories master table (Casting, Fabricated, Barstock, Investment Casting, Forging) and a Category field on Models, cascading from it — backfilled for 907 existing models from an admin-corrected review file. BOM Coverage now groups Item → Category → Model → Size, with a colored category tag and an \"Open BOM\" button per size that jumps straight into the Estimator with that model loaded. Master Data → Models also gained a \"Download all models\" button (every model, not just the current page, with its category) for offline review." },
   { date:"15 Jul 2026", summary:"Currency conversion (AED), Contacts as a company sub-form + upload-to-extract, Estimator manual line item with cascading dropdowns, freeze pane, mirrored scrollbar, global Sf change, global delete confirmation audit, nearest-5 rounding on rates/totals, cover letter Customer/Address/Attention fields, Datasheet Add-line now updates the Master too, \"Other\" dropdown bug fixed." },
   { date:"14 Jul 2026", summary:"Quote# selector defaults to the most recently created quote; Export panel follows the header selection instead of a separate picker." },
   { date:"13 Jul 2026", summary:"Datasheet save error now surfaces real failures instead of a false \"Saved\"; fixed a double-submit gap on the Estimator Save button." }
@@ -7794,7 +7813,8 @@ const TOUR_SLIDES = [
     "title": "Master Data",
     "tag": "The lookup lists behind everything",
     "bullets": [
-      "BOM setup \u2014 Models, Items, Sizes, Components, Material Specs, and more",
+      "BOM setup \u2014 Models, Categories (Casting/Fabricated/Barstock/Investment Casting/Forging), Items, Sizes, Components, Material Specs, and more",
+      "Every model carries a Category (strict dropdown from the Categories master) \u2014 drives the grouping in BOM Coverage",
       "Commercial Terms masters \u2014 every dropdown's option list",
       "Missing an option? Add it inline without losing your place",
       "Datasheet Master and Allowable Stress round out the engineering data"
@@ -8957,7 +8977,7 @@ function PermissionsEditor() {
   const [users,setUsers]=useState([]); const [selUser,setSelUser]=useState("");
   const [perms,setPerms]=useState({}); const [loading,setLoading]=useState(false);
   const [saving,setSaving]=useState(false); const [msg,setMsg]=useState("");
-  const tables=["bom","model_tbl","item_tbl","size_tbl","component_item_tbl","subassembly_tbl","materials_shape","material_spec","uom_tbl","material_rates"];
+  const tables=["bom","model_tbl","category_tbl","item_tbl","size_tbl","component_item_tbl","subassembly_tbl","materials_shape","material_spec","uom_tbl","material_rates"];
 
   useEffect(()=>{ sb.from("app_users").select("username,role").order("username").then(({data})=>setUsers(data||[])); },[]);
 
@@ -9679,10 +9699,10 @@ function CalcHistoryViewer({ user }) {
 
 
 /* ---- REPORTS ---- */
-function ReportsScreen({ user }) {
+function ReportsScreen({ user, onOpenModel }) {
   const [showMode,setShowMode]=useState("available"); // "available" | "missing" | "all"
   const [loading,setLoading]=useState(true);
-  const [modelRows,setModelRows]=useState([]); // {item,model,size} from model_tbl
+  const [modelRows,setModelRows]=useState([]); // {item,model,size,category} from model_tbl
   const [bomCounts,setBomCounts]=useState(new Map()); // model -> component count
   const [search,setSearch]=useState("");
   const [itemFilter,setItemFilter]=useState(new Set()); // empty = all items
@@ -9692,7 +9712,7 @@ function ReportsScreen({ user }) {
   const load = useCallback(async()=>{
     setLoading(true);
     const [models, bomRows] = await Promise.all([
-      fetchAll("model_tbl","item,model,size"),
+      fetchAll("model_tbl","item,model,size,category"),
       fetchAll("bom","model"),
     ]);
     const counts = new Map();
@@ -9719,7 +9739,7 @@ function ReportsScreen({ user }) {
     return { available, missing: baseFiltered.length-available, all: baseFiltered.length };
   },[baseFiltered,bomCounts]);
 
-  // Group by Item -> Model -> Size, in the order items/models first appear.
+  // Group by Item -> Category -> Model -> Size, in the order items/categories/models first appear.
   const grouped = useMemo(()=>{
     const filtered = baseFiltered.filter(r=>{
       if(showMode==="all") return true;
@@ -9729,11 +9749,14 @@ function ReportsScreen({ user }) {
     const items=[]; const itemMap=new Map();
     filtered.forEach(r=>{
       const itemKey = r.item||"(no item)";
-      if(!itemMap.has(itemKey)){ const g={item:itemKey, models:[], modelMap:new Map()}; itemMap.set(itemKey,g); items.push(g); }
+      if(!itemMap.has(itemKey)){ const g={item:itemKey, cats:[], catMap:new Map()}; itemMap.set(itemKey,g); items.push(g); }
       const ig = itemMap.get(itemKey);
+      const catKey = r.category||"Uncategorized";
+      if(!ig.catMap.has(catKey)){ const cg={category:catKey, models:[], modelMap:new Map()}; ig.catMap.set(catKey,cg); ig.cats.push(cg); }
+      const cg = ig.catMap.get(catKey);
       const modelKey = r.model||"(no model)";
-      if(!ig.modelMap.has(modelKey)){ const mg={model:modelKey, sizes:[]}; ig.modelMap.set(modelKey,mg); ig.models.push(mg); }
-      ig.modelMap.get(modelKey).sizes.push({ size:r.size||"—", count: bomCounts.get(r.model)||0 });
+      if(!cg.modelMap.has(modelKey)){ const mg={model:modelKey, sizes:[]}; cg.modelMap.set(modelKey,mg); cg.models.push(mg); }
+      cg.modelMap.get(modelKey).sizes.push({ size:r.size||"—", count: bomCounts.get(r.model)||0 });
     });
     return items;
   },[baseFiltered,bomCounts,showMode]);
@@ -9747,21 +9770,21 @@ function ReportsScreen({ user }) {
   const modeLabel = showMode==="available" ? "Available" : showMode==="missing" ? "Not Set" : "All";
 
   const exportExcel = ()=>{
-    const rows=[["Item","Model","Size","Components","Status"]];
-    grouped.forEach(ig=>ig.models.forEach(mg=>mg.sizes.forEach(s=>{
-      rows.push([ig.item, mg.model, s.size, s.count, s.count>0?"BOM available":"Not set up"]);
-    })));
+    const rows=[["Item","Category","Model","Size","Components","Status"]];
+    grouped.forEach(ig=>ig.cats.forEach(cg=>cg.models.forEach(mg=>mg.sizes.forEach(s=>{
+      rows.push([ig.item, cg.category, mg.model, s.size, s.count, s.count>0?"BOM available":"Not set up"]);
+    }))));
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws["!cols"] = [{wch:22},{wch:26},{wch:12},{wch:12},{wch:16}];
+    ws["!cols"] = [{wch:22},{wch:16},{wch:26},{wch:12},{wch:12},{wch:16}];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "BOM Coverage");
     XLSX.writeFile(wb, "bom_coverage_"+modeLabel.toLowerCase().replace(/\s+/g,"_")+".xlsx");
   };
   const exportPDF = ()=>{
     const items=[];
-    grouped.forEach(ig=>ig.models.forEach(mg=>mg.sizes.forEach(s=>{
-      items.push({ item:ig.item, sub:mg.model+"  ·  "+s.size+"  ·  "+(s.count>0?s.count+" comp.":"Not set up") });
-    })));
+    grouped.forEach(ig=>ig.cats.forEach(cg=>cg.models.forEach(mg=>mg.sizes.forEach(s=>{
+      items.push({ item:ig.item, sub:"["+cg.category+"] "+mg.model+"  ·  "+s.size+"  ·  "+(s.count>0?s.count+" comp.":"Not set up") });
+    }))));
     generateMultiColumnListPDF({ title:"BOM Coverage — "+modeLabel, subtitle:items.length+" model+size combinations", items, columnsCount:3, createdBy:user.username, filename:"bom_coverage_"+modeLabel.toLowerCase().replace(/\s+/g,"_")+".pdf" });
   };
 
@@ -9804,16 +9827,27 @@ function ReportsScreen({ user }) {
       grouped.map(ig=>h("div",{key:ig.item,style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden",marginBottom:10}},
         h("div",{style:{background:colors.dark,color:"#fff",padding:"9px 14px",fontSize:12.5,fontWeight:700,display:"flex",justifyContent:"space-between"}},
           h("span",null,ig.item),
-          h("span",{style:{fontWeight:400,opacity:0.7,fontSize:11}},ig.models.length+" model"+(ig.models.length===1?"":"s"))
+          h("span",{style:{fontWeight:400,opacity:0.7,fontSize:11}},ig.cats.reduce((n,c)=>n+c.models.length,0)+" model"+(ig.cats.reduce((n,c)=>n+c.models.length,0)===1?"":"s"))
         ),
-        ig.models.map(mg=>h("div",{key:mg.model},
-          h("div",{style:{padding:"6px 14px 6px 28px",fontSize:12,fontWeight:700,background:"#faf9f4",borderTop:"1px solid #eceae0"}},mg.model),
-          mg.sizes.map((s,si)=>h("div",{key:si,style:{display:"flex",alignItems:"center",padding:"6px 14px 6px 44px",fontSize:12,borderTop:"1px solid #f0efe8"}},
-            h("div",{style:{width:90,color:colors.muted}},s.size),
-            h("div",{style:{width:130,color:s.count>0?colors.text:colors.mutedLight}},s.count+" component"+(s.count===1?"":"s")),
-            s.count>0
-              ? h("div",{style:{color:"#085041"}},"✓ BOM available")
-              : h("div",{style:{color:"#b8472f"}},"⚠ Not set up")
+        ig.cats.map(cg=>h("div",{key:cg.category},
+          h("div",{style:{padding:"6px 14px 6px 22px",fontSize:11.5,fontWeight:600,background:"#f4f2ea",borderTop:"1px solid #eceae0"}},
+            h("span",{style:categoryTagStyle(cg.category)},cg.category)
+          ),
+          cg.models.map(mg=>h("div",{key:mg.model},
+            h("div",{style:{padding:"6px 14px 6px 38px",fontSize:12,fontWeight:700,background:"#faf9f4",borderTop:"1px solid #eceae0"}},mg.model),
+            mg.sizes.map((s,si)=>h("div",{key:si,style:{display:"flex",alignItems:"center",padding:"6px 14px 6px 54px",fontSize:12,borderTop:"1px solid #f0efe8"}},
+              h("div",{style:{width:90,color:colors.muted}},s.size),
+              h("div",{style:{width:130,color:s.count>0?colors.text:colors.mutedLight}},s.count+" component"+(s.count===1?"":"s")),
+              h("div",{style:{width:130},},s.count>0
+                ? h("span",{style:{color:"#085041"}},"✓ BOM available")
+                : h("span",{style:{color:"#b8472f"}},"⚠ Not set up")),
+              onOpenModel && h("button",{
+                onClick:()=>onOpenModel(mg.model),
+                disabled:s.count===0,
+                title:s.count===0?"No BOM lines yet for this model":"Open this model in the Estimator",
+                style:{...btnSecondary,marginLeft:"auto",padding:"4px 10px",fontSize:11,opacity:s.count===0?0.45:1,cursor:s.count===0?"not-allowed":"pointer"}
+              },"Open BOM")
+            ))
           ))
         ))
       )),
@@ -10314,6 +10348,7 @@ function App() {
   const [sessionCompanyId,setSessionCompanyId]=useState(null); // Super Admin's chosen company for this session
   const [masterData,setMasterData]=useState({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],uoms:[],allComponents:[],subAssembliesByComponent:new Map(),loadingMaster:true});
   const [quoteToOpen,setQuoteToOpen]=useState(null); // {reference_number,item_sl_no} bridge from Estimator's save popup to Quotes
+  const [openModelTarget,setOpenModelTarget]=useState(null); // model string bridge from BOM Coverage's "Open BOM" button to Estimator
   const [monthlyArchiveDone,setMonthlyArchiveDone]=useState(false);
   const [draftReminderDone,setDraftReminderDone]=useState(false);
 
@@ -10334,9 +10369,9 @@ function App() {
     (user.role!=="super_admin" || monthlyArchiveDone) && !draftReminderDone && h(DraftOfferReminder,{user,onDone:()=>setDraftReminderDone(true)}),
     h(TopBar,{user,sessionCompanyId,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyId(null)):null,onLogout:()=>{setUser(null);setSessionCompanyId(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
     h(MenuTabs,{user,active:tab,onChange:setTab}),
-    h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}})),
+    h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null)})),
     tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null)}):
-    tab==="reports"?h(ReportsScreen,{user}):
+    tab==="reports"?h(ReportsScreen,{user,onOpenModel:(m)=>{setOpenModelTarget(m);setTab("estimator");}}):
     tab==="reports_activity"?h(ActivityByUserReport,{user}):
     tab==="reports_quotes"?h(QuoteReports,{user}):
     tab==="reports_masters"?h(MaterialRatesReport,{user}):
