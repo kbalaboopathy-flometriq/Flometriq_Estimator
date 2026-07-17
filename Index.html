@@ -1310,6 +1310,16 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
   const [lines,setLines]=useState([]); const [overrides,setOverrides]=useState({});
   const [loadingLines,setLoadingLines]=useState(false); const [error,setError]=useState("");
   const [cart,setCart]=useState([]); const [showSave,setShowSave]=useState(false);
+  const [showAddGateway,setShowAddGateway]=useState(false);
+  const [gatewayStep,setGatewayStep]=useState("quote"); // "quote" | "newConfirm" | "existingChoice" | "slNo"
+  const [gatewayRef,setGatewayRef]=useState("");
+  const [gatewaySiblings,setGatewaySiblings]=useState(null); // [{item_sl_no,...}] or null while unresolved
+  const [gatewaySlNoInput,setGatewaySlNoInput]=useState("");
+  const [gatewaySlNoWarn,setGatewaySlNoWarn]=useState(false);
+  const [gatewayBusy,setGatewayBusy]=useState(false);
+  const [showSimpleSave,setShowSimpleSave]=useState(false);
+  const [simpleSaving,setSimpleSaving]=useState(false);
+  const [gatewayConfirmedNewSlNo,setGatewayConfirmedNewSlNo]=useState(false);
   const [saveMaximised,setSaveMaximised]=useState(false);
   const [refNumber,setRefNumber]=useState(""); const [refDesc,setRefDesc]=useState("");
   const [descMasterPrompt,setDescMasterPrompt]=useState(null); // item name once we've decided to prompt for it
@@ -1876,7 +1886,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
     if(!selectedModel||computedLines.length===0) return;
     const toAdd=computedLines.map(l=>({model:selectedModel,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec||"",grade:l.selGrade||(l.hasSpec?"":""),qty_required:l.qty,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.salesPrice,show_in_moc:l.showInMoc,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||""}));
     setCart(c=>c.concat(toAdd));
-    setTimeout(()=>{ setShowSave(true); loadQuoteOptions(); }, 0);
+    setTimeout(()=>{ setShowAddGateway(true); setGatewayStep("quote"); setGatewayRef(""); setGatewaySiblings(null); setGatewaySlNoInput(""); setGatewaySlNoWarn(false); loadQuoteOptions(); }, 0);
   };
 
   const removeFromCart = (idx)=>setCart(c=>c.filter((_,i)=>i!==idx));
@@ -1884,6 +1894,56 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
   const cartTotalSales=useMemo(()=>cart.reduce((s,l)=>s+(l.sales_price||0),0),[cart]);
 
   const clearEstimate = ()=>{ if(!confirm("Clear the current estimate and all cart items?")) return; setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setCurrency("INR");setConversionRate("1");setCustomerName("");setCustomerAddress("");setContactName("");setContactDesignation("");setSignatoryName("");setSignatoryDesignation("");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg(""); };
+
+  // ---- "+ Add to estimate" gateway: Quote# first, then branch ----
+  const gatewayLookup = async()=>{
+    const ref = gatewayRef.trim();
+    if(!ref) return;
+    setGatewayBusy(true);
+    const { data } = await sb.from("estimates").select("item_sl_no,customer_name").eq("reference_number",ref).order("item_sl_no");
+    setGatewayBusy(false);
+    if(data && data.length>0){ setGatewaySiblings(data); setGatewayStep("existingChoice"); }
+    else { setGatewaySiblings(null); setGatewayStep("newConfirm"); }
+  };
+  const gatewayCreateNew = ()=>{
+    setRefNumber(gatewayRef.trim()); setItemSlNo("1"); setExistingQuoteHeader(null);
+    setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setConversionRate("1");
+    setCustomerName(""); setCustomerAddress(""); setContactName(""); setContactDesignation("");
+    setSignatoryName(""); setSignatoryDesignation(""); setRefDesc("");
+    setShowAddGateway(false); setShowSave(true);
+  };
+  const gatewayViewExisting = ()=>{
+    const firstSlNo = Math.min(...gatewaySiblings.map(r=>r.item_sl_no));
+    setShowAddGateway(false);
+    onOpenQuote(gatewayRef.trim(), firstSlNo);
+  };
+  const gatewayGoToSlNoStep = ()=>{ setGatewaySlNoInput(""); setGatewaySlNoWarn(false); setGatewayStep("slNo"); };
+  const gatewaySlNoContinue = async()=>{
+    const slNo = Number(gatewaySlNoInput);
+    if(!slNo || slNo<=0) return;
+    if(gatewaySiblings.some(r=>r.item_sl_no===slNo)){ setGatewaySlNoWarn(true); return; }
+    setGatewayBusy(true);
+    const ref = gatewayRef.trim();
+    const { data } = await sb.from("estimates").select("enquiry_number,enquiry_date,quote_date,currency,conversion_rate,customer_name,customer_address,contact_name,contact_designation,signatory_name,signatory_designation").eq("reference_number",ref).order("item_sl_no").limit(1);
+    setGatewayBusy(false);
+    const head = (data&&data[0])||{};
+    setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
+    setCurrency(head.currency||"INR"); setConversionRate(String(head.conversion_rate||1));
+    setCustomerName(head.customer_name||""); setCustomerAddress(head.customer_address||"");
+    setContactName(head.contact_name||""); setContactDesignation(head.contact_designation||"");
+    setSignatoryName(head.signatory_name||""); setSignatoryDesignation(head.signatory_designation||"");
+    setRefNumber(ref); setItemSlNo(String(slNo)); setRefDesc("");
+    setExistingQuoteHeader({ usedSlNos: gatewaySiblings.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
+    setGatewayConfirmedNewSlNo(true);
+    setShowAddGateway(false); setShowSimpleSave(true);
+  };
+  const simpleSaveConfirm = async()=>{
+    if(!refDesc.trim()){ alert("Description is required."); return; }
+    setSimpleSaving(true);
+    const ok = await saveReference();
+    setSimpleSaving(false);
+    if(ok) setShowSimpleSave(false); // on failure, stay open so the error in saveMsg is visible
+  };
 
   // Populate the Quote# combo box with every saved quote + its customer, so the
   // person can either pick an existing one or type a brand new Quote#.
@@ -1947,9 +2007,12 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
     // Always confirm before writing into an existing Quote# — whether that
     // means adding a brand-new Sl No alongside it, or overwriting one that's
     // already there. A fresh Quote# (no siblings at all) needs no prompt.
+    // Skipped only when the "+ Add to estimate" gateway already validated
+    // this exact Sl No as new (not an overwrite) one step earlier — asking
+    // twice for the same thing already confirmed would just be annoying.
     setSavingRef(true);
     const { data: siblingRows } = await sb.from("estimates").select("item_sl_no,company_id").eq("reference_number",ref);
-    if(siblingRows && siblingRows.length>0){
+    if(siblingRows && siblingRows.length>0 && !gatewayConfirmedNewSlNo){
       const usedSlNos = siblingRows.map(r=>r.item_sl_no);
       const isOverwrite = usedSlNos.includes(slNo);
       const msg = isOverwrite
@@ -1957,6 +2020,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
         : "Quote# \""+ref+"\" already exists. This will add a new line item as Sl No "+slNo+" alongside its existing Sl No(s) ("+usedSlNos.join(", ")+"). Proceed?";
       if(!confirm(msg)) { setSavingRef(false); setSaveMsg("Save cancelled — nothing was changed. Click \"Confirm save\" again if you want to proceed."); return; }
     }
+    setGatewayConfirmedNewSlNo(false);
     // Which company this quote is issued under is resolved once, at the
     // moment the Quote# is FIRST created, and never changes afterward —
     // even if a different Super Admin later edits or re-saves it. If the
@@ -1982,6 +2046,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
       setSaveMsg("Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).");
       setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setConversionRate("1"); setCustomerName(""); setCustomerAddress(""); setContactName(""); setContactDesignation(""); setSignatoryName(""); setSignatoryDesignation(""); setExistingQuoteHeader(null); setShowSave(false);
+      return true;
     } catch(e){
       // If the lines insert is what failed, don't leave a header behind with
       // no lines under it — that's how "dirty" quotes with no sub-form data
@@ -1992,6 +2057,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
         try{ await sb.from("estimates").delete().eq("id",estimateId); }catch(cleanupErr){}
       }
       setSaveMsg("Save failed: "+(e.message||"unknown"));
+      return false;
     } finally{setSavingRef(false);}
   };
 
@@ -2398,6 +2464,73 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
       })();
     }}),
 
+    // "+ Add to estimate" gateway — Quote# first, then branches to either
+    // the full Save popup (new quote) or the simple save (new Sl No on an
+    // existing quote), or navigates straight to Quotes (view existing).
+    showAddGateway && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1050,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:12,width:420,maxWidth:"94vw",boxShadow:"0 8px 32px rgba(0,0,0,0.2)",overflow:"hidden"}},
+        h("div",{style:{background:colors.dark,padding:"12px 16px"}},
+          h("div",{style:{fontWeight:600,fontSize:14,color:"#fff"}},"Add to estimate")
+        ),
+        gatewayStep==="quote" && h("div",{style:{padding:"18px 20px"}},
+          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Quote#"),
+          h("input",{list:"gateway-quote-options",value:gatewayRef,onChange:e=>setGatewayRef(e.target.value),placeholder:"Type or pick…",autoFocus:true,style:inputStyle,onKeyDown:e=>{ if(e.key==="Enter") gatewayLookup(); }}),
+          h("datalist",{id:"gateway-quote-options"}, quoteOptions.map(o=>h("option",{key:o.reference_number,value:o.reference_number},o.reference_number+(o.description?" — "+o.description:"")))),
+          h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
+            h("button",{onClick:()=>setShowAddGateway(false),style:btnSecondary},"Cancel"),
+            h("button",{onClick:gatewayLookup,disabled:!gatewayRef.trim()||gatewayBusy,style:{...btnPrimary,opacity:(!gatewayRef.trim()||gatewayBusy)?0.6:1}},gatewayBusy?"Checking…":"Continue")
+          )
+        ),
+        gatewayStep==="newConfirm" && h("div",{style:{padding:"18px 20px"}},
+          h("div",{style:{fontSize:12.5,marginBottom:16}},"Quote# \""+gatewayRef.trim()+"\" doesn't exist yet. Create it as a new quote?"),
+          h("div",{style:{display:"flex",gap:8}},
+            h("button",{onClick:gatewayCreateNew,style:btnPrimary},"Create new quote"),
+            h("button",{onClick:()=>setGatewayStep("quote"),style:btnSecondary},"Cancel")
+          )
+        ),
+        gatewayStep==="existingChoice" && h("div",{style:{padding:"18px 20px"}},
+          h("div",{style:{fontSize:12.5,marginBottom:16}},
+            "Quote# \""+gatewayRef.trim()+"\" already exists"+(gatewaySiblings&&gatewaySiblings[0]&&gatewaySiblings[0].customer_name?" ("+gatewaySiblings[0].customer_name+")":"")+". View an existing Sl No, or create a new one?"
+          ),
+          h("div",{style:{display:"flex",gap:8}},
+            h("button",{onClick:gatewayViewExisting,style:btnSecondary},"View existing Sl No"),
+            h("button",{onClick:gatewayGoToSlNoStep,style:btnPrimary},"Create new Sl No")
+          )
+        ),
+        gatewayStep==="slNo" && h("div",{style:{padding:"18px 20px"}},
+          h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8}},"Last Sl No used: "+Math.max(...gatewaySiblings.map(r=>r.item_sl_no))),
+          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"New Sl No"),
+          h("input",{value:gatewaySlNoInput,onChange:e=>{ setGatewaySlNoInput(e.target.value); setGatewaySlNoWarn(false); },placeholder:String(Math.max(...gatewaySiblings.map(r=>r.item_sl_no))+1),autoFocus:true,style:inputStyle,onKeyDown:e=>{ if(e.key==="Enter") gatewaySlNoContinue(); }}),
+          gatewaySlNoWarn && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:8}},"Sl No "+gatewaySlNoInput+" already exists under this quote — enter a different number."),
+          h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
+            h("button",{onClick:()=>setShowAddGateway(false),style:btnSecondary},"Cancel"),
+            h("button",{onClick:gatewaySlNoContinue,disabled:!gatewaySlNoInput.trim()||gatewayBusy,style:{...btnPrimary,opacity:(!gatewaySlNoInput.trim()||gatewayBusy)?0.6:1}},gatewayBusy?"Loading…":"Continue")
+          )
+        )
+      )
+    ),
+
+    // Simple Save — new Sl No on an existing quote. Everything else already
+    // carries over from the gateway step, so this is just Description + Save.
+    showSimpleSave && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1050,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:12,width:440,maxWidth:"94vw",boxShadow:"0 8px 32px rgba(0,0,0,0.2)",overflow:"hidden"}},
+        h("div",{style:{background:colors.dark,padding:"12px 16px"}},
+          h("div",{style:{fontWeight:600,fontSize:14,color:"#fff"}},"Sl No "+itemSlNo+" — "+refNumber),
+          h("div",{style:{fontSize:11,color:"#9a9d8f",marginTop:2}},cart.length+" line(s) across "+Array.from(new Set(cart.map(c=>c.model))).length+" model(s)")
+        ),
+        h("div",{style:{padding:"18px 20px"}},
+          h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14,lineHeight:1.5}},"Customer, Currency, Address, Attention, and Signatory already carry over from this quote — nothing to re-enter."),
+          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Description ",h("span",{style:{color:colors.danger}},"*required")),
+          h("input",{value:refDesc,onChange:e=>setRefDesc(e.target.value),placeholder:"e.g. 150nb Y Strainer",autoFocus:true,style:inputStyle}),
+          saveMsg&&h("div",{style:{fontSize:12,marginTop:10,color:saveMsg.startsWith("Save failed")||saveMsg.startsWith("Save cancelled")?colors.danger:"#2d7a4f"}},saveMsg),
+          h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16}},
+            h("button",{onClick:()=>{ setShowSimpleSave(false); setGatewayConfirmedNewSlNo(false); },style:btnSecondary},"Cancel"),
+            h("button",{onClick:simpleSaveConfirm,disabled:simpleSaving,style:{...btnPrimary,opacity:simpleSaving?0.6:1}},simpleSaving?"Saving…":"Save")
+          )
+        )
+      )
+    ),
+
     // Save Estimate Popup Modal
     showSave&&h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{id:"save-modal",style:{background:"#fff",borderRadius:12,width:"100%",maxWidth:saveMaximised?("calc(100vw - 40px)"):620,maxHeight:saveMaximised?"calc(100vh - 40px)":"85vh",boxShadow:"0 8px 32px rgba(0,0,0,0.2)",overflow:"hidden",display:"flex",flexDirection:"column",transition:"max-width 0.15s"}},
@@ -2485,7 +2618,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote 
           )
         ),
         // Cart lines table
-        h("div",{style:{overflowY:"auto",flex:1}},
+        h("div",{style:{overflowY:"auto",flex:1,minHeight:0}},
           h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse"}},
             h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left",position:"sticky",top:0,zIndex:1}},
               ["Sl","Model","Component","Material spec","Grade","Cost","Sales price",""].map(c=>h("th",{key:c,style:{padding:"7px 10px",borderBottom:"1px solid "+colors.border,fontWeight:600,fontSize:11}},c))
