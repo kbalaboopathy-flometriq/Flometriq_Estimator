@@ -684,6 +684,9 @@ function MenuTabs({ user, active, onChange }) {
         {key:"audit_log",label:"Audit Log"},
         ...(isSuperAdmin?[{key:"delete_activity_report",label:"Delete Activity Report"}]:[]),
       ]},
+      { label:"Data", tabs:[
+        {key:"data_backup",label:"Data Backup"},
+      ]},
     ]});
   }
 
@@ -8529,6 +8532,167 @@ function QuoteStatusReport(){
   );
 }
 
+// Every table currently in the database — master tables come straight from
+// MASTER_TABLES (the same list Master Data itself is built from), plus the
+// operational/transactional tables that aren't master data.
+const BACKUP_EXTRA_TABLES = [
+  "estimates","estimate_lines","contacts","datasheets","datasheet_master_fields",
+  "quote_commercial_terms","company_master","description_master","zone_tbl",
+  "authorization_codes","deletion_codes","audit_log","app_users",
+  "monthly_archive_prompts","login_history","calc_history","user_permissions"
+];
+const BACKUP_ALL_TABLES = Array.from(new Set([...MASTER_TABLES.map(t=>t.key), ...BACKUP_EXTRA_TABLES]));
+
+function DataBackupScreen({ user }){
+  const isSuperAdmin = user?.role==="super_admin";
+  const [running,setRunning] = useState(false);
+  const [progress,setProgress] = useState({done:0,total:BACKUP_ALL_TABLES.length,current:""});
+  const [lastBackup,setLastBackup] = useState(null);
+
+  const [restoreFile,setRestoreFile] = useState(null);
+  const [restoreRunning,setRestoreRunning] = useState(false);
+  const [restoreResults,setRestoreResults] = useState([]); // [{table,status,detail}]
+
+  useEffect(()=>{
+    (async()=>{
+      const { data } = await sb.from("audit_log").select("*").eq("action","EXPORT").eq("table_name","__backup__").order("performed_at",{ascending:false}).limit(1).maybeSingle();
+      if(data) setLastBackup(data);
+    })();
+  },[]);
+
+  const runBackup = async()=>{
+    setRunning(true);
+    setProgress({done:0,total:BACKUP_ALL_TABLES.length,current:""});
+    const wb = XLSX.utils.book_new();
+    let successCount = 0, failCount = 0;
+    for(let i=0;i<BACKUP_ALL_TABLES.length;i++){
+      const table = BACKUP_ALL_TABLES[i];
+      setProgress({done:i,total:BACKUP_ALL_TABLES.length,current:table});
+      try{
+        const { data, error } = await sb.from(table).select("*");
+        if(error) throw error;
+        const rows = data||[];
+        const ws = rows.length
+          ? XLSX.utils.json_to_sheet(rows.map(r=>{
+              // Flatten anything jsonb/object so it lands in a cell as text, not [object Object]
+              const flat = {};
+              Object.keys(r).forEach(k=>{ const v=r[k]; flat[k] = (v&&typeof v==="object") ? JSON.stringify(v) : v; });
+              return flat;
+            }))
+          : XLSX.utils.aoa_to_sheet([["(no rows)"]]);
+        // Sheet names are capped at 31 characters in Excel
+        XLSX.utils.book_append_sheet(wb, ws, table.slice(0,31));
+        successCount++;
+      } catch(e){
+        console.error("Backup failed for table",table,e);
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Could not export: "+(e.message||e)]]), table.slice(0,31));
+        failCount++;
+      }
+    }
+    setProgress({done:BACKUP_ALL_TABLES.length,total:BACKUP_ALL_TABLES.length,current:""});
+    const filename = "Flometriq_Backup_"+new Date().toISOString().slice(0,10)+".xlsx";
+    XLSX.writeFile(wb, filename);
+    await logAudit("EXPORT","__backup__","full-backup","Manual data backup — "+successCount+" table(s) exported"+(failCount?", "+failCount+" failed":""),user?.username||"unknown",null,null);
+    setLastBackup({performed_by:user?.username,performed_at:new Date().toISOString()});
+    setRunning(false);
+  };
+
+  // Restore is a MERGE only — never deletes anything. Rows with an "id"
+  // column get upserted (updates the existing row if that id already
+  // exists, inserts if it doesn't). Rows without a single "id" primary key
+  // (a handful of tables use composite keys) get plain-inserted — re-running
+  // a restore on those specific tables can create duplicates, which is
+  // called out per-table in the results below rather than hidden.
+  const runRestore = async()=>{
+    if(!restoreFile) return;
+    if(!confirm("This will merge the backup file's data into the live database — updating matching rows by id and adding anything missing. Nothing gets deleted. Continue?")) return;
+    setRestoreRunning(true);
+    setRestoreResults([]);
+    try{
+      const buf = await restoreFile.arrayBuffer();
+      const wb = XLSX.read(buf, {type:"array"});
+      const results = [];
+      for(const sheetName of wb.SheetNames){
+        const table = BACKUP_ALL_TABLES.find(t=>t.slice(0,31)===sheetName);
+        if(!table){ results.push({table:sheetName,status:"skipped",detail:"Not a recognized table"}); setRestoreResults([...results]); continue; }
+        const ws = wb.Sheets[sheetName];
+        let rows = XLSX.utils.sheet_to_json(ws, {defval:null});
+        if(rows.length===1 && ("(no rows)" in rows[0])){ results.push({table,status:"ok",detail:"0 rows (was empty in backup)"}); setRestoreResults([...results]); continue; }
+        // Best-effort: fields that were JSON-stringified on export (jsonb
+        // columns) get parsed back into objects before re-inserting.
+        rows = rows.map(r=>{
+          const out = {};
+          Object.keys(r).forEach(k=>{
+            const v = r[k];
+            if(typeof v==="string" && v.length>1 && (v[0]==="{"||v[0]==="[")){
+              try{ out[k]=JSON.parse(v); } catch{ out[k]=v; }
+            } else out[k]=v;
+          });
+          return out;
+        });
+        try{
+          const hasId = rows.length>0 && rows[0].id!==undefined && rows[0].id!==null;
+          const chunkSize = 500;
+          let count = 0;
+          for(let i=0;i<rows.length;i+=chunkSize){
+            const chunk = rows.slice(i,i+chunkSize);
+            const { error } = hasId
+              ? await sb.from(table).upsert(chunk,{onConflict:"id"})
+              : await sb.from(table).insert(chunk);
+            if(error) throw error;
+            count += chunk.length;
+          }
+          results.push({table,status:"ok",detail:count+" row(s) "+(hasId?"merged":"inserted (no id column — re-running this may duplicate)")});
+        } catch(e){
+          results.push({table,status:"error",detail:e.message||String(e)});
+        }
+        setRestoreResults([...results]);
+      }
+      const okCount = results.filter(r=>r.status==="ok").length;
+      const errCount = results.filter(r=>r.status==="error").length;
+      await logAudit("UPDATE","__backup__","restore","Data restore from "+restoreFile.name+" — "+okCount+" table(s) OK"+(errCount?", "+errCount+" failed":""),user?.username||"unknown",null,null);
+    } catch(e){
+      alert("Could not read that file: "+(e.message||e));
+    } finally {
+      setRestoreRunning(false);
+    }
+  };
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:640}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:4}},"Data Backup"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14,lineHeight:1.6}},"Downloads every table's current data as one Excel file, one sheet per table. Nothing scheduled — click whenever you want a snapshot. This is a data-only snapshot, not a restore point — see the note below before relying on it."),
+    lastBackup && h("div",{style:{fontSize:11,color:colors.muted,marginBottom:14}},"Last backup: "+new Date(lastBackup.performed_at).toLocaleString()+" by "+lastBackup.performed_by),
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,background:"#fff",padding:"14px 16px",marginBottom:14,maxHeight:180,overflowY:"auto"}},
+      h("div",{style:{fontSize:10.5,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:6}},BACKUP_ALL_TABLES.length+" tables"),
+      BACKUP_ALL_TABLES.map(t=>h("div",{key:t,style:{fontSize:12,padding:"2px 0",color:progress.current===t?colors.accent:colors.text,fontWeight:progress.current===t?700:400}},t))
+    ),
+    h("button",{onClick:runBackup,disabled:running,style:{...btnPrimary,width:"100%",opacity:running?0.7:1}},running?"Backing up…":"Backup Now"),
+    running && h("div",{style:{marginTop:12}},
+      h("div",{style:{background:"#eceae0",borderRadius:6,height:8,overflow:"hidden"}},
+        h("div",{style:{background:colors.dark,height:"100%",width:((progress.done/progress.total)*100)+"%",transition:"width 0.2s"}})
+      ),
+      h("div",{style:{fontSize:11,color:colors.muted,marginTop:6}},progress.done<progress.total?("Exporting "+progress.current+"…"):"Finishing…")
+    ),
+    h("div",{style:{marginTop:16,fontSize:11,color:colors.mutedLight,lineHeight:1.6,borderTop:"1px solid "+colors.border,paddingTop:12}},
+      h("strong",null,"Restoring from this file isn't a one-click process — "),
+      "it's data only, not the database schema or relationships. If Supabase itself is lost, someone (realistically, whoever built this app) needs to rebuild the tables first, then re-import this data carefully. For real point-in-time recovery, check whether your Supabase plan includes built-in daily backups under Database → Backups in the Supabase dashboard — that restores everything, schema included, in one step."
+    ),
+    isSuperAdmin && h("div",{style:{marginTop:24,paddingTop:20,borderTop:"2px solid "+colors.border}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Restore from Backup"),
+      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14,lineHeight:1.6}},"Upload a Flometriq_Backup_*.xlsx file. Merge only — updates matching rows by id and adds anything missing, never deletes. Only restores into tables that already exist in the database."),
+      h("input",{type:"file",accept:".xlsx",onChange:e=>{ setRestoreFile(e.target.files[0]||null); setRestoreResults([]); },style:{marginBottom:10}}),
+      h("div",null,
+        h("button",{onClick:runRestore,disabled:!restoreFile||restoreRunning,style:{...btnPrimary,opacity:(!restoreFile||restoreRunning)?0.6:1}},restoreRunning?"Restoring…":"Start Restore")
+      ),
+      restoreResults.length>0 && h("div",{style:{marginTop:14,maxHeight:220,overflowY:"auto",border:"1px solid "+colors.border,borderRadius:8,padding:"10px 12px"}},
+        restoreResults.map((r,i)=>h("div",{key:i,style:{fontSize:11.5,padding:"3px 0",color:r.status==="error"?colors.danger:r.status==="skipped"?colors.mutedLight:"#0f6e56"}},
+          (r.status==="error"?"✕ ":r.status==="skipped"?"— ":"✓ ")+r.table+": "+r.detail
+        ))
+      )
+    )
+  );
+}
+
 function DeletionCodesScreen({ user }){
   const [codes,setCodes]=useState([]); const [loading,setLoading]=useState(true);
   const [generating,setGenerating]=useState(false); const [justGenerated,setJustGenerated]=useState(null);
@@ -10012,6 +10176,7 @@ function App() {
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="authorization_codes"?h(AuthorizationCodesScreen,{user}):
     tab==="delete_activity_report"?h(DeleteActivityReportScreen,{user}):
+    tab==="data_backup"?h(DataBackupScreen,{user}):
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab}):
