@@ -771,6 +771,7 @@ function MenuTabs({ user, active, onChange }) {
 
 /* ---- BOM ENTRY FORM (Access main/sub form style) ---- */
 function BomEntryForm({ onGoToTab, user }) {
+  const canEditBom = user?.role==="admin" || user?.role==="super_admin";
   const [allModels, setAllModels] = useState([]);
   const [modelInput, setModelInput] = useState("");
   const [subRows, setSubRows] = useState([]);
@@ -811,21 +812,29 @@ function BomEntryForm({ onGoToTab, user }) {
 
   const loadSubForm = async(model)=>{
     setLoadingSub(true); setSubRows([]);
-    const { data } = await sb.from("bom").select("*").eq("model",model).order("id");
+    const [{ data }, { data:statusRow }] = await Promise.all([
+      sb.from("bom").select("*").eq("model",model).order("id"),
+      sb.from("model_tbl").select("bom_status").eq("model",model).limit(1).maybeSingle(),
+    ]);
     setSubRows(data||[]); setLoadingSub(false);
     setNewRowDraft({model, sf:3.1});
+    const status = statusRow?.bom_status||"Dirty";
+    setBomStatus(status);
+    if(status==="Dirty" && confirm("\""+model+"\"'s BOM is marked Dirty — not yet reviewed. Start cleaning it now?")){
+      await setModelBomStatus("Cleaning Up", null, model);
+    }
   };
 
   const handleModelSelect = (val)=>{
     setModelInput(val); setMsg(""); setModelNotFoundPrompt(false);
-    if(!val.trim()) { setSubRows([]); return; }
-    if(allModels.includes(val.trim())) { loadSubForm(val.trim()); }
+    if(!val.trim()) { setSubRows([]); setBomStatus(null); return; }
+    if(allModels.includes(val.trim())) { loadSubForm(val.trim()); } else { setBomStatus(null); }
   };
 
   const handleModelBlur = ()=>{
     const val = modelInput.trim();
     if(!val) return;
-    if(!allModels.includes(val)) { setModelNotFoundPrompt(true); setSubRows([]); }
+    if(!allModels.includes(val)) { setModelNotFoundPrompt(true); setSubRows([]); setBomStatus(null); }
   };
 
   const goAddModel = ()=>{ setModelNotFoundPrompt(false); onGoToTab("model_tbl"); };
@@ -846,8 +855,20 @@ function BomEntryForm({ onGoToTab, user }) {
   const startEditRow = (row)=>{ setEditingRowId(row.id); setEditRowDraft({...row}); };
   const cancelEditRow = ()=>{ setEditingRowId(null); setEditRowDraft({}); };
   const setEditField = (field,value)=>{
-    setEditRowDraft(d=>{ const next={...d,[field]:value}; if(field==="material_spec") delete next.grade; return next; });
+    setEditRowDraft(d=>{ const next={...d,[field]:value}; if(field==="material_spec") delete next.grade; if(field==="component") delete next.sub_assembly; return next; });
   };
+  const editComponentOptions = useMemo(()=>{
+    if(!masterData) return [];
+    return Array.from(new Set(masterData.ciTbl.map(r=>r.component).filter(Boolean))).sort();
+  },[masterData]);
+  const editSubAssemblyOptions = useMemo(()=>{
+    if(!masterData||!editRowDraft.component) return [];
+    return Array.from(new Set(masterData.saTbl.filter(r=>r.component===editRowDraft.component).map(r=>r.sub_assembly).filter(Boolean))).sort();
+  },[masterData, editRowDraft.component]);
+  const editSpecOptions = useMemo(()=>{
+    if(!masterData) return [];
+    return Array.from(new Set(masterData.specs.map(r=>r.material_spec).filter(Boolean))).sort();
+  },[masterData]);
   const editGradeOptions = useMemo(()=>{
     if(!masterData||!editRowDraft.material_spec) return [];
     return masterData.gradesBySpec.get(editRowDraft.material_spec)||[];
@@ -888,16 +909,11 @@ function BomEntryForm({ onGoToTab, user }) {
 
   // BOM cleanup tracking — Dirty (default) / Cleaning Up / Clean, stored on
   // model_tbl (shared across that model's size rows), logged to Audit Log.
+  // Status is fetched as part of loadSubForm (see above), not on every keystroke.
   const [bomStatus,setBomStatus]=useState(null);
   const [bomStatusBusy,setBomStatusBusy]=useState(false);
-  useEffect(()=>{
-    const m = modelInput.trim();
-    if(!m || modelNotFoundPrompt){ setBomStatus(null); return; }
-    sb.from("model_tbl").select("bom_status").eq("model",m).limit(1).maybeSingle()
-      .then(({data})=>setBomStatus(data?.bom_status||"Dirty"));
-  },[modelInput,modelNotFoundPrompt]);
-  const setModelBomStatus = async(newStatus,confirmMsg)=>{
-    const m = modelInput.trim(); if(!m) return;
+  const setModelBomStatus = async(newStatus,confirmMsg,modelOverride)=>{
+    const m = modelOverride||modelInput.trim(); if(!m) return;
     if(confirmMsg && !confirm(confirmMsg)) return;
     setBomStatusBusy(true);
     try{
@@ -993,9 +1009,9 @@ function BomEntryForm({ onGoToTab, user }) {
   const renderSubRow = (r,idx)=> editingRowId===r.id
     ? h("tr",{key:r.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
         h("td",{style:{padding:"6px 8px",color:colors.mutedLight}},idx+1),
-        h("td",{style:{padding:"4px 6px"}},h("input",{list:"ci-list",value:editRowDraft.component||"",onChange:e=>setEditField("component",e.target.value),style:{...iStyle,width:110}})),
-        h("td",{style:{padding:"4px 6px"}},h("input",{list:"sa-list",value:editRowDraft.sub_assembly||"",onChange:e=>setEditField("sub_assembly",e.target.value),style:{...iStyle,width:110}})),
-        h("td",{style:{padding:"4px 6px"}},h("input",{list:"spec-list-form",value:editRowDraft.material_spec||"",onChange:e=>setEditField("material_spec",e.target.value),style:{...iStyle,width:130}})),
+        h("td",{style:{padding:"4px 6px"}},sel(editRowDraft.component,v=>setEditField("component",v),editComponentOptions,"Component…")),
+        h("td",{style:{padding:"4px 6px"}},sel(editRowDraft.sub_assembly,v=>setEditField("sub_assembly",v),editSubAssemblyOptions,editRowDraft.component?"Sub assembly…":"Pick component first")),
+        h("td",{style:{padding:"4px 6px"}},sel(editRowDraft.material_spec,v=>setEditField("material_spec",v),editSpecOptions,"Material spec…")),
         h("td",{style:{padding:"4px 6px"}},
           editGradeOptions.length>0
             ? sel(editRowDraft.grade!==undefined?editRowDraft.grade:editRowDraft.spec_grade, v=>setEditField("grade",v), editGradeOptions.map(g=>g.grade),"Grade…")
@@ -1035,8 +1051,12 @@ function BomEntryForm({ onGoToTab, user }) {
         h("td",{style:{padding:"6px 8px",textAlign:"right"}},[r.sf||3.1]),
         h("td",{style:{padding:"6px 8px",textAlign:"right",color:colors.accent,fontWeight:700}},[fmtR(Number(r.sales_price)||0)]),
         h("td",{style:{padding:"6px 8px",whiteSpace:"nowrap"}},
-          h("button",{onClick:()=>startEditRow(r),style:{...btnSecondary,padding:"5px 9px",fontSize:11,marginRight:4}},"Edit"),
-          h("button",{onClick:()=>deleteSubRow(r.id),style:btnDanger},"Delete")
+          canEditBom
+            ? h(React.Fragment,null,
+                h("button",{onClick:()=>startEditRow(r),style:{...btnSecondary,padding:"5px 9px",fontSize:11,marginRight:4}},"Edit"),
+                h("button",{onClick:()=>deleteSubRow(r.id),style:btnDanger},"Delete")
+              )
+            : h("span",{style:{fontSize:11,color:colors.mutedLight}},"—")
         )
       );
 
@@ -1074,15 +1094,21 @@ function BomEntryForm({ onGoToTab, user }) {
 
     // Sub-form
     (modelInput.trim()&&!modelNotFoundPrompt)&&h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,background:colors.panel}},
-      h("div",{style:{padding:"10px 14px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
-        h("span",{style:{fontSize:13,fontWeight:600}},"BOM lines for: "+modelInput.trim()+" ("+subRows.length+" rows)"),
-        h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
-          bomStatus&&h("span",{style:categoryTagStyle(bomStatus==="Clean"?"Casting":bomStatus==="Cleaning Up"?"Fabricated":"Uncategorized")},bomStatus),
-          bomStatus==="Dirty"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Mark \""+modelInput.trim()+"\" as being cleaned up now?"),disabled:bomStatusBusy,style:{...btnSecondary,fontSize:11,padding:"5px 9px"}},"Start cleaning"),
-          bomStatus==="Cleaning Up"&&h("button",{onClick:()=>setModelBomStatus("Clean","Cleaning completed for \""+modelInput.trim()+"\"?"),disabled:bomStatusBusy,style:{...btnSecondary,fontSize:11,padding:"5px 9px"}},"Mark cleaning complete"),
-          bomStatus==="Clean"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Reopen \""+modelInput.trim()+"\" for further cleanup?"),disabled:bomStatusBusy,style:{...btnSecondary,fontSize:11,padding:"5px 9px"}},"Reopen for cleanup"),
-          subRows.length>0&&h("button",{onClick:deleteEntireBomForModel,style:{...btnDanger,fontSize:11,padding:"5px 9px"}},"Delete BOM"),
-          h("button",{onClick:downloadCleanupTracker,style:{...btnSecondary,fontSize:11,padding:"5px 9px"}},"Download cleanup tracker")
+      h("div",{style:{padding:"10px 14px",borderBottom:"1px solid "+colors.border}},
+        h("span",{style:{fontSize:13,fontWeight:600}},"BOM lines for: "+modelInput.trim()+" ("+subRows.length+" rows)")
+      ),
+      bomStatus&&h("div",{style:{padding:"14px 16px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",borderBottom:"1px solid "+colors.border,
+        background: bomStatus==="Dirty"?"#fdecea":bomStatus==="Cleaning Up"?"#fff4d6":"#e5f6ef"
+      }},
+        h("span",{style:{fontSize:13,fontWeight:800,letterSpacing:"0.03em",padding:"7px 16px",borderRadius:6,color:"#fff",
+          background: bomStatus==="Dirty"?"#c0392b":bomStatus==="Cleaning Up"?"#a9720a":"#0f6e56"
+        }},bomStatus.toUpperCase()),
+        bomStatus==="Dirty"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Mark \""+modelInput.trim()+"\" as being cleaned up now?"),disabled:bomStatusBusy,style:{...btnPrimary,padding:"10px 18px"}},"Start cleaning"),
+        bomStatus==="Cleaning Up"&&h("button",{onClick:()=>setModelBomStatus("Clean","Cleaning completed for \""+modelInput.trim()+"\"?"),disabled:bomStatusBusy,style:{...btnPrimary,padding:"10px 18px",background:"#0f6e56"}},"Mark cleaning complete"),
+        bomStatus==="Clean"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Reopen \""+modelInput.trim()+"\" for further cleanup?"),disabled:bomStatusBusy,style:{...btnSecondary,padding:"10px 18px",fontWeight:600}},"Reopen for cleanup"),
+        h("div",{style:{marginLeft:"auto",display:"flex",gap:8,alignItems:"center"}},
+          subRows.length>0&&h("button",{onClick:deleteEntireBomForModel,style:{...btnDanger,padding:"10px 18px",fontSize:13,fontWeight:700,border:"2px solid "+colors.danger}},"Delete BOM"),
+          h("button",{onClick:downloadCleanupTracker,style:{...btnSecondary,padding:"9px 14px"}},"Download cleanup tracker")
         )
       ),
       loadingSub?h("div",{style:{padding:20,color:colors.mutedLight,fontSize:13}},"Loading…"):
@@ -7609,6 +7635,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (5)", summary:"BOM Entry Form: Edit is now strict cascading dropdowns (Component → Sub Assembly filtered to it, Material Spec → Grade filtered to it) instead of free-typed fields, and Edit/Delete are now restricted to Admin and Super Admin — other roles see the row read-only." },
+  { date:"17 Jul 2026 (4)", summary:"BOM Entry Form: loading a Dirty model now prompts \"Start cleaning it now?\" right away instead of waiting for a manual click. The status/cleanup bar is now a full-width colored banner (red/amber/green by status) with bold buttons, replacing the small inline tag and thin outlined buttons." },
   { date:"17 Jul 2026 (3)", summary:"Corrected the previous entry: the BOM cleanup work now lives on the actual BOM Entry Form (BOM setup → BOM Entry Form), not the old Master Data → BOM table. Lines for the loaded model now group by Component, each with a proper Edit button (in-place, same fields as Add) alongside Delete. Added the Dirty / Cleaning Up / Clean status control, Delete BOM (entire model), and Download cleanup tracker to this screen. Master Data → BOM keeps its own equivalent controls too." },
   { date:"17 Jul 2026 (2)", summary:"Master Data → BOM can now focus on one model at a time, grouping its lines by Component; each model tracks a Dirty / Cleaning Up / Clean status (logged to Audit Log), with a \"Download cleanup tracker\" Excel across all models. Delete BOM (entire model's lines) added. Deleting a Model now checks for an existing BOM first and asks separately whether to delete that too — declining keeps the model untouched. New \"Rename model\" tool updates Models and BOM everywhere and Draft quotes only, leaving non-Draft quotes on the old name. Standing rule going forward: every delete action prompts for confirmation." },
   { date:"17 Jul 2026", summary:"New Categories master table (Casting, Fabricated, Barstock, Investment Casting, Forging) and a Category field on Models, cascading from it — backfilled for 907 existing models from an admin-corrected review file. BOM Coverage now groups Category → Model → Size (item shown alongside each model), with a colored category tag and an \"Open BOM\" button per size that jumps straight into the Estimator with that model loaded. Master Data → Models also gained a \"Download all models\" button (every model, not just the current page, with its category) for offline review." },
