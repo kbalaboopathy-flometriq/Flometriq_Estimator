@@ -869,6 +869,72 @@ function BomEntryForm({ onGoToTab, user }) {
     if(!masterData) return [];
     return Array.from(new Set(masterData.specs.map(r=>r.material_spec).filter(Boolean))).sort();
   },[masterData]);
+
+  // Universal edit — flip every line of the loaded model into the same
+  // cascading dropdowns at once, instead of one row at a time.
+  const [editAllMode,setEditAllMode]=useState(false);
+  const [editAllDrafts,setEditAllDrafts]=useState({});
+  const [savingAll,setSavingAll]=useState(false);
+  const subAssemblyOptionsFor = (component)=>{
+    if(!masterData||!component) return [];
+    return Array.from(new Set(masterData.saTbl.filter(r=>r.component===component).map(r=>r.sub_assembly).filter(Boolean))).sort();
+  };
+  const gradeOptionsFor = (spec)=>{
+    if(!masterData||!spec) return [];
+    return masterData.gradesBySpec.get(spec)||[];
+  };
+  const startEditAll = ()=>{
+    const drafts={};
+    subRows.forEach(r=>{
+      const spec = r.material_spec||"";
+      const grade = (spec && r.spec_grade && r.spec_grade.startsWith(spec)) ? r.spec_grade.slice(spec.length) : (r.spec_grade||"");
+      drafts[r.id]={...r, grade};
+    });
+    setEditAllDrafts(drafts);
+    setEditAllMode(true);
+    setEditingRowId(null); setEditRowDraft({});
+  };
+  const cancelEditAll = ()=>{ setEditAllMode(false); setEditAllDrafts({}); };
+  const setEditAllField = (id,field,value)=>{
+    setEditAllDrafts(d=>{
+      const row={...(d[id]||{}),[field]:value};
+      if(field==="material_spec") delete row.grade;
+      if(field==="component") delete row.sub_assembly;
+      return {...d,[id]:row};
+    });
+  };
+  const saveAllEdits = async()=>{
+    const m = modelInput.trim();
+    if(!confirm("Save changes to all "+subRows.length+" line(s) of \""+m+"\"?")) return;
+    setSavingAll(true);
+    try{
+      const updates=[];
+      for(const r of subRows){
+        const draft = editAllDrafts[r.id] || r;
+        const spec = draft.material_spec||"";
+        const grade = draft.grade||"";
+        const hit = (masterData && spec && grade) ? masterData.rateBySpecGrade.get(spec+"||"+grade) : null;
+        const rate = hit ? hit.rate : (Number(draft.rate)||0);
+        const qty = Number(draft.qty_required)||0;
+        const sf = Number(draft.sf)||3.1;
+        const cost = qty*rate;
+        const payload = {
+          component:draft.component||"", sub_assembly:draft.sub_assembly||"",
+          material_spec:spec, spec_grade: spec+grade,
+          cutting_plan_layout_size:draft.cutting_plan_layout_size||"",
+          cutting_plan_qty:Number(draft.cutting_plan_qty)||0,
+          cutting_plan_uom:draft.cutting_plan_uom||"",
+          qty_required:qty, uom:draft.uom||"",
+          rate, cost, sf, sales_price:sf*cost,
+        };
+        await sb.from("bom").update(payload).eq("id",r.id);
+        updates.push({id:r.id, ...payload});
+      }
+      await logAudit("UPDATE","bom",m,"Bulk edit via \"Edit all lines\": "+updates.length+" line(s) updated for model \""+m+"\"",user?.username||"unknown",null,{lineCount:updates.length});
+      setSubRows(rs=>rs.map(r=>{ const u=updates.find(x=>x.id===r.id); return u?{...r,...u}:r; }));
+      setEditAllMode(false); setEditAllDrafts({});
+    } finally { setSavingAll(false); }
+  };
   const editGradeOptions = useMemo(()=>{
     if(!masterData||!editRowDraft.material_spec) return [];
     return masterData.gradesBySpec.get(editRowDraft.material_spec)||[];
@@ -1060,6 +1126,36 @@ function BomEntryForm({ onGoToTab, user }) {
         )
       );
 
+  const renderEditAllRow = (r,idx)=>{
+    const draft = editAllDrafts[r.id] || r;
+    const subOpts = subAssemblyOptionsFor(draft.component);
+    const gradeOpts = gradeOptionsFor(draft.material_spec);
+    const lookedRate = (masterData && draft.material_spec && draft.grade) ? (masterData.rateBySpecGrade.get(draft.material_spec+"||"+draft.grade)?.rate ?? null) : null;
+    return h("tr",{key:r.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
+      h("td",{style:{padding:"6px 8px",color:colors.mutedLight}},idx+1),
+      h("td",{style:{padding:"4px 6px"}},sel(draft.component,v=>setEditAllField(r.id,"component",v),editComponentOptions,"Component…")),
+      h("td",{style:{padding:"4px 6px"}},sel(draft.sub_assembly,v=>setEditAllField(r.id,"sub_assembly",v),subOpts,draft.component?"Sub assembly…":"Pick component first")),
+      h("td",{style:{padding:"4px 6px"}},sel(draft.material_spec,v=>setEditAllField(r.id,"material_spec",v),editSpecOptions,"Material spec…")),
+      h("td",{style:{padding:"4px 6px"}},
+        gradeOpts.length>0
+          ? sel(draft.grade,v=>setEditAllField(r.id,"grade",v),gradeOpts.map(g=>g.grade),"Grade…")
+          : h("input",{value:draft.grade||"",onChange:e=>setEditAllField(r.id,"grade",e.target.value),style:{...iStyle,width:100}})
+      ),
+      h("td",{style:{padding:"4px 6px"}},h("input",{value:draft.cutting_plan_layout_size||"",onChange:e=>setEditAllField(r.id,"cutting_plan_layout_size",e.target.value),style:{...iStyle,width:100}})),
+      h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:draft.cutting_plan_qty||"",onChange:e=>setEditAllField(r.id,"cutting_plan_qty",e.target.value),style:{...iStyle,width:60,textAlign:"right"}})),
+      h("td",{style:{padding:"4px 6px"}},sel(draft.cutting_plan_uom,v=>setEditAllField(r.id,"cutting_plan_uom",v),masterData.uoms.map(u=>u.uom),"UOM")),
+      h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:draft.qty_required||"",onChange:e=>setEditAllField(r.id,"qty_required",e.target.value),style:{...iStyle,width:55,textAlign:"right"}})),
+      h("td",{style:{padding:"4px 6px"}},sel(draft.uom,v=>setEditAllField(r.id,"uom",v),masterData.uoms.map(u=>u.uom),"UOM")),
+      h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:lookedRate!==null?lookedRate:(draft.rate||""),onChange:e=>setEditAllField(r.id,"rate",e.target.value),style:{...iStyle,width:65,textAlign:"right"},readOnly:lookedRate!==null})),
+      h("td",{style:{padding:"6px 8px",textAlign:"right",fontSize:11,color:colors.mutedLight}},fmtR((Number(draft.qty_required)||0)*(lookedRate!==null?lookedRate:(Number(draft.rate)||0)))),
+      h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",step:"0.1",value:draft.sf||3.1,onChange:e=>setEditAllField(r.id,"sf",e.target.value),style:{...iStyle,width:45,textAlign:"right"}})),
+      h("td",{style:{padding:"6px 8px",textAlign:"right",fontSize:11,color:colors.accent}},fmtR((Number(draft.qty_required)||0)*(lookedRate!==null?lookedRate:(Number(draft.rate)||0))*(Number(draft.sf)||3.1))),
+      h("td",{style:{padding:"4px 6px",whiteSpace:"nowrap",position:"sticky",right:0,background:"#eef6f3",boxShadow:"-2px 0 4px rgba(0,0,0,0.08)"}},
+        h("button",{onClick:()=>deleteSubRow(r.id),style:btnDanger},"Delete")
+      )
+    );
+  };
+
   if(loadingMasters) return h("div",{style:{padding:"40px 24px",color:colors.mutedLight}},"Loading master data…");
 
   return h("div",{style:{padding:"20px 24px"}},
@@ -1107,6 +1203,11 @@ function BomEntryForm({ onGoToTab, user }) {
         bomStatus==="Cleaning Up"&&h("button",{onClick:()=>setModelBomStatus("Clean","Cleaning completed for \""+modelInput.trim()+"\"?"),disabled:bomStatusBusy,style:{...btnPrimary,padding:"10px 18px",background:"#0f6e56"}},"Mark cleaning complete"),
         bomStatus==="Clean"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Reopen \""+modelInput.trim()+"\" for further cleanup?"),disabled:bomStatusBusy,style:{...btnSecondary,padding:"10px 18px",fontWeight:600}},"Reopen for cleanup"),
         h("div",{style:{marginLeft:"auto",display:"flex",gap:8,alignItems:"center"}},
+          canEditBom&&!editAllMode&&subRows.length>0&&h("button",{onClick:startEditAll,style:{...btnPrimary,padding:"10px 18px"}},"Edit all lines"),
+          canEditBom&&editAllMode&&h(React.Fragment,null,
+            h("button",{onClick:saveAllEdits,disabled:savingAll,style:{...btnPrimary,padding:"10px 18px",background:"#0f6e56"}},savingAll?"Saving…":"Save all changes"),
+            h("button",{onClick:cancelEditAll,disabled:savingAll,style:{...btnSecondary,padding:"10px 18px",fontWeight:600}},"Cancel all")
+          ),
           subRows.length>0&&h("button",{onClick:deleteEntireBomForModel,style:{...btnDanger,padding:"10px 18px",fontSize:13,fontWeight:700,border:"2px solid "+colors.danger}},"Delete BOM"),
           h("button",{onClick:downloadCleanupTracker,style:{...btnSecondary,padding:"9px 14px"}},"Download cleanup tracker")
         )
@@ -1126,7 +1227,7 @@ function BomEntryForm({ onGoToTab, user }) {
               h("tr",{key:"grp-"+comp,style:{background:"#f4f2ea"}},
                 h("td",{colSpan:15,style:{padding:"6px 8px",fontSize:11.5,fontWeight:700}},comp+"  ("+groupRows.length+")")
               ),
-              ...groupRows.map((r,i)=>renderSubRow(r,i))
+              ...groupRows.map((r,i)=>editAllMode?renderEditAllRow(r,i):renderSubRow(r,i))
             ]),
             // New row input at the bottom
             h("tr",{style:{background:"#fbf6e8",borderTop:"2px solid "+colors.border}},
@@ -7635,6 +7736,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (7)", summary:"BOM Entry Form: new \"Edit all lines\" button (Admin/Super Admin) flips every line of the loaded model into the same cascading dropdowns at once — no more Edit/Save per row. \"Save all changes\" commits every line in one go and logs a single bulk-edit entry to Audit Log; \"Cancel all\" discards everything. Delete stays per-row even in this mode." },
   { date:"17 Jul 2026 (6)", summary:"BOM Entry Form: the Edit/Delete (and Add row) column is now pinned to the right edge of the table, always visible without needing to scroll the table horizontally — it was there all along, just past the visible columns on wide screens." },
   { date:"17 Jul 2026 (5)", summary:"BOM Entry Form: Edit is now strict cascading dropdowns (Component → Sub Assembly filtered to it, Material Spec → Grade filtered to it) instead of free-typed fields, and Edit/Delete are now restricted to Admin and Super Admin — other roles see the row read-only." },
   { date:"17 Jul 2026 (4)", summary:"BOM Entry Form: loading a Dirty model now prompts \"Start cleaning it now?\" right away instead of waiting for a manual click. The status/cleanup bar is now a full-width colored banner (red/amber/green by status) with bold buttons, replacing the small inline tag and thin outlined buttons." },
