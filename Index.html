@@ -1054,6 +1054,81 @@ function MasterEditor({ tableKey, user }) {
 
   useEffect(()=>{ if(tableKey==="bom") fetchAll("bom","model").then(d=>setAllModels(Array.from(new Set(d.map(r=>r.model).filter(Boolean))).sort())); },[tableKey]);
 
+  // BOM cleanup workflow: focus the BOM screen on one model at a time,
+  // group its lines by Component, and track a Dirty/Cleaning Up/Clean flag
+  // on model_tbl (shared across that model's size rows), logged to Audit Log.
+  const [bomModelFilter,setBomModelFilter]=useState("");
+  const [bomStatus,setBomStatus]=useState(null);
+  const [bomStatusBusy,setBomStatusBusy]=useState(false);
+  useEffect(()=>{
+    if(tableKey!=="bom" || !bomModelFilter){ setBomStatus(null); return; }
+    sb.from("model_tbl").select("bom_status").eq("model",bomModelFilter).limit(1).maybeSingle()
+      .then(({data})=>setBomStatus(data?.bom_status||"Dirty"));
+  },[tableKey,bomModelFilter]);
+  const setModelBomStatus = async(newStatus, confirmMsg)=>{
+    if(confirmMsg && !confirm(confirmMsg)) return;
+    setBomStatusBusy(true);
+    try{
+      await sb.from("model_tbl").update({bom_status:newStatus}).eq("model",bomModelFilter);
+      await logAudit("UPDATE","model_tbl",bomModelFilter,"BOM cleanup status for \""+bomModelFilter+"\" changed to "+newStatus,user?.username||"unknown",{bom_status:bomStatus},{bom_status:newStatus});
+      setBomStatus(newStatus);
+    } finally { setBomStatusBusy(false); }
+  };
+  const deleteEntireBom = async()=>{
+    if(!bomModelFilter) return;
+    const n = rows.length;
+    if(!confirm("Delete the entire BOM for \""+bomModelFilter+"\" ("+n+" line"+(n===1?"":"s")+")? This cannot be undone.")) return;
+    setLoading(true);
+    const { data:rowsData } = await sb.from("bom").select("*").eq("model",bomModelFilter);
+    await sb.from("bom").delete().eq("model",bomModelFilter);
+    await logAudit("DELETE","bom",bomModelFilter,"Entire BOM for model \""+bomModelFilter+"\" deleted ("+n+" lines)",user?.username||"unknown",rowsData,null);
+    load();
+  };
+  const downloadCleanupTracker = async()=>{
+    const models = await fetchAll("model_tbl","item,model,size,category,bom_status");
+    const seen=new Map();
+    models.forEach(r=>{ if(r.model && !seen.has(r.model)) seen.set(r.model,r); });
+    const rowsOut=[["Model","Item","Category","BOM status"]];
+    Array.from(seen.values()).sort((a,b)=>(a.model||"").localeCompare(b.model||"")).forEach(r=>{
+      rowsOut.push([r.model||"",r.item||"",r.category||"",r.bom_status||"Dirty"]);
+    });
+    const ws=XLSX.utils.aoa_to_sheet(rowsOut); ws["!cols"]=[{wch:26},{wch:22},{wch:16},{wch:14}];
+    const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"BOM Cleanup");
+    XLSX.writeFile(wb,"bom_cleanup_tracker.xlsx");
+  };
+
+  // Rename model (Models table only) — updates Models + BOM everywhere, and
+  // Draft quotes only. Non-Draft quotes keep the old model name on purpose.
+  const [showRename,setShowRename]=useState(false);
+  const [renameOld,setRenameOld]=useState(""); const [renameNew,setRenameNew]=useState("");
+  const [renameBusy,setRenameBusy]=useState(false); const [renameMsg,setRenameMsg]=useState("");
+  const [allModelNamesForRename,setAllModelNamesForRename]=useState([]);
+  useEffect(()=>{ if(tableKey==="model_tbl") fetchAll("model_tbl","model").then(d=>setAllModelNamesForRename(Array.from(new Set(d.map(r=>r.model).filter(Boolean))).sort())); },[tableKey]);
+  const renameModel = async()=>{
+    setRenameMsg("");
+    if(!renameOld){ setRenameMsg("Pick the model to rename."); return; }
+    const newName = renameNew.trim();
+    if(!newName){ setRenameMsg("Enter the new model name."); return; }
+    if(newName===renameOld){ setRenameMsg("New name is the same as the old one."); return; }
+    if(allModelNamesForRename.includes(newName)){ setRenameMsg("A model with that name already exists."); return; }
+    if(!confirm("Rename model \""+renameOld+"\" to \""+newName+"\" everywhere (Models + BOM), and on Draft quotes only? Non-Draft quotes will keep \""+renameOld+"\".")) return;
+    setRenameBusy(true);
+    try{
+      const { data: draftEstimates } = await sb.from("estimates").select("id").eq("model",renameOld).eq("quote_status","Draft");
+      await sb.from("model_tbl").update({model:newName}).eq("model",renameOld);
+      await sb.from("bom").update({model:newName}).eq("model",renameOld);
+      if(draftEstimates && draftEstimates.length){
+        await sb.from("estimates").update({model:newName}).eq("model",renameOld).eq("quote_status","Draft");
+      }
+      await logAudit("UPDATE","model_tbl",newName,"Renamed model \""+renameOld+"\" to \""+newName+"\" (Models + BOM + "+(draftEstimates?.length||0)+" Draft quote(s))",user?.username||"unknown",{model:renameOld},{model:newName});
+      setRenameMsg("Renamed. "+(draftEstimates?.length||0)+" Draft quote(s) updated; non-Draft quotes kept \""+renameOld+"\".");
+      setAllModelNamesForRename(names=>names.map(n=>n===renameOld?newName:n).sort());
+      setAllModels(m=>m.map(n=>n===renameOld?newName:n).sort());
+      setRenameOld(""); setRenameNew("");
+      load();
+    } catch(e){ setRenameMsg("Failed: "+e.message); } finally { setRenameBusy(false); }
+  };
+
   // Load cascade options for all cascade fields
   useEffect(()=>{
     if(!tableDef.cascade) return;
@@ -1071,10 +1146,15 @@ function MasterEditor({ tableKey, user }) {
   const load = useCallback(async()=>{
     setLoading(true); setError("");
     try {
-      const { data, error:err } = await sb.from(tableKey).select("*").order("id",{ascending:true}).range(page*pageSize,page*pageSize+pageSize-1);
-      if(err) throw err; setRows(data||[]);
+      if(tableKey==="bom" && bomModelFilter){
+        const { data, error:err } = await sb.from("bom").select("*").eq("model",bomModelFilter).order("component",{ascending:true});
+        if(err) throw err; setRows(data||[]);
+      } else {
+        const { data, error:err } = await sb.from(tableKey).select("*").order("id",{ascending:true}).range(page*pageSize,page*pageSize+pageSize-1);
+        if(err) throw err; setRows(data||[]);
+      }
     } catch(e) { setError(e.message); } finally { setLoading(false); }
-  },[tableKey,page]);
+  },[tableKey,page,bomModelFilter]);
 
   useEffect(()=>{ setPage(0); },[tableKey]);
   useEffect(()=>{ load(); },[load]);
@@ -1112,7 +1192,28 @@ function MasterEditor({ tableKey, user }) {
       setPendingDeleteIds(needsCode); setCodeInput(""); setCodeMsg("");
     }
   };
-  const deleteRow = (id)=>{ if(!confirm("Delete this row?")) return; requestDelete([id]); };
+  const deleteRow = (id)=>{
+    const row = rows.find(r=>r.id===id);
+    if(tableKey==="model_tbl" && row?.model){
+      (async()=>{
+        const { data: bomRows } = await sb.from("bom").select("id").eq("model",row.model);
+        const n = (bomRows||[]).length;
+        if(n>0){
+          const alsoDelete = confirm("This model's BOM has "+n+" line"+(n===1?"":"s")+" built. Delete that BOM as well?\n\nOK = delete the model and its BOM. Cancel = keep this model, delete nothing.");
+          if(!alsoDelete) return; // per instruction: declining means the model is kept, untouched
+          if(!confirm("Confirm: permanently delete model \""+row.model+"\" and its "+n+"-line BOM?")) return;
+          await sb.from("bom").delete().eq("model",row.model);
+          await logAudit("DELETE","bom",row.model,"BOM for model \""+row.model+"\" ("+n+" lines) deleted along with the model",user?.username||"unknown",{model:row.model,lineCount:n},null);
+          requestDelete([id]);
+          return;
+        }
+        if(!confirm("Delete this row?")) return;
+        requestDelete([id]);
+      })();
+      return;
+    }
+    if(!confirm("Delete this row?")) return; requestDelete([id]);
+  };
   const deleteSelected = ()=>{
     if(selectedIds.size===0) return;
     if(!confirm("Delete "+selectedIds.size+" selected row(s)?")) return;
@@ -1183,6 +1284,27 @@ function MasterEditor({ tableKey, user }) {
   const filteredRows = useMemo(()=>{ if(!search) return rows; const s=search.toLowerCase(); return rows.filter(r=>tableDef.columns.some(c=>String(r[c]??"").toLowerCase().includes(s))); },[rows,search,tableDef]);
   const addLabel = tableDef.addLabel||"New row";
 
+  const renderRow = (row)=>h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
+    h("td",{style:{padding:"7px 9px"}},h("input",{type:"checkbox",checked:selectedIds.has(row.id),onChange:e=>setSelectedIds(prev=>{ const next=new Set(prev); if(e.target.checked) next.add(row.id); else next.delete(row.id); return next; })})),
+    tableDef.columns.map(c=>h("td",{key:c,style:{padding:"7px 9px"}},
+      editingId===row.id?h("input",{value:editDraft[c]??"",onChange:e=>setEditDraft(d=>({...d,[c]:e.target.value})),style:{...inputStyle,padding:"5px 7px",fontSize:12}}):
+      (NUMERIC_COLS.has(c)?fmt(Number(row[c])||0):String(row[c]??""))
+    )),
+    h("td",{style:{padding:"7px 9px",whiteSpace:"nowrap"}},
+      editingId===row.id?h(React.Fragment,null,h("button",{onClick:saveEdit,style:{...btnSecondary,marginRight:6}},"Save"),h("button",{onClick:()=>{setEditingId(null);setEditDraft({});},style:btnSecondary},"Cancel")):
+      h(React.Fragment,null,h("button",{onClick:()=>{setEditingId(row.id);setEditDraft({...row});},style:{...btnSecondary,marginRight:6}},"Edit"),h("button",{onClick:()=>deleteRow(row.id),style:btnDanger},freshIds.has(row.id)||isSuperAdmin?"Delete":"Delete 🔒"))
+    )
+  );
+
+  // When the BOM screen is focused on one model, cluster its lines by Component
+  // for easier review instead of one long flat list.
+  const groupedByComponent = useMemo(()=>{
+    if(tableKey!=="bom"||!bomModelFilter) return null;
+    const map=new Map();
+    filteredRows.forEach(r=>{ const k=r.component||"(no component)"; if(!map.has(k)) map.set(k,[]); map.get(k).push(r); });
+    return Array.from(map.entries()).sort((a,b)=>a[0].localeCompare(b[0]));
+  },[filteredRows,tableKey,bomModelFilter]);
+
   return h("div",{style:{padding:"20px 24px",position:"relative"}},
     h(Watermark,{user}),
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
@@ -1192,6 +1314,8 @@ function MasterEditor({ tableKey, user }) {
         h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search…",style:{...inputStyle,width:200}}),
         tableKey==="bom"&&h("button",{onClick:()=>{setShowDup(v=>!v);setDupMsg("");},style:btnSecondary},"Duplicate model"),
         tableKey==="model_tbl"&&h("button",{onClick:downloadAllModels,disabled:modelsExportBusy,style:btnSecondary},modelsExportBusy?"Preparing…":"Download all models"),
+        tableKey==="model_tbl"&&h("button",{onClick:()=>{setShowRename(v=>!v);setRenameMsg("");},style:btnSecondary},"Rename model"),
+        tableKey==="bom"&&h("button",{onClick:downloadCleanupTracker,style:btnSecondary},"Download cleanup tracker"),
         h("button",{onClick:()=>{setAdding(v=>!v);setAddDraft({});},style:btnPrimary},"+ "+addLabel)
       )
     ),
@@ -1218,6 +1342,23 @@ function MasterEditor({ tableKey, user }) {
       h("button",{onClick:duplicateModel,disabled:dupBusy,style:btnPrimary},dupBusy?"Copying…":"Create copy"),
       dupMsg&&h("div",{style:{fontSize:12,color:dupMsg.startsWith("Failed")||dupMsg.includes("already")?colors.danger:colors.muted,width:"100%"}},dupMsg)
     ),
+    tableKey==="model_tbl"&&showRename&&h("div",{style:{padding:14,background:"#fbf6e8",borderRadius:8,marginBottom:16,display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap"}},
+      h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Old model"),h("select",{value:renameOld,onChange:e=>setRenameOld(e.target.value),style:{...inputStyle,width:240}},h("option",{value:""},"Select model…"),allModelNamesForRename.map(m=>h("option",{key:m,value:m},m)))),
+      h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"New model name"),h("input",{value:renameNew,onChange:e=>setRenameNew(e.target.value),placeholder:"New model name",style:{...inputStyle,width:220}})),
+      h("button",{onClick:renameModel,disabled:renameBusy,style:btnPrimary},renameBusy?"Renaming…":"Rename everywhere"),
+      renameMsg&&h("div",{style:{fontSize:12,color:renameMsg.startsWith("Failed")||renameMsg.includes("already")?colors.danger:colors.muted,width:"100%"}},renameMsg)
+    ),
+    tableKey==="bom"&&h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:14}},
+      h("select",{value:bomModelFilter,onChange:e=>{setBomModelFilter(e.target.value);setPage(0);},style:{...inputStyle,width:230}},
+        h("option",{value:""},"— Focus on a model —"),
+        allModels.map(m=>h("option",{key:m,value:m},m))
+      ),
+      bomModelFilter&&bomStatus&&h("span",{style:categoryTagStyle(bomStatus==="Clean"?"Casting":bomStatus==="Cleaning Up"?"Fabricated":"Uncategorized")},bomStatus),
+      bomModelFilter&&bomStatus==="Dirty"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Mark \""+bomModelFilter+"\" as being cleaned up now?"),disabled:bomStatusBusy,style:btnSecondary},"Start cleaning"),
+      bomModelFilter&&bomStatus==="Cleaning Up"&&h("button",{onClick:()=>setModelBomStatus("Clean","Cleaning completed for \""+bomModelFilter+"\"?"),disabled:bomStatusBusy,style:btnSecondary},"Mark cleaning complete"),
+      bomModelFilter&&bomStatus==="Clean"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Reopen \""+bomModelFilter+"\" for further cleanup?"),disabled:bomStatusBusy,style:btnSecondary},"Reopen for cleanup"),
+      bomModelFilter&&h("button",{onClick:deleteEntireBom,style:btnDanger},"Delete BOM")
+    ),
     error&&h("div",{style:{color:colors.danger,fontSize:13,marginBottom:10}},error),
     loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
     h("div",{style:{overflowX:"auto",border:"1px solid "+colors.border,borderRadius:6}},
@@ -1240,21 +1381,18 @@ function MasterEditor({ tableKey, user }) {
               h("button",{onClick:()=>setAdding(false),style:btnSecondary},"Cancel")
             )
           ),
-          filteredRows.map(row=>h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
-            h("td",{style:{padding:"7px 9px"}},h("input",{type:"checkbox",checked:selectedIds.has(row.id),onChange:e=>setSelectedIds(prev=>{ const next=new Set(prev); if(e.target.checked) next.add(row.id); else next.delete(row.id); return next; })})),
-            tableDef.columns.map(c=>h("td",{key:c,style:{padding:"7px 9px"}},
-              editingId===row.id?h("input",{value:editDraft[c]??"",onChange:e=>setEditDraft(d=>({...d,[c]:e.target.value})),style:{...inputStyle,padding:"5px 7px",fontSize:12}}):
-              (NUMERIC_COLS.has(c)?fmt(Number(row[c])||0):String(row[c]??""))
-            )),
-            h("td",{style:{padding:"7px 9px",whiteSpace:"nowrap"}},
-              editingId===row.id?h(React.Fragment,null,h("button",{onClick:saveEdit,style:{...btnSecondary,marginRight:6}},"Save"),h("button",{onClick:()=>{setEditingId(null);setEditDraft({});},style:btnSecondary},"Cancel")):
-              h(React.Fragment,null,h("button",{onClick:()=>{setEditingId(row.id);setEditDraft({...row});},style:{...btnSecondary,marginRight:6}},"Edit"),h("button",{onClick:()=>deleteRow(row.id),style:btnDanger},freshIds.has(row.id)||isSuperAdmin?"Delete":"Delete 🔒"))
-            )
-          ))
+          groupedByComponent
+            ? groupedByComponent.flatMap(([comp,groupRows])=>[
+                h("tr",{key:"grp-"+comp,style:{background:"#f4f2ea"}},
+                  h("td",{colSpan:tableDef.columns.length+2,style:{padding:"7px 10px",fontSize:12,fontWeight:700}},comp+"  ("+groupRows.length+")")
+                ),
+                ...groupRows.map(renderRow)
+              ])
+            : filteredRows.map(renderRow)
         )
       )
     ),
-    h("div",{style:{display:"flex",justifyContent:"center",gap:10,marginTop:14}},
+    !(tableKey==="bom"&&bomModelFilter) && h("div",{style:{display:"flex",justifyContent:"center",gap:10,marginTop:14}},
       h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSecondary},"Previous"),
       h("span",{style:{fontSize:12,color:colors.muted,padding:"8px 0"}},"Page "+(page+1)),
       h("button",{onClick:()=>setPage(p=>p+1),disabled:rows.length<pageSize,style:btnSecondary},"Next")
@@ -7335,6 +7473,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (2)", summary:"Master Data → BOM can now focus on one model at a time, grouping its lines by Component; each model tracks a Dirty / Cleaning Up / Clean status (logged to Audit Log), with a \"Download cleanup tracker\" Excel across all models. Delete BOM (entire model's lines) added. Deleting a Model now checks for an existing BOM first and asks separately whether to delete that too — declining keeps the model untouched. New \"Rename model\" tool updates Models and BOM everywhere and Draft quotes only, leaving non-Draft quotes on the old name. Standing rule going forward: every delete action prompts for confirmation." },
   { date:"17 Jul 2026", summary:"New Categories master table (Casting, Fabricated, Barstock, Investment Casting, Forging) and a Category field on Models, cascading from it — backfilled for 907 existing models from an admin-corrected review file. BOM Coverage now groups Category → Model → Size (item shown alongside each model), with a colored category tag and an \"Open BOM\" button per size that jumps straight into the Estimator with that model loaded. Master Data → Models also gained a \"Download all models\" button (every model, not just the current page, with its category) for offline review." },
   { date:"15 Jul 2026", summary:"Currency conversion (AED), Contacts as a company sub-form + upload-to-extract, Estimator manual line item with cascading dropdowns, freeze pane, mirrored scrollbar, global Sf change, global delete confirmation audit, nearest-5 rounding on rates/totals, cover letter Customer/Address/Attention fields, Datasheet Add-line now updates the Master too, \"Other\" dropdown bug fixed." },
   { date:"14 Jul 2026", summary:"Quote# selector defaults to the most recently created quote; Export panel follows the header selection instead of a separate picker." },
@@ -7815,6 +7954,7 @@ const TOUR_SLIDES = [
     "bullets": [
       "BOM setup \u2014 Models, Categories (Casting/Fabricated/Barstock/Investment Casting/Forging), Items, Sizes, Components, Material Specs, and more",
       "Every model carries a Category (strict dropdown from the Categories master) \u2014 drives the grouping in BOM Coverage",
+      "BOM screen can focus on one model at a time (grouped by Component), track its cleanup status (Dirty / Cleaning Up / Clean), delete its entire BOM, or rename the model everywhere (Draft quotes only \u2014 non-Draft quotes keep the old name)",
       "Commercial Terms masters \u2014 every dropdown's option list",
       "Missing an option? Add it inline without losing your place",
       "Datasheet Master and Allowable Stress round out the engineering data"
