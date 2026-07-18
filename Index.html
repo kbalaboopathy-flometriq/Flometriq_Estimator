@@ -770,7 +770,7 @@ function MenuTabs({ user, active, onChange }) {
 }
 
 /* ---- BOM ENTRY FORM (Access main/sub form style) ---- */
-function BomEntryForm({ onGoToTab }) {
+function BomEntryForm({ onGoToTab, user }) {
   const [allModels, setAllModels] = useState([]);
   const [modelInput, setModelInput] = useState("");
   const [subRows, setSubRows] = useState([]);
@@ -835,8 +835,97 @@ function BomEntryForm({ onGoToTab }) {
     if(!confirm("Delete this BOM line?")) return;
     const{data:rowData}=await sb.from("bom").select("*").eq("id",id).single();
     await sb.from("bom").delete().eq("id",id);
-    await logAudit("DELETE","bom",id,(rowData?.model||"")+" — "+(rowData?.component||""),"unknown",rowData,null);
+    await logAudit("DELETE","bom",id,(rowData?.model||"")+" — "+(rowData?.component||""),user?.username||"unknown",rowData,null);
     setSubRows(r=>r.filter(x=>x.id!==id));
+  };
+
+  // Edit an existing line in place (component/spec/grade/qty/etc), instead of
+  // only being able to add new lines or delete existing ones.
+  const [editingRowId,setEditingRowId]=useState(null);
+  const [editRowDraft,setEditRowDraft]=useState({});
+  const startEditRow = (row)=>{ setEditingRowId(row.id); setEditRowDraft({...row}); };
+  const cancelEditRow = ()=>{ setEditingRowId(null); setEditRowDraft({}); };
+  const setEditField = (field,value)=>{
+    setEditRowDraft(d=>{ const next={...d,[field]:value}; if(field==="material_spec") delete next.grade; return next; });
+  };
+  const editGradeOptions = useMemo(()=>{
+    if(!masterData||!editRowDraft.material_spec) return [];
+    return masterData.gradesBySpec.get(editRowDraft.material_spec)||[];
+  },[masterData, editRowDraft.material_spec]);
+  const editLookedUpRate = useMemo(()=>{
+    if(!masterData||!editRowDraft.material_spec||!editRowDraft.grade) return null;
+    const hit = masterData.rateBySpecGrade.get(editRowDraft.material_spec+"||"+editRowDraft.grade);
+    return hit ? hit.rate : null;
+  },[masterData, editRowDraft.material_spec, editRowDraft.grade]);
+  const saveEditRow = async()=>{
+    const rate = editLookedUpRate!==null ? editLookedUpRate : (Number(editRowDraft.rate)||0);
+    const qty = Number(editRowDraft.qty_required)||0;
+    const sf = Number(editRowDraft.sf)||3.1;
+    const cost = qty*rate;
+    const payload = {
+      component:editRowDraft.component||"", sub_assembly:editRowDraft.sub_assembly||"",
+      material_spec:editRowDraft.material_spec||"",
+      spec_grade:(editRowDraft.material_spec||"")+(editRowDraft.grade||editRowDraft.spec_grade||""),
+      cutting_plan_layout_size:editRowDraft.cutting_plan_layout_size||"",
+      cutting_plan_qty:Number(editRowDraft.cutting_plan_qty)||0,
+      cutting_plan_uom:editRowDraft.cutting_plan_uom||"",
+      qty_required:qty, uom:editRowDraft.uom||"",
+      rate, cost, sf, sales_price:sf*cost,
+    };
+    const { error:err } = await sb.from("bom").update(payload).eq("id",editingRowId);
+    if(err){ setMsg("Save failed: "+err.message); return; }
+    await logAudit("UPDATE","bom",editingRowId,(modelInput.trim())+" — "+(payload.component),user?.username||"unknown",null,payload);
+    setSubRows(rs=>rs.map(r=>r.id===editingRowId?{...r,...payload}:r));
+    setEditingRowId(null); setEditRowDraft({});
+  };
+
+  // Cluster the currently loaded model's lines by Component for easier review.
+  const groupedSubRows = useMemo(()=>{
+    const map=new Map();
+    subRows.forEach(r=>{ const k=r.component||"(no component)"; if(!map.has(k)) map.set(k,[]); map.get(k).push(r); });
+    return Array.from(map.entries()).sort((a,b)=>a[0].localeCompare(b[0]));
+  },[subRows]);
+
+  // BOM cleanup tracking — Dirty (default) / Cleaning Up / Clean, stored on
+  // model_tbl (shared across that model's size rows), logged to Audit Log.
+  const [bomStatus,setBomStatus]=useState(null);
+  const [bomStatusBusy,setBomStatusBusy]=useState(false);
+  useEffect(()=>{
+    const m = modelInput.trim();
+    if(!m || modelNotFoundPrompt){ setBomStatus(null); return; }
+    sb.from("model_tbl").select("bom_status").eq("model",m).limit(1).maybeSingle()
+      .then(({data})=>setBomStatus(data?.bom_status||"Dirty"));
+  },[modelInput,modelNotFoundPrompt]);
+  const setModelBomStatus = async(newStatus,confirmMsg)=>{
+    const m = modelInput.trim(); if(!m) return;
+    if(confirmMsg && !confirm(confirmMsg)) return;
+    setBomStatusBusy(true);
+    try{
+      await sb.from("model_tbl").update({bom_status:newStatus}).eq("model",m);
+      await logAudit("UPDATE","model_tbl",m,"BOM cleanup status for \""+m+"\" changed to "+newStatus,user?.username||"unknown",{bom_status:bomStatus},{bom_status:newStatus});
+      setBomStatus(newStatus);
+    } finally { setBomStatusBusy(false); }
+  };
+  const deleteEntireBomForModel = async()=>{
+    const m = modelInput.trim(); if(!m) return;
+    const n = subRows.length;
+    if(!confirm("Delete the entire BOM for \""+m+"\" ("+n+" line"+(n===1?"":"s")+")? This cannot be undone.")) return;
+    const { data:rowsData } = await sb.from("bom").select("*").eq("model",m);
+    await sb.from("bom").delete().eq("model",m);
+    await logAudit("DELETE","bom",m,"Entire BOM for model \""+m+"\" deleted ("+n+" lines)",user?.username||"unknown",rowsData,null);
+    setSubRows([]);
+  };
+  const downloadCleanupTracker = async()=>{
+    const models = await fetchAll("model_tbl","item,model,size,category,bom_status");
+    const seen=new Map();
+    models.forEach(r=>{ if(r.model && !seen.has(r.model)) seen.set(r.model,r); });
+    const rowsOut=[["Model","Item","Category","BOM status"]];
+    Array.from(seen.values()).sort((a,b)=>(a.model||"").localeCompare(b.model||"")).forEach(r=>{
+      rowsOut.push([r.model||"",r.item||"",r.category||"",r.bom_status||"Dirty"]);
+    });
+    const ws=XLSX.utils.aoa_to_sheet(rowsOut); ws["!cols"]=[{wch:26},{wch:22},{wch:16},{wch:14}];
+    const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"BOM Cleanup");
+    XLSX.writeFile(wb,"bom_cleanup_tracker.xlsx");
   };
 
   const setDraft = (field,value)=>{
@@ -901,6 +990,56 @@ function BomEntryForm({ onGoToTab }) {
     options.map(o=>h("option",{key:o,value:o},o))
   );
 
+  const renderSubRow = (r,idx)=> editingRowId===r.id
+    ? h("tr",{key:r.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
+        h("td",{style:{padding:"6px 8px",color:colors.mutedLight}},idx+1),
+        h("td",{style:{padding:"4px 6px"}},h("input",{list:"ci-list",value:editRowDraft.component||"",onChange:e=>setEditField("component",e.target.value),style:{...iStyle,width:110}})),
+        h("td",{style:{padding:"4px 6px"}},h("input",{list:"sa-list",value:editRowDraft.sub_assembly||"",onChange:e=>setEditField("sub_assembly",e.target.value),style:{...iStyle,width:110}})),
+        h("td",{style:{padding:"4px 6px"}},h("input",{list:"spec-list-form",value:editRowDraft.material_spec||"",onChange:e=>setEditField("material_spec",e.target.value),style:{...iStyle,width:130}})),
+        h("td",{style:{padding:"4px 6px"}},
+          editGradeOptions.length>0
+            ? sel(editRowDraft.grade!==undefined?editRowDraft.grade:editRowDraft.spec_grade, v=>setEditField("grade",v), editGradeOptions.map(g=>g.grade),"Grade…")
+            : h("input",{value:editRowDraft.grade!==undefined?editRowDraft.grade:(editRowDraft.spec_grade||""),onChange:e=>setEditField("grade",e.target.value),style:{...iStyle,width:110}})
+        ),
+        h("td",{style:{padding:"4px 6px"}},h("input",{value:editRowDraft.cutting_plan_layout_size||"",onChange:e=>setEditField("cutting_plan_layout_size",e.target.value),style:{...iStyle,width:110}})),
+        h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:editRowDraft.cutting_plan_qty||"",onChange:e=>setEditField("cutting_plan_qty",e.target.value),style:{...iStyle,width:70,textAlign:"right"}})),
+        h("td",{style:{padding:"4px 6px"}},sel(editRowDraft.cutting_plan_uom,v=>setEditField("cutting_plan_uom",v),masterData.uoms.map(u=>u.uom),"Cutting UOM")),
+        h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:editRowDraft.qty_required||"",onChange:e=>setEditField("qty_required",e.target.value),style:{...iStyle,width:60,textAlign:"right"}})),
+        h("td",{style:{padding:"4px 6px"}},sel(editRowDraft.uom,v=>setEditField("uom",v),masterData.uoms.map(u=>u.uom),"UOM")),
+        h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:editLookedUpRate!==null?editLookedUpRate:(editRowDraft.rate||""),onChange:e=>setEditField("rate",e.target.value),style:{...iStyle,width:70,textAlign:"right"},readOnly:editLookedUpRate!==null})),
+        h("td",{style:{padding:"6px 8px",textAlign:"right",color:colors.mutedLight,fontSize:11}},
+          fmtR((Number(editRowDraft.qty_required)||0)*(editLookedUpRate!==null?editLookedUpRate:(Number(editRowDraft.rate)||0)))
+        ),
+        h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",step:"0.1",value:editRowDraft.sf||3.1,onChange:e=>setEditField("sf",e.target.value),style:{...iStyle,width:50,textAlign:"right"}})),
+        h("td",{style:{padding:"6px 8px",color:colors.accent,textAlign:"right",fontSize:11}},
+          fmtR((Number(editRowDraft.qty_required)||0)*(editLookedUpRate!==null?editLookedUpRate:(Number(editRowDraft.rate)||0))*(Number(editRowDraft.sf)||3.1))
+        ),
+        h("td",{style:{padding:"4px 6px",whiteSpace:"nowrap"}},
+          h("button",{onClick:saveEditRow,style:{...btnPrimary,padding:"5px 9px",fontSize:11,marginRight:4}},"Save"),
+          h("button",{onClick:cancelEditRow,style:{...btnSecondary,padding:"5px 9px",fontSize:11}},"Cancel")
+        )
+      )
+    : h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0",background:(!r.cost||r.cost===0)?"#fdecea":"transparent"}},
+        h("td",{style:{padding:"6px 8px",color:colors.mutedLight}},idx+1),
+        h("td",{style:{padding:"6px 8px",fontWeight:600}},r.component),
+        h("td",{style:{padding:"6px 8px"}},[r.sub_assembly]),
+        h("td",{style:{padding:"6px 8px"}},[r.material_spec]),
+        h("td",{style:{padding:"6px 8px"}},[r.spec_grade]),
+        h("td",{style:{padding:"6px 8px"}},[r.cutting_plan_layout_size]),
+        h("td",{style:{padding:"6px 8px",textAlign:"right"}},[r.cutting_plan_qty]),
+        h("td",{style:{padding:"6px 8px"}},[r.cutting_plan_uom]),
+        h("td",{style:{padding:"6px 8px",textAlign:"right"}},[r.qty_required]),
+        h("td",{style:{padding:"6px 8px"}},[r.uom]),
+        h("td",{style:{padding:"6px 8px",textAlign:"right"}},[fmtR(Number(r.rate)||0)]),
+        h("td",{style:{padding:"6px 8px",textAlign:"right",fontWeight:700}},[fmtR(Number(r.cost)||0)]),
+        h("td",{style:{padding:"6px 8px",textAlign:"right"}},[r.sf||3.1]),
+        h("td",{style:{padding:"6px 8px",textAlign:"right",color:colors.accent,fontWeight:700}},[fmtR(Number(r.sales_price)||0)]),
+        h("td",{style:{padding:"6px 8px",whiteSpace:"nowrap"}},
+          h("button",{onClick:()=>startEditRow(r),style:{...btnSecondary,padding:"5px 9px",fontSize:11,marginRight:4}},"Edit"),
+          h("button",{onClick:()=>deleteSubRow(r.id),style:btnDanger},"Delete")
+        )
+      );
+
   if(loadingMasters) return h("div",{style:{padding:"40px 24px",color:colors.mutedLight}},"Loading master data…");
 
   return h("div",{style:{padding:"20px 24px"}},
@@ -935,8 +1074,16 @@ function BomEntryForm({ onGoToTab }) {
 
     // Sub-form
     (modelInput.trim()&&!modelNotFoundPrompt)&&h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,background:colors.panel}},
-      h("div",{style:{padding:"10px 14px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+      h("div",{style:{padding:"10px 14px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
         h("span",{style:{fontSize:13,fontWeight:600}},"BOM lines for: "+modelInput.trim()+" ("+subRows.length+" rows)"),
+        h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
+          bomStatus&&h("span",{style:categoryTagStyle(bomStatus==="Clean"?"Casting":bomStatus==="Cleaning Up"?"Fabricated":"Uncategorized")},bomStatus),
+          bomStatus==="Dirty"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Mark \""+modelInput.trim()+"\" as being cleaned up now?"),disabled:bomStatusBusy,style:{...btnSecondary,fontSize:11,padding:"5px 9px"}},"Start cleaning"),
+          bomStatus==="Cleaning Up"&&h("button",{onClick:()=>setModelBomStatus("Clean","Cleaning completed for \""+modelInput.trim()+"\"?"),disabled:bomStatusBusy,style:{...btnSecondary,fontSize:11,padding:"5px 9px"}},"Mark cleaning complete"),
+          bomStatus==="Clean"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Reopen \""+modelInput.trim()+"\" for further cleanup?"),disabled:bomStatusBusy,style:{...btnSecondary,fontSize:11,padding:"5px 9px"}},"Reopen for cleanup"),
+          subRows.length>0&&h("button",{onClick:deleteEntireBomForModel,style:{...btnDanger,fontSize:11,padding:"5px 9px"}},"Delete BOM"),
+          h("button",{onClick:downloadCleanupTracker,style:{...btnSecondary,fontSize:11,padding:"5px 9px"}},"Download cleanup tracker")
+        )
       ),
       loadingSub?h("div",{style:{padding:20,color:colors.mutedLight,fontSize:13}},"Loading…"):
       h("div",{style:{overflowX:"auto"}},
@@ -949,23 +1096,12 @@ function BomEntryForm({ onGoToTab }) {
             )
           ),
           h("tbody",null,
-            subRows.map((r,idx)=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0",background:(!r.cost||r.cost===0)?"#fdecea":"transparent"}},
-              h("td",{style:{padding:"6px 8px",color:colors.mutedLight}},idx+1),
-              h("td",{style:{padding:"6px 8px",fontWeight:600}},r.component),
-              h("td",{style:{padding:"6px 8px"}},[r.sub_assembly]),
-              h("td",{style:{padding:"6px 8px"}},[r.material_spec]),
-              h("td",{style:{padding:"6px 8px"}},[r.spec_grade]),
-              h("td",{style:{padding:"6px 8px"}},[r.cutting_plan_layout_size]),
-              h("td",{style:{padding:"6px 8px",textAlign:"right"}},[r.cutting_plan_qty]),
-              h("td",{style:{padding:"6px 8px"}},[r.cutting_plan_uom]),
-              h("td",{style:{padding:"6px 8px",textAlign:"right"}},[r.qty_required]),
-              h("td",{style:{padding:"6px 8px"}},[r.uom]),
-              h("td",{style:{padding:"6px 8px",textAlign:"right"}},[fmtR(Number(r.rate)||0)]),
-              h("td",{style:{padding:"6px 8px",textAlign:"right",fontWeight:700}},[fmtR(Number(r.cost)||0)]),
-              h("td",{style:{padding:"6px 8px",textAlign:"right"}},[r.sf||3.1]),
-              h("td",{style:{padding:"6px 8px",textAlign:"right",color:colors.accent,fontWeight:700}},[fmtR(Number(r.sales_price)||0)]),
-              h("td",{style:{padding:"6px 8px"}},h("button",{onClick:()=>deleteSubRow(r.id),style:btnDanger},"Delete"))
-            )),
+            groupedSubRows.flatMap(([comp,groupRows])=>[
+              h("tr",{key:"grp-"+comp,style:{background:"#f4f2ea"}},
+                h("td",{colSpan:15,style:{padding:"6px 8px",fontSize:11.5,fontWeight:700}},comp+"  ("+groupRows.length+")")
+              ),
+              ...groupRows.map((r,i)=>renderSubRow(r,i))
+            ]),
             // New row input at the bottom
             h("tr",{style:{background:"#fbf6e8",borderTop:"2px solid "+colors.border}},
               h("td",{style:{padding:"6px 8px",color:colors.mutedLight,fontSize:11}},"new"),
@@ -7067,7 +7203,7 @@ const MANUAL_SECTIONS = [
             "type": "steps",
             "items": [
               "The generic table editor (add, edit, delete rows one at a time).",
-              "The BOM Entry Form \u2014 a faster quick-add screen for building out a model's whole BOM in one sitting."
+              "The BOM Entry Form \u2014 a faster quick-add screen for building out a model's whole BOM in one sitting. Lines group by Component, each with Edit and Delete; the header bar tracks a Dirty / Cleaning Up / Clean status per model, a Delete BOM (whole model), and a downloadable cleanup tracker across all models."
             ]
           },
           {
@@ -7473,6 +7609,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (3)", summary:"Corrected the previous entry: the BOM cleanup work now lives on the actual BOM Entry Form (BOM setup → BOM Entry Form), not the old Master Data → BOM table. Lines for the loaded model now group by Component, each with a proper Edit button (in-place, same fields as Add) alongside Delete. Added the Dirty / Cleaning Up / Clean status control, Delete BOM (entire model), and Download cleanup tracker to this screen. Master Data → BOM keeps its own equivalent controls too." },
   { date:"17 Jul 2026 (2)", summary:"Master Data → BOM can now focus on one model at a time, grouping its lines by Component; each model tracks a Dirty / Cleaning Up / Clean status (logged to Audit Log), with a \"Download cleanup tracker\" Excel across all models. Delete BOM (entire model's lines) added. Deleting a Model now checks for an existing BOM first and asks separately whether to delete that too — declining keeps the model untouched. New \"Rename model\" tool updates Models and BOM everywhere and Draft quotes only, leaving non-Draft quotes on the old name. Standing rule going forward: every delete action prompts for confirmation." },
   { date:"17 Jul 2026", summary:"New Categories master table (Casting, Fabricated, Barstock, Investment Casting, Forging) and a Category field on Models, cascading from it — backfilled for 907 existing models from an admin-corrected review file. BOM Coverage now groups Category → Model → Size (item shown alongside each model), with a colored category tag and an \"Open BOM\" button per size that jumps straight into the Estimator with that model loaded. Master Data → Models also gained a \"Download all models\" button (every model, not just the current page, with its category) for offline review." },
   { date:"15 Jul 2026", summary:"Currency conversion (AED), Contacts as a company sub-form + upload-to-extract, Estimator manual line item with cascading dropdowns, freeze pane, mirrored scrollbar, global Sf change, global delete confirmation audit, nearest-5 rounding on rates/totals, cover letter Customer/Address/Attention fields, Datasheet Add-line now updates the Master too, \"Other\" dropdown bug fixed." },
@@ -10522,7 +10659,7 @@ function App() {
     tab==="data_backup"?h(DataBackupScreen,{user}):
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
-    tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab}):
+    tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
     tab==="customers"?h(CustomersScreen,{user}):
     tab==="user_manual"?h(UserManualScreen,null):
