@@ -1360,6 +1360,139 @@ function MasterEditor({ tableKey, user }) {
     XLSX.writeFile(wb,"bom_cleanup_tracker.xlsx");
   };
 
+  // Material Rates — wildcard filters (Spec/Grade/Shape/UOM, each matches
+  // anywhere in the text), grouped by spec, cascading edit (Spec -> Shape
+  // auto-fills and locks, from the spec's own Material Specs master record),
+  // and a bulk "Edit all lines" mode. Admin/Super Admin only, same as BOM.
+  const canEditMR = isAdmin;
+  const [mrSpecFilter,setMrSpecFilter]=useState("");
+  const [mrGradeFilter,setMrGradeFilter]=useState("");
+  const [mrShapeFilter,setMrShapeFilter]=useState("");
+  const [mrUomFilter,setMrUomFilter]=useState("");
+  const [specShapeMap,setSpecShapeMap]=useState(new Map());
+  const [mrSpecOptions,setMrSpecOptions]=useState([]);
+  const [mrUomOptions,setMrUomOptions]=useState([]);
+  useEffect(()=>{
+    if(tableKey!=="material_rates") return;
+    fetchAll("material_spec","material_spec,material_shape").then(d=>{
+      const m=new Map(); d.forEach(r=>{ if(r.material_spec) m.set(r.material_spec, r.material_shape||""); });
+      setSpecShapeMap(m);
+      setMrSpecOptions(Array.from(m.keys()).sort());
+    });
+    fetchAll("uom_tbl","uom").then(d=>setMrUomOptions(Array.from(new Set(d.map(r=>r.uom).filter(Boolean))).sort()));
+  },[tableKey]);
+
+
+  const [mrEditingId,setMrEditingId]=useState(null);
+  const [mrEditDraft,setMrEditDraft]=useState({});
+  const mrStartEdit = (row)=>{ setMrEditingId(row.id); setMrEditDraft({...row}); };
+  const mrCancelEdit = ()=>{ setMrEditingId(null); setMrEditDraft({}); };
+  const mrSetField = (field,value)=>{
+    setMrEditDraft(d=>{ const next={...d,[field]:value}; if(field==="material_spec") next.material_shape = specShapeMap.get(value)||""; return next; });
+  };
+  const mrSaveEdit = async()=>{
+    const payload = {
+      material_spec: mrEditDraft.material_spec||"", material_shape: mrEditDraft.material_shape||"",
+      material_grade: mrEditDraft.material_grade||"", rate: Number(mrEditDraft.rate)||0,
+      uom: mrEditDraft.uom||"", spec_grade: (mrEditDraft.material_spec||"")+(mrEditDraft.material_grade||""),
+    };
+    const { error:err } = await sb.from("material_rates").update(payload).eq("id",mrEditingId);
+    if(err){ setError(err.message); return; }
+    await logAudit("UPDATE","material_rates",mrEditingId,payload.material_spec+" — "+payload.material_grade,user?.username||"unknown",null,payload);
+    setRows(rs=>rs.map(r=>r.id===mrEditingId?{...r,...payload}:r));
+    setMrEditingId(null); setMrEditDraft({});
+  };
+  const mrDeleteRow = async(row)=>{
+    if(!confirm("Delete this rate line (\""+row.material_spec+" — "+row.material_grade+"\")?")) return;
+    await sb.from("material_rates").delete().eq("id",row.id);
+    await logAudit("DELETE","material_rates",row.id,row.material_spec+" — "+row.material_grade,user?.username||"unknown",row,null);
+    setRows(rs=>rs.filter(r=>r.id!==row.id));
+  };
+
+  const [mrEditAllMode,setMrEditAllMode]=useState(false);
+  const [mrEditAllDrafts,setMrEditAllDrafts]=useState({});
+  const [mrSavingAll,setMrSavingAll]=useState(false);
+  const mrStartEditAll = ()=>{
+    const drafts={}; mrFilteredRows.forEach(r=>{ drafts[r.id]={...r}; });
+    setMrEditAllDrafts(drafts); setMrEditAllMode(true); setMrEditingId(null); setMrEditDraft({});
+  };
+  const mrCancelEditAll = ()=>{ setMrEditAllMode(false); setMrEditAllDrafts({}); };
+  const mrSetAllField = (id,field,value)=>{
+    setMrEditAllDrafts(d=>{
+      const row={...(d[id]||{}),[field]:value};
+      if(field==="material_spec") row.material_shape = specShapeMap.get(value)||"";
+      return {...d,[id]:row};
+    });
+  };
+  const mrSaveAllEdits = async()=>{
+    if(!confirm("Save changes to "+mrFilteredRows.length+" rate line(s)?")) return;
+    setMrSavingAll(true);
+    try{
+      const updates=[];
+      for(const r of mrFilteredRows){
+        const draft = mrEditAllDrafts[r.id]||r;
+        const payload = {
+          material_spec: draft.material_spec||"", material_shape: draft.material_shape||"",
+          material_grade: draft.material_grade||"", rate: Number(draft.rate)||0,
+          uom: draft.uom||"", spec_grade: (draft.material_spec||"")+(draft.material_grade||""),
+        };
+        await sb.from("material_rates").update(payload).eq("id",r.id);
+        updates.push({id:r.id,...payload});
+      }
+      await logAudit("UPDATE","material_rates","bulk edit","Bulk edit via \"Edit all lines\": "+updates.length+" rate line(s) updated",user?.username||"unknown",null,{lineCount:updates.length});
+      setRows(rs=>rs.map(r=>{ const u=updates.find(x=>x.id===r.id); return u?{...r,...u}:r; }));
+      setMrEditAllMode(false); setMrEditAllDrafts({});
+    } finally { setMrSavingAll(false); }
+  };
+  const mrDeleteAllFiltered = async()=>{
+    const n = mrFilteredRows.length;
+    if(n===0) return;
+    if(!confirm("Delete all "+n+" filtered rate line(s)? This cannot be undone.")) return;
+    for(const r of mrFilteredRows){ await sb.from("material_rates").delete().eq("id",r.id); }
+    await logAudit("DELETE","material_rates","bulk delete","Bulk delete: "+n+" filtered rate line(s) deleted",user?.username||"unknown",{count:n},null);
+    setRows(rs=>rs.filter(r=>!mrFilteredRows.some(f=>f.id===r.id)));
+  };
+  const mrRenderRow = (row)=> mrEditingId===row.id
+    ? h("tr",{key:row.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
+        h("td",{style:{padding:"4px 6px"}},h("select",{value:mrEditDraft.material_spec||"",onChange:e=>mrSetField("material_spec",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:""},"Spec…"),mrSpecOptions.map(s=>h("option",{key:s,value:s},s)))),
+        h("td",{style:{padding:"4px 6px"}},h("input",{value:mrEditDraft.material_grade||"",onChange:e=>mrSetField("material_grade",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:100}})),
+        h("td",{style:{padding:"4px 6px"}},h("input",{value:mrEditDraft.material_shape||"",readOnly:true,style:{...inputStyle,padding:"5px 7px",fontSize:12,width:100,background:"#f4f2ea",color:colors.muted}})),
+        h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:mrEditDraft.rate||"",onChange:e=>mrSetField("rate",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:90,textAlign:"right"}})),
+        h("td",{style:{padding:"4px 6px"}},h("select",{value:mrEditDraft.uom||"",onChange:e=>mrSetField("uom",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:""},"UOM…"),mrUomOptions.map(u=>h("option",{key:u,value:u},u)))),
+        h("td",{style:{padding:"4px 6px",whiteSpace:"nowrap",position:"sticky",right:0,background:"#eef6f3",boxShadow:"-2px 0 4px rgba(0,0,0,0.08)"}},
+          h("button",{onClick:mrSaveEdit,style:{...btnPrimary,padding:"5px 9px",fontSize:11,marginRight:4}},"Save"),
+          h("button",{onClick:mrCancelEdit,style:{...btnSecondary,padding:"5px 9px",fontSize:11}},"Cancel")
+        )
+      )
+    : h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
+        h("td",{style:{padding:"7px 9px"}},row.material_spec),
+        h("td",{style:{padding:"7px 9px"}},row.material_grade),
+        h("td",{style:{padding:"7px 9px"}},row.material_shape),
+        h("td",{style:{padding:"7px 9px",textAlign:"right"}},fmt(Number(row.rate)||0)),
+        h("td",{style:{padding:"7px 9px"}},row.uom),
+        h("td",{style:{padding:"7px 9px",whiteSpace:"nowrap",position:"sticky",right:0,background:"#fff",boxShadow:"-2px 0 4px rgba(0,0,0,0.08)"}},
+          canEditMR
+            ? h(React.Fragment,null,
+                h("button",{onClick:()=>mrStartEdit(row),style:{...btnSecondary,padding:"5px 9px",fontSize:11,marginRight:4}},"Edit"),
+                h("button",{onClick:()=>mrDeleteRow(row),style:btnDanger},"Delete")
+              )
+            : h("span",{style:{fontSize:11,color:colors.mutedLight}},"—")
+        )
+      );
+  const mrRenderEditAllRow = (row)=>{
+    const draft = mrEditAllDrafts[row.id]||row;
+    return h("tr",{key:row.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
+      h("td",{style:{padding:"4px 6px"}},h("select",{value:draft.material_spec||"",onChange:e=>mrSetAllField(row.id,"material_spec",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:""},"Spec…"),mrSpecOptions.map(s=>h("option",{key:s,value:s},s)))),
+      h("td",{style:{padding:"4px 6px"}},h("input",{value:draft.material_grade||"",onChange:e=>mrSetAllField(row.id,"material_grade",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:100}})),
+      h("td",{style:{padding:"4px 6px"}},h("input",{value:draft.material_shape||"",readOnly:true,style:{...inputStyle,padding:"5px 7px",fontSize:12,width:100,background:"#f4f2ea",color:colors.muted}})),
+      h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:draft.rate||"",onChange:e=>mrSetAllField(row.id,"rate",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:90,textAlign:"right"}})),
+      h("td",{style:{padding:"4px 6px"}},h("select",{value:draft.uom||"",onChange:e=>mrSetAllField(row.id,"uom",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:""},"UOM…"),mrUomOptions.map(u=>h("option",{key:u,value:u},u)))),
+      h("td",{style:{padding:"4px 6px",whiteSpace:"nowrap",position:"sticky",right:0,background:"#eef6f3",boxShadow:"-2px 0 4px rgba(0,0,0,0.08)"}},
+        h("button",{onClick:()=>mrDeleteRow(row),style:btnDanger},"Delete")
+      )
+    );
+  };
+
   // Rename model (Models table only) — updates Models + BOM everywhere, and
   // Draft quotes only. Non-Draft quotes keep the old model name on purpose.
   const [showRename,setShowRename]=useState(false);
@@ -1411,6 +1544,9 @@ function MasterEditor({ tableKey, user }) {
     try {
       if(tableKey==="bom" && bomModelFilter){
         const { data, error:err } = await sb.from("bom").select("*").eq("model",bomModelFilter).order("component",{ascending:true});
+        if(err) throw err; setRows(data||[]);
+      } else if(tableKey==="material_rates"){
+        const { data, error:err } = await sb.from("material_rates").select("*").order("material_spec",{ascending:true});
         if(err) throw err; setRows(data||[]);
       } else {
         const { data, error:err } = await sb.from(tableKey).select("*").order("id",{ascending:true}).range(page*pageSize,page*pageSize+pageSize-1);
@@ -1545,6 +1681,19 @@ function MasterEditor({ tableKey, user }) {
   };
 
   const filteredRows = useMemo(()=>{ if(!search) return rows; const s=search.toLowerCase(); return rows.filter(r=>tableDef.columns.some(c=>String(r[c]??"").toLowerCase().includes(s))); },[rows,search,tableDef]);
+
+  const mrFilteredRows = useMemo(()=>{
+    if(tableKey!=="material_rates") return [];
+    const m=(val,f)=> !f || String(val||"").toLowerCase().includes(f.toLowerCase());
+    return filteredRows.filter(r=>m(r.material_spec,mrSpecFilter)&&m(r.material_grade,mrGradeFilter)&&m(r.material_shape,mrShapeFilter)&&m(r.uom,mrUomFilter));
+  },[filteredRows,tableKey,mrSpecFilter,mrGradeFilter,mrShapeFilter,mrUomFilter]);
+
+  const groupedByMaterialSpec = useMemo(()=>{
+    if(tableKey!=="material_rates") return null;
+    const map=new Map();
+    mrFilteredRows.forEach(r=>{ const k=r.material_spec||"(no spec)"; if(!map.has(k)) map.set(k,[]); map.get(k).push(r); });
+    return Array.from(map.entries()).sort((a,b)=>a[0].localeCompare(b[0]));
+  },[mrFilteredRows,tableKey]);
   const addLabel = tableDef.addLabel||"New row";
 
   const renderRow = (row)=>h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
@@ -1622,8 +1771,41 @@ function MasterEditor({ tableKey, user }) {
       bomModelFilter&&bomStatus==="Clean"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Reopen \""+bomModelFilter+"\" for further cleanup?"),disabled:bomStatusBusy,style:btnSecondary},"Reopen for cleanup"),
       bomModelFilter&&h("button",{onClick:deleteEntireBom,style:btnDanger},"Delete BOM")
     ),
+    tableKey==="material_rates"&&h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:14}},
+      h("input",{value:mrSpecFilter,onChange:e=>setMrSpecFilter(e.target.value),placeholder:"Spec…",style:{...inputStyle,width:130}}),
+      h("input",{value:mrGradeFilter,onChange:e=>setMrGradeFilter(e.target.value),placeholder:"Grade…",style:{...inputStyle,width:110}}),
+      h("input",{value:mrShapeFilter,onChange:e=>setMrShapeFilter(e.target.value),placeholder:"Shape…",style:{...inputStyle,width:110}}),
+      h("input",{value:mrUomFilter,onChange:e=>setMrUomFilter(e.target.value),placeholder:"UOM…",style:{...inputStyle,width:90}}),
+      (mrSpecFilter||mrGradeFilter||mrShapeFilter||mrUomFilter)&&h("button",{onClick:()=>{setMrSpecFilter("");setMrGradeFilter("");setMrShapeFilter("");setMrUomFilter("");},style:btnSecondary},"Clear filters"),
+      h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
+        canEditMR&&!mrEditAllMode&&mrFilteredRows.length>0&&h("button",{onClick:mrStartEditAll,style:btnPrimary},"Edit all lines"),
+        canEditMR&&mrEditAllMode&&h(React.Fragment,null,
+          h("button",{onClick:mrSaveAllEdits,disabled:mrSavingAll,style:{...btnPrimary,background:"#0f6e56"}},mrSavingAll?"Saving…":"Save all changes"),
+          h("button",{onClick:mrCancelEditAll,disabled:mrSavingAll,style:btnSecondary},"Cancel all")
+        ),
+        canEditMR&&mrFilteredRows.length>0&&h("button",{onClick:mrDeleteAllFiltered,style:btnDanger},"Delete filtered")
+      )
+    ),
     error&&h("div",{style:{color:colors.danger,fontSize:13,marginBottom:10}},error),
     loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
+    tableKey==="material_rates"?
+    h("div",{style:{overflowX:"auto",border:"1px solid "+colors.border,borderRadius:6}},
+      h("table",{style:{fontSize:12.5,minWidth:600}},
+        h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left",background:"#faf9f4"}},
+          ["Material Spec","Grade","Shape","Rate","UOM","Action"].map((c,ci,arr)=>h("th",{key:c,style:ci===arr.length-1?{padding:"8px 10px",position:"sticky",right:0,background:"#faf9f4",boxShadow:"-2px 0 4px rgba(0,0,0,0.08)"}:{padding:"8px 10px"}},c))
+        )),
+        h("tbody",null,
+          (groupedByMaterialSpec||[]).length===0
+            ? h("tr",null,h("td",{colSpan:6,style:{padding:16,color:colors.mutedLight}},"No matching rates."))
+            : groupedByMaterialSpec.flatMap(([spec,groupRows])=>[
+                h("tr",{key:"grp-"+spec,style:{background:"#f4f2ea"}},
+                  h("td",{colSpan:6,style:{padding:"7px 10px",fontSize:12,fontWeight:700}},spec+"  ("+groupRows.length+")")
+                ),
+                ...groupRows.map(row=>mrEditAllMode?mrRenderEditAllRow(row):mrRenderRow(row))
+              ])
+        )
+      )
+    ):
     h("div",{style:{overflowX:"auto",border:"1px solid "+colors.border,borderRadius:6}},
       h("table",{style:{fontSize:12.5,minWidth:600}},
         h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left",background:"#faf9f4"}},
@@ -1655,7 +1837,7 @@ function MasterEditor({ tableKey, user }) {
         )
       )
     ),
-    !(tableKey==="bom"&&bomModelFilter) && h("div",{style:{display:"flex",justifyContent:"center",gap:10,marginTop:14}},
+    !(tableKey==="bom"&&bomModelFilter) && tableKey!=="material_rates" && h("div",{style:{display:"flex",justifyContent:"center",gap:10,marginTop:14}},
       h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSecondary},"Previous"),
       h("span",{style:{fontSize:12,color:colors.muted,padding:"8px 0"}},"Page "+(page+1)),
       h("button",{onClick:()=>setPage(p=>p+1),disabled:rows.length<pageSize,style:btnSecondary},"Next")
@@ -7736,6 +7918,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (8)", summary:"Master Data → Material Rates now matches the BOM treatment: wildcard filters on Spec/Grade/Shape/UOM (each matches anywhere, combine together, Clear filters resets all), grouped by Material Spec, sticky Edit/Delete pinned right and restricted to Admin/Super Admin, cascading edit (picking Material Spec auto-fills and locks Shape from that spec's own master record), \"Edit all lines\" bulk mode with Save all / Cancel all, and \"Delete filtered\" (bulk delete of whatever the filters currently show) — every delete still confirms first." },
   { date:"17 Jul 2026 (7)", summary:"BOM Entry Form: new \"Edit all lines\" button (Admin/Super Admin) flips every line of the loaded model into the same cascading dropdowns at once — no more Edit/Save per row. \"Save all changes\" commits every line in one go and logs a single bulk-edit entry to Audit Log; \"Cancel all\" discards everything. Delete stays per-row even in this mode." },
   { date:"17 Jul 2026 (6)", summary:"BOM Entry Form: the Edit/Delete (and Add row) column is now pinned to the right edge of the table, always visible without needing to scroll the table horizontally — it was there all along, just past the visible columns on wide screens." },
   { date:"17 Jul 2026 (5)", summary:"BOM Entry Form: Edit is now strict cascading dropdowns (Component → Sub Assembly filtered to it, Material Spec → Grade filtered to it) instead of free-typed fields, and Edit/Delete are now restricted to Admin and Super Admin — other roles see the row read-only." },
