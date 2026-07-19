@@ -1360,18 +1360,22 @@ function MasterEditor({ tableKey, user }) {
     XLSX.writeFile(wb,"bom_cleanup_tracker.xlsx");
   };
 
-  // Material Rates — wildcard filters (Spec/Grade/Shape/UOM, each matches
-  // anywhere in the text), grouped by spec, cascading edit (Spec -> Shape
-  // auto-fills and locks, from the spec's own Material Specs master record),
-  // and a bulk "Edit all lines" mode. Admin/Super Admin only, same as BOM.
+  // Material Rates — Shape is the required "focus" combo (type-to-search
+  // datalist) so we only ever load ONE shape's rows into the DOM at a time,
+  // never the whole table (that unconditional full-table load was the cause
+  // of the page hanging). Spec then Grade cascade from it in sequence, their
+  // combo options built only from whatever's currently loaded. UOM isn't part
+  // of the filter chain — it's shown as a result column only. The top-right
+  // Search box does a separate scoped server-side wildcard search across
+  // every shape/spec/grade/UOM at once (capped at 300 matches).
   const canEditMR = isAdmin;
+  const [mrShapeFocus,setMrShapeFocus]=useState("");
   const [mrSpecFilter,setMrSpecFilter]=useState("");
   const [mrGradeFilter,setMrGradeFilter]=useState("");
-  const [mrShapeFilter,setMrShapeFilter]=useState("");
-  const [mrUomFilter,setMrUomFilter]=useState("");
   const [specShapeMap,setSpecShapeMap]=useState(new Map());
-  const [mrSpecOptions,setMrSpecOptions]=useState([]);
-  const [mrUomOptions,setMrUomOptions]=useState([]);
+  const [mrShapeOptionsAll,setMrShapeOptionsAll]=useState([]);
+  const [mrUomOptions,setMrUomOptions]=useState([]); // for the Edit form's UOM dropdown, not for filtering
+  const [mrSpecOptions,setMrSpecOptions]=useState([]); // ALL specs, for the Edit form's Spec dropdown (not shape-scoped)
   useEffect(()=>{
     if(tableKey!=="material_rates") return;
     fetchAll("material_spec","material_spec,material_shape").then(d=>{
@@ -1379,25 +1383,32 @@ function MasterEditor({ tableKey, user }) {
       setSpecShapeMap(m);
       setMrSpecOptions(Array.from(m.keys()).sort());
     });
+    fetchAll("materials_shape","shape").then(d=>setMrShapeOptionsAll(Array.from(new Set(d.map(r=>r.shape).filter(Boolean))).sort()));
     fetchAll("uom_tbl","uom").then(d=>setMrUomOptions(Array.from(new Set(d.map(r=>r.uom).filter(Boolean))).sort()));
   },[tableKey]);
 
 
   const [mrEditingId,setMrEditingId]=useState(null);
   const [mrEditDraft,setMrEditDraft]=useState({});
-  const mrStartEdit = (row)=>{ setMrEditingId(row.id); setMrEditDraft({...row}); };
+  const mrStartEdit = (row)=>{ setMrEditingId(row.id); setMrEditDraft({...row, _originalRate:row.rate}); };
   const mrCancelEdit = ()=>{ setMrEditingId(null); setMrEditDraft({}); };
   const mrSetField = (field,value)=>{
     setMrEditDraft(d=>{ const next={...d,[field]:value}; if(field==="material_spec") next.material_shape = specShapeMap.get(value)||""; return next; });
   };
   const mrSaveEdit = async()=>{
+    const newRate = Number(mrEditDraft.rate)||0;
+    const oldRate = Number(mrEditDraft._originalRate ?? mrEditDraft.rate)||0;
     const payload = {
       material_spec: mrEditDraft.material_spec||"", material_shape: mrEditDraft.material_shape||"",
-      material_grade: mrEditDraft.material_grade||"", rate: Number(mrEditDraft.rate)||0,
+      material_grade: mrEditDraft.material_grade||"", rate: newRate,
       uom: mrEditDraft.uom||"", spec_grade: (mrEditDraft.material_spec||"")+(mrEditDraft.material_grade||""),
     };
+    if(newRate!==oldRate) payload.rate_effective_date = new Date().toISOString().slice(0,10);
     const { error:err } = await sb.from("material_rates").update(payload).eq("id",mrEditingId);
     if(err){ setError(err.message); return; }
+    if(newRate!==oldRate){
+      await sb.from("rate_history").insert({material_spec:payload.material_spec, material_grade:payload.material_grade, old_rate:oldRate, new_rate:newRate, changed_by:user?.username||"unknown"});
+    }
     await logAudit("UPDATE","material_rates",mrEditingId,payload.material_spec+" — "+payload.material_grade,user?.username||"unknown",null,payload);
     setRows(rs=>rs.map(r=>r.id===mrEditingId?{...r,...payload}:r));
     setMrEditingId(null); setMrEditDraft({});
@@ -1428,18 +1439,25 @@ function MasterEditor({ tableKey, user }) {
     if(!confirm("Save changes to "+mrFilteredRows.length+" rate line(s)?")) return;
     setMrSavingAll(true);
     try{
-      const updates=[];
+      const updates=[]; const historyInserts=[];
       for(const r of mrFilteredRows){
         const draft = mrEditAllDrafts[r.id]||r;
+        const newRate = Number(draft.rate)||0;
+        const oldRate = Number(r.rate)||0;
         const payload = {
           material_spec: draft.material_spec||"", material_shape: draft.material_shape||"",
-          material_grade: draft.material_grade||"", rate: Number(draft.rate)||0,
+          material_grade: draft.material_grade||"", rate: newRate,
           uom: draft.uom||"", spec_grade: (draft.material_spec||"")+(draft.material_grade||""),
         };
+        if(newRate!==oldRate){
+          payload.rate_effective_date = new Date().toISOString().slice(0,10);
+          historyInserts.push({material_spec:payload.material_spec, material_grade:payload.material_grade, old_rate:oldRate, new_rate:newRate, changed_by:user?.username||"unknown"});
+        }
         await sb.from("material_rates").update(payload).eq("id",r.id);
         updates.push({id:r.id,...payload});
       }
-      await logAudit("UPDATE","material_rates","bulk edit","Bulk edit via \"Edit all lines\": "+updates.length+" rate line(s) updated",user?.username||"unknown",null,{lineCount:updates.length});
+      if(historyInserts.length) await sb.from("rate_history").insert(historyInserts);
+      await logAudit("UPDATE","material_rates","bulk edit","Bulk edit via \"Edit all lines\": "+updates.length+" rate line(s) updated ("+historyInserts.length+" rate change(s))",user?.username||"unknown",null,{lineCount:updates.length});
       setRows(rs=>rs.map(r=>{ const u=updates.find(x=>x.id===r.id); return u?{...r,...u}:r; }));
       setMrEditAllMode(false); setMrEditAllDrafts({});
     } finally { setMrSavingAll(false); }
@@ -1451,6 +1469,47 @@ function MasterEditor({ tableKey, user }) {
     for(const r of mrFilteredRows){ await sb.from("material_rates").delete().eq("id",r.id); }
     await logAudit("DELETE","material_rates","bulk delete","Bulk delete: "+n+" filtered rate line(s) deleted",user?.username||"unknown",{count:n},null);
     setRows(rs=>rs.filter(r=>!mrFilteredRows.some(f=>f.id===r.id)));
+  };
+
+  // "Rate = 0" table — every line missing a rate, editable right there.
+  const [zeroRateCount,setZeroRateCount]=useState(0);
+  const [zeroRateOpen,setZeroRateOpen]=useState(false);
+  const [zeroRateRows,setZeroRateRows]=useState([]);
+  const [zeroRateDrafts,setZeroRateDrafts]=useState({});
+  useEffect(()=>{
+    if(tableKey!=="material_rates") return;
+    sb.from("material_rates").select("id",{count:"exact",head:true}).eq("rate",0).then(({count})=>setZeroRateCount(count||0));
+  },[tableKey,rows]);
+  const openZeroRateTable = async()=>{
+    const { data } = await sb.from("material_rates").select("*").eq("rate",0).order("material_spec",{ascending:true});
+    setZeroRateRows(data||[]); setZeroRateDrafts({}); setZeroRateOpen(true);
+  };
+  const saveZeroRate = async(row)=>{
+    const val = Number(zeroRateDrafts[row.id]);
+    if(!val || val<=0){ alert("Enter a rate greater than 0."); return; }
+    const payload = { rate: val, rate_effective_date: new Date().toISOString().slice(0,10) };
+    await sb.from("material_rates").update(payload).eq("id",row.id);
+    await sb.from("rate_history").insert({material_spec:row.material_spec, material_grade:row.material_grade, old_rate:0, new_rate:val, changed_by:user?.username||"unknown"});
+    await logAudit("UPDATE","material_rates",row.id,row.material_spec+" — "+row.material_grade+" (rate set from 0 to "+val+")",user?.username||"unknown",{rate:0},payload);
+    setZeroRateRows(rs=>rs.filter(r=>r.id!==row.id));
+    setZeroRateCount(c=>Math.max(0,c-1));
+    setRows(rs=>rs.map(r=>r.id===row.id?{...r,...payload}:r));
+  };
+  const downloadZeroRates = async()=>{
+    const { data } = await sb.from("material_rates").select("material_shape,material_spec,material_grade,uom").eq("rate",0).order("material_spec",{ascending:true});
+    const rowsOut=[["Shape","Spec","Grade","UOM"]];
+    (data||[]).forEach(r=>rowsOut.push([r.material_shape||"",r.material_spec||"",r.material_grade||"",r.uom||""]));
+    const ws=XLSX.utils.aoa_to_sheet(rowsOut); ws["!cols"]=[{wch:16},{wch:26},{wch:16},{wch:10}];
+    const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"Zero rates");
+    XLSX.writeFile(wb,"material_rates_missing.xlsx");
+  };
+
+  // Rate history popup — every past value for one spec+grade combo.
+  const [historyFor,setHistoryFor]=useState(null);
+  const [historyRows,setHistoryRows]=useState([]);
+  const openRateHistory = async(row)=>{
+    const { data } = await sb.from("rate_history").select("*").eq("material_spec",row.material_spec).eq("material_grade",row.material_grade).order("changed_at",{ascending:false});
+    setHistoryRows(data||[]); setHistoryFor(row);
   };
   const mrRenderRow = (row)=> mrEditingId===row.id
     ? h("tr",{key:row.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
@@ -1468,7 +1527,11 @@ function MasterEditor({ tableKey, user }) {
         h("td",{style:{padding:"7px 9px"}},row.material_spec),
         h("td",{style:{padding:"7px 9px"}},row.material_grade),
         h("td",{style:{padding:"7px 9px"}},row.material_shape),
-        h("td",{style:{padding:"7px 9px",textAlign:"right"}},fmt(Number(row.rate)||0)),
+        h("td",{style:{padding:"7px 9px",textAlign:"right"}},
+          h("div",null,fmt(Number(row.rate)||0)),
+          row.rate_effective_date&&h("div",{style:{fontSize:10,color:colors.mutedLight}},"as of "+row.rate_effective_date),
+          h("span",{onClick:()=>openRateHistory(row),style:{fontSize:10,color:"#1c8c75",textDecoration:"underline",cursor:"pointer"}},"History")
+        ),
         h("td",{style:{padding:"7px 9px"}},row.uom),
         h("td",{style:{padding:"7px 9px",whiteSpace:"nowrap",position:"sticky",right:0,background:"#fff",boxShadow:"-2px 0 4px rgba(0,0,0,0.08)"}},
           canEditMR
@@ -1546,14 +1609,24 @@ function MasterEditor({ tableKey, user }) {
         const { data, error:err } = await sb.from("bom").select("*").eq("model",bomModelFilter).order("component",{ascending:true});
         if(err) throw err; setRows(data||[]);
       } else if(tableKey==="material_rates"){
-        const { data, error:err } = await sb.from("material_rates").select("*").order("material_spec",{ascending:true});
-        if(err) throw err; setRows(data||[]);
+        if(search.trim()){
+          const s = search.trim();
+          const { data, error:err } = await sb.from("material_rates").select("*")
+            .or("material_spec.ilike.%"+s+"%,material_grade.ilike.%"+s+"%,material_shape.ilike.%"+s+"%,uom.ilike.%"+s+"%,spec_grade.ilike.%"+s+"%")
+            .order("material_spec",{ascending:true}).limit(300);
+          if(err) throw err; setRows(data||[]);
+        } else if(mrShapeFocus){
+          const { data, error:err } = await sb.from("material_rates").select("*").eq("material_shape",mrShapeFocus).order("material_spec",{ascending:true}).limit(1000);
+          if(err) throw err; setRows(data||[]);
+        } else {
+          setRows([]);
+        }
       } else {
         const { data, error:err } = await sb.from(tableKey).select("*").order("id",{ascending:true}).range(page*pageSize,page*pageSize+pageSize-1);
         if(err) throw err; setRows(data||[]);
       }
     } catch(e) { setError(e.message); } finally { setLoading(false); }
-  },[tableKey,page,bomModelFilter]);
+  },[tableKey,page,bomModelFilter,search,mrShapeFocus]);
 
   useEffect(()=>{ setPage(0); },[tableKey]);
   useEffect(()=>{ load(); },[load]);
@@ -1685,8 +1758,23 @@ function MasterEditor({ tableKey, user }) {
   const mrFilteredRows = useMemo(()=>{
     if(tableKey!=="material_rates") return [];
     const m=(val,f)=> !f || String(val||"").toLowerCase().includes(f.toLowerCase());
-    return filteredRows.filter(r=>m(r.material_spec,mrSpecFilter)&&m(r.material_grade,mrGradeFilter)&&m(r.material_shape,mrShapeFilter)&&m(r.uom,mrUomFilter));
-  },[filteredRows,tableKey,mrSpecFilter,mrGradeFilter,mrShapeFilter,mrUomFilter]);
+    return filteredRows.filter(r=>m(r.material_spec,mrSpecFilter)&&m(r.material_grade,mrGradeFilter));
+  },[filteredRows,tableKey,mrSpecFilter,mrGradeFilter]);
+
+  // Cascading option lists — built only from whatever's currently loaded
+  // (the focused shape's rows, or the current search results), so Spec/Grade
+  // choices always reflect what's actually available right now.
+  const mrSpecOptionsScoped = useMemo(()=> tableKey==="material_rates" ? Array.from(new Set(rows.map(r=>r.material_spec).filter(Boolean))).sort() : [],[rows,tableKey]);
+  const mrGradeOptionsScoped = useMemo(()=>{
+    if(tableKey!=="material_rates") return [];
+    const scoped = mrSpecFilter ? rows.filter(r=>r.material_spec===mrSpecFilter) : rows;
+    return Array.from(new Set(scoped.map(r=>r.material_grade).filter(Boolean))).sort();
+  },[rows,tableKey,mrSpecFilter]);
+  const [mrStepMsg,setMrStepMsg]=useState("");
+  const mrGuardStep = (label, ready, e)=>{
+    if(!ready){ setMrStepMsg("Pick "+label+" first — filters apply in order: Shape → Spec → Grade."); e.target.blur(); }
+    else setMrStepMsg("");
+  };
 
   const groupedByMaterialSpec = useMemo(()=>{
     if(tableKey!=="material_rates") return null;
@@ -1728,6 +1816,7 @@ function MasterEditor({ tableKey, user }) {
         tableKey==="model_tbl"&&h("button",{onClick:downloadAllModels,disabled:modelsExportBusy,style:btnSecondary},modelsExportBusy?"Preparing…":"Download all models"),
         tableKey==="model_tbl"&&h("button",{onClick:()=>{setShowRename(v=>!v);setRenameMsg("");},style:btnSecondary},"Rename model"),
         tableKey==="bom"&&h("button",{onClick:downloadCleanupTracker,style:btnSecondary},"Download cleanup tracker"),
+        tableKey==="material_rates"&&zeroRateCount>0&&h("button",{onClick:openZeroRateTable,style:{...btnDanger,fontWeight:600}},"⚠ Rate = 0 ("+zeroRateCount+")"),
         h("button",{onClick:()=>{setAdding(v=>!v);setAddDraft({});},style:btnPrimary},"+ "+addLabel)
       )
     ),
@@ -1771,20 +1860,25 @@ function MasterEditor({ tableKey, user }) {
       bomModelFilter&&bomStatus==="Clean"&&h("button",{onClick:()=>setModelBomStatus("Cleaning Up","Reopen \""+bomModelFilter+"\" for further cleanup?"),disabled:bomStatusBusy,style:btnSecondary},"Reopen for cleanup"),
       bomModelFilter&&h("button",{onClick:deleteEntireBom,style:btnDanger},"Delete BOM")
     ),
-    tableKey==="material_rates"&&h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:14}},
-      h("input",{value:mrSpecFilter,onChange:e=>setMrSpecFilter(e.target.value),placeholder:"Spec…",style:{...inputStyle,width:130}}),
-      h("input",{value:mrGradeFilter,onChange:e=>setMrGradeFilter(e.target.value),placeholder:"Grade…",style:{...inputStyle,width:110}}),
-      h("input",{value:mrShapeFilter,onChange:e=>setMrShapeFilter(e.target.value),placeholder:"Shape…",style:{...inputStyle,width:110}}),
-      h("input",{value:mrUomFilter,onChange:e=>setMrUomFilter(e.target.value),placeholder:"UOM…",style:{...inputStyle,width:90}}),
-      (mrSpecFilter||mrGradeFilter||mrShapeFilter||mrUomFilter)&&h("button",{onClick:()=>{setMrSpecFilter("");setMrGradeFilter("");setMrShapeFilter("");setMrUomFilter("");},style:btnSecondary},"Clear filters"),
-      h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
-        canEditMR&&!mrEditAllMode&&mrFilteredRows.length>0&&h("button",{onClick:mrStartEditAll,style:btnPrimary},"Edit all lines"),
-        canEditMR&&mrEditAllMode&&h(React.Fragment,null,
-          h("button",{onClick:mrSaveAllEdits,disabled:mrSavingAll,style:{...btnPrimary,background:"#0f6e56"}},mrSavingAll?"Saving…":"Save all changes"),
-          h("button",{onClick:mrCancelEditAll,disabled:mrSavingAll,style:btnSecondary},"Cancel all")
-        ),
-        canEditMR&&mrFilteredRows.length>0&&h("button",{onClick:mrDeleteAllFiltered,style:btnDanger},"Delete filtered")
-      )
+    tableKey==="material_rates"&&h("div",{style:{marginBottom:14}},
+      h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
+        h("input",{list:"mr-shape-datalist",value:mrShapeFocus,onChange:e=>{setMrShapeFocus(e.target.value);setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");setPage(0);},placeholder:"1. Shape…",style:{...inputStyle,width:160}}),
+        h("datalist",{id:"mr-shape-datalist"},mrShapeOptionsAll.map(s=>h("option",{key:s,value:s}))),
+        h("input",{list:"mr-spec-datalist",value:mrSpecFilter,readOnly:!mrShapeFocus,onFocus:e=>mrGuardStep("a Shape",!!mrShapeFocus,e),onChange:e=>{setMrSpecFilter(e.target.value);setMrGradeFilter("");},placeholder:"2. Spec…",style:{...inputStyle,width:190,background:mrShapeFocus?"#fff":"#f4f2ea",color:mrShapeFocus?colors.text:colors.mutedLight}}),
+        h("datalist",{id:"mr-spec-datalist"},mrSpecOptionsScoped.map(s=>h("option",{key:s,value:s}))),
+        h("input",{list:"mr-grade-datalist",value:mrGradeFilter,readOnly:!mrSpecFilter,onFocus:e=>mrGuardStep("a Spec",!!mrSpecFilter,e),onChange:e=>setMrGradeFilter(e.target.value),placeholder:"3. Grade…",style:{...inputStyle,width:150,background:mrSpecFilter?"#fff":"#f4f2ea",color:mrSpecFilter?colors.text:colors.mutedLight}}),
+        h("datalist",{id:"mr-grade-datalist"},mrGradeOptionsScoped.map(g=>h("option",{key:g,value:g}))),
+        (mrShapeFocus||mrSpecFilter||mrGradeFilter)&&h("button",{onClick:()=>{setMrShapeFocus("");setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");},style:btnSecondary},"Clear filters"),
+        h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
+          canEditMR&&!mrEditAllMode&&mrFilteredRows.length>0&&h("button",{onClick:mrStartEditAll,style:btnPrimary},"Edit all lines"),
+          canEditMR&&mrEditAllMode&&h(React.Fragment,null,
+            h("button",{onClick:mrSaveAllEdits,disabled:mrSavingAll,style:{...btnPrimary,background:"#0f6e56"}},mrSavingAll?"Saving…":"Save all changes"),
+            h("button",{onClick:mrCancelEditAll,disabled:mrSavingAll,style:btnSecondary},"Cancel all")
+          ),
+          canEditMR&&mrFilteredRows.length>0&&h("button",{onClick:mrDeleteAllFiltered,style:btnDanger},"Delete filtered")
+        )
+      ),
+      mrStepMsg&&h("div",{style:{marginTop:6,fontSize:12,color:colors.danger}},mrStepMsg)
     ),
     error&&h("div",{style:{color:colors.danger,fontSize:13,marginBottom:10}},error),
     loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
@@ -1796,7 +1890,7 @@ function MasterEditor({ tableKey, user }) {
         )),
         h("tbody",null,
           (groupedByMaterialSpec||[]).length===0
-            ? h("tr",null,h("td",{colSpan:6,style:{padding:16,color:colors.mutedLight}},"No matching rates."))
+            ? h("tr",null,h("td",{colSpan:6,style:{padding:16,color:colors.mutedLight}},mrShapeFocus||search.trim()?"No matching rates.":"Focus on a shape above, or use Search (top right) to find rates across everything."))
             : groupedByMaterialSpec.flatMap(([spec,groupRows])=>[
                 h("tr",{key:"grp-"+spec,style:{background:"#f4f2ea"}},
                   h("td",{colSpan:6,style:{padding:"7px 10px",fontSize:12,fontWeight:700}},spec+"  ("+groupRows.length+")")
@@ -1854,6 +1948,57 @@ function MasterEditor({ tableKey, user }) {
           h("button",{onClick:()=>setPendingDeleteIds(null),style:btnSecondary},"Cancel"),
           h("button",{onClick:submitDeletionCode,disabled:codeBusy,style:btnPrimary},codeBusy?"Checking…":"Confirm delete")
         )
+      )
+    ),
+    zeroRateOpen && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:640,maxHeight:"80vh",overflowY:"auto",padding:"20px 22px"}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
+          h("div",{style:{fontSize:15,fontWeight:700}},"Rates missing a value ("+zeroRateRows.length+")"),
+          h("div",{style:{display:"flex",gap:8}},
+            h("button",{onClick:downloadZeroRates,style:btnSecondary},"Download"),
+            h("button",{onClick:()=>setZeroRateOpen(false),style:btnSecondary},"Close")
+          )
+        ),
+        zeroRateRows.length===0
+          ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"All rates are filled in now.")
+          : h("table",{style:{width:"100%",fontSize:12.5,marginTop:10}},
+              h("thead",null,h("tr",{style:{textAlign:"left",borderBottom:"2px solid "+colors.dark}},
+                ["Shape","Spec","Grade","UOM","Rate"].map(c=>h("th",{key:c,style:{padding:"6px 8px"}},c))
+              )),
+              h("tbody",null,zeroRateRows.map(row=>h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
+                h("td",{style:{padding:"6px 8px"}},row.material_shape),
+                h("td",{style:{padding:"6px 8px"}},row.material_spec),
+                h("td",{style:{padding:"6px 8px"}},row.material_grade),
+                h("td",{style:{padding:"6px 8px"}},row.uom),
+                h("td",{style:{padding:"6px 8px"}},
+                  h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
+                    h("input",{type:"number",placeholder:"0.00",value:zeroRateDrafts[row.id]??"",onChange:e=>setZeroRateDrafts(d=>({...d,[row.id]:e.target.value})),style:{...inputStyle,width:80,padding:"5px 7px",fontSize:12}}),
+                    h("button",{onClick:()=>saveZeroRate(row),style:{...btnPrimary,padding:"5px 10px",fontSize:11}},"Save")
+                  )
+                )
+              )))
+            )
+      )
+    ),
+    historyFor && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:420,maxHeight:"70vh",overflowY:"auto",padding:"20px 22px"}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
+          h("div",{style:{fontSize:14,fontWeight:700}},"Rate history — "+historyFor.material_spec+" / "+historyFor.material_grade),
+          h("button",{onClick:()=>setHistoryFor(null),style:btnSecondary},"Close")
+        ),
+        historyRows.length===0
+          ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"14px 0"}},"No changes recorded yet — this rate hasn't been edited since rate history was added.")
+          : h("table",{style:{width:"100%",fontSize:12.5,marginTop:10}},
+              h("thead",null,h("tr",{style:{textAlign:"left",borderBottom:"2px solid "+colors.dark}},
+                ["Old rate","New rate","Date","By"].map(c=>h("th",{key:c,style:{padding:"6px 8px"}},c))
+              )),
+              h("tbody",null,historyRows.map(hrow=>h("tr",{key:hrow.id,style:{borderBottom:"1px solid #eceae0"}},
+                h("td",{style:{padding:"6px 8px"}},fmt(Number(hrow.old_rate)||0)),
+                h("td",{style:{padding:"6px 8px",fontWeight:700}},fmt(Number(hrow.new_rate)||0)),
+                h("td",{style:{padding:"6px 8px",color:colors.muted}},new Date(hrow.changed_at).toLocaleDateString()),
+                h("td",{style:{padding:"6px 8px",color:colors.muted}},hrow.changed_by)
+              )))
+            )
       )
     )
   );
@@ -7918,6 +8063,10 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (12)", summary:"Material Rates: new \"⚠ Rate = 0 (N)\" button opens every line missing a rate as its own table, with the Rate field editable right there — Save fixes it in place and the row drops off the list immediately (Download also available). Every rate change (there, in Edit, or in Edit all lines) now stamps today's date and writes an entry to a new Rate History log; each line shows \"as of [date]\" under its rate with a History link showing every past value, who changed it, and when. Existing untouched rates get dated today as a starting baseline." },
+  { date:"17 Jul 2026 (11)", summary:"Corrected Material Rates' filter order to Shape → Spec → Grade (was Spec-first) — picking a Shape loads every rate under it grouped by Spec with all its grades; adding Spec narrows to that one group; adding Grade narrows to a single line. UOM dropped out of the filter chain entirely (still shown as a result column). Loading is now scoped by Shape, capped at 1000 rows, so it can't hang the page even for a shape with many specs." },
+  { date:"17 Jul 2026 (10)", summary:"Material Rates filters are now a strict sequence — Spec → Grade → UOM, each a type-to-search combo, greyed out and read-only until the one before it is filled; touching a locked field shows \"Pick X first\" instead of doing nothing. Shape is no longer a separate filter step since it's derived from Spec (auto-displays, read-only). You can still stop at any step — Spec alone, Spec+Grade, or all three." },
+  { date:"17 Jul 2026 (9)", summary:"Fixed a serious bug: Material Rates was loading its entire table unconditionally, which could freeze the page on a large dataset. Now it only loads one Spec's rows at a time via a required \"Focus on a spec\" combo (type-to-search, cascading — Grade/Shape filter choices are built from whatever's actually loaded). The top-right Search box now does a proper wildcard search across every spec/grade/shape/UOM at once (server-side, capped at 300 matches), independent of the spec focus." },
   { date:"17 Jul 2026 (8)", summary:"Master Data → Material Rates now matches the BOM treatment: wildcard filters on Spec/Grade/Shape/UOM (each matches anywhere, combine together, Clear filters resets all), grouped by Material Spec, sticky Edit/Delete pinned right and restricted to Admin/Super Admin, cascading edit (picking Material Spec auto-fills and locks Shape from that spec's own master record), \"Edit all lines\" bulk mode with Save all / Cancel all, and \"Delete filtered\" (bulk delete of whatever the filters currently show) — every delete still confirms first." },
   { date:"17 Jul 2026 (7)", summary:"BOM Entry Form: new \"Edit all lines\" button (Admin/Super Admin) flips every line of the loaded model into the same cascading dropdowns at once — no more Edit/Save per row. \"Save all changes\" commits every line in one go and logs a single bulk-edit entry to Audit Log; \"Cancel all\" discards everything. Delete stays per-row even in this mode." },
   { date:"17 Jul 2026 (6)", summary:"BOM Entry Form: the Edit/Delete (and Add row) column is now pinned to the right edge of the table, always visible without needing to scroll the table horizontally — it was there all along, just past the visible columns on wide screens." },
