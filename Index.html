@@ -1472,18 +1472,61 @@ function MasterEditor({ tableKey, user }) {
   };
 
   // "Rate = 0" table — every line missing a rate, editable right there.
+  // Paginated (200/page) and filtered the same Shape -> Spec -> Grade way as
+  // the main screen, so it never has to load all 6,800+ rows at once.
+  const ZR_PAGE_SIZE = 200;
   const [zeroRateCount,setZeroRateCount]=useState(0);
   const [zeroRateOpen,setZeroRateOpen]=useState(false);
   const [zeroRateRows,setZeroRateRows]=useState([]);
+  const [zeroRateTotal,setZeroRateTotal]=useState(0);
   const [zeroRateDrafts,setZeroRateDrafts]=useState({});
+  const [zrShapeFocus,setZrShapeFocus]=useState("");
+  const [zrSpecFilter,setZrSpecFilter]=useState("");
+  const [zrGradeFilter,setZrGradeFilter]=useState("");
+  const [zrPage,setZrPage]=useState(0);
+  const [zrStepMsg,setZrStepMsg]=useState("");
+  const [zrSpecOptions,setZrSpecOptions]=useState([]);
+  const [zrGradeOptions,setZrGradeOptions]=useState([]);
   useEffect(()=>{
     if(tableKey!=="material_rates") return;
     sb.from("material_rates").select("id",{count:"exact",head:true}).eq("rate",0).then(({count})=>setZeroRateCount(count||0));
   },[tableKey,rows]);
-  const openZeroRateTable = async()=>{
-    const { data } = await sb.from("material_rates").select("*").eq("rate",0).order("material_spec",{ascending:true});
-    setZeroRateRows(data||[]); setZeroRateDrafts({}); setZeroRateOpen(true);
+  const openZeroRateTable = ()=>{ setZrShapeFocus("");setZrSpecFilter("");setZrGradeFilter("");setZrPage(0);setZeroRateDrafts({});setZeroRateOpen(true); };
+  const loadZeroRateRows = useCallback(async()=>{
+    let q = sb.from("material_rates").select("*",{count:"exact"}).eq("rate",0);
+    if(zrShapeFocus) q = q.eq("material_shape",zrShapeFocus);
+    if(zrSpecFilter) q = q.eq("material_spec",zrSpecFilter);
+    if(zrGradeFilter) q = q.eq("material_grade",zrGradeFilter);
+    const { data, count } = await q.order("material_shape",{ascending:true}).order("material_spec",{ascending:true}).range(zrPage*ZR_PAGE_SIZE, zrPage*ZR_PAGE_SIZE+ZR_PAGE_SIZE-1);
+    setZeroRateRows(data||[]); setZeroRateTotal(count||0);
+  },[zrShapeFocus,zrSpecFilter,zrGradeFilter,zrPage]);
+  useEffect(()=>{ if(zeroRateOpen) loadZeroRateRows(); },[zeroRateOpen,loadZeroRateRows]);
+  useEffect(()=>{
+    if(!zeroRateOpen || !zrShapeFocus){ setZrSpecOptions([]); return; }
+    sb.from("material_rates").select("material_spec").eq("rate",0).eq("material_shape",zrShapeFocus).limit(2000)
+      .then(({data})=>setZrSpecOptions(Array.from(new Set((data||[]).map(r=>r.material_spec).filter(Boolean))).sort()));
+  },[zeroRateOpen,zrShapeFocus]);
+  useEffect(()=>{
+    if(!zeroRateOpen || !zrSpecFilter){ setZrGradeOptions([]); return; }
+    sb.from("material_rates").select("material_grade").eq("rate",0).eq("material_shape",zrShapeFocus).eq("material_spec",zrSpecFilter).limit(2000)
+      .then(({data})=>setZrGradeOptions(Array.from(new Set((data||[]).map(r=>r.material_grade).filter(Boolean))).sort()));
+  },[zeroRateOpen,zrShapeFocus,zrSpecFilter]);
+  const zrGuardStep = (label, ready, e)=>{
+    if(!ready){ setZrStepMsg("Pick "+label+" first — filters apply in order: Shape → Spec → Grade."); e.target.blur(); }
+    else setZrStepMsg("");
   };
+  const zeroRateGrouped = useMemo(()=>{
+    const shapeMap=new Map();
+    zeroRateRows.forEach(r=>{
+      const sk=r.material_shape||"(no shape)";
+      if(!shapeMap.has(sk)) shapeMap.set(sk,new Map());
+      const specMap=shapeMap.get(sk);
+      const pk=r.material_spec||"(no spec)";
+      if(!specMap.has(pk)) specMap.set(pk,[]);
+      specMap.get(pk).push(r);
+    });
+    return Array.from(shapeMap.entries()).map(([shape,specMap])=>[shape,Array.from(specMap.entries())]);
+  },[zeroRateRows]);
   const saveZeroRate = async(row)=>{
     const val = Number(zeroRateDrafts[row.id]);
     if(!val || val<=0){ alert("Enter a rate greater than 0."); return; }
@@ -1492,6 +1535,7 @@ function MasterEditor({ tableKey, user }) {
     await sb.from("rate_history").insert({material_spec:row.material_spec, material_grade:row.material_grade, old_rate:0, new_rate:val, changed_by:user?.username||"unknown"});
     await logAudit("UPDATE","material_rates",row.id,row.material_spec+" — "+row.material_grade+" (rate set from 0 to "+val+")",user?.username||"unknown",{rate:0},payload);
     setZeroRateRows(rs=>rs.filter(r=>r.id!==row.id));
+    setZeroRateTotal(c=>Math.max(0,c-1));
     setZeroRateCount(c=>Math.max(0,c-1));
     setRows(rs=>rs.map(r=>r.id===row.id?{...r,...payload}:r));
   };
@@ -1524,7 +1568,7 @@ function MasterEditor({ tableKey, user }) {
           : h("input",{value:mrEditDraft.material_spec||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:140}})
         ),
         h("td",{style:{padding:"4px 6px"}},isSuperAdmin
-          ? h(React.Fragment,null,h("input",{list:"mr-edit-grade-datalist",value:mrEditDraft.material_grade||"",onChange:e=>mrSetField("material_grade",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:190}}))
+          ? h(React.Fragment,null,h("input",{list:"mr-edit-grade-datalist",value:mrEditDraft.material_grade||"",onFocus:comboRefocus(mrEditDraft.material_grade||"",v=>mrSetField("material_grade",v)).onFocus,onBlur:comboRefocus(mrEditDraft.material_grade||"",v=>mrSetField("material_grade",v)).onBlur,onChange:e=>mrSetField("material_grade",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:190}}))
           : h("input",{value:mrEditDraft.material_grade||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:190}})
         ),
         h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:mrEditDraft.rate||"",onChange:e=>mrSetField("rate",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:90,textAlign:"right"}})),
@@ -1565,7 +1609,7 @@ function MasterEditor({ tableKey, user }) {
         : h("input",{value:draft.material_spec||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:140}})
       ),
       h("td",{style:{padding:"4px 6px"}},isSuperAdmin
-        ? h("input",{list:"mr-edit-grade-datalist",value:draft.material_grade||"",onChange:e=>mrSetAllField(row.id,"material_grade",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:190}})
+        ? h("input",{list:"mr-edit-grade-datalist",value:draft.material_grade||"",onFocus:comboRefocus(draft.material_grade||"",v=>mrSetAllField(row.id,"material_grade",v)).onFocus,onBlur:comboRefocus(draft.material_grade||"",v=>mrSetAllField(row.id,"material_grade",v)).onBlur,onChange:e=>mrSetAllField(row.id,"material_grade",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:190}})
         : h("input",{value:draft.material_grade||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:190}})
       ),
       h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:draft.rate||"",onChange:e=>mrSetAllField(row.id,"rate",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:90,textAlign:"right"}})),
@@ -1799,6 +1843,14 @@ function MasterEditor({ tableKey, user }) {
     if(!ready){ setMrStepMsg("Pick "+label+" first — filters apply in order: Shape → Spec → Grade."); e.target.blur(); }
     else setMrStepMsg("");
   };
+  // Combo fields keep their typed value after a pick, so the browser's native
+  // datalist then only suggests matches for that leftover text instead of the
+  // full list. Clearing on focus makes every option show again; blurring
+  // without picking anything new restores whatever was there before.
+  const comboRefocus = (value, setValue) => ({
+    onFocus: (e)=>{ e.target.dataset.prevVal = value; setValue(""); },
+    onBlur: (e)=>{ if(!e.target.value) setValue(e.target.dataset.prevVal||""); }
+  });
 
   const groupedByMaterialSpec = useMemo(()=>{
     if(tableKey!=="material_rates") return null;
@@ -1887,11 +1939,11 @@ function MasterEditor({ tableKey, user }) {
     ),
     tableKey==="material_rates"&&h("div",{style:{marginBottom:14}},
       h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
-        h("input",{list:"mr-shape-datalist",value:mrShapeFocus,onChange:e=>{setMrShapeFocus(e.target.value);setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");setPage(0);},placeholder:"1. Shape…",style:{...inputStyle,width:160}}),
+        h("input",{list:"mr-shape-datalist",value:mrShapeFocus,onFocus:comboRefocus(mrShapeFocus,setMrShapeFocus).onFocus,onBlur:comboRefocus(mrShapeFocus,setMrShapeFocus).onBlur,onChange:e=>{setMrShapeFocus(e.target.value);setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");setPage(0);},placeholder:"1. Shape…",style:{...inputStyle,width:160}}),
         h("datalist",{id:"mr-shape-datalist"},mrShapeOptionsAll.map(s=>h("option",{key:s,value:s}))),
-        h("input",{list:"mr-spec-datalist",value:mrSpecFilter,readOnly:!mrShapeFocus,onFocus:e=>mrGuardStep("a Shape",!!mrShapeFocus,e),onChange:e=>{setMrSpecFilter(e.target.value);setMrGradeFilter("");},placeholder:"2. Spec…",style:{...inputStyle,width:190,background:mrShapeFocus?"#fff":"#f4f2ea",color:mrShapeFocus?colors.text:colors.mutedLight}}),
+        h("input",{list:"mr-spec-datalist",value:mrSpecFilter,readOnly:!mrShapeFocus,onFocus:e=>mrShapeFocus?comboRefocus(mrSpecFilter,setMrSpecFilter).onFocus(e):mrGuardStep("a Shape",false,e),onBlur:comboRefocus(mrSpecFilter,setMrSpecFilter).onBlur,onChange:e=>{setMrSpecFilter(e.target.value);setMrGradeFilter("");},placeholder:"2. Spec…",style:{...inputStyle,width:190,background:mrShapeFocus?"#fff":"#f4f2ea",color:mrShapeFocus?colors.text:colors.mutedLight}}),
         h("datalist",{id:"mr-spec-datalist"},mrSpecOptionsScoped.map(s=>h("option",{key:s,value:s}))),
-        h("input",{list:"mr-grade-datalist",value:mrGradeFilter,readOnly:!mrSpecFilter,onFocus:e=>mrGuardStep("a Spec",!!mrSpecFilter,e),onChange:e=>setMrGradeFilter(e.target.value),placeholder:"3. Grade…",style:{...inputStyle,width:150,background:mrSpecFilter?"#fff":"#f4f2ea",color:mrSpecFilter?colors.text:colors.mutedLight}}),
+        h("input",{list:"mr-grade-datalist",value:mrGradeFilter,readOnly:!mrSpecFilter,onFocus:e=>mrSpecFilter?comboRefocus(mrGradeFilter,setMrGradeFilter).onFocus(e):mrGuardStep("a Spec",false,e),onBlur:comboRefocus(mrGradeFilter,setMrGradeFilter).onBlur,onChange:e=>setMrGradeFilter(e.target.value),placeholder:"3. Grade…",style:{...inputStyle,width:150,background:mrSpecFilter?"#fff":"#f4f2ea",color:mrSpecFilter?colors.text:colors.mutedLight}}),
         h("datalist",{id:"mr-grade-datalist"},mrGradeOptionsScoped.map(g=>h("option",{key:g,value:g}))),
         h("datalist",{id:"mr-edit-grade-datalist"},mrGradeDatalistOptions.map(g=>h("option",{key:g,value:g}))),
         (mrShapeFocus||mrSpecFilter||mrGradeFilter)&&h("button",{onClick:()=>{setMrShapeFocus("");setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");},style:btnSecondary},"Clear filters"),
@@ -2008,32 +2060,56 @@ function MasterEditor({ tableKey, user }) {
       )
     ),
     zeroRateOpen && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
-      h("div",{style:{background:"#fff",borderRadius:8,width:640,maxHeight:"80vh",overflowY:"auto",padding:"20px 22px"}},
-        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
-          h("div",{style:{fontSize:15,fontWeight:700}},"Rates missing a value ("+zeroRateRows.length+")"),
-          h("div",{style:{display:"flex",gap:8}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:720,maxHeight:"85vh",overflowY:"auto",padding:"20px 22px"}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:6}},
+          h("div",{style:{fontSize:15,fontWeight:700}},"Rates missing a value ("+zeroRateTotal+")"),
+          h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+            zeroRateTotal>0&&h("span",{style:{fontSize:11,color:colors.muted}},"Page "+(zrPage+1)+" of "+Math.max(1,Math.ceil(zeroRateTotal/ZR_PAGE_SIZE))+" · "+ZR_PAGE_SIZE+" per page"),
             h("button",{onClick:downloadZeroRates,style:btnSecondary},"Download"),
             h("button",{onClick:()=>setZeroRateOpen(false),style:btnSecondary},"Close")
           )
         ),
+        h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:6}},
+          h("input",{list:"zr-shape-datalist",value:zrShapeFocus,onFocus:comboRefocus(zrShapeFocus,setZrShapeFocus).onFocus,onBlur:comboRefocus(zrShapeFocus,setZrShapeFocus).onBlur,onChange:e=>{setZrShapeFocus(e.target.value);setZrSpecFilter("");setZrGradeFilter("");setZrStepMsg("");setZrPage(0);},placeholder:"1. Shape…",style:{...inputStyle,width:150}}),
+          h("datalist",{id:"zr-shape-datalist"},mrShapeOptionsAll.map(s=>h("option",{key:s,value:s}))),
+          h("input",{list:"zr-spec-datalist",value:zrSpecFilter,readOnly:!zrShapeFocus,onFocus:e=>zrShapeFocus?comboRefocus(zrSpecFilter,setZrSpecFilter).onFocus(e):zrGuardStep("a Shape",false,e),onBlur:comboRefocus(zrSpecFilter,setZrSpecFilter).onBlur,onChange:e=>{setZrSpecFilter(e.target.value);setZrGradeFilter("");setZrPage(0);},placeholder:"2. Spec…",style:{...inputStyle,width:170,background:zrShapeFocus?"#fff":"#f4f2ea",color:zrShapeFocus?colors.text:colors.mutedLight}}),
+          h("datalist",{id:"zr-spec-datalist"},zrSpecOptions.map(s=>h("option",{key:s,value:s}))),
+          h("input",{list:"zr-grade-datalist",value:zrGradeFilter,readOnly:!zrSpecFilter,onFocus:e=>zrSpecFilter?comboRefocus(zrGradeFilter,setZrGradeFilter).onFocus(e):zrGuardStep("a Spec",false,e),onBlur:comboRefocus(zrGradeFilter,setZrGradeFilter).onBlur,onChange:e=>{setZrGradeFilter(e.target.value);setZrPage(0);},placeholder:"3. Grade…",style:{...inputStyle,width:150,background:zrSpecFilter?"#fff":"#f4f2ea",color:zrSpecFilter?colors.text:colors.mutedLight}}),
+          h("datalist",{id:"zr-grade-datalist"},zrGradeOptions.map(g=>h("option",{key:g,value:g}))),
+          (zrShapeFocus||zrSpecFilter||zrGradeFilter)&&h("button",{onClick:()=>{setZrShapeFocus("");setZrSpecFilter("");setZrGradeFilter("");setZrStepMsg("");setZrPage(0);},style:btnSecondary},"Clear filters")
+        ),
+        zrStepMsg&&h("div",{style:{fontSize:12,color:colors.danger,marginBottom:6}},zrStepMsg),
         zeroRateRows.length===0
-          ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"All rates are filled in now.")
-          : h("table",{style:{width:"100%",fontSize:12.5,marginTop:10}},
-              h("thead",null,h("tr",{style:{textAlign:"left",borderBottom:"2px solid "+colors.dark}},
-                ["Shape","Spec","Grade","UOM","Rate"].map(c=>h("th",{key:c,style:{padding:"6px 8px"}},c))
-              )),
-              h("tbody",null,zeroRateRows.map(row=>h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
-                h("td",{style:{padding:"6px 8px"}},row.material_shape),
-                h("td",{style:{padding:"6px 8px"}},row.material_spec),
-                h("td",{style:{padding:"6px 8px"}},row.material_grade),
-                h("td",{style:{padding:"6px 8px"}},row.uom),
-                h("td",{style:{padding:"6px 8px"}},
-                  h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
-                    h("input",{type:"number",placeholder:"0.00",value:zeroRateDrafts[row.id]??"",onChange:e=>setZeroRateDrafts(d=>({...d,[row.id]:e.target.value})),style:{...inputStyle,width:80,padding:"5px 7px",fontSize:12}}),
-                    h("button",{onClick:()=>saveZeroRate(row),style:{...btnPrimary,padding:"5px 10px",fontSize:11}},"Save")
-                  )
+          ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"No matching zero-rate lines.")
+          : h(React.Fragment,null,
+              h("table",{style:{width:"100%",fontSize:12.5,marginTop:6}},
+                h("thead",null,h("tr",{style:{textAlign:"left",borderBottom:"2px solid "+colors.dark}},
+                  ["Grade","UOM","Rate"].map(c=>h("th",{key:c,style:{padding:"6px 8px"}},c))
+                )),
+                h("tbody",null,
+                  zeroRateGrouped.flatMap(([shape,specGroups])=>[
+                    h("tr",{key:"zr-shape-"+shape,style:{background:"#f4f2ea"}},h("td",{colSpan:3,style:{padding:"6px 8px",fontWeight:700,fontSize:12}},shape)),
+                    ...specGroups.flatMap(([spec,specRows])=>[
+                      h("tr",{key:"zr-spec-"+shape+"-"+spec,style:{background:"#faf9f4"}},h("td",{colSpan:3,style:{padding:"5px 8px 5px 18px",fontWeight:600,fontSize:11.5,color:colors.muted}},spec+" ("+specRows.length+")")),
+                      ...specRows.map(row=>h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
+                        h("td",{style:{padding:"6px 8px 6px 26px"}},row.material_grade),
+                        h("td",{style:{padding:"6px 8px"}},row.uom),
+                        h("td",{style:{padding:"6px 8px"}},
+                          h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
+                            h("input",{type:"number",placeholder:"0.00",value:zeroRateDrafts[row.id]??"",onChange:e=>setZeroRateDrafts(d=>({...d,[row.id]:e.target.value})),style:{...inputStyle,width:80,padding:"5px 7px",fontSize:12}}),
+                            h("button",{onClick:()=>saveZeroRate(row),style:{...btnPrimary,padding:"5px 10px",fontSize:11}},"Save")
+                          )
+                        )
+                      ))
+                    ])
+                  ])
                 )
-              )))
+              ),
+              zeroRateTotal>ZR_PAGE_SIZE && h("div",{style:{display:"flex",justifyContent:"center",gap:10,marginTop:14}},
+                h("button",{onClick:()=>setZrPage(p=>Math.max(0,p-1)),disabled:zrPage===0,style:btnSecondary},"Previous"),
+                h("span",{style:{fontSize:12,color:colors.muted,padding:"8px 0"}},"Page "+(zrPage+1)+" of "+Math.ceil(zeroRateTotal/ZR_PAGE_SIZE)),
+                h("button",{onClick:()=>setZrPage(p=>p+1),disabled:(zrPage+1)*ZR_PAGE_SIZE>=zeroRateTotal,style:btnSecondary},"Next")
+              )
             )
       )
     ),
@@ -8120,6 +8196,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (14)", summary:"Fixed a combo-box bug: after picking a value (Shape/Spec/Grade, on Material Rates' filters and the Edit forms), clicking back into that field only showed the one already-picked option instead of the full list — clicking in now clears it so every option shows again, and clicking away without picking restores what was there. The \"Rate = 0\" table now has the same Shape → Spec → Grade filters as the main screen, is paginated 200 rows at a time (grouped by Shape → Spec within each page), and defaults to showing everything when no filter is set — never loading all 6,800+ rows into the page at once." },
   { date:"17 Jul 2026 (13)", summary:"Material Rates: a \"please wait, saving N lines…\" overlay now shows during Save all changes. Admins can now only edit Rate — Spec/Grade/Shape/UOM are locked to Super Admin, with a message (no code prompt) if an Admin tries. \"+ New rate\" is now Admin/Super Admin only. Grade is now a type-to-search combo instead of free text. Columns reordered to Shape → Spec → Grade → Rate → UOM (matching the filter sequence), with Grade widened and Spec narrowed. New \"⤢ Zoom\" button opens the table full-screen for going through many lines comfortably." },
   { date:"17 Jul 2026 (12)", summary:"Material Rates: new \"⚠ Rate = 0 (N)\" button opens every line missing a rate as its own table, with the Rate field editable right there — Save fixes it in place and the row drops off the list immediately (Download also available). Every rate change (there, in Edit, or in Edit all lines) now stamps today's date and writes an entry to a new Rate History log; each line shows \"as of [date]\" under its rate with a History link showing every past value, who changed it, and when. Existing untouched rates get dated today as a starting baseline." },
   { date:"17 Jul 2026 (11)", summary:"Corrected Material Rates' filter order to Shape → Spec → Grade (was Spec-first) — picking a Shape loads every rate under it grouped by Spec with all its grades; adding Spec narrows to that one group; adding Grade narrows to a single line. UOM dropped out of the filter chain entirely (still shown as a result column). Loading is now scoped by Shape, capped at 1000 rows, so it can't hang the page even for a shape with many specs." },
