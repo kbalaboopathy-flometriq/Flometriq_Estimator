@@ -3885,6 +3885,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       const payload = { reference_number: openRef.reference_number, item_sl_no: openRef.item_sl_no, template_key: normalizeItemName(itemName), field_values: values, overrides, updated_by: user.username, updated_at: new Date().toISOString() };
       const { error } = await sb.from("datasheets").upsert(payload, { onConflict: "reference_number,item_sl_no,template_key" });
       if(error) throw error;
+      await sb.from("estimates").update({datasheet_skipped:false}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
       await logAudit("SAVE","datasheets",openRef.reference_number+"-"+openRef.item_sl_no,"Datasheet ("+itemName+") for "+openRef.reference_number+" Sl No "+openRef.item_sl_no,user.username,null,payload);
       setSaved(true); setTimeout(()=>setSaved(false),2000);
     } catch(e){ console.error("Datasheet save failed",e); alert("Save failed: "+(e.message||e)); }
@@ -4855,6 +4856,30 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     setShowNewSlNoModal(false);
     if(onNewSlNo) onNewSlNo(refFilter, n);
   };
+
+  // "+ Add new" — prompts for a quote number, checks if it's taken, and
+  // either offers to open the existing one or hands off to the Estimator
+  // to create it, same as the search box's not-found flow.
+  const [showAddNewModal,setShowAddNewModal]=useState(false);
+  const [addNewInput,setAddNewInput]=useState("");
+  const [addNewMsg,setAddNewMsg]=useState(null); // {type:"exists", rn, label} | {type:"invalid", text}
+  const confirmAddNew = ()=>{
+    const val = addNewInput.trim();
+    if(!val){ setAddNewMsg({type:"invalid",text:"Enter a quote number."}); return; }
+    const hit = refOptionsList.find(o=>o.rn===val);
+    if(hit){ setAddNewMsg({type:"exists", rn:hit.rn, label:hit.label}); return; }
+    setShowAddNewModal(false);
+    if(onGoToTab) onGoToTab("estimator");
+    alert("Opening the Estimator — use \"+ Add to estimate\" there and enter \""+val+"\" as the Quote# to start it.");
+  };
+  const openExistingFromAddNew = ()=>{
+    if(!addNewMsg || addNewMsg.type!=="exists") return;
+    setShowAddNewModal(false);
+    setRefSearchDisplay(addNewMsg.label);
+    setRefFilter(addNewMsg.rn); setSlNoFilter("");
+    const pool = refs.filter(r=>r.reference_number===addNewMsg.rn);
+    if(pool.length===1) openEstimate(pool[0]);
+  };
   const [pdfPreview,setPdfPreview]=useState(null); // {doc, filename} — Quote/BOM PDFs preview before download
   const [editingDescSlNo,setEditingDescSlNo]=useState(false);
   const [descDraft,setDescDraft]=useState("");
@@ -5302,6 +5327,14 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
 
   // Delete one whole Sl No (a card in the left list = one line item of a quote):
   // removes the estimates row and every estimate_lines row under it.
+  // Called after ANY mutation on this screen (delete Sl No, delete quote,
+  // datasheet built/skipped) — re-fetches refs from the DB rather than
+  // patching local state, so flags (datasheet_skipped, readiness) never go
+  // stale relative to what actually happened.
+  const refreshAll = async()=>{
+    await load();
+    if(refFilter) refreshReadiness(refFilter);
+  };
   const doDeleteSlNo=async(ref)=>{
     setDeletingSlNo(ref.id);
     try {
@@ -5309,8 +5342,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       await sb.from("estimate_lines").delete().eq("reference_number",ref.reference_number).eq("item_sl_no",ref.item_sl_no);
       await sb.from("estimates").delete().eq("id",ref.id);
       await logAudit("DELETE","estimates",ref.reference_number+"-"+ref.item_sl_no,"Quote#: "+ref.reference_number+" Sl No: "+ref.item_sl_no+" ("+(linesData?.length||0)+" BOM lines)"+(ref.model?" \u2014 "+ref.model:""),user?.username||"unknown",{...ref,lines:linesData},null);
-      setRefs(rs=>rs.filter(r=>r.id!==ref.id));
       if(openRef&&openRef.id===ref.id){ setOpenRef(null); setOpenLines([]); }
+      await refreshAll();
     } catch(e){ console.error("Delete Sl No failed",e); alert("Delete failed: "+e.message); }
     finally { setDeletingSlNo(null); }
   };
@@ -5343,7 +5376,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       await sb.from("estimate_lines").delete().eq("reference_number",refFilter);
       await sb.from("estimates").delete().eq("reference_number",refFilter);
       await logAudit("DELETE","estimates",refFilter,"Deleted entire quote "+refFilter+" ("+slRows.length+" Sl Nos, "+(linesData?.length||0)+" BOM lines total)",user?.username||"unknown",{slRows,lines:linesData},null);
-      setRefs(rs=>rs.filter(r=>r.reference_number!==refFilter));
+      await load();
       if(openRef&&openRef.reference_number===refFilter){ setOpenRef(null); setOpenLines([]); }
       setShowDeleteQuoteModal(false); setRefFilter(""); setSlNoFilter("");
     } catch(e){ console.error("Delete quote failed",e); alert("Delete failed: "+e.message); }
@@ -6400,6 +6433,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
         h("div",{style:{display:"flex",alignItems:"center",gap:10}},
           h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Quotes"),
+          h("button",{onClick:()=>window.open(window.location.href,"_blank"),style:btnSmall},"⧉ New tab"),
           refFilter && h("div",{onClick:()=>{ if(!readiness.loading&&!readiness.ready) alert(readiness.missing.map(m=>m.section+": "+m.items.join(", ")).join("\n")); },
             title: readiness.ready?"Every commercial term is filled in and every Sl No has a datasheet.":"Click to see what's missing.",
             style:{display:"flex",alignItems:"center",gap:6,padding:"5px 12px",borderRadius:8,cursor:readiness.ready?"default":"pointer",
@@ -6410,8 +6444,9 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
           )
         ),
         h("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
-          h("input",{list:"quote-search-datalist",value:refSearchDisplay,onFocus:comboRefocusRS,onChange:e=>handleRefSearchChange(e.target.value),onBlur:handleRefSearchBlur,placeholder:"Quote number or client name…",style:{...inputStyle,width:260}}),
+          h("input",{list:"quote-search-datalist",value:refSearchDisplay,onFocus:comboRefocusRS,onChange:e=>handleRefSearchChange(e.target.value),onBlur:handleRefSearchBlur,placeholder:"Quote number or client name…",style:{...inputStyle,width:280,background:"#185fa5",color:"#fff",border:"1px solid #185fa5",fontWeight:600}}),
           h("datalist",{id:"quote-search-datalist"},refOptionsList.map(o=>h("option",{key:o.rn,value:o.label}))),
+          h("button",{onClick:()=>{ setAddNewInput(""); setAddNewMsg(null); setShowAddNewModal(true); },style:{...btnSmall,fontWeight:600}},"+ Add new"),
           refFilter && h("button",{onClick:()=>{setRefFilter("");setRefSearchDisplay("");setSlNoFilter("");},style:btnSmall},"All quotes"),
           h("select",{value:slNoFilter,onChange:e=>{
             const val=e.target.value; setSlNoFilter(val);
@@ -7004,8 +7039,27 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
         )
       )
     ),
-    showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>setShowDatasheet(false) }),
+    showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>{ setShowDatasheet(false); refreshAll(); } }),
     historyOpen && refFilter && h(QuoteHistoryPanel,{ referenceNumber:refFilter, onClose:()=>setHistoryOpen(false) }),
+    showAddNewModal && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:360,padding:"20px 22px"}},
+        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:10}},"New quote number"),
+        h("input",{value:addNewInput,autoFocus:true,onChange:e=>{setAddNewInput(e.target.value);setAddNewMsg(null);},onKeyDown:e=>{ if(e.key==="Enter") confirmAddNew(); },placeholder:"e.g. 10102099",style:{...inputStyle,width:"100%",marginBottom:8}}),
+        addNewMsg&&addNewMsg.type==="invalid" && h("div",{style:{fontSize:12,color:colors.danger,marginBottom:8}},addNewMsg.text),
+        addNewMsg&&addNewMsg.type==="exists" && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"8px 10px",marginBottom:10,fontSize:12.5,color:colors.danger}},
+          "Quote \""+addNewMsg.rn+"\" already exists ("+addNewMsg.label.split(" — ")[1]+")."
+        ),
+        addNewMsg&&addNewMsg.type==="exists"
+          ? h("div",{style:{display:"flex",gap:8}},
+              h("button",{onClick:openExistingFromAddNew,style:{...btnSecondary,flex:1}},"Open it instead"),
+              h("button",{onClick:()=>{setAddNewInput("");setAddNewMsg(null);},style:{...btnSecondary,flex:1}},"Try another number")
+            )
+          : h("div",{style:{display:"flex",gap:8}},
+              h("button",{onClick:confirmAddNew,style:{...btnPrimary,flex:1}},"Continue"),
+              h("button",{onClick:()=>setShowAddNewModal(false),style:{...btnSecondary,flex:1}},"Cancel")
+            )
+      )
+    ),
     showNewSlNoModal && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
       h("div",{style:{background:"#fff",borderRadius:8,width:340,padding:"20px 22px"}},
         h("div",{style:{fontSize:14,fontWeight:700,marginBottom:10}},"New Sl No for "+refFilter),
@@ -8480,6 +8534,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (21)", summary:"Quotes screen: the quote search field is now prominent (solid blue fill, white text). New \"⧉ New tab\" button opens another instance of the app in a fresh browser tab. New \"+ Add new\" button prompts for a quote number, checks whether it's already taken (shows which client it belongs to with \"Open it instead\" / \"Try another number\"), or hands off to the Estimator to create it if it's free. Also fixed: delete Sl No, delete whole quote, and datasheet save/skip all now re-fetch from the database instead of patching local state, so the readiness indicator and \"Datasheet skipped\" flag never go stale after any of those actions." },
   { date:"17 Jul 2026 (20)", summary:"Redesigned \"+ New Sl No\": prompts for the number right on the Quotes page, checks it isn't already used for that quote (blocks with a message if it is), then hands off to the Estimator holding that Quote#/Sl No in memory — a banner shows it, header fields are pre-filled from the quote, and Save to estimate writes straight to that Sl No with no re-typing. After saving, checks whether a datasheet exists yet: prompts \"Build datasheet now?\" or \"Skip for now\" — skipping sets a flag (new datasheet_skipped column) shown as a badge back on the Quotes page, and clears automatically once a datasheet is actually built." },
   { date:"17 Jul 2026 (19)", summary:"Renamed the Sl No list's \"Details\" button to \"B.O.M / Datasheet\"." },
   { date:"17 Jul 2026 (18)", summary:"Quotes screen restyled toward the old Access workflow: Quote# selector is now a wildcard search (\"quote# — client\"), picking one loads it filtered; typing an unmatched number prompts to create it as a new quote (routes to the Estimator's existing \"+ Add to estimate\" gateway). Each Sl No now has an explicit Details button, plus \"+ New Sl No\" under the list. New Notes panel — multiple free-text notes per quote, no dates, ordered by Sl No (new quote_notes table) — and Notes now appears as its own page in the generated Quote PDF, right after Commercial Terms. Quote Status (quote_status_tbl, already existed) now protects \"Draft\" from edit/delete in the UI, since the app's code depends on that exact value." },
