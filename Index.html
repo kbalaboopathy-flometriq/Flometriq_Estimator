@@ -2304,7 +2304,7 @@ async function loadMasterData(setMasterData) {
 }
 
 /* ---- ESTIMATOR ---- */
-function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote, initialModel, onConsumedInitialModel }) {
+function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote, initialModel, onConsumedInitialModel, pendingNewSlNo, onConsumedPendingNewSlNo }) {
   const { models, gradesBySpec, rateBySpecGrade, allSpecs, uoms, allComponents, subAssembliesByComponent, loadingMaster } = masterData;
   const [modelFilter,setModelFilter]=useState(""); const [selectedModel,setSelectedModel]=useState(null);
   const [lines,setLines]=useState([]); const [overrides,setOverrides]=useState({});
@@ -2942,12 +2942,51 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
     setGatewayConfirmedNewSlNo(true);
     setShowAddGateway(false); setShowSimpleSave(true);
   };
+  const [holdingNewSlNo,setHoldingNewSlNo]=useState(null); // {reference_number,item_sl_no} banner shown while building this line
+  useEffect(()=>{
+    if(!pendingNewSlNo) return;
+    (async()=>{
+      const ref = pendingNewSlNo.reference_number;
+      const { data } = await sb.from("estimates").select("enquiry_number,enquiry_date,quote_date,currency,conversion_rate,customer_name,customer_address,contact_name,contact_designation,signatory_name,signatory_designation").eq("reference_number",ref).order("item_sl_no").limit(1);
+      const head = (data&&data[0])||{};
+      setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
+      setCurrency(head.currency||"INR"); setConversionRate(String(head.conversion_rate||1));
+      setCustomerName(head.customer_name||""); setCustomerAddress(head.customer_address||"");
+      setContactName(head.contact_name||""); setContactDesignation(head.contact_designation||"");
+      setSignatoryName(head.signatory_name||""); setSignatoryDesignation(head.signatory_designation||"");
+      setRefNumber(ref); setItemSlNo(String(pendingNewSlNo.item_sl_no)); setRefDesc("");
+      setGatewayConfirmedNewSlNo(true);
+      setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no});
+      setShowSimpleSave(true);
+      if(onConsumedPendingNewSlNo) onConsumedPendingNewSlNo();
+    })();
+  },[pendingNewSlNo]);
+
+  // After a successful save that came through the "+ New Sl No" flow: check
+  // whether a datasheet exists yet for this Sl No, and if not, ask whether to
+  // build it now or skip (flagging the skip so it isn't silently forgotten).
+  const afterNewSlNoSave = async()=>{
+    if(!holdingNewSlNo) return;
+    const { reference_number, item_sl_no } = holdingNewSlNo;
+    setHoldingNewSlNo(null);
+    const { data } = await sb.from("datasheets").select("id").eq("reference_number",reference_number).eq("item_sl_no",item_sl_no).limit(1);
+    const hasDatasheet = data && data.length>0;
+    if(hasDatasheet){ if(onOpenQuote) onOpenQuote(reference_number, item_sl_no, false); return; }
+    if(confirm("No datasheet exists yet for Sl No "+item_sl_no+". Build it now?")){
+      await sb.from("estimates").update({datasheet_skipped:false}).eq("reference_number",reference_number).eq("item_sl_no",item_sl_no);
+      if(onOpenQuote) onOpenQuote(reference_number, item_sl_no, true);
+    } else {
+      await sb.from("estimates").update({datasheet_skipped:true}).eq("reference_number",reference_number).eq("item_sl_no",item_sl_no);
+      await logAudit("UPDATE","estimates",reference_number,"Datasheet prompt skipped for Sl No "+item_sl_no+" of "+reference_number,user?.username||"unknown",null,{datasheet_skipped:true});
+      if(onOpenQuote) onOpenQuote(reference_number, item_sl_no, false);
+    }
+  };
   const simpleSaveConfirm = async()=>{
     if(!refDesc.trim()){ alert("Description is required."); return; }
     setSimpleSaving(true);
     const ok = await saveReference();
     setSimpleSaving(false);
-    if(ok) setShowSimpleSave(false); // on failure, stay open so the error in saveMsg is visible
+    if(ok){ setShowSimpleSave(false); if(holdingNewSlNo) await afterNewSlNoSave(); } // on failure, stay open so the error in saveMsg is visible
   };
 
   // Populate the Quote# combo box with every saved quote + its customer, so the
@@ -3068,6 +3107,9 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
 
 
   return h(React.Fragment, null,
+    holdingNewSlNo && h("div",{style:{background:"#eaf2fb",border:"1px solid #85b7eb",borderRadius:6,padding:"9px 14px",margin:"0 0 12px",fontSize:13,color:"#0c447c",fontWeight:600}},
+      "Adding Sl No "+holdingNewSlNo.item_sl_no+" to Quote# "+holdingNewSlNo.reference_number+" — build the BOM below, then Save to estimate."
+    ),
     // MOC Selection Popup
     showMOC && h("div", {style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"40px 16px",overflowY:"auto"}},
       h("div", {style:{background:"#fff",borderRadius:12,width:"100%",maxWidth:580,boxShadow:"0 8px 32px rgba(0,0,0,0.18)",overflow:"hidden"}},
@@ -4705,7 +4747,7 @@ function QuoteNotesPanel({ referenceNumber, user }){
   );
 }
 
-function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab }) {
+function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSlNo }) {
   const [refs,setRefs]=useState([]); const [loading,setLoading]=useState(true);
   const [refFilter,setRefFilter]=useState(""); const [slNoFilter,setSlNoFilter]=useState(""); const [descSearch,setDescSearch]=useState(""); const [openRef,setOpenRef]=useState(null);
 
@@ -4802,6 +4844,17 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab }) {
     setUnsavedGuard(true,"You have unsaved Quote Header changes. Leave anyway?");
   };
   const [authGate,setAuthGate]=useState(null); // {requiredType, action} — shared by every gated save/delete in this screen
+  const [showNewSlNoModal,setShowNewSlNoModal]=useState(false);
+  const [newSlNoInput,setNewSlNoInput]=useState("");
+  const [newSlNoError,setNewSlNoError]=useState("");
+  const confirmNewSlNo = ()=>{
+    const n = Number(newSlNoInput);
+    if(!newSlNoInput.trim() || !Number.isInteger(n) || n<=0){ setNewSlNoError("Enter a whole number greater than 0."); return; }
+    const existingSlNos = refs.filter(r=>r.reference_number===refFilter).map(r=>r.item_sl_no);
+    if(existingSlNos.includes(n)){ setNewSlNoError("Sl No "+n+" already exists for Quote# "+refFilter+". Pick a different number."); return; }
+    setShowNewSlNoModal(false);
+    if(onNewSlNo) onNewSlNo(refFilter, n);
+  };
   const [pdfPreview,setPdfPreview]=useState(null); // {doc, filename} — Quote/BOM PDFs preview before download
   const [editingDescSlNo,setEditingDescSlNo]=useState(false);
   const [descDraft,setDescDraft]=useState("");
@@ -5076,12 +5129,16 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab }) {
   const load=useCallback(async()=>{ setLoading(true); const{data}=await sb.from("estimates").select("*").order("created_at",{ascending:false}); setRefs(data||[]); setLoading(false); },[]);
   useEffect(()=>{load();},[load]);
 
+  const [pendingOpenDatasheet,setPendingOpenDatasheet]=useState(false);
   useEffect(()=>{
     if(!openTarget || loading || refs.length===0) return;
     const match = refs.find(r=>r.reference_number===openTarget.reference_number && (openTarget.item_sl_no==null || r.item_sl_no===openTarget.item_sl_no));
-    if(match){ setRefFilter(match.reference_number); setSlNoFilter(String(match.item_sl_no)); openEstimate(match); }
+    if(match){ setRefFilter(match.reference_number); setSlNoFilter(String(match.item_sl_no)); openEstimate(match); if(openTarget.openDatasheet) setPendingOpenDatasheet(true); }
     if(onConsumedTarget) onConsumedTarget();
   },[openTarget, loading, refs]);
+  useEffect(()=>{
+    if(pendingOpenDatasheet && !loadingLines && openRef){ setShowDatasheet(true); setPendingOpenDatasheet(false); }
+  },[pendingOpenDatasheet, loadingLines, openRef]);
 
   const filtered=useMemo(()=>{
     let out = refs;
@@ -6512,7 +6569,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab }) {
               h("div",{style:{minWidth:0}},
                 h("div",{style:{fontWeight:600,fontSize:13}},r.reference_number+"  ·  Sl "+r.item_sl_no),
                 r.description&&h("div",{style:{fontSize:11,opacity:0.8}},r.description),
-                h("div",{style:{fontSize:10.5,opacity:0.6,marginTop:2}},(r.created_by||"")+" · "+new Date(r.created_at).toLocaleDateString())
+                h("div",{style:{fontSize:10.5,opacity:0.6,marginTop:2}},(r.created_by||"")+" · "+new Date(r.created_at).toLocaleDateString()),
+                r.datasheet_skipped && h("span",{style:{display:"inline-block",marginTop:4,fontSize:10,fontWeight:600,padding:"1px 7px",borderRadius:4,background:active?"rgba(255,255,255,0.2)":"#fff4d6",color:active?"#fac775":"#854f0b"}},"Datasheet skipped")
               ),
               h("div",{style:{display:"flex",gap:6,alignItems:"center",flexShrink:0}},
                 h("button",{
@@ -6530,7 +6588,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab }) {
             filtered.length===0&&h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No quotes yet.")
           ),
           refFilter && h("div",{style:{marginTop:8,textAlign:"center"}},
-            h("button",{onClick:()=>{ if(onGoToTab) onGoToTab("estimator"); alert("In the Estimator, use \"+ Add to estimate\" and enter \""+refFilter+"\" — it'll offer to add a new Sl No alongside the existing one(s)."); },style:{...btnSmall,width:"100%"}},"+ New Sl No for "+refFilter)
+            h("button",{onClick:()=>{ setNewSlNoInput(""); setNewSlNoError(""); setShowNewSlNoModal(true); },style:{...btnSmall,width:"100%"}},"+ New Sl No for "+refFilter)
           )
         ),
         h("div",{style:{flex:"1 1 400px",minWidth:0}},
@@ -6948,6 +7006,17 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab }) {
     ),
     showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>setShowDatasheet(false) }),
     historyOpen && refFilter && h(QuoteHistoryPanel,{ referenceNumber:refFilter, onClose:()=>setHistoryOpen(false) }),
+    showNewSlNoModal && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:340,padding:"20px 22px"}},
+        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:10}},"New Sl No for "+refFilter),
+        h("input",{type:"number",value:newSlNoInput,autoFocus:true,onChange:e=>{setNewSlNoInput(e.target.value);setNewSlNoError("");},onKeyDown:e=>{ if(e.key==="Enter") confirmNewSlNo(); },style:{...inputStyle,width:"100%",marginBottom:8}}),
+        newSlNoError && h("div",{style:{fontSize:12,color:colors.danger,marginBottom:8}},newSlNoError),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:confirmNewSlNo,style:{...btnPrimary,flex:1}},"Continue"),
+          h("button",{onClick:()=>setShowNewSlNoModal(false),style:{...btnSecondary,flex:1}},"Cancel")
+        )
+      )
+    ),
     authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action }),
     pdfPreview && h(PdfPreviewModal,{ doc:pdfPreview.doc, filename:pdfPreview.filename, buildDoc:pdfPreview.buildDoc, quickEditDefaults:pdfPreview.quickEditDefaults, onClose:()=>setPdfPreview(null) }),
     showDeleteQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
@@ -8411,6 +8480,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (20)", summary:"Redesigned \"+ New Sl No\": prompts for the number right on the Quotes page, checks it isn't already used for that quote (blocks with a message if it is), then hands off to the Estimator holding that Quote#/Sl No in memory — a banner shows it, header fields are pre-filled from the quote, and Save to estimate writes straight to that Sl No with no re-typing. After saving, checks whether a datasheet exists yet: prompts \"Build datasheet now?\" or \"Skip for now\" — skipping sets a flag (new datasheet_skipped column) shown as a badge back on the Quotes page, and clears automatically once a datasheet is actually built." },
   { date:"17 Jul 2026 (19)", summary:"Renamed the Sl No list's \"Details\" button to \"B.O.M / Datasheet\"." },
   { date:"17 Jul 2026 (18)", summary:"Quotes screen restyled toward the old Access workflow: Quote# selector is now a wildcard search (\"quote# — client\"), picking one loads it filtered; typing an unmatched number prompts to create it as a new quote (routes to the Estimator's existing \"+ Add to estimate\" gateway). Each Sl No now has an explicit Details button, plus \"+ New Sl No\" under the list. New Notes panel — multiple free-text notes per quote, no dates, ordered by Sl No (new quote_notes table) — and Notes now appears as its own page in the generated Quote PDF, right after Commercial Terms. Quote Status (quote_status_tbl, already existed) now protects \"Draft\" from edit/delete in the UI, since the app's code depends on that exact value." },
   { date:"17 Jul 2026 (17)", summary:"Material Rates: blank filters now show \"All rates\", paginated 200 at a time (Previous/Next), instead of showing nothing until a Shape was picked — with an explicit \"All rates\" pill to jump back to it. Rate=0 table: dropped the Grade filter entirely (Shape → Spec only) since narrowing to one grade defeated the point of finding gaps; added the same explicit \"All zero rates\" pill." },
@@ -11440,6 +11510,7 @@ function App() {
   const [masterData,setMasterData]=useState({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],uoms:[],allComponents:[],subAssembliesByComponent:new Map(),loadingMaster:true});
   const [quoteToOpen,setQuoteToOpen]=useState(null); // {reference_number,item_sl_no} bridge from Estimator's save popup to Quotes
   const [openModelTarget,setOpenModelTarget]=useState(null); // model string bridge from BOM Coverage's "Open BOM" button to Estimator
+  const [pendingNewSlNo,setPendingNewSlNo]=useState(null); // {reference_number,item_sl_no} bridge from Quotes' "+ New Sl No" to Estimator
   const [monthlyArchiveDone,setMonthlyArchiveDone]=useState(false);
   const [draftReminderDone,setDraftReminderDone]=useState(false);
 
@@ -11460,8 +11531,8 @@ function App() {
     (user.role!=="super_admin" || monthlyArchiveDone) && !draftReminderDone && h(DraftOfferReminder,{user,onDone:()=>setDraftReminderDone(true)}),
     h(TopBar,{user,sessionCompanyId,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyId(null)):null,onLogout:()=>{setUser(null);setSessionCompanyId(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
     h(MenuTabs,{user,active:tab,onChange:setTab}),
-    h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null)})),
-    tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab}):
+    h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo,openDatasheet)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo,openDatasheet:!!openDatasheet});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null),pendingNewSlNo,onConsumedPendingNewSlNo:()=>setPendingNewSlNo(null)})),
+    tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo});setTab("estimator");}}):
     tab==="reports"?h(ReportsScreen,{user,onOpenModel:(m)=>{setOpenModelTarget(m);setTab("estimator");}}):
     tab==="reports_activity"?h(ActivityByUserReport,{user}):
     tab==="reports_quotes"?h(QuoteReports,{user}):
