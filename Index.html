@@ -3499,7 +3499,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
         h("datalist",{id:"spec-list-est"},allSpecs.map(s=>h("option",{key:s,value:s}))),
         h("div",{style:{marginTop:14,display:"flex",gap:8,flexWrap:"wrap"}},
           h("button",{onClick:()=>{ if(!confirm("Clear all "+lines.length+" line item(s) from this draft? This cannot be undone.")) return; setLines([]); setOverrides({}); },disabled:lines.length===0,style:{...btnSecondary,color:colors.danger,borderColor:"#f0b8b8",opacity:lines.length===0?0.5:1}},"Clear all lines"),
-          h("button",{onClick:addCurrentModelToCart,style:{...btnPrimary,marginLeft:"auto"}},"+ Add to estimate")
+          h("button",{onClick:addCurrentModelToCart,style:{...btnPrimary,marginLeft:"auto"}},"Add this model to the cart")
         )
       )
     ),
@@ -7802,7 +7802,7 @@ const MANUAL_SECTIONS = [
               "Fix any line missing a Grade \u2014 the count of items still needing one shows in red until you're done.",
               "Use the Show in MOC checkboxes to control which lines appear on the datasheet's Material Data section later.",
               "Switch between the Detail / Summary / Cutting Plan cards to check totals different ways before saving.",
-              "Click \"+ Add to estimate\" to push this model's lines into your cart.",
+              "Click \"Add this model to the cart\" to push this model's lines into your cart \u2014 renamed from \"+ Add to estimate\" since it was easy to mistake for the final save.",
               "Fill in Quote#, Sl No, and the other header fields, then Save \u2014 this becomes one line item of a quote."
             ]
           },
@@ -8555,6 +8555,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (24)", summary:"Fixed: the stale-Draft reminder was accidentally fully disabled last round — restored properly, now as a toolbar badge (\"⚠ N quotes still in Draft\") instead of a popup on login, so the app still opens with no forced form but the reminder isn't lost. Click the badge to review and change statuses inline, same table as before. Confirmed the \"+ Add to estimate\" button itself was never removed — only its label changed to \"Add this model to the cart\" to avoid confusion with the new \"Save to estimate\" action." },
+  { date:"17 Jul 2026 (23)", summary:"Renamed the \"+ Add to estimate\" button to \"Add this model to the cart\" \u2014 it was easy to confuse with the actual final-save action (now the only thing called \"Save to estimate\", in the banner). The app no longer shows any prompt on open (Monthly Archive, Draft quotes reminder) \u2014 it lands straight on the toolbar." },
   { date:"17 Jul 2026 (22)", summary:"Replaced the \"go to Estimator and re-enter the Quote#\" alert with a direct handoff: creating a brand-new quote (via the search box or \"+ Add new\") now opens the Estimator immediately with a banner reading \"Select a model below to create Quote# X\" — pick a model, Add to estimate (no repeat Quote# prompt, it's already held in memory), then \"Save to estimate\" in the banner opens the full header form (Customer, Enquiry#, Currency, etc., since there's nothing to inherit for a new quote), followed by the same datasheet build-or-skip prompt as the existing-quote flow." },
   { date:"17 Jul 2026 (21)", summary:"Quotes screen: the quote search field is now prominent (solid blue fill, white text). New \"⧉ New tab\" button opens another instance of the app in a fresh browser tab. New \"+ Add new\" button prompts for a quote number, checks whether it's already taken (shows which client it belongs to with \"Open it instead\" / \"Try another number\"), or hands off to the Estimator to create it if it's free. Also fixed: delete Sl No, delete whole quote, and datasheet save/skip all now re-fetch from the database instead of patching local state, so the readiness indicator and \"Datasheet skipped\" flag never go stale after any of those actions." },
   { date:"17 Jul 2026 (20)", summary:"Redesigned \"+ New Sl No\": prompts for the number right on the Quotes page, checks it isn't already used for that quote (blocks with a message if it is), then hands off to the Estimator holding that Quote#/Sl No in memory — a banner shows it, header fields are pre-filled from the quote, and Save to estimate writes straight to that Sl No with no re-typing. After saving, checks whether a datasheet exists yet: prompts \"Build datasheet now?\" or \"Skip for now\" — skipping sets a flag (new datasheet_skipped column) shown as a badge back on the Quotes page, and clears automatically once a datasheet is actually built." },
@@ -9526,8 +9528,7 @@ function DraftOfferReminder({ user, onDone }){
         )))
       ),
       h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
-        h("button",{onClick:onDone,style:btnSecondary},"Remind me next login"),
-        h("button",{onClick:onDone,style:btnPrimary},"Done")
+        h("button",{onClick:onDone,style:btnPrimary},"Close")
       )
     )
   );
@@ -11588,10 +11589,15 @@ function App() {
   const [quoteToOpen,setQuoteToOpen]=useState(null); // {reference_number,item_sl_no} bridge from Estimator's save popup to Quotes
   const [openModelTarget,setOpenModelTarget]=useState(null); // model string bridge from BOM Coverage's "Open BOM" button to Estimator
   const [pendingNewSlNo,setPendingNewSlNo]=useState(null); // {reference_number,item_sl_no} bridge from Quotes' "+ New Sl No" to Estimator
-  const [monthlyArchiveDone,setMonthlyArchiveDone]=useState(false);
-  const [draftReminderDone,setDraftReminderDone]=useState(false);
+  const [monthlyArchiveDone,setMonthlyArchiveDone]=useState(true); // suppressed on open — no form should show before the toolbar
+  const [draftCount,setDraftCount]=useState(0); // fetched silently — surfaced as a toolbar badge, not a popup
+  const [showDraftPanel,setShowDraftPanel]=useState(false);
+  const refreshDraftCount = useCallback(()=>{
+    sb.from("estimates").select("id",{count:"exact",head:true}).eq("quote_status","Draft").then(({count})=>setDraftCount(count||0));
+  },[]);
 
   useEffect(()=>{ if(user) loadMasterData(setMasterData); },[user]);
+  useEffect(()=>{ if(user) refreshDraftCount(); },[user,refreshDraftCount]);
   const refresh=useCallback(()=>{ setMasterData(m=>({...m,loadingMaster:true})); loadMasterData(setMasterData); },[]);
 
   useEffect(()=>{
@@ -11605,8 +11611,11 @@ function App() {
 
   return h("div",{style:{minHeight:"100vh"}},
     user.role==="super_admin" && !monthlyArchiveDone && h(MonthlyArchivePrompt,{user,onDone:()=>setMonthlyArchiveDone(true)}),
-    (user.role!=="super_admin" || monthlyArchiveDone) && !draftReminderDone && h(DraftOfferReminder,{user,onDone:()=>setDraftReminderDone(true)}),
+    showDraftPanel && h(DraftOfferReminder,{user,onDone:()=>{ setShowDraftPanel(false); refreshDraftCount(); }}),
     h(TopBar,{user,sessionCompanyId,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyId(null)):null,onLogout:()=>{setUser(null);setSessionCompanyId(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
+    draftCount>0 && h("div",{onClick:()=>setShowDraftPanel(true),style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
+      "⚠ "+draftCount+" quote"+(draftCount===1?"":"s")+" still in Draft — click to review and update status"
+    ),
     h(MenuTabs,{user,active:tab,onChange:setTab}),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo,openDatasheet)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo,openDatasheet:!!openDatasheet});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null),pendingNewSlNo,onConsumedPendingNewSlNo:()=>setPendingNewSlNo(null)})),
     tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo});setTab("estimator");}}):
