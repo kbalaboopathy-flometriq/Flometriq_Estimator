@@ -2891,6 +2891,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
     if(!selectedModel||computedLines.length===0) return;
     const toAdd=computedLines.map(l=>({model:selectedModel,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec||"",grade:l.selGrade||(l.hasSpec?"":""),qty_required:l.qty,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.salesPrice,show_in_moc:l.showInMoc,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||""}));
     setCart(c=>c.concat(toAdd));
+    if(holdingNewSlNo) return; // already know the Quote#/Sl No — no need to ask again
     setTimeout(()=>{ setShowAddGateway(true); setGatewayStep("quote"); setGatewayRef(""); setGatewaySiblings(null); setGatewaySlNoInput(""); setGatewaySlNoWarn(false); loadQuoteOptions(); }, 0);
   };
 
@@ -2942,13 +2943,14 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
     setGatewayConfirmedNewSlNo(true);
     setShowAddGateway(false); setShowSimpleSave(true);
   };
-  const [holdingNewSlNo,setHoldingNewSlNo]=useState(null); // {reference_number,item_sl_no} banner shown while building this line
+  const [holdingNewSlNo,setHoldingNewSlNo]=useState(null); // {reference_number,item_sl_no,isNewQuote} banner shown while building this line
   useEffect(()=>{
     if(!pendingNewSlNo) return;
     (async()=>{
       const ref = pendingNewSlNo.reference_number;
       const { data } = await sb.from("estimates").select("enquiry_number,enquiry_date,quote_date,currency,conversion_rate,customer_name,customer_address,contact_name,contact_designation,signatory_name,signatory_designation").eq("reference_number",ref).order("item_sl_no").limit(1);
       const head = (data&&data[0])||{};
+      const isNewQuote = !(data&&data.length>0);
       setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
       setCurrency(head.currency||"INR"); setConversionRate(String(head.conversion_rate||1));
       setCustomerName(head.customer_name||""); setCustomerAddress(head.customer_address||"");
@@ -2956,15 +2958,21 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
       setSignatoryName(head.signatory_name||""); setSignatoryDesignation(head.signatory_designation||"");
       setRefNumber(ref); setItemSlNo(String(pendingNewSlNo.item_sl_no)); setRefDesc("");
       setGatewayConfirmedNewSlNo(true);
-      setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no});
-      setShowSimpleSave(true);
+      setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no, isNewQuote});
+      // Existing quote: the shortened form (Description only) is enough, since
+      // everything else already carries over — show it right away. Brand new
+      // quote: nothing to inherit, so just show the banner and let them pick a
+      // model first; "Save to estimate" in the banner opens the full form once
+      // there's something in the cart.
+      if(!isNewQuote) setShowSimpleSave(true);
       if(onConsumedPendingNewSlNo) onConsumedPendingNewSlNo();
     })();
   },[pendingNewSlNo]);
 
-  // After a successful save that came through the "+ New Sl No" flow: check
-  // whether a datasheet exists yet for this Sl No, and if not, ask whether to
-  // build it now or skip (flagging the skip so it isn't silently forgotten).
+  // After a successful save that came through the "+ New Sl No" / "+ Add new"
+  // flow: check whether a datasheet exists yet for this Sl No, and if not,
+  // ask whether to build it now or skip (flagging the skip so it isn't
+  // silently forgotten).
   const afterNewSlNoSave = async()=>{
     if(!holdingNewSlNo) return;
     const { reference_number, item_sl_no } = holdingNewSlNo;
@@ -3107,8 +3115,17 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
 
 
   return h(React.Fragment, null,
-    holdingNewSlNo && h("div",{style:{background:"#eaf2fb",border:"1px solid #85b7eb",borderRadius:6,padding:"9px 14px",margin:"0 0 12px",fontSize:13,color:"#0c447c",fontWeight:600}},
-      "Adding Sl No "+holdingNewSlNo.item_sl_no+" to Quote# "+holdingNewSlNo.reference_number+" — build the BOM below, then Save to estimate."
+    holdingNewSlNo && h("div",{style:{background:"#eaf2fb",border:"1px solid #85b7eb",borderRadius:6,padding:"9px 14px",margin:"0 0 12px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
+      h("span",{style:{fontSize:13,color:"#0c447c",fontWeight:600}},
+        holdingNewSlNo.isNewQuote
+          ? "Select a model below to create Quote# "+holdingNewSlNo.reference_number
+          : "Adding Sl No "+holdingNewSlNo.item_sl_no+" to Quote# "+holdingNewSlNo.reference_number+" — build the BOM below, then Save to estimate."
+      ),
+      holdingNewSlNo.isNewQuote && h("button",{
+        onClick:()=>{ if(cart.length===0){ alert("Add at least one model's lines to the cart first."); return; } setShowSave(true); },
+        disabled:cart.length===0,
+        style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"none",cursor:cart.length===0?"not-allowed":"pointer",background:cart.length===0?"#b5d4f4":"#0c447c",color:"#fff"}
+      },"Save to estimate")
     ),
     // MOC Selection Popup
     showMOC && h("div", {style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"40px 16px",overflowY:"auto"}},
@@ -3698,7 +3715,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
             h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
               saveMsg&&h("div",{style:{fontSize:12,color:saveMsg.startsWith("Save failed")||saveMsg.startsWith("Enter")||saveMsg.startsWith("Add")?colors.danger:"#2d7a4f"}},saveMsg),
               h("button",{onClick:()=>{setShowSave(false);setSaveMaximised(false);},style:btnSecondary},"Cancel"),
-              h("button",{onClick:saveReference,disabled:savingRef,style:btnPrimary},savingRef?"Saving…":"Confirm save")
+              h("button",{onClick:async()=>{ const ok=await saveReference(); if(ok){ setShowSave(false); setSaveMaximised(false); if(holdingNewSlNo) await afterNewSlNoSave(); } },disabled:savingRef,style:btnPrimary},savingRef?"Saving…":"Confirm save")
             )
           )
         )
@@ -4781,9 +4798,9 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     const looksLikeRefAttempt = /^[A-Za-z0-9\-\/]+$/.test(val) && val.length>=3;
     if(!looksLikeRefAttempt){ setRefSearchDisplay(e.target.dataset.prevVal||""); return; }
     if(confirm("Quote \""+val+"\" doesn't exist. Create it as a new quote?")){
-      if(onGoToTab) onGoToTab("estimator");
-      alert("Opening the Estimator — use \"+ Add to estimate\" there and enter \""+val+"\" as the Quote# to start it.");
       setRefSearchDisplay("");
+      if(onNewSlNo) onNewSlNo(val, 1);
+      else if(onGoToTab) onGoToTab("estimator");
     } else {
       setRefSearchDisplay(e.target.dataset.prevVal||"");
     }
@@ -4869,8 +4886,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     const hit = refOptionsList.find(o=>o.rn===val);
     if(hit){ setAddNewMsg({type:"exists", rn:hit.rn, label:hit.label}); return; }
     setShowAddNewModal(false);
-    if(onGoToTab) onGoToTab("estimator");
-    alert("Opening the Estimator — use \"+ Add to estimate\" there and enter \""+val+"\" as the Quote# to start it.");
+    if(onNewSlNo) onNewSlNo(val, 1);
+    else if(onGoToTab) onGoToTab("estimator");
   };
   const openExistingFromAddNew = ()=>{
     if(!addNewMsg || addNewMsg.type!=="exists") return;
@@ -7807,11 +7824,15 @@ const MANUAL_SECTIONS = [
           {
             "type": "steps",
             "items": [
-              "Pick a Quote# in the top-right filter to see every Sl No under it in the left panel.",
-              "Pick a specific Sl No too, if you want to jump straight to it.",
-              "Click a card in the left list to open that Sl No's detail.",
+              "Search for a quote in the prominent blue field (top toolbar) \u2014 type a Quote# or client name, pick from the wildcard results, and it loads filtered.",
+              "Typing a Quote# that doesn't exist (or using \u201c+ Add new\u201d) prompts \u201cQuote 'X' doesn't exist \u2014 create it?\u201d and, if yes, opens the Estimator immediately with a banner: \u201cSelect a model below to create Quote# X.\u201d Pick a model, Add to estimate, then \u201cSave to estimate\u201d in that banner \u2014 no re-typing the Quote# anywhere in between.",
+              "\u201c+ Add new\u201d (next to the search field) does the same handoff more directly \u2014 prompts for a number, and if it's already taken, offers \u201cOpen it instead\u201d rather than a dead end.",
+              "\u201c\u29c9 New tab\u201d opens another instance of the app in a fresh browser tab, for working two quotes side by side.",
+              "Click a card in the left list, or its \u201cB.O.M / Datasheet\u201d button, to open that Sl No's detail.",
+              "\u201c+ New Sl No\u201d prompts for a number, checks it isn't already used, then opens the Estimator holding that Quote#/Sl No in memory \u2014 header fields are pre-filled, no re-typing. Saving there checks for a datasheet and offers to build it now or skip (skipping shows a \u201cDatasheet skipped\u201d badge back here, which clears automatically once one's built).",
+              "Notes panel (below the Quote Header) holds multiple free-text notes per quote, no dates, ordered by Sl No \u2014 these print as their own page in the generated PDF, right after Commercial Terms.",
               "Set Order Qty (units) \u2014 the whole BOM's quantities scale live as you change it.",
-              "Set Quote Status from the dropdown \u2014 this is per Sl No, not per whole quote.",
+              "Set Quote Status from the dropdown (Master Data \u2192 Quote Status is fully editable, except \u201cDraft\u201d which is locked \u2014 the app's code depends on that exact value).",
               "Use the \u2715 on a card, or \"Delete this Sl No\" / \"Delete entire quote\" buttons, to remove things \u2014 both ask for confirmation first, and deleting a whole quote requires typing the Quote# to confirm."
             ]
           }
@@ -7892,7 +7913,7 @@ const MANUAL_SECTIONS = [
         "blocks": [
           {
             "type": "p",
-            "text": "\"Generate Quote PDF\" compiles one document per Quote#: Cover Letter, Index (with real page numbers), Commercial Terms, Price Summary (one row per Sl No), and every Sl No's Datasheet, in that order."
+            "text": "\"Generate Quote PDF\" compiles one document per Quote#: Cover Letter, Index (with real page numbers), Commercial Terms, Notes (its own page, only when the quote has at least one note \u2014 right after Commercial Terms), Price Summary (one row per Sl No), and every Sl No's Datasheet, in that order."
           },
           {
             "type": "p",
@@ -8534,6 +8555,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (22)", summary:"Replaced the \"go to Estimator and re-enter the Quote#\" alert with a direct handoff: creating a brand-new quote (via the search box or \"+ Add new\") now opens the Estimator immediately with a banner reading \"Select a model below to create Quote# X\" — pick a model, Add to estimate (no repeat Quote# prompt, it's already held in memory), then \"Save to estimate\" in the banner opens the full header form (Customer, Enquiry#, Currency, etc., since there's nothing to inherit for a new quote), followed by the same datasheet build-or-skip prompt as the existing-quote flow." },
   { date:"17 Jul 2026 (21)", summary:"Quotes screen: the quote search field is now prominent (solid blue fill, white text). New \"⧉ New tab\" button opens another instance of the app in a fresh browser tab. New \"+ Add new\" button prompts for a quote number, checks whether it's already taken (shows which client it belongs to with \"Open it instead\" / \"Try another number\"), or hands off to the Estimator to create it if it's free. Also fixed: delete Sl No, delete whole quote, and datasheet save/skip all now re-fetch from the database instead of patching local state, so the readiness indicator and \"Datasheet skipped\" flag never go stale after any of those actions." },
   { date:"17 Jul 2026 (20)", summary:"Redesigned \"+ New Sl No\": prompts for the number right on the Quotes page, checks it isn't already used for that quote (blocks with a message if it is), then hands off to the Estimator holding that Quote#/Sl No in memory — a banner shows it, header fields are pre-filled from the quote, and Save to estimate writes straight to that Sl No with no re-typing. After saving, checks whether a datasheet exists yet: prompts \"Build datasheet now?\" or \"Skip for now\" — skipping sets a flag (new datasheet_skipped column) shown as a badge back on the Quotes page, and clears automatically once a datasheet is actually built." },
   { date:"17 Jul 2026 (19)", summary:"Renamed the Sl No list's \"Details\" button to \"B.O.M / Datasheet\"." },
