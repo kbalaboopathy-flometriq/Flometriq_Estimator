@@ -1781,6 +1781,7 @@ function MasterEditor({ tableKey, user }) {
   };
   const deleteRow = (id)=>{
     const row = rows.find(r=>r.id===id);
+    if(isProtectedStatusRow(row)){ alert("\"Draft\" is a system value the app depends on and can't be deleted."); return; }
     if(tableKey==="model_tbl" && row?.model){
       (async()=>{
         const { data: bomRows } = await sb.from("bom").select("id").eq("model",row.model);
@@ -1907,15 +1908,18 @@ function MasterEditor({ tableKey, user }) {
   },[mrFilteredRows,tableKey]);
   const addLabel = tableDef.addLabel||"New row";
 
+  const isProtectedStatusRow = (row)=> tableKey==="quote_status_tbl" && String(row.status||"").trim()==="Draft";
   const renderRow = (row)=>h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
-    h("td",{style:{padding:"7px 9px"}},h("input",{type:"checkbox",checked:selectedIds.has(row.id),onChange:e=>setSelectedIds(prev=>{ const next=new Set(prev); if(e.target.checked) next.add(row.id); else next.delete(row.id); return next; })})),
+    h("td",{style:{padding:"7px 9px"}},h("input",{type:"checkbox",checked:selectedIds.has(row.id),disabled:isProtectedStatusRow(row),onChange:e=>setSelectedIds(prev=>{ const next=new Set(prev); if(e.target.checked) next.add(row.id); else next.delete(row.id); return next; })})),
     tableDef.columns.map(c=>h("td",{key:c,style:{padding:"7px 9px"}},
       editingId===row.id?h("input",{value:editDraft[c]??"",onChange:e=>setEditDraft(d=>({...d,[c]:e.target.value})),style:{...inputStyle,padding:"5px 7px",fontSize:12}}):
       (NUMERIC_COLS.has(c)?fmt(Number(row[c])||0):String(row[c]??""))
     )),
     h("td",{style:{padding:"7px 9px",whiteSpace:"nowrap"}},
-      editingId===row.id?h(React.Fragment,null,h("button",{onClick:saveEdit,style:{...btnSecondary,marginRight:6}},"Save"),h("button",{onClick:()=>{setEditingId(null);setEditDraft({});},style:btnSecondary},"Cancel")):
-      h(React.Fragment,null,h("button",{onClick:()=>{setEditingId(row.id);setEditDraft({...row});},style:{...btnSecondary,marginRight:6}},"Edit"),h("button",{onClick:()=>deleteRow(row.id),style:btnDanger},freshIds.has(row.id)||isSuperAdmin?"Delete":"Delete 🔒"))
+      isProtectedStatusRow(row)
+        ? h("span",{style:{fontSize:11,color:colors.mutedLight}},"🔒 system value — locked")
+        : editingId===row.id?h(React.Fragment,null,h("button",{onClick:saveEdit,style:{...btnSecondary,marginRight:6}},"Save"),h("button",{onClick:()=>{setEditingId(null);setEditDraft({});},style:btnSecondary},"Cancel")):
+          h(React.Fragment,null,h("button",{onClick:()=>{setEditingId(row.id);setEditDraft({...row});},style:{...btnSecondary,marginRight:6}},"Edit"),h("button",{onClick:()=>deleteRow(row.id),style:btnDanger},freshIds.has(row.id)||isSuperAdmin?"Delete":"Delete 🔒"))
     )
   );
 
@@ -4643,9 +4647,104 @@ function CustomerSelect({ value, onSelect, disabled }){
   );
 }
 
-function SavedEstimates({ user, openTarget, onConsumedTarget }) {
+// Multiple free-text notes per quote, no date tracking, ordered by Sl No —
+// mirrors the old Access subform (quote number as the parent key).
+function QuoteNotesPanel({ referenceNumber, user }){
+  const [notes,setNotes]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [saving,setSaving]=useState({});
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("quote_notes").select("*").eq("reference_number",referenceNumber).order("sl_no",{ascending:true});
+    setNotes(data&&data.length ? data : []);
+    setLoading(false);
+  },[referenceNumber]);
+  useEffect(()=>{ load(); },[load]);
+  const addNote = ()=>{
+    const nextSlNo = notes.length ? Math.max(...notes.map(n=>n.sl_no||0))+1 : 1;
+    setNotes(ns=>[...ns,{id:"new-"+Date.now(), reference_number:referenceNumber, sl_no:nextSlNo, note_text:"", _unsaved:true}]);
+  };
+  const setNoteText = (id,val)=> setNotes(ns=>ns.map(n=>n.id===id?{...n,note_text:val}:n));
+  const saveNote = async(note)=>{
+    setSaving(s=>({...s,[note.id]:true}));
+    try{
+      if(note._unsaved){
+        const { data, error:err } = await sb.from("quote_notes").insert({reference_number:note.reference_number, sl_no:note.sl_no, note_text:note.note_text}).select().single();
+        if(err){ alert("Failed to save note: "+err.message); return; }
+        await logAudit("CREATE","quote_notes",referenceNumber,"Note "+note.sl_no+" added to "+referenceNumber,user?.username||"unknown",null,{note_text:note.note_text});
+        setNotes(ns=>ns.map(n=>n.id===note.id?data:n));
+      } else {
+        const { error:err } = await sb.from("quote_notes").update({note_text:note.note_text}).eq("id",note.id);
+        if(err){ alert("Failed to save note: "+err.message); return; }
+        await logAudit("UPDATE","quote_notes",referenceNumber,"Note "+note.sl_no+" updated on "+referenceNumber,user?.username||"unknown",null,{note_text:note.note_text});
+      }
+    } finally { setSaving(s=>({...s,[note.id]:false})); }
+  };
+  const deleteNote = async(note)=>{
+    if(!confirm("Delete note "+note.sl_no+"?")) return;
+    if(!note._unsaved){
+      await sb.from("quote_notes").delete().eq("id",note.id);
+      await logAudit("DELETE","quote_notes",referenceNumber,"Note "+note.sl_no+" deleted from "+referenceNumber,user?.username||"unknown",note,null);
+    }
+    setNotes(ns=>ns.filter(n=>n.id!==note.id));
+  };
+  return h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:2}},
+      h("div",{style:{fontSize:12.5,fontWeight:700}},"Notes"),
+      h("button",{onClick:addNote,style:btnSmall},"+ Add note")
+    ),
+    h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:10}},"Multiple notes for this quote — no dates, just Sl No order. Appears as its own page in the generated PDF, right after Commercial Terms."),
+    loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
+    notes.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"No notes yet.") :
+    notes.map(n=>h("div",{key:n.id,style:{display:"flex",gap:8,alignItems:"flex-start",marginBottom:8}},
+      h("div",{style:{fontSize:11,color:colors.mutedLight,paddingTop:8,width:20}},n.sl_no),
+      h("textarea",{rows:2,value:n.note_text||"",onChange:e=>setNoteText(n.id,e.target.value),placeholder:"Enter note…",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12,resize:"vertical",fontFamily:"inherit"}}),
+      h("button",{onClick:()=>saveNote(n),disabled:!!saving[n.id],style:{...btnSmall,marginTop:2}},saving[n.id]?"…":"Save"),
+      h("button",{onClick:()=>deleteNote(n),style:{...btnSmall,marginTop:2,border:"1px solid "+colors.danger,color:colors.danger}},"Delete")
+    ))
+  );
+}
+
+function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab }) {
   const [refs,setRefs]=useState([]); const [loading,setLoading]=useState(true);
   const [refFilter,setRefFilter]=useState(""); const [slNoFilter,setSlNoFilter]=useState(""); const [descSearch,setDescSearch]=useState(""); const [openRef,setOpenRef]=useState(null);
+
+  // Wildcard quote search — "quote# — client", picking one loads it filtered;
+  // typing a number that doesn't exist offers to create it as a new quote.
+  const [refSearchDisplay,setRefSearchDisplay]=useState("");
+  const refOptionsList = useMemo(()=>{
+    const seen=new Set(); const out=[];
+    refs.forEach(r=>{ if(!seen.has(r.reference_number)){ seen.add(r.reference_number); out.push({ rn:r.reference_number, label:r.reference_number+" — "+(r.customer_name||"—") }); } });
+    return out.sort((a,b)=>a.rn.localeCompare(b.rn));
+  },[refs]);
+  const comboRefocusRS = (e)=>{ e.target.dataset.prevVal = refSearchDisplay; setRefSearchDisplay(""); };
+  const handleRefSearchChange = (val)=>{
+    setRefSearchDisplay(val);
+    const hit = refOptionsList.find(o=>o.label===val);
+    if(hit){
+      setRefFilter(hit.rn); setSlNoFilter("");
+      const pool = refs.filter(r=>r.reference_number===hit.rn);
+      if(pool.length===1) openEstimate(pool[0]);
+    }
+  };
+  const handleRefSearchBlur = (e)=>{
+    const val = refSearchDisplay.trim();
+    if(!val){ setRefSearchDisplay(e.target.dataset.prevVal||""); return; }
+    const hit = refOptionsList.find(o=>o.label===val || o.rn===val);
+    if(hit){ setRefFilter(hit.rn); setSlNoFilter(""); setRefSearchDisplay(hit.label); return; }
+    // Also allow typing just the client name portion to narrow, without
+    // triggering the "doesn't exist" prompt on every partial keystroke —
+    // only prompt when it looks like a specific quote number was intended.
+    const looksLikeRefAttempt = /^[A-Za-z0-9\-\/]+$/.test(val) && val.length>=3;
+    if(!looksLikeRefAttempt){ setRefSearchDisplay(e.target.dataset.prevVal||""); return; }
+    if(confirm("Quote \""+val+"\" doesn't exist. Create it as a new quote?")){
+      if(onGoToTab) onGoToTab("estimator");
+      alert("Opening the Estimator — use \"+ Add to estimate\" there and enter \""+val+"\" as the Quote# to start it.");
+      setRefSearchDisplay("");
+    } else {
+      setRefSearchDisplay(e.target.dataset.prevVal||"");
+    }
+  };
   const [showDatasheet,setShowDatasheet]=useState(false);
   const [openLines,setOpenLines]=useState([]); const [loadingLines,setLoadingLines]=useState(false);
   const [frozenColIdxQ,setFrozenColIdxQ]=useState(null);
@@ -4674,6 +4773,11 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
   // The row currently backing the shared quote-level fields — any Sl No under
   // this Quote# works, they're kept identical across all of them.
   const quoteHeaderRow = useMemo(()=> refs.find(r=>r.reference_number===refFilter) || null, [refs,refFilter]);
+  useEffect(()=>{
+    if(!refFilter){ return; }
+    const hit = refOptionsList.find(o=>o.rn===refFilter);
+    if(hit) setRefSearchDisplay(hit.label);
+  },[refFilter,refOptionsList]);
   const [companyNameById,setCompanyNameById]=useState({});
   const [allCompaniesForRetrofit,setAllCompaniesForRetrofit]=useState([]);
   useEffect(()=>{
@@ -5719,6 +5823,8 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       const terms = termsRow || {};
       const forceMaj = terms.force_majeure || CT_DEFAULTS.force_majeure;
       const cancelCharges = terms.order_cancellation_charges || CT_DEFAULTS.order_cancellation_charges;
+      const {data:notesRows} = await sb.from("quote_notes").select("*").eq("reference_number",quoteExportRef).order("sl_no",{ascending:true});
+      const quoteNotes = (notesRows||[]).filter(n=>n.note_text&&n.note_text.trim());
       const first = estimatesRows[0];
       if(!first.company_id){
         alert("Can't generate PDF — this quote has no Company resolved.\n\nIt was created by \""+(first.created_by||"unknown")+"\", whose account has no Company assigned. Ask your Super Admin to assign one in Admin \u2192 User Management (or, if the creator is a Super Admin, they need to pick a company at login) before this PDF can be generated.");
@@ -5861,6 +5967,26 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
       });
       const termsEndPage = doc.internal.getNumberOfPages();
 
+      // ---- Notes (new) — its own page, only when there's at least one note ----
+      let notesStartPage = null, notesEndPage = null;
+      if(quoteNotes.length){
+        doc.addPage();
+        letterhead("ANNEXURE - IB  NOTES");
+        notesStartPage = doc.internal.getNumberOfPages();
+        doc.autoTable({
+          startY:34,
+          head:[["Sl No","Note"]],
+          body:quoteNotes.map(n=>[String(n.sl_no??""),n.note_text||""]),
+          theme:"plain",
+          styles:{font:"times",fontSize:8.5,textColor:dark,cellPadding:{top:2.5,bottom:2.5,left:2,right:4}},
+          headStyles:{font:"times",fontStyle:"bold"},
+          columnStyles:{0:{cellWidth:20},1:{cellWidth:"auto"}},
+          margin:{top:32,left:12,right:12,bottom:16},
+          didDrawPage:()=>letterhead("ANNEXURE - IB  NOTES")
+        });
+        notesEndPage = doc.internal.getNumberOfPages();
+      }
+
       // ---- Price Summary — one row per Sl No ----
       doc.addPage();
       const summaryStartPage = doc.internal.getNumberOfPages();
@@ -5936,6 +6062,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           ["1","","Cover Page","1"],
           ["2","","Index","2"],
           ["3","Annexure-I","Commercial Terms", termsStartPage===termsEndPage?String(termsStartPage):termsStartPage+"-"+termsEndPage],
+          ...(quoteNotes.length ? [["","Annexure-IB","Notes", notesStartPage===notesEndPage?String(notesStartPage):notesStartPage+"-"+notesEndPage]] : []),
           ["4","Annexure-II","Price Summary", summaryStartPage===summaryEndPage?String(summaryStartPage):summaryStartPage+"-"+summaryEndPage],
           ["5","Annexure-III","Technical Data Sheet", dsStartPage===dsEndPage?String(dsStartPage):dsStartPage+"-"+dsEndPage],
         ],
@@ -6226,14 +6353,9 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
           )
         ),
         h("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
-          h("select",{value:refFilter,onChange:e=>{
-            const val=e.target.value; setRefFilter(val); setSlNoFilter("");
-            const pool = val ? refs.filter(r=>r.reference_number===val) : [];
-            if(val && pool.length===1) openEstimate(pool[0]);
-          },style:{...inputStyle,width:190}},
-            h("option",{value:""},"All quotes"),
-            Array.from(new Set(refs.map(r=>r.reference_number))).map(rn=>h("option",{key:rn,value:rn},rn))
-          ),
+          h("input",{list:"quote-search-datalist",value:refSearchDisplay,onFocus:comboRefocusRS,onChange:e=>handleRefSearchChange(e.target.value),onBlur:handleRefSearchBlur,placeholder:"Quote number or client name…",style:{...inputStyle,width:260}}),
+          h("datalist",{id:"quote-search-datalist"},refOptionsList.map(o=>h("option",{key:o.rn,value:o.label}))),
+          refFilter && h("button",{onClick:()=>{setRefFilter("");setRefSearchDisplay("");setSlNoFilter("");},style:btnSmall},"All quotes"),
           h("select",{value:slNoFilter,onChange:e=>{
             const val=e.target.value; setSlNoFilter(val);
             if(refFilter && val){ const match=refs.find(r=>r.reference_number===refFilter&&String(r.item_sl_no)===String(val)); if(match) openEstimate(match); }
@@ -6320,6 +6442,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
               )
             )
       ),
+      refFilter && h(QuoteNotesPanel,{referenceNumber:refFilter,user}),
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
         h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},"Export full quote"),
         h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}},
@@ -6391,14 +6514,23 @@ function SavedEstimates({ user, openTarget, onConsumedTarget }) {
                 r.description&&h("div",{style:{fontSize:11,opacity:0.8}},r.description),
                 h("div",{style:{fontSize:10.5,opacity:0.6,marginTop:2}},(r.created_by||"")+" · "+new Date(r.created_at).toLocaleDateString())
               ),
-              isAdmin && h("button",{
-                "aria-label":"Delete Sl No "+r.item_sl_no,
-                onClick:(e)=>{ e.stopPropagation(); deleteSlNo(r); },
-                disabled:deletingSlNo===r.id,
-                style:{border:"none",background:"transparent",color:active?"#f0997b":colors.danger,cursor:"pointer",fontSize:15,padding:2,flexShrink:0,opacity:deletingSlNo===r.id?0.5:1}
-              },deletingSlNo===r.id?"…":"\u2715")
+              h("div",{style:{display:"flex",gap:6,alignItems:"center",flexShrink:0}},
+                h("button",{
+                  onClick:(e)=>{ e.stopPropagation(); openEstimate(r); },
+                  style:{border:"1px solid "+(active?"rgba(255,255,255,0.4)":colors.border),background:active?"rgba(255,255,255,0.12)":"#fff",color:active?"#fff":colors.muted,borderRadius:4,fontSize:11,padding:"3px 8px",cursor:"pointer"}
+                },"B.O.M / Datasheet"),
+                isAdmin && h("button",{
+                  "aria-label":"Delete Sl No "+r.item_sl_no,
+                  onClick:(e)=>{ e.stopPropagation(); deleteSlNo(r); },
+                  disabled:deletingSlNo===r.id,
+                  style:{border:"none",background:"transparent",color:active?"#f0997b":colors.danger,cursor:"pointer",fontSize:15,padding:2,flexShrink:0,opacity:deletingSlNo===r.id?0.5:1}
+                },deletingSlNo===r.id?"…":"\u2715")
+              )
             );}),
             filtered.length===0&&h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No quotes yet.")
+          ),
+          refFilter && h("div",{style:{marginTop:8,textAlign:"center"}},
+            h("button",{onClick:()=>{ if(onGoToTab) onGoToTab("estimator"); alert("In the Estimator, use \"+ Add to estimate\" and enter \""+refFilter+"\" — it'll offer to add a new Sl No alongside the existing one(s)."); },style:{...btnSmall,width:"100%"}},"+ New Sl No for "+refFilter)
           )
         ),
         h("div",{style:{flex:"1 1 400px",minWidth:0}},
@@ -8279,6 +8411,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (19)", summary:"Renamed the Sl No list's \"Details\" button to \"B.O.M / Datasheet\"." },
+  { date:"17 Jul 2026 (18)", summary:"Quotes screen restyled toward the old Access workflow: Quote# selector is now a wildcard search (\"quote# — client\"), picking one loads it filtered; typing an unmatched number prompts to create it as a new quote (routes to the Estimator's existing \"+ Add to estimate\" gateway). Each Sl No now has an explicit Details button, plus \"+ New Sl No\" under the list. New Notes panel — multiple free-text notes per quote, no dates, ordered by Sl No (new quote_notes table) — and Notes now appears as its own page in the generated Quote PDF, right after Commercial Terms. Quote Status (quote_status_tbl, already existed) now protects \"Draft\" from edit/delete in the UI, since the app's code depends on that exact value." },
   { date:"17 Jul 2026 (17)", summary:"Material Rates: blank filters now show \"All rates\", paginated 200 at a time (Previous/Next), instead of showing nothing until a Shape was picked — with an explicit \"All rates\" pill to jump back to it. Rate=0 table: dropped the Grade filter entirely (Shape → Spec only) since narrowing to one grade defeated the point of finding gaps; added the same explicit \"All zero rates\" pill." },
   { date:"17 Jul 2026 (16)", summary:"Material Rates and the Rate=0 table both gained Export Excel / Export PDF, each following whatever filter (Shape/Spec/Grade, or search) is currently active. Every export now shows a preview first — row count, format, and up to 15 sample rows — with Save or Cancel; nothing downloads without that step. Saves locally only for now (no OneDrive yet, on hold per your call)." },
   { date:"17 Jul 2026 (15)", summary:"Fixed: the \"please wait\" hourglass now also shows when clicking \"Edit all lines\" itself (not just Save) — that's where the delay actually was, switching many rows into dropdowns at once. The overlay now appears immediately, before that switch happens, instead of never showing." },
@@ -11327,7 +11461,7 @@ function App() {
     h(TopBar,{user,sessionCompanyId,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyId(null)):null,onLogout:()=>{setUser(null);setSessionCompanyId(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
     h(MenuTabs,{user,active:tab,onChange:setTab}),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null)})),
-    tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null)}):
+    tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab}):
     tab==="reports"?h(ReportsScreen,{user,onOpenModel:(m)=>{setOpenModelTarget(m);setTab("estimator");}}):
     tab==="reports_activity"?h(ActivityByUserReport,{user}):
     tab==="reports_quotes"?h(QuoteReports,{user}):
