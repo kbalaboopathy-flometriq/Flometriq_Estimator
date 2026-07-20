@@ -1482,6 +1482,8 @@ function MasterEditor({ tableKey, user }) {
   // Paginated (200/page) and filtered the same Shape -> Spec -> Grade way as
   // the main screen, so it never has to load all 6,800+ rows at once.
   const ZR_PAGE_SIZE = 200;
+  const MR_ALL_PAGE_SIZE = 200;
+  const [mrAllRatesTotal,setMrAllRatesTotal]=useState(0);
   const [zeroRateCount,setZeroRateCount]=useState(0);
   const [zeroRateOpen,setZeroRateOpen]=useState(false);
   const [zeroRateRows,setZeroRateRows]=useState([]);
@@ -1489,37 +1491,29 @@ function MasterEditor({ tableKey, user }) {
   const [zeroRateDrafts,setZeroRateDrafts]=useState({});
   const [zrShapeFocus,setZrShapeFocus]=useState("");
   const [zrSpecFilter,setZrSpecFilter]=useState("");
-  const [zrGradeFilter,setZrGradeFilter]=useState("");
   const [zrPage,setZrPage]=useState(0);
   const [zrStepMsg,setZrStepMsg]=useState("");
   const [zrSpecOptions,setZrSpecOptions]=useState([]);
-  const [zrGradeOptions,setZrGradeOptions]=useState([]);
   useEffect(()=>{
     if(tableKey!=="material_rates") return;
     sb.from("material_rates").select("id",{count:"exact",head:true}).eq("rate",0).then(({count})=>setZeroRateCount(count||0));
   },[tableKey,rows]);
-  const openZeroRateTable = ()=>{ setZrShapeFocus("");setZrSpecFilter("");setZrGradeFilter("");setZrPage(0);setZeroRateDrafts({});setZeroRateOpen(true); };
+  const openZeroRateTable = ()=>{ setZrShapeFocus("");setZrSpecFilter("");setZrPage(0);setZeroRateDrafts({});setZeroRateOpen(true); };
   const loadZeroRateRows = useCallback(async()=>{
     let q = sb.from("material_rates").select("*",{count:"exact"}).eq("rate",0);
     if(zrShapeFocus) q = q.eq("material_shape",zrShapeFocus);
     if(zrSpecFilter) q = q.eq("material_spec",zrSpecFilter);
-    if(zrGradeFilter) q = q.eq("material_grade",zrGradeFilter);
     const { data, count } = await q.order("material_shape",{ascending:true}).order("material_spec",{ascending:true}).range(zrPage*ZR_PAGE_SIZE, zrPage*ZR_PAGE_SIZE+ZR_PAGE_SIZE-1);
     setZeroRateRows(data||[]); setZeroRateTotal(count||0);
-  },[zrShapeFocus,zrSpecFilter,zrGradeFilter,zrPage]);
+  },[zrShapeFocus,zrSpecFilter,zrPage]);
   useEffect(()=>{ if(zeroRateOpen) loadZeroRateRows(); },[zeroRateOpen,loadZeroRateRows]);
   useEffect(()=>{
     if(!zeroRateOpen || !zrShapeFocus){ setZrSpecOptions([]); return; }
     sb.from("material_rates").select("material_spec").eq("rate",0).eq("material_shape",zrShapeFocus).limit(2000)
       .then(({data})=>setZrSpecOptions(Array.from(new Set((data||[]).map(r=>r.material_spec).filter(Boolean))).sort()));
   },[zeroRateOpen,zrShapeFocus]);
-  useEffect(()=>{
-    if(!zeroRateOpen || !zrSpecFilter){ setZrGradeOptions([]); return; }
-    sb.from("material_rates").select("material_grade").eq("rate",0).eq("material_shape",zrShapeFocus).eq("material_spec",zrSpecFilter).limit(2000)
-      .then(({data})=>setZrGradeOptions(Array.from(new Set((data||[]).map(r=>r.material_grade).filter(Boolean))).sort()));
-  },[zeroRateOpen,zrShapeFocus,zrSpecFilter]);
   const zrGuardStep = (label, ready, e)=>{
-    if(!ready){ setZrStepMsg("Pick "+label+" first — filters apply in order: Shape → Spec → Grade."); e.target.blur(); }
+    if(!ready){ setZrStepMsg("Pick "+label+" first — filters apply in order: Shape → Spec."); e.target.blur(); }
     else setZrStepMsg("");
   };
   const zeroRateGrouped = useMemo(()=>{
@@ -1546,13 +1540,56 @@ function MasterEditor({ tableKey, user }) {
     setZeroRateCount(c=>Math.max(0,c-1));
     setRows(rs=>rs.map(r=>r.id===row.id?{...r,...payload}:r));
   };
-  const downloadZeroRates = async()=>{
-    const { data } = await sb.from("material_rates").select("material_shape,material_spec,material_grade,uom").eq("rate",0).order("material_spec",{ascending:true});
-    const rowsOut=[["Shape","Spec","Grade","UOM"]];
-    (data||[]).forEach(r=>rowsOut.push([r.material_shape||"",r.material_spec||"",r.material_grade||"",r.uom||""]));
-    const ws=XLSX.utils.aoa_to_sheet(rowsOut); ws["!cols"]=[{wch:16},{wch:26},{wch:16},{wch:10}];
-    const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"Zero rates");
-    XLSX.writeFile(wb,"material_rates_missing.xlsx");
+  // Export preview — Excel/PDF for Material Rates or the Rate=0 table, always
+  // shown as a preview first (Save/Cancel), and always following whatever
+  // filter is currently active (or "no filter = everything", capped at 5000
+  // rows as a safety net). Local save only — no OneDrive for now.
+  const [exportPreview,setExportPreview]=useState(null); // {rows,format,title,filenameBase}
+  const [exportPreviewLoading,setExportPreviewLoading]=useState(false);
+  const openMrExportPreview = async(format)=>{
+    setExportPreviewLoading(true);
+    try{
+      let q = sb.from("material_rates").select("*");
+      if(search.trim()){
+        const s = search.trim();
+        q = q.or("material_spec.ilike.%"+s+"%,material_grade.ilike.%"+s+"%,material_shape.ilike.%"+s+"%,uom.ilike.%"+s+"%,spec_grade.ilike.%"+s+"%");
+      } else {
+        if(mrShapeFocus) q = q.eq("material_shape",mrShapeFocus);
+        if(mrSpecFilter) q = q.eq("material_spec",mrSpecFilter);
+        if(mrGradeFilter) q = q.eq("material_grade",mrGradeFilter);
+      }
+      const { data } = await q.order("material_shape",{ascending:true}).order("material_spec",{ascending:true}).order("material_grade",{ascending:true}).limit(5000);
+      setExportPreview({ rows:data||[], format, title:"Material Rates", filenameBase:"material_rates" });
+    } finally { setExportPreviewLoading(false); }
+  };
+  const openZrExportPreview = async(format)=>{
+    setExportPreviewLoading(true);
+    try{
+      let q = sb.from("material_rates").select("*").eq("rate",0);
+      if(zrShapeFocus) q = q.eq("material_shape",zrShapeFocus);
+      if(zrSpecFilter) q = q.eq("material_spec",zrSpecFilter);
+      const { data } = await q.order("material_shape",{ascending:true}).order("material_spec",{ascending:true}).limit(5000);
+      setExportPreview({ rows:data||[], format, title:"Rates Missing a Value", filenameBase:"material_rates_missing" });
+    } finally { setExportPreviewLoading(false); }
+  };
+  const confirmExportSave = ()=>{
+    if(!exportPreview) return;
+    const { rows:r, format, title, filenameBase } = exportPreview;
+    if(format==="excel"){
+      const rowsOut=[["Shape","Spec","Grade","Rate","UOM"]];
+      r.forEach(row=>rowsOut.push([row.material_shape||"",row.material_spec||"",row.material_grade||"",Number(row.rate)||0,row.uom||""]));
+      const ws=XLSX.utils.aoa_to_sheet(rowsOut); ws["!cols"]=[{wch:16},{wch:26},{wch:16},{wch:12},{wch:10}];
+      const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,title.slice(0,31));
+      XLSX.writeFile(wb,filenameBase+".xlsx");
+    } else {
+      generatePDF({
+        title, createdBy:user?.username||"",
+        headers:["Shape","Spec","Grade","Rate","UOM"],
+        rows:r.map(row=>[row.material_shape||"",row.material_spec||"",row.material_grade||"",fmt(Number(row.rate)||0),row.uom||""]),
+        filename:filenameBase+".pdf",
+      });
+    }
+    setExportPreview(null);
   };
 
   // Rate history popup — every past value for one spec+grade combo.
@@ -1694,7 +1731,10 @@ function MasterEditor({ tableKey, user }) {
           const { data, error:err } = await sb.from("material_rates").select("*").eq("material_shape",mrShapeFocus).order("material_spec",{ascending:true}).limit(1000);
           if(err) throw err; setRows(data||[]);
         } else {
-          setRows([]);
+          const { data, count, error:err } = await sb.from("material_rates").select("*",{count:"exact"})
+            .order("material_shape",{ascending:true}).order("material_spec",{ascending:true})
+            .range(page*MR_ALL_PAGE_SIZE, page*MR_ALL_PAGE_SIZE+MR_ALL_PAGE_SIZE-1);
+          if(err) throw err; setRows(data||[]); setMrAllRatesTotal(count||0);
         }
       } else {
         const { data, error:err } = await sb.from(tableKey).select("*").order("id",{ascending:true}).range(page*pageSize,page*pageSize+pageSize-1);
@@ -1901,6 +1941,8 @@ function MasterEditor({ tableKey, user }) {
         tableKey==="bom"&&h("button",{onClick:downloadCleanupTracker,style:btnSecondary},"Download cleanup tracker"),
         tableKey==="material_rates"&&zeroRateCount>0&&h("button",{onClick:openZeroRateTable,style:{...btnDanger,fontWeight:600}},"⚠ Rate = 0 ("+zeroRateCount+")"),
         tableKey==="material_rates"&&mrFilteredRows.length>0&&h("button",{onClick:()=>setMrZoomOpen(true),style:btnSecondary},"⤢ Zoom"),
+        tableKey==="material_rates"&&h("button",{onClick:()=>openMrExportPreview("excel"),disabled:exportPreviewLoading,style:btnSecondary},"Export Excel"),
+        tableKey==="material_rates"&&h("button",{onClick:()=>openMrExportPreview("pdf"),disabled:exportPreviewLoading,style:btnSecondary},"Export PDF"),
         (tableKey!=="material_rates"||canEditMR)&&h("button",{onClick:()=>{setAdding(v=>!v);setAddDraft({});},style:btnPrimary},"+ "+addLabel)
       )
     ),
@@ -1946,6 +1988,7 @@ function MasterEditor({ tableKey, user }) {
     ),
     tableKey==="material_rates"&&h("div",{style:{marginBottom:14}},
       h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
+        h("span",{onClick:()=>{setMrShapeFocus("");setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");setPage(0);},style:{padding:"9px 14px",fontSize:12,fontWeight:600,borderRadius:6,cursor:"pointer",background:(!mrShapeFocus&&!search.trim())?colors.dark:"#fff",color:(!mrShapeFocus&&!search.trim())?"#fff":colors.muted,border:"1px solid "+((!mrShapeFocus&&!search.trim())?colors.dark:colors.border)}},"All rates"),
         h("input",{list:"mr-shape-datalist",value:mrShapeFocus,onFocus:comboRefocus(mrShapeFocus,setMrShapeFocus).onFocus,onBlur:comboRefocus(mrShapeFocus,setMrShapeFocus).onBlur,onChange:e=>{setMrShapeFocus(e.target.value);setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");setPage(0);},placeholder:"1. Shape…",style:{...inputStyle,width:160}}),
         h("datalist",{id:"mr-shape-datalist"},mrShapeOptionsAll.map(s=>h("option",{key:s,value:s}))),
         h("input",{list:"mr-spec-datalist",value:mrSpecFilter,readOnly:!mrShapeFocus,onFocus:e=>mrShapeFocus?comboRefocus(mrSpecFilter,setMrSpecFilter).onFocus(e):mrGuardStep("a Shape",false,e),onBlur:comboRefocus(mrSpecFilter,setMrSpecFilter).onBlur,onChange:e=>{setMrSpecFilter(e.target.value);setMrGradeFilter("");},placeholder:"2. Spec…",style:{...inputStyle,width:190,background:mrShapeFocus?"#fff":"#f4f2ea",color:mrShapeFocus?colors.text:colors.mutedLight}}),
@@ -1976,7 +2019,7 @@ function MasterEditor({ tableKey, user }) {
         )),
         h("tbody",null,
           (groupedByMaterialSpec||[]).length===0
-            ? h("tr",null,h("td",{colSpan:6,style:{padding:16,color:colors.mutedLight}},mrShapeFocus||search.trim()?"No matching rates.":"Focus on a shape above, or use Search (top right) to find rates across everything."))
+            ? h("tr",null,h("td",{colSpan:6,style:{padding:16,color:colors.mutedLight}},"No matching rates."))
             : groupedByMaterialSpec.flatMap(([spec,groupRows])=>[
                 h("tr",{key:"grp-"+spec,style:{background:"#f4f2ea"}},
                   h("td",{colSpan:6,style:{padding:"7px 10px",fontSize:12,fontWeight:700}},spec+"  ("+groupRows.length+")")
@@ -2017,10 +2060,10 @@ function MasterEditor({ tableKey, user }) {
         )
       )
     ),
-    !(tableKey==="bom"&&bomModelFilter) && tableKey!=="material_rates" && h("div",{style:{display:"flex",justifyContent:"center",gap:10,marginTop:14}},
+    !(tableKey==="bom"&&bomModelFilter) && !(tableKey==="material_rates"&&(mrShapeFocus||search.trim())) && h("div",{style:{display:"flex",justifyContent:"center",alignItems:"center",gap:10,marginTop:14}},
       h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSecondary},"Previous"),
-      h("span",{style:{fontSize:12,color:colors.muted,padding:"8px 0"}},"Page "+(page+1)),
-      h("button",{onClick:()=>setPage(p=>p+1),disabled:rows.length<pageSize,style:btnSecondary},"Next")
+      h("span",{style:{fontSize:12,color:colors.muted,padding:"8px 0"}},tableKey==="material_rates"?("Page "+(page+1)+" of "+Math.max(1,Math.ceil(mrAllRatesTotal/MR_ALL_PAGE_SIZE))):("Page "+(page+1))),
+      h("button",{onClick:()=>setPage(p=>p+1),disabled:tableKey==="material_rates"?((page+1)*MR_ALL_PAGE_SIZE>=mrAllRatesTotal):(rows.length<pageSize),style:btnSecondary},"Next")
     ),
     pendingDeleteIds && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
       h("div",{style:{background:"#fff",borderRadius:8,width:380,padding:"20px 22px"}},
@@ -2072,18 +2115,18 @@ function MasterEditor({ tableKey, user }) {
           h("div",{style:{fontSize:15,fontWeight:700}},"Rates missing a value ("+zeroRateTotal+")"),
           h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
             zeroRateTotal>0&&h("span",{style:{fontSize:11,color:colors.muted}},"Page "+(zrPage+1)+" of "+Math.max(1,Math.ceil(zeroRateTotal/ZR_PAGE_SIZE))+" · "+ZR_PAGE_SIZE+" per page"),
-            h("button",{onClick:downloadZeroRates,style:btnSecondary},"Download"),
+            h("button",{onClick:()=>openZrExportPreview("excel"),disabled:exportPreviewLoading,style:btnSecondary},"Export Excel"),
+            h("button",{onClick:()=>openZrExportPreview("pdf"),disabled:exportPreviewLoading,style:btnSecondary},"Export PDF"),
             h("button",{onClick:()=>setZeroRateOpen(false),style:btnSecondary},"Close")
           )
         ),
         h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:6}},
-          h("input",{list:"zr-shape-datalist",value:zrShapeFocus,onFocus:comboRefocus(zrShapeFocus,setZrShapeFocus).onFocus,onBlur:comboRefocus(zrShapeFocus,setZrShapeFocus).onBlur,onChange:e=>{setZrShapeFocus(e.target.value);setZrSpecFilter("");setZrGradeFilter("");setZrStepMsg("");setZrPage(0);},placeholder:"1. Shape…",style:{...inputStyle,width:150}}),
+          h("span",{onClick:()=>{setZrShapeFocus("");setZrSpecFilter("");setZrStepMsg("");setZrPage(0);},style:{padding:"9px 14px",fontSize:12,fontWeight:600,borderRadius:6,cursor:"pointer",background:!zrShapeFocus?colors.dark:"#fff",color:!zrShapeFocus?"#fff":colors.muted,border:"1px solid "+(!zrShapeFocus?colors.dark:colors.border)}},"All zero rates"),
+          h("input",{list:"zr-shape-datalist",value:zrShapeFocus,onFocus:comboRefocus(zrShapeFocus,setZrShapeFocus).onFocus,onBlur:comboRefocus(zrShapeFocus,setZrShapeFocus).onBlur,onChange:e=>{setZrShapeFocus(e.target.value);setZrSpecFilter("");setZrStepMsg("");setZrPage(0);},placeholder:"1. Shape…",style:{...inputStyle,width:150}}),
           h("datalist",{id:"zr-shape-datalist"},mrShapeOptionsAll.map(s=>h("option",{key:s,value:s}))),
-          h("input",{list:"zr-spec-datalist",value:zrSpecFilter,readOnly:!zrShapeFocus,onFocus:e=>zrShapeFocus?comboRefocus(zrSpecFilter,setZrSpecFilter).onFocus(e):zrGuardStep("a Shape",false,e),onBlur:comboRefocus(zrSpecFilter,setZrSpecFilter).onBlur,onChange:e=>{setZrSpecFilter(e.target.value);setZrGradeFilter("");setZrPage(0);},placeholder:"2. Spec…",style:{...inputStyle,width:170,background:zrShapeFocus?"#fff":"#f4f2ea",color:zrShapeFocus?colors.text:colors.mutedLight}}),
+          h("input",{list:"zr-spec-datalist",value:zrSpecFilter,readOnly:!zrShapeFocus,onFocus:e=>zrShapeFocus?comboRefocus(zrSpecFilter,setZrSpecFilter).onFocus(e):zrGuardStep("a Shape",false,e),onBlur:comboRefocus(zrSpecFilter,setZrSpecFilter).onBlur,onChange:e=>{setZrSpecFilter(e.target.value);setZrPage(0);},placeholder:"2. Spec…",style:{...inputStyle,width:170,background:zrShapeFocus?"#fff":"#f4f2ea",color:zrShapeFocus?colors.text:colors.mutedLight}}),
           h("datalist",{id:"zr-spec-datalist"},zrSpecOptions.map(s=>h("option",{key:s,value:s}))),
-          h("input",{list:"zr-grade-datalist",value:zrGradeFilter,readOnly:!zrSpecFilter,onFocus:e=>zrSpecFilter?comboRefocus(zrGradeFilter,setZrGradeFilter).onFocus(e):zrGuardStep("a Spec",false,e),onBlur:comboRefocus(zrGradeFilter,setZrGradeFilter).onBlur,onChange:e=>{setZrGradeFilter(e.target.value);setZrPage(0);},placeholder:"3. Grade…",style:{...inputStyle,width:150,background:zrSpecFilter?"#fff":"#f4f2ea",color:zrSpecFilter?colors.text:colors.mutedLight}}),
-          h("datalist",{id:"zr-grade-datalist"},zrGradeOptions.map(g=>h("option",{key:g,value:g}))),
-          (zrShapeFocus||zrSpecFilter||zrGradeFilter)&&h("button",{onClick:()=>{setZrShapeFocus("");setZrSpecFilter("");setZrGradeFilter("");setZrStepMsg("");setZrPage(0);},style:btnSecondary},"Clear filters")
+          (zrShapeFocus||zrSpecFilter)&&h("button",{onClick:()=>{setZrShapeFocus("");setZrSpecFilter("");setZrStepMsg("");setZrPage(0);},style:btnSecondary},"Clear filters")
         ),
         zrStepMsg&&h("div",{style:{fontSize:12,color:colors.danger,marginBottom:6}},zrStepMsg),
         zeroRateRows.length===0
@@ -2118,6 +2161,39 @@ function MasterEditor({ tableKey, user }) {
                 h("button",{onClick:()=>setZrPage(p=>p+1),disabled:(zrPage+1)*ZR_PAGE_SIZE>=zeroRateTotal,style:btnSecondary},"Next")
               )
             )
+      )
+    ),
+    exportPreviewLoading && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:300}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"28px 36px",textAlign:"center"}},
+        h("div",{style:{fontSize:32,marginBottom:8}},"⏳"),
+        h("div",{style:{fontSize:14,fontWeight:700}},"Preparing preview…")
+      )
+    ),
+    exportPreview && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:560,maxHeight:"80vh",overflowY:"auto",padding:"20px 22px"}},
+        h("div",{style:{fontSize:15,fontWeight:700,marginBottom:2}},"Preview — "+exportPreview.rows.length+" row"+(exportPreview.rows.length===1?"":"s")+" ("+exportPreview.title+")"),
+        h("div",{style:{fontSize:11,color:colors.muted,marginBottom:10}},"Format: "+(exportPreview.format==="excel"?"Excel (.xlsx)":"PDF")),
+        exportPreview.rows.length===0
+          ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"14px 0"}},"Nothing matches the current filter — nothing to export.")
+          : h("table",{style:{width:"100%",fontSize:12,marginBottom:10}},
+              h("thead",null,h("tr",{style:{textAlign:"left",borderBottom:"2px solid "+colors.dark}},
+                ["Shape","Spec","Grade","Rate","UOM"].map(c=>h("th",{key:c,style:{padding:"5px 7px"}},c))
+              )),
+              h("tbody",null,
+                exportPreview.rows.slice(0,15).map((r,i)=>h("tr",{key:i,style:{borderBottom:"1px solid #eceae0"}},
+                  h("td",{style:{padding:"5px 7px"}},r.material_shape),
+                  h("td",{style:{padding:"5px 7px"}},r.material_spec),
+                  h("td",{style:{padding:"5px 7px"}},r.material_grade),
+                  h("td",{style:{padding:"5px 7px",textAlign:"right"}},fmt(Number(r.rate)||0)),
+                  h("td",{style:{padding:"5px 7px"}},r.uom)
+                )),
+                exportPreview.rows.length>15 && h("tr",null,h("td",{colSpan:5,style:{padding:"6px 7px",color:colors.mutedLight,fontStyle:"italic"}},"… "+(exportPreview.rows.length-15)+" more row"+(exportPreview.rows.length-15===1?"":"s")+" …"))
+              )
+            ),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:confirmExportSave,disabled:exportPreview.rows.length===0,style:{...btnPrimary,flex:1}},"💻 Save"),
+          h("button",{onClick:()=>setExportPreview(null),style:{...btnSecondary,flex:1}},"Cancel")
+        )
       )
     ),
     historyFor && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
@@ -8203,6 +8279,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (17)", summary:"Material Rates: blank filters now show \"All rates\", paginated 200 at a time (Previous/Next), instead of showing nothing until a Shape was picked — with an explicit \"All rates\" pill to jump back to it. Rate=0 table: dropped the Grade filter entirely (Shape → Spec only) since narrowing to one grade defeated the point of finding gaps; added the same explicit \"All zero rates\" pill." },
+  { date:"17 Jul 2026 (16)", summary:"Material Rates and the Rate=0 table both gained Export Excel / Export PDF, each following whatever filter (Shape/Spec/Grade, or search) is currently active. Every export now shows a preview first — row count, format, and up to 15 sample rows — with Save or Cancel; nothing downloads without that step. Saves locally only for now (no OneDrive yet, on hold per your call)." },
   { date:"17 Jul 2026 (15)", summary:"Fixed: the \"please wait\" hourglass now also shows when clicking \"Edit all lines\" itself (not just Save) — that's where the delay actually was, switching many rows into dropdowns at once. The overlay now appears immediately, before that switch happens, instead of never showing." },
   { date:"17 Jul 2026 (14)", summary:"Fixed a combo-box bug: after picking a value (Shape/Spec/Grade, on Material Rates' filters and the Edit forms), clicking back into that field only showed the one already-picked option instead of the full list — clicking in now clears it so every option shows again, and clicking away without picking restores what was there. The \"Rate = 0\" table now has the same Shape → Spec → Grade filters as the main screen, is paginated 200 rows at a time (grouped by Shape → Spec within each page), and defaults to showing everything when no filter is set — never loading all 6,800+ rows into the page at once." },
   { date:"17 Jul 2026 (13)", summary:"Material Rates: a \"please wait, saving N lines…\" overlay now shows during Save all changes. Admins can now only edit Rate — Spec/Grade/Shape/UOM are locked to Super Admin, with a message (no code prompt) if an Admin tries. \"+ New rate\" is now Admin/Super Admin only. Grade is now a type-to-search combo instead of free text. Columns reordered to Shape → Spec → Grade → Rate → UOM (matching the filter sequence), with Grade widened and Spec narrowed. New \"⤢ Zoom\" button opens the table full-screen for going through many lines comfortably." },
