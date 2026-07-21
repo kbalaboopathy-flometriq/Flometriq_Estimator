@@ -4787,7 +4787,7 @@ function QuoteNotesPanel({ referenceNumber, user }){
   return h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:2}},
       h("div",{style:{fontSize:12.5,fontWeight:700}},"Notes"),
-      h("button",{onClick:addNote,style:btnSmall},"+ Add note")
+      h("button",{onClick:addNote,style:{...btnSmall,background:"#0f6e56",color:"#fff",border:"none",fontWeight:600}},"+ Add note")
     ),
     h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:10}},"Multiple notes for this quote — no dates, just Sl No order. Appears as its own page in the generated PDF, right after Commercial Terms."),
     loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
@@ -4897,17 +4897,31 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
   },[]);
   const openHeaderEdit = ()=>{
     if(!quoteHeaderRow) return;
-    setHeaderDraft({
-      enquiry_number: quoteHeaderRow.enquiry_number||"", enquiry_date: quoteHeaderRow.enquiry_date||"",
-      quote_date: quoteHeaderRow.quote_date||"", currency: quoteHeaderRow.currency||"INR",
-      conversion_rate: String(quoteHeaderRow.conversion_rate||1),
-      customer_name: quoteHeaderRow.customer_name||"", customer_address: quoteHeaderRow.customer_address||"",
-      contact_name: quoteHeaderRow.contact_name||"", contact_designation: quoteHeaderRow.contact_designation||"",
-      signatory_name: quoteHeaderRow.signatory_name||"", signatory_designation: quoteHeaderRow.signatory_designation||""
-    });
+    if((refFilter||"").includes("-Rev-")){
+      // Amendment ghost mode: every field starts blank. Blank = keep the
+      // existing (cloned) value; only fill in what's actually changing.
+      setHeaderDraft({ enquiry_number:"", enquiry_date:"", quote_date:"", currency:"", conversion_rate:"", customer_address:"", contact_name:"", contact_designation:"", signatory_name:"", signatory_designation:"" });
+    } else {
+      setHeaderDraft({
+        enquiry_number: quoteHeaderRow.enquiry_number||"", enquiry_date: quoteHeaderRow.enquiry_date||"",
+        quote_date: quoteHeaderRow.quote_date||"", currency: quoteHeaderRow.currency||"INR",
+        conversion_rate: String(quoteHeaderRow.conversion_rate||1),
+        customer_name: quoteHeaderRow.customer_name||"", customer_address: quoteHeaderRow.customer_address||"",
+        contact_name: quoteHeaderRow.contact_name||"", contact_designation: quoteHeaderRow.contact_designation||"",
+        signatory_name: quoteHeaderRow.signatory_name||"", signatory_designation: quoteHeaderRow.signatory_designation||""
+      });
+    }
     setHeaderEditOpen(true);
     setUnsavedGuard(true,"You have unsaved Quote Header changes. Leave anyway?");
   };
+  const isRevisionRef = (refFilter||"").includes("-Rev-");
+  const [revisionAddressOptions,setRevisionAddressOptions]=useState([]);
+  useEffect(()=>{
+    if(!isRevisionRef || !quoteHeaderRow?.customer_name){ setRevisionAddressOptions([]); return; }
+    sb.from("customer_addresses").select("address_text").eq("company_name",quoteHeaderRow.customer_name).then(({data})=>setRevisionAddressOptions((data||[]).map(a=>a.address_text)));
+  },[isRevisionRef,quoteHeaderRow?.customer_name]);
+  const logRevisionChange = (revisionRef, area, fieldName, oldVal, newVal, slNo)=>
+    sb.from("revision_changes").insert({ revision_ref:revisionRef, area, item_sl_no:slNo??null, field_name:fieldName, old_value:oldVal==null?"":String(oldVal), new_value:newVal==null?"":String(newVal), changed_by:user?.username||"unknown" });
   const [authGate,setAuthGate]=useState(null); // {requiredType, action} — shared by every gated save/delete in this screen
 
   // Quote Amendment / Revisions — each revision is a full independent clone
@@ -5043,15 +5057,40 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     if(!refFilter) return;
     setSavingHeader(true);
     try{
-      const payload = {
-        enquiry_number: headerDraft.enquiry_number.trim(), enquiry_date: headerDraft.enquiry_date||null,
-        quote_date: headerDraft.quote_date||null, currency: headerDraft.currency||"INR",
-        conversion_rate: headerDraft.currency==="INR"?1:(Number(headerDraft.conversion_rate)||1),
-        customer_name: headerDraft.customer_name.trim(), customer_address: headerDraft.customer_address.trim(),
-        contact_name: headerDraft.contact_name.trim(), contact_designation: headerDraft.contact_designation.trim(),
-        signatory_name: headerDraft.signatory_name.trim(), signatory_designation: headerDraft.signatory_designation.trim(),
-        updated_at: new Date().toISOString()
-      };
+      let payload;
+      if(isRevisionRef){
+        // Ghost mode: blank field = keep the existing (cloned) value.
+        // Filled = use the new value, and log old -> new for the History report.
+        const pick = (field)=> (headerDraft[field]||"").trim()!=="" ? headerDraft[field].trim() : quoteHeaderRow[field];
+        payload = {
+          enquiry_number: pick("enquiry_number"),
+          enquiry_date: (headerDraft.enquiry_date||"").trim()!=="" ? headerDraft.enquiry_date : quoteHeaderRow.enquiry_date,
+          quote_date: (headerDraft.quote_date||"").trim()!=="" ? headerDraft.quote_date : quoteHeaderRow.quote_date,
+          currency: (headerDraft.currency||"").trim()!=="" ? headerDraft.currency : quoteHeaderRow.currency,
+          conversion_rate: (headerDraft.conversion_rate||"").trim()!=="" ? (Number(headerDraft.conversion_rate)||quoteHeaderRow.conversion_rate) : quoteHeaderRow.conversion_rate,
+          customer_name: quoteHeaderRow.customer_name, // locked — never changeable on an amendment
+          customer_address: pick("customer_address"),
+          contact_name: pick("contact_name"), contact_designation: pick("contact_designation"),
+          signatory_name: pick("signatory_name"), signatory_designation: pick("signatory_designation"),
+          updated_at: new Date().toISOString()
+        };
+        const fieldLabels = {enquiry_number:"Enquiry number",enquiry_date:"Enquiry date",quote_date:"Quote date",currency:"Currency",conversion_rate:"Conversion rate",customer_address:"Address",contact_name:"Contact name",contact_designation:"Contact designation",signatory_name:"Signatory",signatory_designation:"Signatory designation"};
+        const logs = [];
+        Object.keys(fieldLabels).forEach(f=>{
+          if(String(payload[f])!==String(quoteHeaderRow[f]||"")) logs.push(logRevisionChange(refFilter,"header",fieldLabels[f],quoteHeaderRow[f],payload[f]));
+        });
+        if(logs.length) await Promise.all(logs);
+      } else {
+        payload = {
+          enquiry_number: headerDraft.enquiry_number.trim(), enquiry_date: headerDraft.enquiry_date||null,
+          quote_date: headerDraft.quote_date||null, currency: headerDraft.currency||"INR",
+          conversion_rate: headerDraft.currency==="INR"?1:(Number(headerDraft.conversion_rate)||1),
+          customer_name: headerDraft.customer_name.trim(), customer_address: headerDraft.customer_address.trim(),
+          contact_name: headerDraft.contact_name.trim(), contact_designation: headerDraft.contact_designation.trim(),
+          signatory_name: headerDraft.signatory_name.trim(), signatory_designation: headerDraft.signatory_designation.trim(),
+          updated_at: new Date().toISOString()
+        };
+      }
       const { error } = await sb.from("estimates").update(payload).eq("reference_number",refFilter);
       if(error) throw error;
       await logAudit("UPDATE","estimates",refFilter,"Quote header fields updated for "+refFilter+" (applied to all Sl Nos)",user?.username||"unknown",null,payload);
@@ -5071,6 +5110,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
   const setQuoteCuttingPlanIncludeCost=(v)=>{ setQuoteCuttingPlanIncludeCostState(v); setCuttingPlanIncludeCostPref(v); };
   const [showCommercialTerms,setShowCommercialTerms]=useState(false);
   const [ctData,setCtData]=useState(null);
+  const [ctOriginalData,setCtOriginalData]=useState(null); // snapshot at load time, for revision diff-logging
   const [ctLoading,setCtLoading]=useState(false);
   const [ctSaving,setCtSaving]=useState(false);
   const [showCtMissingModal,setShowCtMissingModal]=useState(false);
@@ -5088,7 +5128,9 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     setCtLoading(true); setShowCommercialTerms(true); setCtAllowMismatch(false); setCtMismatchBlocked(false);
     try {
       const{data}=await sb.from("quote_commercial_terms").select("*").eq("reference_number",quoteExportRef).maybeSingle();
-      setCtData(data||{reference_number:quoteExportRef,validity:"",payment_term:"",delivery_term:"",packing_forwarding:"",insurance:"",price_basis:"",guarantee:"",dispatch_through:"",incoterms:"",freight:"",tax:"",warranty_coverage:"",jurisdiction:CT_DEFAULTS.jurisdiction,force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges});
+      const loaded = data||{reference_number:quoteExportRef,validity:"",payment_term:"",delivery_term:"",packing_forwarding:"",insurance:"",price_basis:"",guarantee:"",dispatch_through:"",incoterms:"",freight:"",tax:"",warranty_coverage:"",jurisdiction:CT_DEFAULTS.jurisdiction,force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges};
+      setCtData(loaded);
+      setCtOriginalData(loaded);
     } catch(e){ console.error("Load commercial terms failed",e); setCtData({reference_number:quoteExportRef,jurisdiction:CT_DEFAULTS.jurisdiction,force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges}); }
     finally { setCtLoading(false); }
   };
@@ -5109,6 +5151,14 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       delete payload.id;
       const{error}=await sb.from("quote_commercial_terms").upsert(payload,{onConflict:"reference_number"});
       if(error) throw error;
+      if((quoteExportRef||"").includes("-Rev-") && ctOriginalData){
+        const CT_FIELD_LABELS = {validity:"Validity",payment_term:"Payment Terms",delivery_term:"Delivery Terms",packing_forwarding:"Packing & Forwarding",insurance:"Insurance",price_basis:"Price Basis",guarantee:"Guarantee",dispatch_through:"Dispatch Through",incoterms:"Incoterms",freight:"Freight",tax:"Tax",warranty_coverage:"Warranty Coverage",jurisdiction:"Jurisdiction",force_majeure:"Force Majeure",order_cancellation_charges:"Order Cancellation Charges"};
+        const logs=[];
+        Object.keys(CT_FIELD_LABELS).forEach(f=>{
+          if(String(ctData[f]||"")!==String(ctOriginalData[f]||"")) logs.push(logRevisionChange(quoteExportRef,"commercial_terms",CT_FIELD_LABELS[f],ctOriginalData[f],ctData[f]));
+        });
+        if(logs.length) await Promise.all(logs);
+      }
       setShowCommercialTerms(false);
       if(openRef && openRef.reference_number===quoteExportRef) refreshReadiness(quoteExportRef);
     } catch(e){ console.error("Save commercial terms failed",e); alert("Save failed: "+e.message); }
@@ -5181,6 +5231,14 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     setLineEdits(e=>({...e,[key]:{...e[key],grade:newGrade,rate:autoRate}}));
   };
 
+  const [bomChangedRows,setBomChangedRows]=useState(new Set()); // "itemSlNo|lineSlNo" keys changed in this revision
+  const loadBomChanges = useCallback(async(ref)=>{
+    if(!ref || !ref.includes("-Rev-")){ setBomChangedRows(new Set()); return; }
+    const { data } = await sb.from("revision_changes").select("item_sl_no,field_name").eq("revision_ref",ref).eq("area","bom");
+    setBomChangedRows(new Set((data||[]).map(r=>r.item_sl_no+"|"+r.field_name.split("|")[0])));
+  },[]);
+  useEffect(()=>{ if(refFilter) loadBomChanges(refFilter); },[refFilter,loadBomChanges]);
+
   const saveLineEdit=async(line)=>{
     const key=line.reference_number+"-"+line.sl_no;
     const edits=lineEdits[key];
@@ -5195,6 +5253,14 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       const sales_price=Number((cost*sf).toFixed(4));
       const payload={...edits,cost,sales_price};
       await sb.from("estimate_lines").update(payload).eq("reference_number",line.reference_number).eq("item_sl_no",line.item_sl_no).eq("sl_no",line.sl_no);
+      if(line.reference_number.includes("-Rev-")){
+        const logs=[];
+        Object.keys(edits).forEach(f=>{
+          if(f==="cost"||f==="sales_price") return; // derived, not a real user-facing change
+          if(String(edits[f]??"")!==String(line[f]??"")) logs.push(logRevisionChange(line.reference_number,"bom",line.sl_no+"|"+f,line[f],edits[f],line.item_sl_no));
+        });
+        if(logs.length){ await Promise.all(logs); setBomChangedRows(s=>new Set([...s, line.item_sl_no+"|"+line.sl_no])); }
+      }
       setOpenLines(ls=>ls.map(l=>l.reference_number===line.reference_number&&l.sl_no===line.sl_no?{...l,...payload}:l));
       setLineEdits(e=>{ const n={...e}; delete n[key]; return n; });
     } catch(err){ console.error("Save failed",err); }
@@ -6043,6 +6109,9 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       const cancelCharges = terms.order_cancellation_charges || CT_DEFAULTS.order_cancellation_charges;
       const {data:notesRows} = await sb.from("quote_notes").select("*").eq("reference_number",quoteExportRef).order("sl_no",{ascending:true});
       const quoteNotes = (notesRows||[]).filter(n=>n.note_text&&n.note_text.trim());
+      const isRevisionPdf = quoteExportRef.includes("-Rev-");
+      const {data:revChangesRows} = isRevisionPdf ? await sb.from("revision_changes").select("*").eq("revision_ref",quoteExportRef).order("changed_at",{ascending:true}) : {data:[]};
+      const revChangesForPdf = revChangesRows||[];
       const first = estimatesRows[0];
       if(!first.company_id){
         alert("Can't generate PDF — this quote has no Company resolved.\n\nIt was created by \""+(first.created_by||"unknown")+"\", whose account has no Company assigned. Ask your Super Admin to assign one in Admin \u2192 User Management (or, if the creator is a Super Admin, they need to pick a company at login) before this PDF can be generated.");
@@ -6100,7 +6169,14 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       if(attnName){ doc.setFont(undefined,"bold"); doc.text("Kind Attention:",12,y); doc.setFont(undefined,"normal"); doc.text(attnName+(attnDesignation?", "+attnDesignation:""),50,y); y+=6; }
       y+=2;
       doc.setFont(undefined,"bold"); doc.text("Quote No:",12,y); doc.setFont(undefined,"normal"); doc.text(quoteExportRef,50,y);
-      doc.setFont(undefined,"bold"); doc.text("Quote Date:",120,y); doc.setFont(undefined,"normal"); doc.text(today,150,y); y+=34;
+      doc.setFont(undefined,"bold"); doc.text("Quote Date:",120,y); doc.setFont(undefined,"normal"); doc.text(today,150,y); y+=6;
+      const revMatch = quoteExportRef.match(/-Rev-(\d+)$/);
+      if(revMatch){
+        doc.setFont(undefined,"bold"); doc.setTextColor(180,60,20);
+        doc.text("Revision "+revMatch[1],12,y);
+        doc.setTextColor(...dark); y+=6;
+      }
+      y+=(revMatch?22:28);
       doc.setFont(undefined,"normal"); doc.text("Dear Sir,",12,y); y+=8;
       const enquiryNo = first.enquiry_number || "";
       const enquiryDt = first.enquiry_date ? new Date(first.enquiry_date).toLocaleDateString("en-GB") : "";
@@ -6205,6 +6281,27 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
         notesEndPage = doc.internal.getNumberOfPages();
       }
 
+      // ---- Revision History (new) — its own page, only for a revision with logged changes ----
+      let revHistStartPage = null, revHistEndPage = null;
+      if(isRevisionPdf && revChangesForPdf.length){
+        const AREA_LABELS_PDF = {header:"Header",commercial_terms:"Commercial Terms",notes:"Notes",datasheet:"Datasheet",bom:"BOM"};
+        doc.addPage();
+        letterhead("ANNEXURE - IC  REVISION HISTORY");
+        revHistStartPage = doc.internal.getNumberOfPages();
+        doc.autoTable({
+          startY:34,
+          head:[["Area","Field","Old value","New value","By"]],
+          body:revChangesForPdf.map(r=>[AREA_LABELS_PDF[r.area]||r.area,(r.item_sl_no?("Sl "+r.item_sl_no+" — "):"")+(r.field_name||"").split("|").pop(),r.old_value||"—",r.new_value||"—",r.changed_by||"—"]),
+          theme:"plain",
+          styles:{font:"times",fontSize:8,textColor:dark,cellPadding:{top:2.5,bottom:2.5,left:2,right:4}},
+          headStyles:{font:"times",fontStyle:"bold"},
+          columnStyles:{0:{cellWidth:26},1:{cellWidth:40},2:{cellWidth:38},3:{cellWidth:38},4:{cellWidth:"auto"}},
+          margin:{top:32,left:12,right:12,bottom:16},
+          didDrawPage:()=>letterhead("ANNEXURE - IC  REVISION HISTORY")
+        });
+        revHistEndPage = doc.internal.getNumberOfPages();
+      }
+
       // ---- Price Summary — one row per Sl No ----
       doc.addPage();
       const summaryStartPage = doc.internal.getNumberOfPages();
@@ -6281,6 +6378,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
           ["2","","Index","2"],
           ["3","Annexure-I","Commercial Terms", termsStartPage===termsEndPage?String(termsStartPage):termsStartPage+"-"+termsEndPage],
           ...(quoteNotes.length ? [["","Annexure-IB","Notes", notesStartPage===notesEndPage?String(notesStartPage):notesStartPage+"-"+notesEndPage]] : []),
+          ...(revHistStartPage ? [["","Annexure-IC","Revision History", revHistStartPage===revHistEndPage?String(revHistStartPage):revHistStartPage+"-"+revHistEndPage]] : []),
           ["4","Annexure-II","Price Summary", summaryStartPage===summaryEndPage?String(summaryStartPage):summaryStartPage+"-"+summaryEndPage],
           ["5","Annexure-III","Technical Data Sheet", dsStartPage===dsEndPage?String(dsStartPage):dsStartPage+"-"+dsEndPage],
         ],
@@ -6584,6 +6682,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
             slNoOptions.map(sn=>h("option",{key:sn,value:sn},sn))
           ),
           h("input",{value:descSearch,onChange:e=>setDescSearch(e.target.value),placeholder:"Search description…",style:{...inputStyle,width:200}}),
+          refFilter && h("button",{onClick:openCommercialTerms,style:{...btnSmall,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Commercial Terms"),
           refFilter && h("div",{style:{display:"flex",gap:4,alignItems:"center"}},
             h("input",{type:"number",step:"0.1",value:globalSfInput,onChange:e=>setGlobalSfInput(e.target.value),placeholder:"New Sf",style:{...inputStyle,width:80}}),
             h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf to all lines")
@@ -6596,7 +6695,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
           h("div",{style:{fontSize:12.5,fontWeight:700}},"Quote Header — "+refFilter),
           h("div",{style:{display:"flex",gap:8}},
-            isAdmin && quoteHeaderRow.quote_status!=="Draft" && h("button",{onClick:()=>setShowAmendGate(true),style:{...btnSmall,background:"#0c447c",color:"#fff",border:"none"}},"Amend quote"),
+            quoteHeaderRow.quote_status!=="Draft" && h("button",{onClick:()=>{ if(isAdmin) setShowAmendPicker(true); else setShowAmendGate(true); },style:{...btnSmall,background:"#0c447c",color:"#fff",border:"none"}},"Amend quote"),
             !headerEditOpen && h("button",{onClick:openHeaderEdit,style:btnSmall},"Edit")
           )
         ),
@@ -6638,7 +6737,42 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
             },style:{...btnSmall,fontSize:11,padding:"4px 9px"}},"Resolve for this quote")
           )
         ),
-        headerEditOpen && h("div",null,
+        headerEditOpen && isRevisionRef && h("div",null,
+              h("div",{style:{background:"#eaf2fb",border:"1px solid #85b7eb",borderRadius:6,padding:"8px 12px",marginBottom:10,fontSize:11.5,color:"#0c447c"}},
+                "Amending "+refFilter+" — leave a field blank to keep its current value. Only fill in what's actually changing."
+              ),
+              [
+                ["enquiry_number","Enquiry number","text"],["enquiry_date","Enquiry date","date"],["quote_date","Quote date","date"],
+                ["contact_name","Attention — Contact","text"],["contact_designation","Attention — Designation","text"],
+                ["signatory_name","Signatory","text"],["signatory_designation","Signatory Designation","text"]
+              ].map(([field,label,type])=>
+                h("div",{key:field,style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,fontSize:12}},
+                  h("div",{style:{width:150,color:colors.muted,fontSize:10.5}},label),
+                  h("div",{style:{width:170,color:colors.mutedLight}},quoteHeaderRow[field]||"— not set"),
+                  h("input",{type:type||"text",value:headerDraft[field]||"",onChange:e=>setHeaderDraft(d=>({...d,[field]:e.target.value})),placeholder:"new value…",style:{...inputStyle,width:170,padding:"5px 7px",fontSize:12}})
+                )
+              ),
+              h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,fontSize:12}},
+                h("div",{style:{width:150,color:colors.muted,fontSize:10.5}},"Customer"),
+                h("div",{style:{width:170,fontWeight:600}},quoteHeaderRow.customer_name),
+                h("div",{style:{fontSize:10.5,color:colors.danger}},"Locked — create a new offer instead of changing the customer.")
+              ),
+              h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,fontSize:12}},
+                h("div",{style:{width:150,color:colors.muted,fontSize:10.5}},"Address"),
+                h("div",{style:{width:170,color:colors.mutedLight,whiteSpace:"pre-line",fontSize:11}},quoteHeaderRow.customer_address||"— not set"),
+                revisionAddressOptions.length
+                  ? h("select",{value:headerDraft.customer_address||"",onChange:e=>setHeaderDraft(d=>({...d,customer_address:e.target.value})),style:{...inputStyle,width:200,padding:"5px 7px",fontSize:12}},
+                      h("option",{value:""},"— keep current —"),
+                      revisionAddressOptions.map(a=>h("option",{key:a,value:a},a.slice(0,60)))
+                    )
+                  : h("div",{style:{fontSize:10.5,color:colors.mutedLight,width:200}},"No saved addresses for this customer yet — add one in Master Data → Customers first.")
+              ),
+              h("div",{style:{display:"flex",gap:8,marginTop:8}},
+                h("button",{onClick:saveQuoteHeader,disabled:savingHeader,style:{...btnPrimary,fontSize:12}},savingHeader?"Saving…":"Save amendment"),
+                h("button",{onClick:()=>{ setHeaderEditOpen(false); setUnsavedGuard(false); },style:{...btnSecondary,fontSize:12}},"Cancel")
+              )
+            ),
+        headerEditOpen && !isRevisionRef && h("div",null,
               h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}},
                 h("div",{style:{width:150}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Enquiry number"),h("input",{value:headerDraft.enquiry_number,onChange:e=>setHeaderDraft(d=>({...d,enquiry_number:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
                 h("div",{style:{width:130}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Enquiry date"),h("input",{type:"date",value:headerDraft.enquiry_date,onChange:e=>setHeaderDraft(d=>({...d,enquiry_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
@@ -6847,7 +6981,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
                     quoteStatuses.map(s=>h("option",{key:s,value:s},s))
                   )
                 ),
-                h("button",{onClick:()=>setShowDatasheet(true),style:btnSecondary},"Datasheet"),
+                h("button",{onClick:()=>setShowDatasheet(true),style:{...btnSecondary,background:"#b8590a",color:"#fff",border:"none",fontWeight:600}},"Datasheet"),
                 h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line"),
                 isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No")
               )
@@ -6937,8 +7071,9 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
                   const sales=cost*sf;
                   const isZero=!cost||cost===0;
                   const showMoc=lineEdits[key]?.show_in_moc!==undefined?lineEdits[key].show_in_moc:(l.show_in_moc===true);
-                  const rowBg=isZero?"#fdecea":"transparent";
-                  const stickyBg=isZero?"#fdecea":"#fff";
+                  const isChangedInRevision = bomChangedRows.has(l.item_sl_no+"|"+l.sl_no);
+                  const rowBg=isZero?"#fdecea":(isChangedInRevision?"#fff8e1":"transparent");
+                  const stickyBg=isZero?"#fdecea":(isChangedInRevision?"#fff8e1":"#fff");
                   const bdr=(changed)=>"0.5px solid "+(changed?"#1c8c75":colors.border);
                   const inBase={padding:"5px 7px",fontSize:12,borderRadius:5,fontFamily:"inherit",width:"100%",boxSizing:"border-box"};
                   const inStyle=(changed)=>({...inBase,border:bdr(changed),background:changed?"#f0faf6":"#fff",color:colors.text});
@@ -8767,6 +8902,9 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (35)", summary:"Major amendment-system slice: Header now uses real ghost-field editing on a revision (existing value shown, blank field beside it — blank keeps it, filled overrides and logs old→new) — Customer is locked entirely (message tells you to create a new offer instead), Address is only pickable from that customer's saved Addresses list. Commercial Terms keeps its normal edit form but now diff-logs whatever actually changed against the pre-amendment values. BOM line edits on a revision now log every changed field and highlight that whole line (amber) the moment it's saved — persists after reload, not just live. New \"What changed in this revision\" report in the History panel, plus a matching Revision History page in the generated PDF (right after Notes) and a \"Revision N\" marker on the cover page." },
+  { date:"17 Jul 2026 (34)", summary:"Commercial Terms now has its own prominent, colored button in the main toolbar (purple, before New Sf) instead of being buried as a small \"Edit terms\" link inside the Export panel. Datasheet (orange) and + Add note (green) are now colored/bold too, so all three stand out at a glance instead of blending into the row of plain buttons." },
+  { date:"17 Jul 2026 (33)", summary:"Fixed: \"Amend quote\" was requiring a code even for Admin/Super Admin — now matches the app's existing non-Draft rule everywhere else: Admin/Super Admin can start an amendment directly, only a regular user needs a one-time code (still sourced from an Admin/Super Admin). The button is now visible to any user on a non-Draft quote, not just Admins." },
   { date:"17 Jul 2026 (32)", summary:"First slice of Quote Amendment / Revisions: an \"Amend quote\" button (Admin/Super Admin, needs an authorization code, only on non-Draft quotes) prompts what you're amending (Header/Commercial Terms/Notes/Datasheet/BOM), then clones the entire latest revision — Header, Commercial Terms, BOM, Notes, Datasheets, all of it — into a new independent record named \"{quote#}-Rev-{n}\", with status reset to Draft until changed. A Revisions strip on the Quote Header lets you jump between Rev 0/1/2..., and the quote search box now always shows one entry per family (\"quote# — client\") regardless of how many revisions exist, opening the latest one. Still to come: the ghost-field editing pattern for Header/Terms/Notes/Datasheet, live BOM-change coloring persisted into the revision, the Customer-locked/Address-from-list-only rule, the PDF Revision marker + History page, and the in-app History report — for now the new revision is just editable like any other Draft quote." },
   { date:"17 Jul 2026 (31)", summary:"Customers can now have multiple Addresses, each with its own GST Number — new sub-form on the Customer record (Master Data → Customers), same pattern as Contacts: inline \"+ Add address\", Edit/Remove per row, one flaggable as Primary. Foundational piece for the upcoming quote amendment/revision system, where Address will only be pickable from a customer's saved list, not typed freehand." },
   { date:"17 Jul 2026 (30)", summary:"Fixed a real bug: Material Rates' Shape/Spec/Grade filter row (and the Rate=0 table's) had been missed in the app-wide combo conversion — still the old per-keystroke text input with no exact-match enforcement, and picking Spec or Grade never reset the page number. Together these could show stale/wrong results (a partially-typed Spec effectively filtering nothing) or trigger a \"Requested range not satisfiable\" error that left old data on screen looking like the filter had done nothing. Both filter rows now use the same LimitToListCombo as everywhere else, every filter change resets to page 1, the search box does too, and a load failure now clears the table instead of leaving misleading stale rows." },
@@ -10544,20 +10682,47 @@ function LoginHistoryViewer() {
 function QuoteHistoryPanel({ referenceNumber, onClose }){
   const [rows,setRows] = useState([]);
   const [loading,setLoading] = useState(true);
+  const [revChanges,setRevChanges] = useState([]);
   useEffect(()=>{
     (async()=>{
       setLoading(true);
       const { data } = await sb.from("audit_log").select("*").eq("record_id",referenceNumber).order("performed_at",{ascending:false});
       setRows(data||[]);
+      const { data:rc } = await sb.from("revision_changes").select("*").eq("revision_ref",referenceNumber).order("changed_at",{ascending:true});
+      setRevChanges(rc||[]);
       setLoading(false);
     })();
   },[referenceNumber]);
+  const AREA_LABELS = {header:"Header",commercial_terms:"Commercial Terms",notes:"Notes",datasheet:"Datasheet",bom:"BOM"};
   return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.35)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:640,maxWidth:"100%",maxHeight:"80vh",overflowY:"auto"}},
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
         h("div",{style:{fontWeight:700,fontSize:15}},"History — "+referenceNumber),
         h("button",{onClick:onClose,style:btnSecondary},"Close")
       ),
+      referenceNumber.includes("-Rev-") && h("div",{style:{marginTop:14,marginBottom:16}},
+        h("div",{style:{fontWeight:700,fontSize:13,marginBottom:2}},"What changed in this revision"),
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8}},"Every field this revision changed from what it was cloned from."),
+        loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+        revChanges.length===0?h("div",{style:{fontSize:12,color:colors.mutedLight}},"No changes logged yet — this revision is still identical to what it was cloned from."):
+        h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",marginBottom:6}},
+          h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+            h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Area"),
+            h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Field"),
+            h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Old value"),
+            h("th",{style:{padding:"6px 8px",fontSize:10.5}},"New value"),
+            h("th",{style:{padding:"6px 8px",fontSize:10.5}},"By")
+          )),
+          h("tbody",null,revChanges.map((r,i)=>h("tr",{key:i,style:{borderTop:"1px solid #eceae0"}},
+            h("td",{style:{padding:"6px 8px"}},h("span",{style:{fontSize:10,fontWeight:600,padding:"1px 7px",borderRadius:6,background:"#eef2fb",color:"#2b4a9e"}},AREA_LABELS[r.area]||r.area)),
+            h("td",{style:{padding:"6px 8px",fontWeight:600}},(r.item_sl_no?("Sl "+r.item_sl_no+" — "):"")+(r.field_name||"").split("|").pop()),
+            h("td",{style:{padding:"6px 8px",color:colors.mutedLight}},r.old_value||"—"),
+            h("td",{style:{padding:"6px 8px",fontWeight:600}},r.new_value||"—"),
+            h("td",{style:{padding:"6px 8px",color:colors.muted}},r.changed_by||"—")
+          )))
+        )
+      ),
+      h("div",{style:{fontWeight:700,fontSize:13,marginBottom:2}},"Full audit trail"),
       h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:14}},"Every create, edit, and PDF/export action logged against this quote, most recent first."),
       loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
       rows.length===0?h("div",{style:{fontSize:12,color:colors.mutedLight}},"No history recorded yet for this quote."):
