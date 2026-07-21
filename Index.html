@@ -3819,6 +3819,10 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   // Per-section "add line" draft inputs, keyed by section number: {label, value}
   const [addDraft,setAddDraft] = useState({});
 
+  const isRevisionDs = openRef.reference_number.includes("-Rev-");
+  const originalValuesRef = useRef({});
+  const [changedFieldKeys,setChangedFieldKeys] = useState(new Set());
+
   useEffect(()=>{
     let cancelled=false;
     (async()=>{
@@ -3829,8 +3833,14 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       if(t){
         const { data } = await sb.from("datasheets").select("*").eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no).eq("template_key",normalizeItemName(itemName)).maybeSingle();
         if(!cancelled){
-          setValues((data&&data.field_values)||{});
+          const loadedValues = (data&&data.field_values)||{};
+          setValues(loadedValues);
           setOverrides((data&&data.overrides)||{});
+          originalValuesRef.current = loadedValues;
+        }
+        if(isRevisionDs && !cancelled){
+          const { data:rc } = await sb.from("revision_changes").select("field_name").eq("revision_ref",openRef.reference_number).eq("area","datasheet").eq("item_sl_no",openRef.item_sl_no);
+          setChangedFieldKeys(new Set((rc||[]).map(r=>r.field_name)));
         }
       }
       if(!cancelled) setLoading(false);
@@ -3946,6 +3956,21 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       if(error) throw error;
       await sb.from("estimates").update({datasheet_skipped:false}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
       await logAudit("SAVE","datasheets",openRef.reference_number+"-"+openRef.item_sl_no,"Datasheet ("+itemName+") for "+openRef.reference_number+" Sl No "+openRef.item_sl_no,user.username,null,payload);
+      if(isRevisionDs){
+        const fieldLabelByKey = {}; (template.sections||[]).forEach(s=>s.fields.forEach(f=>{ fieldLabelByKey[f.key]=f.label; }));
+        const allKeys = new Set([...Object.keys(values),...Object.keys(originalValuesRef.current)]);
+        const newlyChanged = new Set(changedFieldKeys);
+        const logs=[];
+        allKeys.forEach(k=>{
+          if(k.startsWith("__custom__")) return;
+          const oldV = originalValuesRef.current[k]??""; const newV = values[k]??"";
+          if(String(oldV)!==String(newV)){
+            logs.push(sb.from("revision_changes").insert({revision_ref:openRef.reference_number,area:"datasheet",item_sl_no:openRef.item_sl_no,field_name:k,old_value:oldV,new_value:newV,changed_by:user.username}));
+            newlyChanged.add(k);
+          }
+        });
+        if(logs.length){ await Promise.all(logs); setChangedFieldKeys(newlyChanged); originalValuesRef.current = {...values}; }
+      }
       setSaved(true); setTimeout(()=>setSaved(false),2000);
     } catch(e){ console.error("Datasheet save failed",e); alert("Save failed: "+(e.message||e)); }
     finally{ setSaving(false); }
@@ -4101,8 +4126,11 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
             h("button",{onClick:()=>setFillOpen(false),style:{background:"none",border:"none",color:"#fff",cursor:"pointer"}},"✕")
           ),
           h("div",{style:{padding:"14px 16px",overflowY:"auto",flex:1}},
-            editableSections[sectionIdx].fields.map(field=>h("div",{key:field.key,style:{marginBottom:12}},
-              h("label",{style:{fontSize:11,color:colors.muted,display:"block",marginBottom:3}},field.label),
+            editableSections[sectionIdx].fields.map(field=>{
+              const fieldChanged = changedFieldKeys.has(field.key);
+              const changedStyle = fieldChanged?{background:"#fff8e1",border:"1px solid #e0b325"}:{};
+              return h("div",{key:field.key,style:{marginBottom:12}},
+              h("label",{style:{fontSize:11,color:colors.muted,display:"block",marginBottom:3}},field.label,fieldChanged&&h("span",{style:{marginLeft:6,fontSize:9,fontWeight:600,color:"#8a6d1f"}},"● changed")),
               isSlNoLabel(field.label)
                 ? h("input",{value:String(openRef.item_sl_no),disabled:true,style:{...inputStyle,background:"#f4f2ea"}})
               : field.type==="auto_model"
@@ -4112,15 +4140,15 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
                     h("select",{value:values["__custom__"+field.key]?"__custom__":(values[field.key]!==undefined?values[field.key]:(field.default||"")),onChange:e=>{
                       if(e.target.value==="__custom__") setValues(vv=>({...vv,["__custom__"+field.key]:true,[field.key]:""}));
                       else setValues(vv=>({...vv,["__custom__"+field.key]:false,[field.key]:e.target.value}));
-                    },style:inputStyle},
+                    },style:{...inputStyle,...changedStyle}},
                       h("option",{value:""},"— select —"),
                       field.options.map(o=>h("option",{key:o,value:o},o)),
                       h("option",{value:"__custom__"},"Other (type below)")
                     ),
-                    values["__custom__"+field.key] && h("input",{placeholder:"Type custom value",value:values[field.key]||"",onChange:e=>setField(field.key,e.target.value),style:{...inputStyle,marginTop:6}})
+                    values["__custom__"+field.key] && h("input",{placeholder:"Type custom value",value:values[field.key]||"",onChange:e=>setField(field.key,e.target.value),style:{...inputStyle,marginTop:6,...changedStyle}})
                   )
-                : h("input",{value:values[field.key]!==undefined?values[field.key]:(field.default||""),onChange:e=>setField(field.key,e.target.value),style:inputStyle})
-            ))
+                : h("input",{value:values[field.key]!==undefined?values[field.key]:(field.default||""),onChange:e=>setField(field.key,e.target.value),style:{...inputStyle,...changedStyle}})
+            );})
           ),
           h("div",{style:{padding:"8px 16px",borderTop:"1px solid "+colors.border,display:"flex",gap:8,justifyContent:"center"}},
             h("button",{onClick:exportExcel,style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"Export Excel"),
@@ -4749,12 +4777,20 @@ function QuoteNotesPanel({ referenceNumber, user }){
   const [notes,setNotes]=useState([]);
   const [loading,setLoading]=useState(true);
   const [saving,setSaving]=useState({});
+  const [changedNoteIds,setChangedNoteIds]=useState(new Set());
+  const originalTextRef = useRef({});
+  const isRevision = referenceNumber.includes("-Rev-");
   const load = useCallback(async()=>{
     setLoading(true);
     const { data } = await sb.from("quote_notes").select("*").eq("reference_number",referenceNumber).order("sl_no",{ascending:true});
     setNotes(data&&data.length ? data : []);
+    originalTextRef.current = {}; (data||[]).forEach(n=>{ originalTextRef.current[n.id]=n.note_text||""; });
+    if(isRevision){
+      const { data:rc } = await sb.from("revision_changes").select("field_name").eq("revision_ref",referenceNumber).eq("area","notes");
+      setChangedNoteIds(new Set((rc||[]).map(r=>r.field_name)));
+    }
     setLoading(false);
-  },[referenceNumber]);
+  },[referenceNumber,isRevision]);
   useEffect(()=>{ load(); },[load]);
   const addNote = ()=>{
     const nextSlNo = notes.length ? Math.max(...notes.map(n=>n.sl_no||0))+1 : 1;
@@ -4768,11 +4804,23 @@ function QuoteNotesPanel({ referenceNumber, user }){
         const { data, error:err } = await sb.from("quote_notes").insert({reference_number:note.reference_number, sl_no:note.sl_no, note_text:note.note_text}).select().single();
         if(err){ alert("Failed to save note: "+err.message); return; }
         await logAudit("CREATE","quote_notes",referenceNumber,"Note "+note.sl_no+" added to "+referenceNumber,user?.username||"unknown",null,{note_text:note.note_text});
+        if(isRevision){
+          const fieldKey = "Note (Sl "+note.sl_no+")";
+          await sb.from("revision_changes").insert({revision_ref:referenceNumber,area:"notes",field_name:fieldKey,old_value:"",new_value:note.note_text,changed_by:user?.username||"unknown"});
+          setChangedNoteIds(s=>new Set([...s,fieldKey]));
+        }
         setNotes(ns=>ns.map(n=>n.id===note.id?data:n));
+        originalTextRef.current[data.id]=note.note_text;
       } else {
         const { error:err } = await sb.from("quote_notes").update({note_text:note.note_text}).eq("id",note.id);
         if(err){ alert("Failed to save note: "+err.message); return; }
         await logAudit("UPDATE","quote_notes",referenceNumber,"Note "+note.sl_no+" updated on "+referenceNumber,user?.username||"unknown",null,{note_text:note.note_text});
+        if(isRevision && note.note_text!==originalTextRef.current[note.id]){
+          const fieldKey = "Note (Sl "+note.sl_no+")";
+          await sb.from("revision_changes").insert({revision_ref:referenceNumber,area:"notes",field_name:fieldKey,old_value:originalTextRef.current[note.id]||"",new_value:note.note_text,changed_by:user?.username||"unknown"});
+          setChangedNoteIds(s=>new Set([...s,fieldKey]));
+          originalTextRef.current[note.id]=note.note_text;
+        }
       }
     } finally { setSaving(s=>({...s,[note.id]:false})); }
   };
@@ -4792,12 +4840,15 @@ function QuoteNotesPanel({ referenceNumber, user }){
     h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:10}},"Multiple notes for this quote — no dates, just Sl No order. Appears as its own page in the generated PDF, right after Commercial Terms."),
     loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
     notes.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"No notes yet.") :
-    notes.map(n=>h("div",{key:n.id,style:{display:"flex",gap:8,alignItems:"flex-start",marginBottom:8}},
-      h("div",{style:{fontSize:11,color:colors.mutedLight,paddingTop:8,width:20}},n.sl_no),
-      h("textarea",{rows:2,value:n.note_text||"",onChange:e=>setNoteText(n.id,e.target.value),placeholder:"Enter note…",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12,resize:"vertical",fontFamily:"inherit"}}),
-      h("button",{onClick:()=>saveNote(n),disabled:!!saving[n.id],style:{...btnSmall,marginTop:2}},saving[n.id]?"…":"Save"),
-      h("button",{onClick:()=>deleteNote(n),style:{...btnSmall,marginTop:2,border:"1px solid "+colors.danger,color:colors.danger}},"Delete")
-    ))
+    notes.map(n=>{
+      const isChanged = changedNoteIds.has("Note (Sl "+n.sl_no+")");
+      return h("div",{key:n.id,style:{display:"flex",gap:8,alignItems:"flex-start",marginBottom:8}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,paddingTop:8,width:20}},n.sl_no),
+        h("textarea",{rows:2,value:n.note_text||"",onChange:e=>setNoteText(n.id,e.target.value),placeholder:"Enter note…",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12,resize:"vertical",fontFamily:"inherit",background:isChanged?"#fff8e1":"#fff",border:"1px solid "+(isChanged?"#e0b325":colors.border)}}),
+        h("button",{onClick:()=>saveNote(n),disabled:!!saving[n.id],style:{...btnSmall,marginTop:2}},saving[n.id]?"…":"Save"),
+        h("button",{onClick:()=>deleteNote(n),style:{...btnSmall,marginTop:2,border:"1px solid "+colors.danger,color:colors.danger}},"Delete")
+      );
+    })
   );
 }
 
@@ -5125,7 +5176,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
   };
   const openCommercialTerms=async()=>{
     if(!quoteExportRef) return;
-    setCtLoading(true); setShowCommercialTerms(true); setCtAllowMismatch(false); setCtMismatchBlocked(false);
+    setCtLoading(true); setShowCommercialTerms(true); setCtAllowMismatch(false); setCtMismatchBlocked(false); setCtGhostDraft({});
     try {
       const{data}=await sb.from("quote_commercial_terms").select("*").eq("reference_number",quoteExportRef).maybeSingle();
       const loaded = data||{reference_number:quoteExportRef,validity:"",payment_term:"",delivery_term:"",packing_forwarding:"",insurance:"",price_basis:"",guarantee:"",dispatch_through:"",incoterms:"",freight:"",tax:"",warranty_coverage:"",jurisdiction:CT_DEFAULTS.jurisdiction,force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges};
@@ -5151,17 +5202,49 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       delete payload.id;
       const{error}=await sb.from("quote_commercial_terms").upsert(payload,{onConflict:"reference_number"});
       if(error) throw error;
-      if((quoteExportRef||"").includes("-Rev-") && ctOriginalData){
-        const CT_FIELD_LABELS = {validity:"Validity",payment_term:"Payment Terms",delivery_term:"Delivery Terms",packing_forwarding:"Packing & Forwarding",insurance:"Insurance",price_basis:"Price Basis",guarantee:"Guarantee",dispatch_through:"Dispatch Through",incoterms:"Incoterms",freight:"Freight",tax:"Tax",warranty_coverage:"Warranty Coverage",jurisdiction:"Jurisdiction",force_majeure:"Force Majeure",order_cancellation_charges:"Order Cancellation Charges"};
-        const logs=[];
-        Object.keys(CT_FIELD_LABELS).forEach(f=>{
-          if(String(ctData[f]||"")!==String(ctOriginalData[f]||"")) logs.push(logRevisionChange(quoteExportRef,"commercial_terms",CT_FIELD_LABELS[f],ctOriginalData[f],ctData[f]));
-        });
-        if(logs.length) await Promise.all(logs);
-      }
       setShowCommercialTerms(false);
       if(openRef && openRef.reference_number===quoteExportRef) refreshReadiness(quoteExportRef);
     } catch(e){ console.error("Save commercial terms failed",e); alert("Save failed: "+e.message); }
+    finally { setCtSaving(false); }
+  };
+  const CT_GHOST_FIELDS = [
+    ["validity","Validity","text"],
+    ["payment_term","Payment term","combo"],
+    ["delivery_term","Delivery term","list"],
+    ["price_basis","Price basis","list"],
+    ["packing_forwarding","Packing and forwarding","list"],
+    ["insurance","Insurance","list"],
+    ["guarantee","Guarantee","list"],
+    ["warranty_coverage","Warranty coverage","list"],
+    ["dispatch_through","Transport through","list"],
+    ["incoterms","Inco terms","list"],
+    ["freight","Freight","list"],
+    ["tax","Tax","list"],
+  ];
+  const CT_GHOST_TEXTAREAS = [
+    ["jurisdiction","Jurisdiction"], ["force_majeure","Force majeure"], ["order_cancellation_charges","Order cancellation charges"]
+  ];
+  const CT_LABELS = {validity:"Validity",payment_term:"Payment Term",delivery_term:"Delivery Term",price_basis:"Price Basis",packing_forwarding:"Packing and Forwarding",insurance:"Insurance",guarantee:"Guarantee",warranty_coverage:"Warranty Coverage",dispatch_through:"Transport Through",incoterms:"Inco Terms",freight:"Freight",tax:"Tax",jurisdiction:"Jurisdiction",force_majeure:"Force Majeure",order_cancellation_charges:"Order Cancellation Charges"};
+  const [ctGhostDraft,setCtGhostDraft]=useState({});
+  const saveCommercialTermsGhost = async()=>{
+    setCtSaving(true);
+    try{
+      const allFields = [...CT_GHOST_FIELDS.map(f=>f[0]), ...CT_GHOST_TEXTAREAS.map(f=>f[0])];
+      const payload = { reference_number:quoteExportRef, updated_by:user?.username||"unknown", updated_at:new Date().toISOString() };
+      allFields.forEach(f=>{
+        const val=(ctGhostDraft[f]||"").trim();
+        payload[f] = val!=="" ? val : (ctOriginalData?.[f]||"");
+      });
+      const { error } = await sb.from("quote_commercial_terms").upsert(payload,{onConflict:"reference_number"});
+      if(error) throw error;
+      const logs=[];
+      allFields.forEach(f=>{
+        if(String(payload[f]||"")!==String(ctOriginalData?.[f]||"")) logs.push(logRevisionChange(quoteExportRef,"commercial_terms",CT_LABELS[f],ctOriginalData?.[f],payload[f]));
+      });
+      if(logs.length) await Promise.all(logs);
+      setCtData(payload); setShowCommercialTerms(false);
+      if(openRef && openRef.reference_number===quoteExportRef) refreshReadiness(quoteExportRef);
+    } catch(e){ alert("Save failed: "+(e.message||e)); }
     finally { setCtSaving(false); }
   };
   const [generatingQuotePdf,setGeneratingQuotePdf]=useState(false);
@@ -7365,6 +7448,39 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Commercial Terms — "+quoteExportRef),
         h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"One set of terms per quote, applied to every Sl No in it."),
         ctLoading || !ctData ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"Loading…") :
+        quoteExportRef.includes("-Rev-") ? h(React.Fragment,null,
+          h("div",{style:{background:"#eaf2fb",border:"1px solid #85b7eb",borderRadius:6,padding:"8px 12px",marginBottom:14,fontSize:11.5,color:"#0c447c"}},
+            "Amending "+quoteExportRef+" — leave a field blank to keep its current value. Only fill in what's actually changing."
+          ),
+          CT_GHOST_FIELDS.map(([field,label,kind])=>
+            h("div",{key:field,style:{display:"flex",alignItems:"center",gap:10,marginBottom:9,fontSize:12}},
+              h("div",{style:{width:150,color:colors.muted,fontSize:10.5}},label),
+              h("div",{style:{width:170,color:colors.mutedLight,fontSize:11}},ctOriginalData?.[field]||"— not set"),
+              kind==="text" ? h("input",{value:ctGhostDraft[field]||"",onChange:e=>setCtGhostDraft(d=>({...d,[field]:e.target.value})),placeholder:"new value…",style:{...inputStyle,width:190,padding:"6px 8px",fontSize:12}}) :
+              kind==="combo" ? h(React.Fragment,null,
+                h("input",{list:"ct-ghost-payment-terms",value:ctGhostDraft[field]||"",onChange:e=>setCtGhostDraft(d=>({...d,[field]:e.target.value})),placeholder:"new value…",style:{...inputStyle,width:190,padding:"6px 8px",fontSize:12}}),
+                h("datalist",{id:"ct-ghost-payment-terms"},(ctMasters.payment_term||[]).map(v=>h("option",{key:v,value:v})))
+              ) :
+              h("select",{value:ctGhostDraft[field]||"",onChange:e=>setCtGhostDraft(d=>({...d,[field]:e.target.value})),style:{...inputStyle,width:190,padding:"6px 8px",fontSize:12}},
+                h("option",{value:""},"— keep current —"),
+                (ctMasters[field]||[]).map(v=>h("option",{key:v,value:v},v))
+              )
+            )
+          ),
+          CT_GHOST_TEXTAREAS.map(([field,label])=>
+            h("div",{key:field,style:{marginBottom:10,fontSize:12}},
+              h("div",{style:{color:colors.muted,fontSize:10.5,marginBottom:3}},label),
+              h("div",{style:{display:"flex",gap:10}},
+                h("div",{style:{width:220,color:colors.mutedLight,fontSize:10.5,whiteSpace:"pre-wrap",maxHeight:60,overflowY:"auto",border:"1px solid "+colors.border,borderRadius:5,padding:"6px 8px",background:"#faf9f4"}},ctOriginalData?.[field]||"— not set"),
+                h("textarea",{value:ctGhostDraft[field]||"",onChange:e=>setCtGhostDraft(d=>({...d,[field]:e.target.value})),placeholder:"new value… (blank keeps current)",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12,height:60,fontFamily:"inherit",resize:"vertical"}})
+              )
+            )
+          ),
+          h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:14}},
+            h("button",{onClick:()=>setShowCommercialTerms(false),style:btnSecondary},"Cancel"),
+            h("button",{onClick:saveCommercialTermsGhost,disabled:ctSaving,style:{...btnPrimary,opacity:ctSaving?0.6:1}},ctSaving?"Saving…":"Save amendment")
+          )
+        ) :
         h(React.Fragment,null,
           h("div",{style:{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap"}},
             fld("Validity",null,h("input",{value:ctData.validity||"",onChange:e=>setCtData(d=>({...d,validity:e.target.value})),style:{...inputStyle,padding:"7px 9px",fontSize:12},placeholder:"e.g. 30 days from quote date"})),
@@ -8902,6 +9018,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (37)", summary:"Notes and Datasheet — where the ghost-field pattern doesn't really apply (a list of notes, a form of many diverse field types) — now use coloring instead, same idea as BOM: on a revision, editing a note or a datasheet field and saving it highlights that note/field amber and logs old→new, persisting after reload. A new note added on a revision is logged and highlighted too, not just edits to existing ones." },
+  { date:"17 Jul 2026 (36)", summary:"Commercial Terms now has the real ghost-field pattern on a revision, same as Header — every one of the 15 fields shows its existing value plus a blank field beside it (dropdown, combo, or text depending on the field), blank keeps it, filled overrides and logs old→new. Replaces the diff-on-save workaround from the previous round." },
   { date:"17 Jul 2026 (35)", summary:"Major amendment-system slice: Header now uses real ghost-field editing on a revision (existing value shown, blank field beside it — blank keeps it, filled overrides and logs old→new) — Customer is locked entirely (message tells you to create a new offer instead), Address is only pickable from that customer's saved Addresses list. Commercial Terms keeps its normal edit form but now diff-logs whatever actually changed against the pre-amendment values. BOM line edits on a revision now log every changed field and highlight that whole line (amber) the moment it's saved — persists after reload, not just live. New \"What changed in this revision\" report in the History panel, plus a matching Revision History page in the generated PDF (right after Notes) and a \"Revision N\" marker on the cover page." },
   { date:"17 Jul 2026 (34)", summary:"Commercial Terms now has its own prominent, colored button in the main toolbar (purple, before New Sf) instead of being buried as a small \"Edit terms\" link inside the Export panel. Datasheet (orange) and + Add note (green) are now colored/bold too, so all three stand out at a glance instead of blending into the row of plain buttons." },
   { date:"17 Jul 2026 (33)", summary:"Fixed: \"Amend quote\" was requiring a code even for Admin/Super Admin — now matches the app's existing non-Draft rule everywhere else: Admin/Super Admin can start an amendment directly, only a regular user needs a one-time code (still sourced from an Admin/Super Admin). The button is now visible to any user on a non-Draft quote, not just Admins." },
