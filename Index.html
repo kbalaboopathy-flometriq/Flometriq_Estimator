@@ -7502,6 +7502,50 @@ function CustomersScreen({ user }){
   },[]);
   useEffect(()=>{ if(selected) loadContacts(selected.company_name); },[selected,loadContacts]);
 
+  const [addresses,setAddresses] = useState([]);
+  const [loadingAddresses,setLoadingAddresses] = useState(false);
+  const [newAddressRow,setNewAddressRow] = useState(null);
+  const [savingAddressRow,setSavingAddressRow] = useState(false);
+  const [addressFormOpen,setAddressFormOpen] = useState(null); // null | address obj (for Edit)
+
+  const loadAddresses = useCallback(async(companyName)=>{
+    if(!companyName){ setAddresses([]); return; }
+    setLoadingAddresses(true);
+    const {data} = await sb.from("customer_addresses").select("*").eq("company_name",companyName).order("is_primary",{ascending:false}).order("id");
+    setAddresses(data||[]);
+    setLoadingAddresses(false);
+  },[]);
+  useEffect(()=>{ if(selected) loadAddresses(selected.company_name); },[selected,loadAddresses]);
+
+  const removeAddress = async(addr)=>{
+    if(!confirm("Remove this address from "+selected.company_name+"?")) return;
+    await sb.from("customer_addresses").delete().eq("id",addr.id);
+    await logAudit("DELETE","customer_addresses",String(addr.id),"Removed address from "+selected.company_name,user?.username||"unknown",addr,null);
+    loadAddresses(selected.company_name);
+  };
+
+  const saveNewAddressRow = async()=>{
+    if(!newAddressRow.address_text.trim()){ alert("Address is required."); return; }
+    setSavingAddressRow(true);
+    try{
+      const payload = {
+        company_name:selected.company_name, address_text:newAddressRow.address_text.trim(),
+        gst_number:(newAddressRow.gst_number||"").trim(), is_primary:newAddressRow.is_primary||"No"
+      };
+      await sb.from("customer_addresses").insert({...payload, created_by:user?.username||"customers_screen"});
+      setNewAddressRow(null);
+      await loadAddresses(selected.company_name);
+    } finally { setSavingAddressRow(false); }
+  };
+
+  const saveEditedAddress = async(addr)=>{
+    const payload = { address_text:addr.address_text.trim(), gst_number:(addr.gst_number||"").trim(), is_primary:addr.is_primary||"No" };
+    if(!payload.address_text){ alert("Address is required."); return; }
+    await sb.from("customer_addresses").update(payload).eq("id",addr.id);
+    setAddressFormOpen(null);
+    await loadAddresses(selected.company_name);
+  };
+
   const filtered = companies.filter(c=>!search||(c.company_name||"").toLowerCase().includes(search.toLowerCase()));
 
   const removeContact = async(contact)=>{
@@ -7685,6 +7729,52 @@ function CustomersScreen({ user }){
             h("td",{style:{padding:"6px 8px",whiteSpace:"nowrap"}},
               h("button",{onClick:saveNewRow,disabled:savingRow,style:{...btnSmall,fontSize:10,padding:"3px 8px",marginRight:5}},savingRow?"Saving…":"Save"),
               h("button",{onClick:()=>setNewRow(null),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Cancel")
+            )
+          )
+        )
+      ),
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",margin:"18px 0 8px"}},
+        h("div",{style:{fontWeight:700,fontSize:13}},"Addresses ("+addresses.length+")"),
+        h("button",{onClick:()=>setNewAddressRow({address_text:"",gst_number:"",is_primary:"No"}),style:btnSmall},"+ Add address")
+      ),
+      loadingAddresses?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+      (addresses.length===0 && !newAddressRow)?h("div",{style:{fontSize:12,color:colors.mutedLight,padding:"10px 0"}},"No addresses yet for this company."):
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"6px 8px",fontSize:10.5,color:colors.muted}},"Address"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5,color:colors.muted}},"GST Number"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5,color:colors.muted}},"Primary"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5,color:colors.muted}},"")
+        )),
+        h("tbody",null,
+          addresses.map(addr=>
+            addressFormOpen&&addressFormOpen.id===addr.id
+            ? h("tr",{key:addr.id,style:{borderTop:"1px solid #eceae0",background:"#eef6f3"}},
+                h("td",{style:{padding:"6px 8px"}},h("input",{value:addressFormOpen.address_text,onChange:e=>setAddressFormOpen({...addressFormOpen,address_text:e.target.value}),style:{...inputStyle,padding:"5px 7px",fontSize:11.5,width:"100%"}})),
+                h("td",{style:{padding:"6px 8px"}},h("input",{value:addressFormOpen.gst_number,onChange:e=>setAddressFormOpen({...addressFormOpen,gst_number:e.target.value}),style:{...inputStyle,padding:"5px 7px",fontSize:11.5}})),
+                h("td",{style:{padding:"6px 8px"}},h("select",{value:addressFormOpen.is_primary,onChange:e=>setAddressFormOpen({...addressFormOpen,is_primary:e.target.value}),style:{...inputStyle,padding:"5px 7px",fontSize:11.5}},h("option",{value:"No"},"No"),h("option",{value:"Yes"},"Yes"))),
+                h("td",{style:{padding:"6px 8px",whiteSpace:"nowrap"}},
+                  h("button",{onClick:()=>saveEditedAddress(addressFormOpen),style:{...btnSmall,fontSize:10,padding:"3px 8px",marginRight:5}},"Save"),
+                  h("button",{onClick:()=>setAddressFormOpen(null),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Cancel")
+                )
+              )
+            : h("tr",{key:addr.id,style:{borderTop:"1px solid #eceae0"}},
+                h("td",{style:{padding:"7px 8px",fontWeight:600}},addr.address_text),
+                h("td",{style:{padding:"7px 8px"}},addr.gst_number||"—"),
+                h("td",{style:{padding:"7px 8px"}},addr.is_primary==="Yes"?h("span",{style:{background:"#e1f5ee",color:"#085041",fontSize:9.5,padding:"1px 7px",borderRadius:8}},"Yes"):"—"),
+                h("td",{style:{padding:"7px 8px",whiteSpace:"nowrap"}},
+                  h("button",{onClick:()=>setAddressFormOpen({...addr}),style:{...btnSmall,fontSize:10,padding:"3px 8px",marginRight:5}},"Edit"),
+                  h("button",{onClick:()=>removeAddress(addr),style:{...btnSmall,fontSize:10,padding:"3px 8px",border:"1px solid #f0b8b8",color:colors.danger}},"Remove")
+                )
+              )
+          ),
+          newAddressRow && h("tr",{style:{borderTop:"1px solid #eceae0"}},
+            h("td",{style:{padding:"6px 8px"}},h("input",{value:newAddressRow.address_text,onChange:e=>setNewAddressRow({...newAddressRow,address_text:e.target.value}),placeholder:"Street, city, state, PIN, country",style:{...inputStyle,padding:"5px 7px",fontSize:11.5,width:"100%"}})),
+            h("td",{style:{padding:"6px 8px"}},h("input",{value:newAddressRow.gst_number,onChange:e=>setNewAddressRow({...newAddressRow,gst_number:e.target.value}),placeholder:"GST number",style:{...inputStyle,padding:"5px 7px",fontSize:11.5}})),
+            h("td",{style:{padding:"6px 8px"}},h("select",{value:newAddressRow.is_primary,onChange:e=>setNewAddressRow({...newAddressRow,is_primary:e.target.value}),style:{...inputStyle,padding:"5px 7px",fontSize:11.5}},h("option",{value:"No"},"No"),h("option",{value:"Yes"},"Yes"))),
+            h("td",{style:{padding:"6px 8px",whiteSpace:"nowrap"}},
+              h("button",{onClick:saveNewAddressRow,disabled:savingAddressRow,style:{...btnSmall,fontSize:10,padding:"3px 8px",marginRight:5}},savingAddressRow?"Saving…":"Save"),
+              h("button",{onClick:()=>setNewAddressRow(null),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Cancel")
             )
           )
         )
@@ -8577,6 +8667,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (31)", summary:"Customers can now have multiple Addresses, each with its own GST Number — new sub-form on the Customer record (Master Data → Customers), same pattern as Contacts: inline \"+ Add address\", Edit/Remove per row, one flaggable as Primary. Foundational piece for the upcoming quote amendment/revision system, where Address will only be pickable from a customer's saved list, not typed freehand." },
   { date:"17 Jul 2026 (30)", summary:"Fixed a real bug: Material Rates' Shape/Spec/Grade filter row (and the Rate=0 table's) had been missed in the app-wide combo conversion — still the old per-keystroke text input with no exact-match enforcement, and picking Spec or Grade never reset the page number. Together these could show stale/wrong results (a partially-typed Spec effectively filtering nothing) or trigger a \"Requested range not satisfiable\" error that left old data on screen looking like the filter had done nothing. Both filter rows now use the same LimitToListCombo as everywhere else, every filter change resets to page 1, the search box does too, and a load failure now clears the table instead of leaving misleading stale rows." },
   { date:"17 Jul 2026 (29)", summary:"Performance fix: capped every Material Rates list at 25 rows per page (was up to 1,000/200/300 in different places) — Master Data → Material Rates now applies Shape/Spec/Grade filters server-side and paginates everything at 25, including the Rate=0 table (was 200). The separate Material Rates Report (Reports menu) no longer loads up to 5,000 rows unscoped on open — it's now filtered and paginated server-side too, with lightweight count-only queries for the All/Stale/Zero tab badges instead of counting in the browser. This should fix the \"Page Unresponsive\" slowdown that showed up as more rate data got added." },
   { date:"17 Jul 2026 (28)", summary:"App-wide: converted dropdowns to predictive-text comboboxes, MS Access \"Limit To List\" style — type to filter live, but a value that isn't actually in the options list gets rejected on blur and reverts (new shared LimitToListCombo component). Covers Material Rates (Spec/Grade widened to 220px + column headers to match), BOM Entry Form, Master Data's cascade Add fields (every table), the Estimator's manual line adder and detail lines, the Quotes screen's inline line editor (Spec/Grade widened there too), the stress-calc tool, the Material Rates report's Shape/Spec/Grade filter, and Description Master's parameter picker — roughly 45+ individual fields via ~15 source edits, several through shared components (MasterSelect, the Customer picker) that cascade to many call sites at once. Left as plain selects on purpose: true small fixed-choice fields (role, Yes/No, currency, D1/D2, metric/imperial, field type) where predictive text adds nothing." },
@@ -9098,6 +9189,7 @@ const TOUR_SLIDES = [
     "bullets": [
       "Company is the primary record; contacts nest underneath it",
       "One company can have many contacts, one flagged Primary",
+      "A company can also have many Addresses, each with its own GST Number, one flagged Primary \u2014 same sub-form pattern as Contacts",
       "Bulk upload from a two-sheet Excel workbook",
       "Duplicates are skipped, near-matches flagged for your review"
     ]
