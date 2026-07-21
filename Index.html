@@ -1535,8 +1535,8 @@ function MasterEditor({ tableKey, user }) {
   // "Rate = 0" table — every line missing a rate, editable right there.
   // Paginated (200/page) and filtered the same Shape -> Spec -> Grade way as
   // the main screen, so it never has to load all 6,800+ rows at once.
-  const ZR_PAGE_SIZE = 200;
-  const MR_ALL_PAGE_SIZE = 200;
+  const ZR_PAGE_SIZE = 25; // hard cap — never load more than this at once
+  const MR_PAGE_SIZE = 25; // hard cap — never load more than this at once
   const [mrAllRatesTotal,setMrAllRatesTotal]=useState(0);
   const [zeroRateCount,setZeroRateCount]=useState(0);
   const [zeroRateOpen,setZeroRateOpen]=useState(false);
@@ -1775,27 +1775,25 @@ function MasterEditor({ tableKey, user }) {
         const { data, error:err } = await sb.from("bom").select("*").eq("model",bomModelFilter).order("component",{ascending:true});
         if(err) throw err; setRows(data||[]);
       } else if(tableKey==="material_rates"){
+        let q = sb.from("material_rates").select("*",{count:"exact"});
         if(search.trim()){
           const s = search.trim();
-          const { data, error:err } = await sb.from("material_rates").select("*")
-            .or("material_spec.ilike.%"+s+"%,material_grade.ilike.%"+s+"%,material_shape.ilike.%"+s+"%,uom.ilike.%"+s+"%,spec_grade.ilike.%"+s+"%")
-            .order("material_spec",{ascending:true}).limit(300);
-          if(err) throw err; setRows(data||[]);
-        } else if(mrShapeFocus){
-          const { data, error:err } = await sb.from("material_rates").select("*").eq("material_shape",mrShapeFocus).order("material_spec",{ascending:true}).limit(1000);
-          if(err) throw err; setRows(data||[]);
+          q = q.or("material_spec.ilike.%"+s+"%,material_grade.ilike.%"+s+"%,material_shape.ilike.%"+s+"%,uom.ilike.%"+s+"%,spec_grade.ilike.%"+s+"%");
         } else {
-          const { data, count, error:err } = await sb.from("material_rates").select("*",{count:"exact"})
-            .order("material_shape",{ascending:true}).order("material_spec",{ascending:true})
-            .range(page*MR_ALL_PAGE_SIZE, page*MR_ALL_PAGE_SIZE+MR_ALL_PAGE_SIZE-1);
-          if(err) throw err; setRows(data||[]); setMrAllRatesTotal(count||0);
+          if(mrShapeFocus) q = q.eq("material_shape",mrShapeFocus);
+          if(mrSpecFilter) q = q.eq("material_spec",mrSpecFilter);
+          if(mrGradeFilter) q = q.eq("material_grade",mrGradeFilter);
         }
+        const { data, count, error:err } = await q
+          .order("material_shape",{ascending:true}).order("material_spec",{ascending:true})
+          .range(page*MR_PAGE_SIZE, page*MR_PAGE_SIZE+MR_PAGE_SIZE-1);
+        if(err) throw err; setRows(data||[]); setMrAllRatesTotal(count||0);
       } else {
         const { data, error:err } = await sb.from(tableKey).select("*").order("id",{ascending:true}).range(page*pageSize,page*pageSize+pageSize-1);
         if(err) throw err; setRows(data||[]);
       }
     } catch(e) { setError(e.message); } finally { setLoading(false); }
-  },[tableKey,page,bomModelFilter,search,mrShapeFocus]);
+  },[tableKey,page,bomModelFilter,search,mrShapeFocus,mrSpecFilter,mrGradeFilter]);
 
   useEffect(()=>{ setPage(0); },[tableKey]);
   useEffect(()=>{ load(); },[load]);
@@ -1924,19 +1922,24 @@ function MasterEditor({ tableKey, user }) {
 
   const mrFilteredRows = useMemo(()=>{
     if(tableKey!=="material_rates") return [];
-    const m=(val,f)=> !f || String(val||"").toLowerCase().includes(f.toLowerCase());
-    return filteredRows.filter(r=>m(r.material_spec,mrSpecFilter)&&m(r.material_grade,mrGradeFilter));
-  },[filteredRows,tableKey,mrSpecFilter,mrGradeFilter]);
+    return filteredRows; // Shape/Spec/Grade already applied server-side in load()
+  },[filteredRows,tableKey]);
 
   // Cascading option lists — built only from whatever's currently loaded
-  // (the focused shape's rows, or the current search results), so Spec/Grade
-  // choices always reflect what's actually available right now.
-  const mrSpecOptionsScoped = useMemo(()=> tableKey==="material_rates" ? Array.from(new Set(rows.map(r=>r.material_spec).filter(Boolean))).sort() : [],[rows,tableKey]);
-  const mrGradeOptionsScoped = useMemo(()=>{
-    if(tableKey!=="material_rates") return [];
-    const scoped = mrSpecFilter ? rows.filter(r=>r.material_spec===mrSpecFilter) : rows;
-    return Array.from(new Set(scoped.map(r=>r.material_grade).filter(Boolean))).sort();
-  },[rows,tableKey,mrSpecFilter]);
+  // (a small dedicated query — never derived from `rows`, since rows is now
+  // just the current 25-row page and wouldn't have every option on it).
+  const [mrSpecOptionsScoped,setMrSpecOptionsScoped]=useState([]);
+  const [mrGradeOptionsScoped,setMrGradeOptionsScoped]=useState([]);
+  useEffect(()=>{
+    if(tableKey!=="material_rates"||!mrShapeFocus){ setMrSpecOptionsScoped([]); return; }
+    sb.from("material_rates").select("material_spec").eq("material_shape",mrShapeFocus).limit(2000)
+      .then(({data})=>setMrSpecOptionsScoped(Array.from(new Set((data||[]).map(r=>r.material_spec).filter(Boolean))).sort()));
+  },[tableKey,mrShapeFocus]);
+  useEffect(()=>{
+    if(tableKey!=="material_rates"||!mrSpecFilter){ setMrGradeOptionsScoped([]); return; }
+    sb.from("material_rates").select("material_grade").eq("material_shape",mrShapeFocus).eq("material_spec",mrSpecFilter).limit(2000)
+      .then(({data})=>setMrGradeOptionsScoped(Array.from(new Set((data||[]).map(r=>r.material_grade).filter(Boolean))).sort()));
+  },[tableKey,mrShapeFocus,mrSpecFilter]);
   const [mrStepMsg,setMrStepMsg]=useState("");
   const mrGuardStep = (label, ready, e)=>{
     if(!ready){ setMrStepMsg("Pick "+label+" first — filters apply in order: Shape → Spec → Grade."); e.target.blur(); }
@@ -2115,10 +2118,10 @@ function MasterEditor({ tableKey, user }) {
         )
       )
     ),
-    !(tableKey==="bom"&&bomModelFilter) && !(tableKey==="material_rates"&&(mrShapeFocus||search.trim())) && h("div",{style:{display:"flex",justifyContent:"center",alignItems:"center",gap:10,marginTop:14}},
+    !(tableKey==="bom"&&bomModelFilter) && h("div",{style:{display:"flex",justifyContent:"center",alignItems:"center",gap:10,marginTop:14}},
       h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSecondary},"Previous"),
-      h("span",{style:{fontSize:12,color:colors.muted,padding:"8px 0"}},tableKey==="material_rates"?("Page "+(page+1)+" of "+Math.max(1,Math.ceil(mrAllRatesTotal/MR_ALL_PAGE_SIZE))):("Page "+(page+1))),
-      h("button",{onClick:()=>setPage(p=>p+1),disabled:tableKey==="material_rates"?((page+1)*MR_ALL_PAGE_SIZE>=mrAllRatesTotal):(rows.length<pageSize),style:btnSecondary},"Next")
+      h("span",{style:{fontSize:12,color:colors.muted,padding:"8px 0"}},tableKey==="material_rates"?("Page "+(page+1)+" of "+Math.max(1,Math.ceil(mrAllRatesTotal/MR_PAGE_SIZE))+"  ("+mrAllRatesTotal+" total)"):("Page "+(page+1))),
+      h("button",{onClick:()=>setPage(p=>p+1),disabled:tableKey==="material_rates"?((page+1)*MR_PAGE_SIZE>=mrAllRatesTotal):(rows.length<pageSize),style:btnSecondary},"Next")
     ),
     pendingDeleteIds && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
       h("div",{style:{background:"#fff",borderRadius:8,width:380,padding:"20px 22px"}},
@@ -8580,6 +8583,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (29)", summary:"Performance fix: capped every Material Rates list at 25 rows per page (was up to 1,000/200/300 in different places) — Master Data → Material Rates now applies Shape/Spec/Grade filters server-side and paginates everything at 25, including the Rate=0 table (was 200). The separate Material Rates Report (Reports menu) no longer loads up to 5,000 rows unscoped on open — it's now filtered and paginated server-side too, with lightweight count-only queries for the All/Stale/Zero tab badges instead of counting in the browser. This should fix the \"Page Unresponsive\" slowdown that showed up as more rate data got added." },
   { date:"17 Jul 2026 (28)", summary:"App-wide: converted dropdowns to predictive-text comboboxes, MS Access \"Limit To List\" style — type to filter live, but a value that isn't actually in the options list gets rejected on blur and reverts (new shared LimitToListCombo component). Covers Material Rates (Spec/Grade widened to 220px + column headers to match), BOM Entry Form, Master Data's cascade Add fields (every table), the Estimator's manual line adder and detail lines, the Quotes screen's inline line editor (Spec/Grade widened there too), the stress-calc tool, the Material Rates report's Shape/Spec/Grade filter, and Description Master's parameter picker — roughly 45+ individual fields via ~15 source edits, several through shared components (MasterSelect, the Customer picker) that cascade to many call sites at once. Left as plain selects on purpose: true small fixed-choice fields (role, Yes/No, currency, D1/D2, metric/imperial, field type) where predictive text adds nothing." },
   { date:"17 Jul 2026 (27)", summary:"Cutting Plan double-click shortcut now also works when UOM is \"Metres\", identical rule to \"Nos\" (straight copy of Material Spec/Qty/UOM, no concatenation). Message updated to mention both allowed values." },
   { date:"17 Jul 2026 (26)", summary:"Cutting Plan double-click shortcut now only works when UOM is exactly \"Nos\" — anything else shows a message (\"This shortcut only works when UOM is 'Nos'.\") instead of silently doing nothing. The Plate/Perforated Sheet/Mesh shape block stays silent as before." },
@@ -11322,38 +11326,76 @@ function QuoteReports({ user }){
 
 /* ---- STALE MATERIAL RATES ---- */
 function MaterialRatesReport({ user }){
+  const RPT_PAGE_SIZE = 25; // hard cap — never load more than this at once
   const [days,setDays]=useState(90);
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
   const [loadError,setLoadError]=useState("");
   const [editing,setEditing]=useState({}); // id -> {newRate}
   const [shapeSel,setShapeSel]=useState(""); const [specSel,setSpecSel]=useState(""); const [gradeSel,setGradeSel]=useState("");
   const [view,setView]=useState("all"); // all | stale | zero
+  const [page,setPage]=useState(0);
+  const [total,setTotal]=useState(0);
+  const [counts,setCounts]=useState({all:0,stale:0,zero:0});
+  const [allShapes,setAllShapes]=useState([]);
+  const [specOptions,setSpecOptions]=useState([]);
+  const [gradeOptions,setGradeOptions]=useState([]);
   const isSuperAdmin = user.role==="super_admin";
   const canExport = isSuperAdmin;
+  const norm = (s)=> (s||"").trim().toLowerCase();
+  const cutoffISO = useMemo(()=> new Date(Date.now()-Number(days||0)*86400000).toISOString(), [days]);
+  const cutoff = useMemo(()=> Date.now()-Number(days||0)*86400000, [days]);
+
+  const filteredQuery = (cols, opts)=>{
+    let q = sb.from("material_rates").select(cols, opts);
+    if(shapeSel) q = q.eq("material_shape",shapeSel);
+    if(specSel) q = q.eq("material_spec",specSel);
+    if(gradeSel) q = q.eq("material_grade",gradeSel);
+    return q;
+  };
 
   const load = useCallback(async()=>{
     setLoading(true); setLoadError("");
-    const { data, error:err } = await sb.from("material_rates").select("id,material_spec,material_grade,material_shape,rate,uom,created_at,created_by").limit(5000);
+    let q = filteredQuery("id,material_spec,material_grade,material_shape,rate,uom,created_at,created_by",{count:"exact"});
+    if(view==="stale") q = q.lt("created_at",cutoffISO);
+    else if(view==="zero") q = q.eq("rate",0);
+    const { data, count, error:err } = await q.order("created_at",{ascending:true}).range(page*RPT_PAGE_SIZE, page*RPT_PAGE_SIZE+RPT_PAGE_SIZE-1);
     if(err){ setLoadError(err.message); setRows([]); setLoading(false); return; }
-    setRows(data||[]);
+    setRows(data||[]); setTotal(count||0);
     setLoading(false);
-  },[]);
+  },[shapeSel,specSel,gradeSel,view,page,cutoffISO]);
   useEffect(()=>{ load(); },[load]);
+  useEffect(()=>{ setPage(0); },[shapeSel,specSel,gradeSel,view]);
 
-  const norm = (s)=> (s||"").trim().toLowerCase();
-  const allShapes = useMemo(()=> Array.from(new Set(rows.map(r=>r.material_shape).filter(Boolean))).sort(), [rows]);
-  // Spec options narrow to the chosen Shape (if any); Grade options narrow to
-  // the chosen Shape + Spec (if any) — each dropdown only ever offers values
-  // that actually exist given what's picked above it, so there's no
-  // "0 results" surprise from typing something that doesn't exist.
-  const specOptions = useMemo(()=>{
-    const pool = shapeSel ? rows.filter(r=>norm(r.material_shape)===norm(shapeSel)) : rows;
-    return Array.from(new Set(pool.map(r=>r.material_spec).filter(Boolean))).sort();
-  },[rows,shapeSel]);
-  const gradeOptions = useMemo(()=>{
-    const pool = rows.filter(r=>(!shapeSel||norm(r.material_shape)===norm(shapeSel)) && (!specSel||r.material_spec===specSel));
-    return Array.from(new Set(pool.map(r=>r.material_grade).filter(Boolean))).sort();
-  },[rows,shapeSel,specSel]);
+  // Lightweight count-only queries for the All/Stale/Zero tab badges — never
+  // pull actual rows just to count them.
+  useEffect(()=>{
+    (async()=>{
+      const [allR, staleR, zeroR] = await Promise.all([
+        filteredQuery("id",{count:"exact",head:true}),
+        filteredQuery("id",{count:"exact",head:true}).lt("created_at",cutoffISO),
+        filteredQuery("id",{count:"exact",head:true}).eq("rate",0),
+      ]);
+      setCounts({all:allR.count||0, stale:staleR.count||0, zero:zeroR.count||0});
+    })();
+  },[shapeSel,specSel,gradeSel,cutoffISO]);
+
+  // Cascading option lists via small dedicated queries — never derived from
+  // `rows`, since rows is now just the current 25-row page.
+  useEffect(()=>{
+    sb.from("material_rates").select("material_shape").limit(2000)
+      .then(({data})=>setAllShapes(Array.from(new Set((data||[]).map(r=>r.material_shape).filter(Boolean))).sort()));
+  },[]);
+  useEffect(()=>{
+    let q = sb.from("material_rates").select("material_spec").limit(2000);
+    if(shapeSel) q = q.eq("material_shape",shapeSel);
+    q.then(({data})=>setSpecOptions(Array.from(new Set((data||[]).map(r=>r.material_spec).filter(Boolean))).sort()));
+  },[shapeSel]);
+  useEffect(()=>{
+    let q = sb.from("material_rates").select("material_grade").limit(2000);
+    if(shapeSel) q = q.eq("material_shape",shapeSel);
+    if(specSel) q = q.eq("material_spec",specSel);
+    q.then(({data})=>setGradeOptions(Array.from(new Set((data||[]).map(r=>r.material_grade).filter(Boolean))).sort()));
+  },[shapeSel,specSel]);
 
   const onShapeChange = (v)=>{ setShapeSel(v); setSpecSel(""); setGradeSel(""); };
   const onSpecChange = (v)=>{ setSpecSel(v); setGradeSel(""); };
@@ -11364,33 +11406,11 @@ function MaterialRatesReport({ user }){
   // fixed offset from "now" — a fixed offset from now never actually ages,
   // which was the bug: a 100-day-old row could never cross a 101-day threshold.
   const effectiveDate = (r)=> r.created_at ? new Date(r.created_at) : new Date(0);
-  const cutoff = useMemo(()=> Date.now() - Number(days||0)*86400000, [days]);
 
-  const enriched = useMemo(()=> rows.map(r=>{
+  const shown = useMemo(()=> rows.map(r=>{
     const _date = effectiveDate(r);
     return { ...r, _date, _estimated: !r.created_at, daysOld: Math.floor((Date.now()-_date.getTime())/86400000) };
   }), [rows]);
-
-  const searched = useMemo(()=>{
-    return enriched.filter(r=>
-      (!shapeSel || norm(r.material_shape)===norm(shapeSel)) &&
-      (!specSel || r.material_spec===specSel) &&
-      (!gradeSel || r.material_grade===gradeSel)
-    );
-  },[enriched,shapeSel,specSel,gradeSel]);
-
-  const counts = useMemo(()=>({
-    all: searched.length,
-    stale: searched.filter(r=>r._date.getTime()<cutoff).length,
-    zero: searched.filter(r=>(Number(r.rate)||0)===0).length,
-  }),[searched,cutoff]);
-
-  const shown = useMemo(()=>{
-    let v = searched;
-    if(view==="stale") v = v.filter(r=>r._date.getTime()<cutoff);
-    else if(view==="zero") v = v.filter(r=>(Number(r.rate)||0)===0);
-    return v.slice().sort((a,b)=>b.daysOld-a.daysOld);
-  },[searched,view,cutoff]);
 
   const applyNewRate = async(row)=>{
     const draft = editing[row.id];
@@ -11404,17 +11424,29 @@ function MaterialRatesReport({ user }){
     load();
   };
 
-  const exportExcel = ()=>{
+  // Exports pull the full matching set fresh (not just the current page) —
+  // a one-off action, not habitual browsing, so a larger capped fetch here
+  // is fine; still capped at 5000 as a safety net against something huge.
+  const fetchExportRows = async()=>{
+    let q = filteredQuery("material_spec,material_grade,material_shape,rate,uom,created_at,created_by");
+    if(view==="stale") q = q.lt("created_at",cutoffISO);
+    else if(view==="zero") q = q.eq("rate",0);
+    const { data } = await q.order("created_at",{ascending:true}).limit(5000);
+    return (data||[]).map(r=>{ const _date=effectiveDate(r); return {...r,_date,_estimated:!r.created_at,daysOld:Math.floor((Date.now()-_date.getTime())/86400000)}; });
+  };
+  const exportExcel = async()=>{
+    const exportRows = await fetchExportRows();
     const headerRow = ["Material spec","Grade","Shape","Current rate","UOM","Days since update","Last updated","Created by"];
-    const dataRows = shown.map(r=>[r.material_spec,r.material_grade,r.material_shape,r2(r.rate),r.uom,r.daysOld,r._date.toLocaleDateString()+(r._estimated?" (estimated)":""),r.created_by||"—"]);
+    const dataRows = exportRows.map(r=>[r.material_spec,r.material_grade,r.material_shape,r2(r.rate),r.uom,r.daysOld,r._date.toLocaleDateString()+(r._estimated?" (estimated)":""),r.created_by||"—"]);
     const ws = XLSX.utils.aoa_to_sheet([headerRow,...dataRows]);
     const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "Material rates");
     XLSX.writeFile(wb, "material_rates_"+view+".xlsx");
   };
-  const exportPDF = ()=>{
+  const exportPDF = async()=>{
+    const exportRows = await fetchExportRows();
     generatePDF({ title:"Material rates — "+view, refNumber:shapeSel||specSel||gradeSel?("Shape: "+(shapeSel||"any")+"  Spec: "+(specSel||"any")+"  Grade: "+(gradeSel||"any")):"", description:"", createdBy:user.username, createdAt:Date.now(),
       headers:["Material spec","Grade","Shape","Rate","UOM","Days old","Last updated","Created by"],
-      rows:shown.map(r=>[r.material_spec,r.material_grade,r.material_shape,fmtR(r.rate),r.uom,String(r.daysOld),r._date.toLocaleDateString()+(r._estimated?" (est.)":""),r.created_by||"—"]),
+      rows:exportRows.map(r=>[r.material_spec,r.material_grade,r.material_shape,fmtR(r.rate),r.uom,String(r.daysOld),r._date.toLocaleDateString()+(r._estimated?" (est.)":""),r.created_by||"—"]),
       filename:"material_rates_"+view+".pdf" });
   };
 
@@ -11473,6 +11505,11 @@ function MaterialRatesReport({ user }){
           ))
         )
       )
+    ),
+    total>0 && h("div",{style:{display:"flex",justifyContent:"center",alignItems:"center",gap:10,marginTop:14}},
+      h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSecondary},"Previous"),
+      h("span",{style:{fontSize:12,color:colors.muted,padding:"8px 0"}},"Page "+(page+1)+" of "+Math.max(1,Math.ceil(total/RPT_PAGE_SIZE))+"  ("+total+" total)"),
+      h("button",{onClick:()=>setPage(p=>p+1),disabled:(page+1)*RPT_PAGE_SIZE>=total,style:btnSecondary},"Next")
     ),
     h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:8}},"Rows with no original date on record are pinned to a 100-day-old baseline so they surface as stale immediately. Any rate saved from now on gets a real date and the user who set it.")
   );
