@@ -4808,18 +4808,29 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
   // Wildcard quote search — "quote# — client", picking one loads it filtered;
   // typing a number that doesn't exist offers to create it as a new quote.
   const [refSearchDisplay,setRefSearchDisplay]=useState("");
+  const baseRefOf = (ref)=> (ref||"").replace(/-Rev-\d+$/,"");
   const refOptionsList = useMemo(()=>{
     const seen=new Set(); const out=[];
-    refs.forEach(r=>{ if(!seen.has(r.reference_number)){ seen.add(r.reference_number); out.push({ rn:r.reference_number, label:r.reference_number+" — "+(r.customer_name||"—") }); } });
+    refs.forEach(r=>{
+      const base = baseRefOf(r.reference_number);
+      if(!seen.has(base)){ seen.add(base); out.push({ rn:base, label:base+" — "+(r.customer_name||"—") }); }
+    });
     return out.sort((a,b)=>a.rn.localeCompare(b.rn));
   },[refs]);
+  const latestRefForBase = (base)=>{
+    const sameFamily = refs.filter(r=>baseRefOf(r.reference_number)===base);
+    let best = base, bestNum = 0;
+    sameFamily.forEach(r=>{ const m=r.reference_number.match(/-Rev-(\d+)$/); if(m && Number(m[1])>bestNum){ bestNum=Number(m[1]); best=r.reference_number; } });
+    return best;
+  };
   const comboRefocusRS = (e)=>{ e.target.dataset.prevVal = refSearchDisplay; setRefSearchDisplay(""); };
   const handleRefSearchChange = (val)=>{
     setRefSearchDisplay(val);
     const hit = refOptionsList.find(o=>o.label===val);
     if(hit){
-      setRefFilter(hit.rn); setSlNoFilter("");
-      const pool = refs.filter(r=>r.reference_number===hit.rn);
+      const target = latestRefForBase(hit.rn);
+      setRefFilter(target); setSlNoFilter("");
+      const pool = refs.filter(r=>r.reference_number===target);
       if(pool.length===1) openEstimate(pool[0]);
     }
   };
@@ -4827,7 +4838,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     const val = refSearchDisplay.trim();
     if(!val){ setRefSearchDisplay(e.target.dataset.prevVal||""); return; }
     const hit = refOptionsList.find(o=>o.label===val || o.rn===val);
-    if(hit){ setRefFilter(hit.rn); setSlNoFilter(""); setRefSearchDisplay(hit.label); return; }
+    if(hit){ const target=latestRefForBase(hit.rn); setRefFilter(target); setSlNoFilter(""); setRefSearchDisplay(hit.label); return; }
     // Also allow typing just the client name portion to narrow, without
     // triggering the "doesn't exist" prompt on every partial keystroke —
     // only prompt when it looks like a specific quote number was intended.
@@ -4898,6 +4909,71 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     setUnsavedGuard(true,"You have unsaved Quote Header changes. Leave anyway?");
   };
   const [authGate,setAuthGate]=useState(null); // {requiredType, action} — shared by every gated save/delete in this screen
+
+  // Quote Amendment / Revisions — each revision is a full independent clone
+  // named "{base}-Rev-{n}", grouped back to its family purely by that naming
+  // convention (no extra table needed for the grouping itself).
+  const [revisionSiblings,setRevisionSiblings]=useState([]); // [{ref,label,revNum}] for the currently open quote's family
+  const [showAmendGate,setShowAmendGate]=useState(false);
+  const [showAmendPicker,setShowAmendPicker]=useState(false);
+  const [amendAreas,setAmendAreas]=useState({header:true,commercial_terms:false,notes:false,datasheet:false,bom:false});
+  const [amendBusy,setAmendBusy]=useState(false);
+
+  const loadRevisionSiblings = useCallback(async(ref)=>{
+    if(!ref){ setRevisionSiblings([]); return; }
+    const base = baseRefOf(ref);
+    const { data } = await sb.from("estimates").select("reference_number").ilike("reference_number", base+"%");
+    const uniqueRefs = Array.from(new Set((data||[]).map(r=>r.reference_number).filter(rn=>rn===base||rn.startsWith(base+"-Rev-"))));
+    const sibs = uniqueRefs.map(rn=>{
+      const m = rn.match(/-Rev-(\d+)$/);
+      return { ref:rn, revNum: m?Number(m[1]):0, label: m?("Rev "+m[1]):"Rev 0 (original)" };
+    }).sort((a,b)=>a.revNum-b.revNum);
+    setRevisionSiblings(sibs);
+  },[]);
+  useEffect(()=>{ if(refFilter) loadRevisionSiblings(refFilter); },[refFilter,loadRevisionSiblings]);
+
+  const jumpToRevision = (ref)=>{
+    const pool = refs.filter(r=>r.reference_number===ref);
+    setRefFilter(ref); setSlNoFilter("");
+    if(pool.length===1) openEstimate(pool[0]); else if(pool.length>1) openEstimate(pool[0]);
+  };
+
+  const startAmendment = async()=>{
+    setAmendBusy(true);
+    try{
+      const latestRef = revisionSiblings.length ? revisionSiblings[revisionSiblings.length-1].ref : refFilter;
+      const nextRevNum = revisionSiblings.length ? (revisionSiblings[revisionSiblings.length-1].revNum+1) : 1;
+      const base = baseRefOf(refFilter);
+      const newRef = base+"-Rev-"+nextRevNum;
+
+      const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows}] = await Promise.all([
+        sb.from("estimates").select("*").eq("reference_number",latestRef),
+        sb.from("estimate_lines").select("*").eq("reference_number",latestRef),
+        sb.from("quote_commercial_terms").select("*").eq("reference_number",latestRef),
+        sb.from("quote_notes").select("*").eq("reference_number",latestRef),
+        sb.from("datasheets").select("*").eq("reference_number",latestRef),
+      ]);
+
+      const stripId = (r)=>{ const c={...r}; delete c.id; return c; };
+      if(estRows?.length) await sb.from("estimates").insert(estRows.map(r=>({...stripId(r), reference_number:newRef, quote_status:"Draft"})));
+      if(lineRows?.length) await sb.from("estimate_lines").insert(lineRows.map(r=>({...stripId(r), reference_number:newRef})));
+      if(termsRows?.length) await sb.from("quote_commercial_terms").insert(termsRows.map(r=>({...stripId(r), reference_number:newRef})));
+      if(noteRows?.length) await sb.from("quote_notes").insert(noteRows.map(r=>({...stripId(r), reference_number:newRef})));
+      if(dsRows?.length) await sb.from("datasheets").insert(dsRows.map(r=>({...stripId(r), reference_number:newRef})));
+
+      await logAudit("CREATE","estimates",newRef,"Amendment: created "+newRef+" as a clone of "+latestRef+" ("+Object.entries(amendAreas).filter(([k,v])=>v).map(([k])=>k).join(", ")+")",user?.username||"unknown",null,{cloned_from:latestRef,areas:amendAreas});
+
+      setShowAmendPicker(false);
+      await load();
+      await loadRevisionSiblings(newRef);
+      setRefFilter(newRef); setSlNoFilter("");
+      const newPool = (await sb.from("estimates").select("*").eq("reference_number",newRef)).data||[];
+      if(newPool.length) openEstimate(newPool[0]);
+      alert(newRef+" created (status: Draft). Ghost-field editing for Header/Commercial Terms/Notes/Datasheet and BOM coloring are the next piece being built — for now, edit this new revision the same way you'd edit any Draft quote.");
+    } catch(e){
+      alert("Amendment failed: "+e.message);
+    } finally { setAmendBusy(false); }
+  };
   const [showNewSlNoModal,setShowNewSlNoModal]=useState(false);
   const [newSlNoInput,setNewSlNoInput]=useState("");
   const [newSlNoError,setNewSlNoError]=useState("");
@@ -4929,8 +5005,9 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     if(!addNewMsg || addNewMsg.type!=="exists") return;
     setShowAddNewModal(false);
     setRefSearchDisplay(addNewMsg.label);
-    setRefFilter(addNewMsg.rn); setSlNoFilter("");
-    const pool = refs.filter(r=>r.reference_number===addNewMsg.rn);
+    const target = latestRefForBase(addNewMsg.rn);
+    setRefFilter(target); setSlNoFilter("");
+    const pool = refs.filter(r=>r.reference_number===target);
     if(pool.length===1) openEstimate(pool[0]);
   };
   const [pdfPreview,setPdfPreview]=useState(null); // {doc, filename} — Quote/BOM PDFs preview before download
@@ -6518,9 +6595,15 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       refFilter && quoteHeaderRow && h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
           h("div",{style:{fontSize:12.5,fontWeight:700}},"Quote Header — "+refFilter),
-          !headerEditOpen && h("button",{onClick:openHeaderEdit,style:btnSmall},"Edit")
+          h("div",{style:{display:"flex",gap:8}},
+            isAdmin && quoteHeaderRow.quote_status!=="Draft" && h("button",{onClick:()=>setShowAmendGate(true),style:{...btnSmall,background:"#0c447c",color:"#fff",border:"none"}},"Amend quote"),
+            !headerEditOpen && h("button",{onClick:openHeaderEdit,style:btnSmall},"Edit")
+          )
         ),
         h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:10}},"Shared across all Sl Nos in this quote — saving here updates every one at once."),
+        revisionSiblings.length>1 && h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}},
+          revisionSiblings.map(rv=>h("span",{key:rv.ref,onClick:()=>jumpToRevision(rv.ref),style:{cursor:"pointer",fontSize:11,fontWeight:600,padding:"4px 10px",borderRadius:5,background:rv.ref===refFilter?colors.dark:"#f4f2ea",color:rv.ref===refFilter?"#fff":colors.muted}},rv.label))
+        ),
         !headerEditOpen
           ? h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"4px 20px",fontSize:12}},
               h("div",null,h("span",{style:{color:colors.muted}},"Enquiry number: "),h("span",{style:!quoteHeaderRow.enquiry_number?{color:colors.danger}:{}},quoteHeaderRow.enquiry_number||"— not set")),
@@ -6586,6 +6669,23 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
             )
       ),
       refFilter && h(QuoteNotesPanel,{referenceNumber:refFilter,user}),
+      showAmendGate && h(AuthCodeGate,{requiredType:"edit",user,onClose:()=>setShowAmendGate(false),onAuthorized:async()=>{ setShowAmendGate(false); setShowAmendPicker(true); }}),
+      showAmendPicker && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:250}},
+        h("div",{style:{background:"#fff",borderRadius:8,width:420,padding:"20px 22px"}},
+          h("div",{style:{fontSize:14,fontWeight:700,marginBottom:4}},"Amend "+refFilter),
+          h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:12}},"What are you amending? Creates a new revision — the rest stays untouched."),
+          [["header","Header"],["commercial_terms","Commercial Terms"],["notes","Notes"],["datasheet","Datasheet"],["bom","BOM / Line items"]].map(([key,label])=>
+            h("label",{key,style:{display:"flex",alignItems:"center",gap:8,padding:"6px 0",fontSize:13,cursor:"pointer"}},
+              h("input",{type:"checkbox",checked:amendAreas[key],onChange:e=>setAmendAreas(a=>({...a,[key]:e.target.checked}))}),
+              label
+            )
+          ),
+          h("div",{style:{display:"flex",gap:8,marginTop:14}},
+            h("button",{onClick:startAmendment,disabled:amendBusy||!Object.values(amendAreas).some(Boolean),style:{...btnPrimary,flex:1}},amendBusy?"Creating…":"Start next revision"),
+            h("button",{onClick:()=>setShowAmendPicker(false),disabled:amendBusy,style:{...btnSecondary,flex:1}},"Cancel")
+          )
+        )
+      ),
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
         h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},"Export full quote"),
         h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}},
@@ -8667,6 +8767,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (32)", summary:"First slice of Quote Amendment / Revisions: an \"Amend quote\" button (Admin/Super Admin, needs an authorization code, only on non-Draft quotes) prompts what you're amending (Header/Commercial Terms/Notes/Datasheet/BOM), then clones the entire latest revision — Header, Commercial Terms, BOM, Notes, Datasheets, all of it — into a new independent record named \"{quote#}-Rev-{n}\", with status reset to Draft until changed. A Revisions strip on the Quote Header lets you jump between Rev 0/1/2..., and the quote search box now always shows one entry per family (\"quote# — client\") regardless of how many revisions exist, opening the latest one. Still to come: the ghost-field editing pattern for Header/Terms/Notes/Datasheet, live BOM-change coloring persisted into the revision, the Customer-locked/Address-from-list-only rule, the PDF Revision marker + History page, and the in-app History report — for now the new revision is just editable like any other Draft quote." },
   { date:"17 Jul 2026 (31)", summary:"Customers can now have multiple Addresses, each with its own GST Number — new sub-form on the Customer record (Master Data → Customers), same pattern as Contacts: inline \"+ Add address\", Edit/Remove per row, one flaggable as Primary. Foundational piece for the upcoming quote amendment/revision system, where Address will only be pickable from a customer's saved list, not typed freehand." },
   { date:"17 Jul 2026 (30)", summary:"Fixed a real bug: Material Rates' Shape/Spec/Grade filter row (and the Rate=0 table's) had been missed in the app-wide combo conversion — still the old per-keystroke text input with no exact-match enforcement, and picking Spec or Grade never reset the page number. Together these could show stale/wrong results (a partially-typed Spec effectively filtering nothing) or trigger a \"Requested range not satisfiable\" error that left old data on screen looking like the filter had done nothing. Both filter rows now use the same LimitToListCombo as everywhere else, every filter change resets to page 1, the search box does too, and a load failure now clears the table instead of leaving misleading stale rows." },
   { date:"17 Jul 2026 (29)", summary:"Performance fix: capped every Material Rates list at 25 rows per page (was up to 1,000/200/300 in different places) — Master Data → Material Rates now applies Shape/Spec/Grade filters server-side and paginates everything at 25, including the Rate=0 table (was 200). The separate Material Rates Report (Reports menu) no longer loads up to 5,000 rows unscoped on open — it's now filtered and paginated server-side too, with lightweight count-only queries for the All/Stale/Zero tab badges instead of counting in the browser. This should fix the \"Page Unresponsive\" slowdown that showed up as more rate data got added." },
