@@ -804,6 +804,93 @@ function MenuTabs({ user, active, onChange }) {
 /* ---- BOM ENTRY FORM (Access main/sub form style) ---- */
 function BomEntryForm({ onGoToTab, user }) {
   const canEditBom = user?.role==="admin" || user?.role==="super_admin";
+  const isSuperAdminBom = user?.role==="super_admin";
+
+  // Bulk Rule — Super Admin only. Match a set of BOM lines by Model prefix +
+  // Sub Assembly, then apply a new Spec/UOM (and optionally refresh Rate,
+  // Cost, Sales Price via Shape+Spec+Grade against Material Rates) — always
+  // previewed first, with a checkbox per matched row so specific lines can be
+  // unpicked before anything actually changes. Re-previewing after adjusting
+  // the match keeps prior checkbox choices for rows that still match.
+  const [showBulkRule,setShowBulkRule]=useState(false);
+  const [bulkModelPattern,setBulkModelPattern]=useState("");
+  const [bulkSubAssembly,setBulkSubAssembly]=useState("");
+  const [bulkNewSpec,setBulkNewSpec]=useState("");
+  const [bulkNewUom,setBulkNewUom]=useState("");
+  const [bulkRefreshRate,setBulkRefreshRate]=useState(true);
+  const [bulkSubAssemblyOptions,setBulkSubAssemblyOptions]=useState([]);
+  const [bulkSpecOptions,setBulkSpecOptions]=useState([]);
+  const [bulkUomOptions,setBulkUomOptions]=useState([]);
+  const [bulkPreview,setBulkPreview]=useState(null); // [{row,checked,newRate,newCost,newSalesPrice,rateFound}]
+  const [bulkPreviewLoading,setBulkPreviewLoading]=useState(false);
+  const [bulkApplying,setBulkApplying]=useState(false);
+  useEffect(()=>{
+    if(!showBulkRule) return;
+    fetchAll("subassembly_tbl","sub_assembly").then(d=>setBulkSubAssemblyOptions(Array.from(new Set(d.map(r=>r.sub_assembly).filter(Boolean))).sort()));
+    fetchAll("material_spec","material_spec").then(d=>setBulkSpecOptions(Array.from(new Set(d.map(r=>r.material_spec).filter(Boolean))).sort()));
+    fetchAll("uom_tbl","uom").then(d=>setBulkUomOptions(Array.from(new Set(d.map(r=>r.uom).filter(Boolean))).sort()));
+  },[showBulkRule]);
+  const clearBulkRule = ()=>{ setBulkModelPattern(""); setBulkSubAssembly(""); setBulkNewSpec(""); setBulkNewUom(""); setBulkRefreshRate(true); setBulkPreview(null); };
+  const previewBulkRule = async()=>{
+    if(!bulkModelPattern.trim()){ alert("Enter a Model (or a prefix, e.g. \"YCP\")."); return; }
+    if(!bulkSubAssembly){ alert("Pick a Sub Assembly."); return; }
+    if(!bulkNewSpec && !bulkNewUom){ alert("Set at least a new Spec or a new UOM."); return; }
+    setBulkPreviewLoading(true);
+    try{
+      const { data:matched, error:err } = await sb.from("bom").select("*").ilike("model",bulkModelPattern.trim()+"%").eq("sub_assembly",bulkSubAssembly);
+      if(err) throw err;
+      let rateByShapeGrade = new Map();
+      if(bulkRefreshRate && bulkNewSpec){
+        const shapes = Array.from(new Set((matched||[]).map(r=>r.material_shape).filter(Boolean)));
+        if(shapes.length){
+          const { data:rates } = await sb.from("material_rates").select("material_shape,material_grade,rate").eq("material_spec",bulkNewSpec).in("material_shape",shapes);
+          (rates||[]).forEach(r=>rateByShapeGrade.set(r.material_shape+"||"+r.material_grade, Number(r.rate)||0));
+        }
+      }
+      const prevChecked = new Map((bulkPreview||[]).map(p=>[p.row.id,p.checked]));
+      const nextPreview = (matched||[]).map(row=>{
+        let newRate = Number(row.rate)||0, rateFound = true;
+        if(bulkRefreshRate && bulkNewSpec){
+          const key = (row.material_shape||"")+"||"+(row.grade||"");
+          if(rateByShapeGrade.has(key)){ newRate = rateByShapeGrade.get(key); rateFound = true; }
+          else { rateFound = false; }
+        }
+        const qty = Number(row.qty_required)||0;
+        const sf = Number(row.sf)||3.1;
+        const newCost = bulkRefreshRate ? Number((qty*newRate).toFixed(4)) : Number(row.cost)||0;
+        const newSalesPrice = bulkRefreshRate ? Number((newCost*sf).toFixed(4)) : Number(row.sales_price)||0;
+        return {
+          row, rateFound,
+          checked: prevChecked.has(row.id) ? prevChecked.get(row.id) : true,
+          newSpec: bulkNewSpec||row.material_spec, newUom: bulkNewUom||row.uom,
+          newRate, newCost, newSalesPrice
+        };
+      });
+      setBulkPreview(nextPreview);
+    } catch(e){ alert("Preview failed: "+e.message); }
+    finally{ setBulkPreviewLoading(false); }
+  };
+  const toggleBulkRow = (id)=> setBulkPreview(p=>p.map(x=>x.row.id===id?{...x,checked:!x.checked}:x));
+  const applyBulkRule = async()=>{
+    const toApply = (bulkPreview||[]).filter(x=>x.checked);
+    if(!toApply.length){ alert("Nothing is checked."); return; }
+    if(!confirm("Apply this change to "+toApply.length+" BOM line"+(toApply.length===1?"":"s")+"? This can't be undone.")) return;
+    setBulkApplying(true);
+    try{
+      for(const x of toApply){
+        const payload = {
+          material_spec: x.newSpec, uom: x.newUom,
+          spec_grade: (x.newSpec||"")+(x.row.grade||""),
+        };
+        if(bulkRefreshRate){ payload.rate = x.newRate; payload.cost = x.newCost; payload.sales_price = x.newSalesPrice; }
+        await sb.from("bom").update(payload).eq("id",x.row.id);
+      }
+      await logAudit("UPDATE","bom","bulk rule","Bulk Rule: "+toApply.length+" line(s) — Model \""+bulkModelPattern+"*\" / Sub Assembly \""+bulkSubAssembly+"\" \u2192 Spec="+(bulkNewSpec||"(unchanged)")+", UOM="+(bulkNewUom||"(unchanged)")+(bulkRefreshRate?", rate refreshed":""),user?.username||"unknown",null,{count:toApply.length});
+      alert("Applied to "+toApply.length+" line"+(toApply.length===1?"":"s")+".");
+      setShowBulkRule(false); clearBulkRule();
+    } catch(e){ alert("Apply failed: "+e.message); }
+    finally{ setBulkApplying(false); }
+  };
   const [allModels, setAllModels] = useState([]);
   const [modelInput, setModelInput] = useState("");
   const [subRows, setSubRows] = useState([]);
@@ -1219,7 +1306,10 @@ function BomEntryForm({ onGoToTab, user }) {
   if(loadingMasters) return h("div",{style:{padding:"40px 24px",color:colors.mutedLight}},"Loading master data…");
 
   return h("div",{style:{padding:"20px 24px"}},
-    h("h2",{style:{margin:"0 0 16px",fontSize:18,fontWeight:700}},"BOM Entry Form"),
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},
+      h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"BOM Entry Form"),
+      isSuperAdminBom && h("button",{onClick:()=>setShowBulkRule(true),style:{...btnSecondary,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Bulk Rule")
+    ),
 
     // Main form — model selector
     h("div",{style:{padding:16,background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,marginBottom:16,maxWidth:480}},
@@ -1324,6 +1414,72 @@ function BomEntryForm({ onGoToTab, user }) {
       // Datalists for combos
       h("datalist",{id:"ci-list"},Array.from(new Set(masterData.ciTbl.map(r=>r.component).filter(Boolean))).sort().map(c=>h("option",{key:c,value:c}))),
       h("datalist",{id:"sa-list"},Array.from(new Set(masterData.saTbl.map(r=>r.sub_assembly).filter(Boolean))).sort().map(s=>h("option",{key:s,value:s})))
+    ),
+    showBulkRule && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:300,padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:760,maxWidth:"96vw",maxHeight:"88vh",overflowY:"auto",padding:"20px 24px"}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+          h("div",{style:{fontSize:15,fontWeight:700}},"BOM Master — Bulk Rule"),
+          h("span",{style:{fontSize:11,color:colors.mutedLight}},"Super Admin only")
+        ),
+        h("div",{style:{borderBottom:"1px solid "+colors.border,paddingBottom:14,marginBottom:14}},
+          h("div",{style:{fontSize:11,fontWeight:700,color:colors.muted,marginBottom:8}},"MATCH — which BOM lines this affects"),
+          h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}},
+            h("div",null,h("label",{style:{fontSize:10,color:colors.muted,display:"block",marginBottom:3}},"Model (prefix — e.g. \"YCP\")"),
+              h("input",{value:bulkModelPattern,onChange:e=>setBulkModelPattern(e.target.value),placeholder:"YCP",style:{...inputStyle,width:150}})
+            ),
+            h("div",null,h("label",{style:{fontSize:10,color:colors.muted,display:"block",marginBottom:3}},"Sub Assembly"),
+              h(LimitToListCombo,{value:bulkSubAssembly,onChange:setBulkSubAssembly,options:bulkSubAssemblyOptions,placeholder:"Sub Assembly…",invalidMessage:v=>"\""+v+"\" isn't a recognized Sub Assembly. Add it in Master Data \u2192 Sub-assemblies first.",style:{...inputStyle,width:180}})
+            )
+          ),
+          h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:6}},"\""+(bulkModelPattern||"…")+"\" matches every model starting with that text.")
+        ),
+        h("div",{style:{borderBottom:"1px solid "+colors.border,paddingBottom:14,marginBottom:14}},
+          h("div",{style:{fontSize:11,fontWeight:700,color:colors.muted,marginBottom:8}},"APPLY — new values for matched lines"),
+          h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end",marginBottom:8}},
+            h("div",null,h("label",{style:{fontSize:10,color:colors.muted,display:"block",marginBottom:3}},"Spec"),
+              h(LimitToListCombo,{value:bulkNewSpec,onChange:setBulkNewSpec,options:bulkSpecOptions,placeholder:"leave blank = unchanged",invalidMessage:v=>"\""+v+"\" isn't a recognized Spec. Add it in Master Data \u2192 Material Specs first.",style:{...inputStyle,width:200}})
+            ),
+            h("div",null,h("label",{style:{fontSize:10,color:colors.muted,display:"block",marginBottom:3}},"UOM"),
+              h(LimitToListCombo,{value:bulkNewUom,onChange:setBulkNewUom,options:bulkUomOptions,placeholder:"leave blank = unchanged",invalidMessage:v=>"\""+v+"\" isn't a recognized UOM. Add it in Master Data \u2192 UOM first.",style:{...inputStyle,width:120}})
+            )
+          ),
+          h("label",{style:{display:"flex",alignItems:"center",gap:6,fontSize:12,cursor:"pointer"}},
+            h("input",{type:"checkbox",checked:bulkRefreshRate,onChange:e=>setBulkRefreshRate(e.target.checked)}),
+            "Refresh Rate from Material Rates (looks up Shape + new Spec + existing Grade) — also recomputes Cost and Sales Price"
+          )
+        ),
+        h("div",{style:{display:"flex",gap:8,marginBottom:14}},
+          h("button",{onClick:previewBulkRule,disabled:bulkPreviewLoading,style:btnPrimary},bulkPreviewLoading?"Loading…":(bulkPreview?"Re-preview":"Preview matches")),
+          h("button",{onClick:clearBulkRule,style:btnSecondary},"Clear"),
+          h("button",{onClick:()=>{setShowBulkRule(false);},style:btnSecondary},"Close")
+        ),
+        bulkPreview && h("div",null,
+          h("div",{style:{fontSize:12,fontWeight:700,marginBottom:2}},"Preview — "+bulkPreview.length+" match"+(bulkPreview.length===1?"":"es")+" ("+bulkPreview.filter(x=>x.checked).length+" selected)"),
+          h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginBottom:8}},"Uncheck any line you don't want touched, then confirm — or adjust the match above and re-preview (your unchecks are kept)."),
+          bulkPreview.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight,padding:"10px 0"}},"No BOM lines match that Model + Sub Assembly.") :
+          h("table",{style:{width:"100%",fontSize:11.5,marginBottom:12}},
+            h("thead",null,h("tr",{style:{textAlign:"left",borderBottom:"2px solid "+colors.dark}},
+              ["","Model","Current Spec","Current UOM","Current Rate","New Spec","New UOM","New Rate"].map(c=>h("th",{key:c,style:{padding:"5px 6px"}},c))
+            )),
+            h("tbody",null,bulkPreview.map(x=>h("tr",{key:x.row.id,style:{borderBottom:"1px solid #eceae0",background:x.checked?(bulkRefreshRate&&!x.rateFound?"#fdecea":"transparent"):"#f4f2ea"}},
+              h("td",{style:{padding:"5px 6px"}},h("input",{type:"checkbox",checked:x.checked,onChange:()=>toggleBulkRow(x.row.id)})),
+              h("td",{style:{padding:"5px 6px"}},x.row.model),
+              h("td",{style:{padding:"5px 6px",color:colors.mutedLight}},x.row.material_spec),
+              h("td",{style:{padding:"5px 6px",color:colors.mutedLight}},x.row.uom),
+              h("td",{style:{padding:"5px 6px",color:colors.mutedLight,textAlign:"right"}},fmt(Number(x.row.rate)||0)),
+              h("td",{style:{padding:"5px 6px",fontWeight:600,color:"#1c8c75"}},x.newSpec),
+              h("td",{style:{padding:"5px 6px",fontWeight:600,color:"#1c8c75"}},x.newUom),
+              h("td",{style:{padding:"5px 6px",fontWeight:600,textAlign:"right",color:bulkRefreshRate?(x.rateFound?"#1c8c75":colors.danger):colors.mutedLight}},
+                bulkRefreshRate?(x.rateFound?fmt(x.newRate):"no rate found"):"(unchanged)"
+              )
+            )))
+          ),
+          bulkPreview.length>0 && h("div",{style:{display:"flex",gap:8}},
+            h("button",{onClick:applyBulkRule,disabled:bulkApplying||!bulkPreview.some(x=>x.checked),style:{...btnPrimary,background:"#0f6e56"}},bulkApplying?"Applying…":"Go ahead ("+bulkPreview.filter(x=>x.checked).length+" selected)"),
+            h("button",{onClick:()=>setBulkPreview(null),style:btnSecondary},"Back to match")
+          )
+        )
+      )
     )
   );
 }
@@ -1816,8 +1972,20 @@ function MasterEditor({ tableKey, user }) {
           .range(page*MR_PAGE_SIZE, page*MR_PAGE_SIZE+MR_PAGE_SIZE-1);
         if(err) throw err; setRows(data||[]); setMrAllRatesTotal(count||0);
       } else {
-        const { data, error:err } = await sb.from(tableKey).select("*").order("id",{ascending:true}).range(page*pageSize,page*pageSize+pageSize-1);
-        if(err) throw err; setRows(data||[]);
+        if(search.trim()){
+          const s = search.trim();
+          const textCols = tableDef.columns.filter(c=>!NUMERIC_COLS.has(c));
+          if(!textCols.length){ setRows([]); }
+          else {
+            const { data, error:err } = await sb.from(tableKey).select("*")
+              .or(textCols.map(c=>c+".ilike.%"+s+"%").join(","))
+              .order("id",{ascending:true}).limit(200);
+            if(err) throw err; setRows(data||[]);
+          }
+        } else {
+          const { data, error:err } = await sb.from(tableKey).select("*").order("id",{ascending:true}).range(page*pageSize,page*pageSize+pageSize-1);
+          if(err) throw err; setRows(data||[]);
+        }
       }
     } catch(e) { setError(e.message); setRows([]); if(page>0) setPage(0); } finally { setLoading(false); }
   },[tableKey,page,bomModelFilter,search,mrShapeFocus,mrSpecFilter,mrGradeFilter]);
@@ -2291,11 +2459,12 @@ function MasterEditor({ tableKey, user }) {
         )
       )
     ),
-    !(tableKey==="bom"&&bomModelFilter) && h("div",{style:{display:"flex",justifyContent:"center",alignItems:"center",gap:10,marginTop:14}},
+    !(tableKey==="bom"&&bomModelFilter) && !(tableKey!=="material_rates"&&search.trim()) && h("div",{style:{display:"flex",justifyContent:"center",alignItems:"center",gap:10,marginTop:14}},
       h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSecondary},"Previous"),
       h("span",{style:{fontSize:12,color:colors.muted,padding:"8px 0"}},tableKey==="material_rates"?("Page "+(page+1)+" of "+Math.max(1,Math.ceil(mrAllRatesTotal/MR_PAGE_SIZE))+"  ("+mrAllRatesTotal+" total)"):("Page "+(page+1))),
       h("button",{onClick:()=>setPage(p=>p+1),disabled:tableKey==="material_rates"?((page+1)*MR_PAGE_SIZE>=mrAllRatesTotal):(rows.length<pageSize),style:btnSecondary},"Next")
     ),
+    tableKey!=="material_rates" && search.trim() && h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:-8,marginBottom:10}},"Search results (capped at 200) — clear the search to go back to normal paging."),
     pendingDeleteIds && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
       h("div",{style:{background:"#fff",borderRadius:8,width:380,padding:"20px 22px"}},
         h("div",{style:{fontSize:14,fontWeight:700,marginBottom:8}},"Deletion approval required"),
@@ -9198,6 +9367,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (41)", summary:"New \"Bulk Rule\" tool on the BOM Entry Form (Super Admin only): match a set of BOM lines by Model prefix (e.g. \"YCP\" matches every YCP-series model) + Sub Assembly, then set a new Spec and/or UOM, with an option to refresh Rate (looked up via Shape + the new Spec + the line's existing Grade against Material Rates) and recompute Cost/Sales Price from it. Always previewed first — every matched line listed with a checkbox, unpick anything that looks wrong, and re-previewing after adjusting the match keeps your unchecks instead of resetting them. Spec/Sub Assembly/UOM are all Limit-to-List with the same \"not recognized — add it to the master first\" prompt used elsewhere." },
+  { date:"17 Jul 2026 (40)", summary:"Fixed a real bug in every Master Data table's Search box (not just Models): it was only ever filtering the currently-loaded 50-row page, not the whole table — so whether a search \"worked\" depended purely on luck, whether a matching row happened to already be on that page. Search is now a proper server-side search across the whole table (capped at 200 results), same fix pattern as Material Rates got earlier." },
   { date:"17 Jul 2026 (39)", summary:"Edit all lines added to Models (grouped by Model → Size), Sizes, Components, and UOM (flat, sorted ascending, no grouping — they don't have Model/Size columns), Sub-assemblies (grouped by Item → Component), and Grades (grouped by Shape) — all sorted ascending. BOM (Master Data screen, when no model is focused) now groups by Item → Model too, sorted ascending, without Edit all lines as asked. \"⧉ New tab\" moved from just the Quotes screen into the shared toolbar — it now appears on every single screen in the app, same rule (opens a fresh tab of the app)." },
   { date:"17 Jul 2026 (38)", summary:"Material Rates fully reworked around the correct relationship: Shape is the one true parent, Spec (dimension) and Grade (M.O.C.) are independent siblings under it, not dependent on each other — applied consistently in the \"+ New rate\" form (now Shape, Spec, Grade, Rate, UOM, Spec+Grade order), both Edit forms, and the filter row. New Grade master table (grade_tbl, next to Material Specs in BOM setup), same interface as Material Specs (Shape + Grade), backfilled from every distinct Shape/Grade pair already in Material Rates. Every Shape/Spec/Grade/UOM field is Limit-to-List everywhere now — typing something that doesn't exist shows \"'X' isn't a recognized [Shape/Spec/Grade/UOM] — add it in Master Data → [the right master] first\" and reverts, instead of silently failing. Spec+Grade is now a locked, auto-built field (Spec + a space + Grade) — never manually typed anywhere." },
   { date:"17 Jul 2026 (37)", summary:"Notes and Datasheet — where the ghost-field pattern doesn't really apply (a list of notes, a form of many diverse field types) — now use coloring instead, same idea as BOM: on a revision, editing a note or a datasheet field and saving it highlights that note/field amber and logs old→new, persisting after reload. A new note added on a revision is logged and highlighted too, not just edits to existing ones." },
