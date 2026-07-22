@@ -36,7 +36,7 @@ const { useState, useMemo, useCallback, useRef, useEffect, createElement: h } = 
 // while typing) only accepts a value that's actually in the options list —
 // anything else reverts to the last valid value. Pass limitToList:false for
 // fields that should behave like free text (Limit To List = No).
-function LimitToListCombo({ value, onChange, options, placeholder, style, disabled, limitToList=true, onBlur }){
+function LimitToListCombo({ value, onChange, options, placeholder, style, disabled, limitToList=true, onBlur, invalidMessage }){
   const [typed,setTyped] = useState(value||"");
   useEffect(()=>{ setTyped(value||""); },[value]);
   const listId = useMemo(()=>"dl-"+Math.random().toString(36).slice(2,9),[]);
@@ -44,7 +44,11 @@ function LimitToListCombo({ value, onChange, options, placeholder, style, disabl
     if(!limitToList){ onChange(v); return; }
     if(v===""){ onChange(""); return; }
     const hit = (options||[]).find(o=>o===v);
-    if(hit) onChange(hit); else setTyped(value||""); // not in list — revert
+    if(hit) onChange(hit);
+    else {
+      if(invalidMessage) alert(typeof invalidMessage==="function" ? invalidMessage(v) : invalidMessage);
+      setTyped(value||""); // not in list — revert
+    }
   };
   return h(React.Fragment,null,
     h("input",{
@@ -91,8 +95,9 @@ const MASTER_TABLES = [
   { key: "subassembly_tbl", label: "Sub-assemblies", columns: ["item","component","sub_assembly"], addLabel:"New sub-assembly", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"component",from:"component_item_tbl",field:"component",filterBy:"item"}], freeText:["sub_assembly"] },
   { key: "materials_shape", label: "Material shapes", columns: ["shape"], addLabel:"New shape", freeText:["shape"] },
   { key: "material_spec", label: "Material specs", columns: ["material_spec","material_shape"], addLabel:"New material spec", cascade:[{col:"material_shape",from:"materials_shape",field:"shape"}], freeText:["material_spec"] },
+  { key: "grade_tbl", label: "Grades", columns: ["material_grade","material_shape"], addLabel:"New grade", cascade:[{col:"material_shape",from:"materials_shape",field:"shape"}], freeText:["material_grade"] },
   { key: "uom_tbl", label: "UOM", columns: ["uom"], addLabel:"New UOM", freeText:["uom"] },
-  { key: "material_rates", label: "Material rates", columns: ["material_spec","material_grade","material_shape","rate","uom","spec_grade"], addLabel:"New rate", cascade:[{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"uom",from:"uom_tbl",field:"uom"}], freeText:["material_grade","rate","spec_grade"] },
+  { key: "material_rates", label: "Material rates", columns: ["material_shape","material_spec","material_grade","rate","uom","spec_grade"], addLabel:"New rate", cascade:[{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"material_grade",from:"grade_tbl",field:"material_grade"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"uom",from:"uom_tbl",field:"uom"}], freeText:["rate","spec_grade"] },
   { key: "bom", label: "BOM", columns: ["item","size","model","sub_assembly","component","material_shape","cutting_plan_layout_size","cutting_plan_qty","cutting_plan_uom","material_spec","qty_required","uom","spec_grade","rate","cost","sf","sales_price"], addLabel:"New BOM line", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"size",from:"size_tbl",field:"size"},{col:"model",from:"model_tbl",field:"model"},{col:"component",from:"component_item_tbl",field:"component"},{col:"sub_assembly",from:"subassembly_tbl",field:"sub_assembly"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"uom",from:"uom_tbl",field:"uom"},{col:"cutting_plan_uom",from:"uom_tbl",field:"uom"}], freeText:["cutting_plan_layout_size","cutting_plan_qty","spec_grade","qty_required","rate","cost","sf","sales_price"] },
   { key: "quote_status_tbl", label: "Quote Status", columns: ["status"], addLabel:"New status", freeText:["status"] },
   { key: "payment_terms_tbl", label: "Payment Terms", columns: ["value"], addLabel:"New payment term", freeText:["value"] },
@@ -686,7 +691,7 @@ function MenuTabs({ user, active, onChange }) {
     return ()=>document.removeEventListener("mousedown", onDocClick);
   },[]);
 
-  const bomSetupKeys = ["model_tbl","category_tbl","item_tbl","size_tbl","component_item_tbl","subassembly_tbl","materials_shape","material_spec","uom_tbl","material_rates","bom"];
+  const bomSetupKeys = ["model_tbl","category_tbl","item_tbl","size_tbl","component_item_tbl","subassembly_tbl","materials_shape","material_spec","grade_tbl","uom_tbl","material_rates","bom"];
   const ctKeys = ["quote_status_tbl","payment_terms_tbl","delivery_terms_tbl","packing_forwarding_tbl","insurance_terms_tbl","price_basis_tbl","guarantee_terms_tbl","dispatch_through_tbl","incoterms_tbl","freight_terms_tbl","tax_terms_tbl","warranty_coverage_tbl"];
   const byKeys = keys => MASTER_TABLES.filter(t=>keys.includes(t.key)).map(t=>({key:t.key,label:t.label}));
 
@@ -1429,17 +1434,32 @@ function MasterEditor({ tableKey, user }) {
   const [specShapeMap,setSpecShapeMap]=useState(new Map());
   const [mrShapeOptionsAll,setMrShapeOptionsAll]=useState([]);
   const [mrUomOptions,setMrUomOptions]=useState([]); // for the Edit form's UOM dropdown, not for filtering
-  const [mrSpecOptions,setMrSpecOptions]=useState([]); // ALL specs, for the Edit form's Spec dropdown (not shape-scoped)
+  const [mrSpecOptions,setMrSpecOptions]=useState([]); // ALL specs (fallback only — edit forms use specsByShape now)
+  const [specsByShape,setSpecsByShape]=useState(new Map()); // shape -> [specs] — Spec depends on Shape
+  const [gradesByShape,setGradesByShape]=useState(new Map()); // shape -> [grades] — Grade also depends on Shape (sibling to Spec, not dependent on it)
   useEffect(()=>{
     if(tableKey!=="material_rates") return;
     fetchAll("material_spec","material_spec,material_shape").then(d=>{
-      const m=new Map(); d.forEach(r=>{ if(r.material_spec) m.set(r.material_spec, r.material_shape||""); });
+      const m=new Map(); const bySh=new Map();
+      d.forEach(r=>{
+        if(r.material_spec) m.set(r.material_spec, r.material_shape||"");
+        if(r.material_shape){ if(!bySh.has(r.material_shape)) bySh.set(r.material_shape,[]); bySh.get(r.material_shape).push(r.material_spec); }
+      });
+      bySh.forEach(v=>v.sort());
       setSpecShapeMap(m);
       setMrSpecOptions(Array.from(m.keys()).sort());
+      setSpecsByShape(bySh);
+    });
+    fetchAll("grade_tbl","material_grade,material_shape").then(d=>{
+      const bySh=new Map();
+      d.forEach(r=>{ if(!r.material_shape||!r.material_grade) return; if(!bySh.has(r.material_shape)) bySh.set(r.material_shape,[]); bySh.get(r.material_shape).push(r.material_grade); });
+      bySh.forEach(v=>v.sort());
+      setGradesByShape(bySh);
     });
     fetchAll("materials_shape","shape").then(d=>setMrShapeOptionsAll(Array.from(new Set(d.map(r=>r.shape).filter(Boolean))).sort()));
     fetchAll("uom_tbl","uom").then(d=>setMrUomOptions(Array.from(new Set(d.map(r=>r.uom).filter(Boolean))).sort()));
   },[tableKey]);
+  const notInListMsg = (masterLabel,masterPath)=>(v)=>"\""+v+"\" isn't a recognized "+masterLabel+". Add it in Master Data \u2192 "+masterPath+" first.";
 
 
   const [mrEditingId,setMrEditingId]=useState(null);
@@ -1447,7 +1467,7 @@ function MasterEditor({ tableKey, user }) {
   const mrStartEdit = (row)=>{ setMrEditingId(row.id); setMrEditDraft({...row, _originalRate:row.rate}); };
   const mrCancelEdit = ()=>{ setMrEditingId(null); setMrEditDraft({}); };
   const mrSetField = (field,value)=>{
-    setMrEditDraft(d=>{ const next={...d,[field]:value}; if(field==="material_spec") next.material_shape = specShapeMap.get(value)||""; return next; });
+    setMrEditDraft(d=>{ const next={...d,[field]:value}; if(field==="material_shape"){ next.material_spec=""; next.material_grade=""; } return next; });
   };
   const mrSaveEdit = async()=>{
     const newRate = Number(mrEditDraft.rate)||0;
@@ -1455,7 +1475,7 @@ function MasterEditor({ tableKey, user }) {
     const payload = {
       material_spec: mrEditDraft.material_spec||"", material_shape: mrEditDraft.material_shape||"",
       material_grade: mrEditDraft.material_grade||"", rate: newRate,
-      uom: mrEditDraft.uom||"", spec_grade: (mrEditDraft.material_spec||"")+(mrEditDraft.material_grade||""),
+      uom: mrEditDraft.uom||"", spec_grade: ((mrEditDraft.material_spec||"")+" "+(mrEditDraft.material_grade||"")).trim(),
     };
     if(newRate!==oldRate) payload.rate_effective_date = new Date().toISOString().slice(0,10);
     const { error:err } = await sb.from("material_rates").update(payload).eq("id",mrEditingId);
@@ -1492,7 +1512,7 @@ function MasterEditor({ tableKey, user }) {
   const mrSetAllField = (id,field,value)=>{
     setMrEditAllDrafts(d=>{
       const row={...(d[id]||{}),[field]:value};
-      if(field==="material_spec") row.material_shape = specShapeMap.get(value)||"";
+      if(field==="material_shape"){ row.material_spec=""; row.material_grade=""; }
       return {...d,[id]:row};
     });
   };
@@ -1508,7 +1528,7 @@ function MasterEditor({ tableKey, user }) {
         const payload = {
           material_spec: draft.material_spec||"", material_shape: draft.material_shape||"",
           material_grade: draft.material_grade||"", rate: newRate,
-          uom: draft.uom||"", spec_grade: (draft.material_spec||"")+(draft.material_grade||""),
+          uom: draft.uom||"", spec_grade: ((draft.material_spec||"")+" "+(draft.material_grade||"")).trim(),
         };
         if(newRate!==oldRate){
           payload.rate_effective_date = new Date().toISOString().slice(0,10);
@@ -1660,18 +1680,21 @@ function MasterEditor({ tableKey, user }) {
 
   const mrRenderRow = (row)=> mrEditingId===row.id
     ? h("tr",{key:row.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
-        h("td",{style:{padding:"4px 6px"}},h("input",{value:mrEditDraft.material_shape||"",readOnly:true,style:{...inputStyle,padding:"5px 7px",fontSize:12,width:100,background:"#f4f2ea",color:colors.muted}})),
         h("td",{style:{padding:"4px 6px"}},isSuperAdmin
-          ? h(LimitToListCombo,{value:mrEditDraft.material_spec||"",onChange:v=>mrSetField("material_spec",v),options:mrSpecOptions,placeholder:"Spec…",style:{...inputStyle,padding:"5px 7px",fontSize:12,width:220}})
+          ? h(LimitToListCombo,{value:mrEditDraft.material_shape||"",onChange:v=>mrSetField("material_shape",v),options:mrShapeOptionsAll,placeholder:"Shape…",invalidMessage:notInListMsg("Shape","Materials Shape"),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:100}})
+          : h("input",{value:mrEditDraft.material_shape||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:100}})
+        ),
+        h("td",{style:{padding:"4px 6px"}},isSuperAdmin
+          ? h(LimitToListCombo,{value:mrEditDraft.material_spec||"",disabled:!mrEditDraft.material_shape,onChange:v=>mrSetField("material_spec",v),options:specsByShape.get(mrEditDraft.material_shape)||[],placeholder:mrEditDraft.material_shape?"Spec…":"Pick Shape first",invalidMessage:notInListMsg("Spec for this Shape","Material Specs"),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:220,background:mrEditDraft.material_shape?"#fff":"#f4f2ea"}})
           : h("input",{value:mrEditDraft.material_spec||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:220}})
         ),
         h("td",{style:{padding:"4px 6px"}},isSuperAdmin
-          ? h(LimitToListCombo,{value:mrEditDraft.material_grade||"",onChange:v=>mrSetField("material_grade",v),options:mrGradeDatalistOptions,placeholder:"Grade…",style:{...inputStyle,padding:"5px 7px",fontSize:12,width:220}})
+          ? h(LimitToListCombo,{value:mrEditDraft.material_grade||"",disabled:!mrEditDraft.material_shape,onChange:v=>mrSetField("material_grade",v),options:gradesByShape.get(mrEditDraft.material_shape)||[],placeholder:mrEditDraft.material_shape?"Grade…":"Pick Shape first",invalidMessage:notInListMsg("Grade for this Shape","Grades"),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:220,background:mrEditDraft.material_shape?"#fff":"#f4f2ea"}})
           : h("input",{value:mrEditDraft.material_grade||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:220}})
         ),
         h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:mrEditDraft.rate||"",onChange:e=>mrSetField("rate",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:90,textAlign:"right"}})),
         h("td",{style:{padding:"4px 6px"}},isSuperAdmin
-          ? h(LimitToListCombo,{value:mrEditDraft.uom||"",onChange:v=>mrSetField("uom",v),options:mrUomOptions,placeholder:"UOM…",style:{...inputStyle,padding:"5px 7px",fontSize:12}})
+          ? h(LimitToListCombo,{value:mrEditDraft.uom||"",onChange:v=>mrSetField("uom",v),options:mrUomOptions,placeholder:"UOM…",invalidMessage:notInListMsg("UOM","UOM"),style:{...inputStyle,padding:"5px 7px",fontSize:12}})
           : h("input",{value:mrEditDraft.uom||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:80}})
         ),
         h("td",{style:{padding:"4px 6px",whiteSpace:"nowrap",position:"sticky",right:0,background:"#eef6f3",boxShadow:"-2px 0 4px rgba(0,0,0,0.08)"}},
@@ -1701,18 +1724,21 @@ function MasterEditor({ tableKey, user }) {
   const mrRenderEditAllRow = (row)=>{
     const draft = mrEditAllDrafts[row.id]||row;
     return h("tr",{key:row.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
-      h("td",{style:{padding:"4px 6px"}},h("input",{value:draft.material_shape||"",readOnly:true,style:{...inputStyle,padding:"5px 7px",fontSize:12,width:100,background:"#f4f2ea",color:colors.muted}})),
       h("td",{style:{padding:"4px 6px"}},isSuperAdmin
-        ? h(LimitToListCombo,{value:draft.material_spec||"",onChange:v=>mrSetAllField(row.id,"material_spec",v),options:mrSpecOptions,placeholder:"Spec…",style:{...inputStyle,padding:"5px 7px",fontSize:12,width:220}})
+        ? h(LimitToListCombo,{value:draft.material_shape||"",onChange:v=>mrSetAllField(row.id,"material_shape",v),options:mrShapeOptionsAll,placeholder:"Shape…",invalidMessage:notInListMsg("Shape","Materials Shape"),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:100}})
+        : h("input",{value:draft.material_shape||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:100}})
+      ),
+      h("td",{style:{padding:"4px 6px"}},isSuperAdmin
+        ? h(LimitToListCombo,{value:draft.material_spec||"",disabled:!draft.material_shape,onChange:v=>mrSetAllField(row.id,"material_spec",v),options:specsByShape.get(draft.material_shape)||[],placeholder:draft.material_shape?"Spec…":"Pick Shape first",invalidMessage:notInListMsg("Spec for this Shape","Material Specs"),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:220,background:draft.material_shape?"#fff":"#f4f2ea"}})
         : h("input",{value:draft.material_spec||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:220}})
       ),
       h("td",{style:{padding:"4px 6px"}},isSuperAdmin
-        ? h(LimitToListCombo,{value:draft.material_grade||"",onChange:v=>mrSetAllField(row.id,"material_grade",v),options:mrGradeDatalistOptions,placeholder:"Grade…",style:{...inputStyle,padding:"5px 7px",fontSize:12,width:220}})
+        ? h(LimitToListCombo,{value:draft.material_grade||"",disabled:!draft.material_shape,onChange:v=>mrSetAllField(row.id,"material_grade",v),options:gradesByShape.get(draft.material_shape)||[],placeholder:draft.material_shape?"Grade…":"Pick Shape first",invalidMessage:notInListMsg("Grade for this Shape","Grades"),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:220,background:draft.material_shape?"#fff":"#f4f2ea"}})
         : h("input",{value:draft.material_grade||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:220}})
       ),
       h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:draft.rate||"",onChange:e=>mrSetAllField(row.id,"rate",e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12,width:90,textAlign:"right"}})),
       h("td",{style:{padding:"4px 6px"}},isSuperAdmin
-        ? h(LimitToListCombo,{value:draft.uom||"",onChange:v=>mrSetAllField(row.id,"uom",v),options:mrUomOptions,placeholder:"UOM…",style:{...inputStyle,padding:"5px 7px",fontSize:12}})
+        ? h(LimitToListCombo,{value:draft.uom||"",onChange:v=>mrSetAllField(row.id,"uom",v),options:mrUomOptions,placeholder:"UOM…",invalidMessage:notInListMsg("UOM","UOM"),style:{...inputStyle,padding:"5px 7px",fontSize:12}})
         : h("input",{value:draft.uom||"",readOnly:true,onFocus:mrGuardField,style:{...lockedFieldStyle,width:80}})
       ),
       h("td",{style:{padding:"4px 6px",whiteSpace:"nowrap",position:"sticky",right:0,background:"#eef6f3",boxShadow:"-2px 0 4px rgba(0,0,0,0.08)"}},
@@ -1871,7 +1897,10 @@ function MasterEditor({ tableKey, user }) {
   const saveAdd = async()=>{
     const payload={};
     tableDef.columns.forEach(c=>{ let v=addDraft[c]; if(NUMERIC_COLS.has(c)) v=v===""||v===undefined?0:Number(v); payload[c]=v===undefined?"":v; });
-    if(tableKey==="material_rates") payload.created_by = user?.username||"unknown";
+    if(tableKey==="material_rates"){
+      payload.created_by = user?.username||"unknown";
+      payload.spec_grade = ((addDraft.material_spec||"")+" "+(addDraft.material_grade||"")).trim(); // locked/auto — never trust a typed value
+    }
     const { data, error:err } = await sb.from(tableKey).insert(payload).select().single();
     if(err) { alert("Add failed: "+err.message); return; }
     if(data && data.id!==undefined) setFreshIds(prev=>new Set(prev).add(data.id));
@@ -2005,7 +2034,40 @@ function MasterEditor({ tableKey, user }) {
       )
     ),
     // Cascading add form
-    adding&&h("div",{style:{padding:"14px 16px",background:"#fff8e1",border:"1px solid #f0c060",borderRadius:8,marginBottom:14}},
+    adding&&tableKey==="material_rates"&&h("div",{style:{padding:"14px 16px",background:"#fff8e1",border:"1px solid #f0c060",borderRadius:8,marginBottom:14}},
+      h("div",{style:{fontWeight:600,fontSize:12,color:"#7a5000",marginBottom:10}},"New rate"),
+      h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}},
+        h("div",{style:{display:"flex",flexDirection:"column",gap:3,minWidth:110}},
+          h("label",{style:{fontSize:10,color:colors.muted,fontWeight:500}},"Shape ",h("span",{style:{color:"#1c8c75",fontSize:9}},"▼ list")),
+          h(LimitToListCombo,{value:addDraft.material_shape||"",onChange:v=>setAddDraft(d=>({material_shape:v})),options:mrShapeOptionsAll,placeholder:"Shape…",invalidMessage:notInListMsg("Shape","Materials Shape"),style:{...inputStyle,padding:"6px 8px",fontSize:12}})
+        ),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:3,minWidth:180}},
+          h("label",{style:{fontSize:10,color:colors.muted,fontWeight:500}},"Spec ",h("span",{style:{color:"#1c8c75",fontSize:9}},"▼ list")),
+          h(LimitToListCombo,{value:addDraft.material_spec||"",disabled:!addDraft.material_shape,onChange:v=>setAddDraft(d=>({...d,material_spec:v})),options:specsByShape.get(addDraft.material_shape)||[],placeholder:addDraft.material_shape?"Spec…":"Enter Shape first",invalidMessage:notInListMsg("Spec for this Shape","Material Specs"),style:{...inputStyle,padding:"6px 8px",fontSize:12,background:addDraft.material_shape?"#fff":"#f4f2ea"}})
+        ),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:3,minWidth:180}},
+          h("label",{style:{fontSize:10,color:colors.muted,fontWeight:500}},"Grade ",h("span",{style:{color:"#1c8c75",fontSize:9}},"▼ list")),
+          h(LimitToListCombo,{value:addDraft.material_grade||"",disabled:!addDraft.material_shape,onChange:v=>setAddDraft(d=>({...d,material_grade:v})),options:gradesByShape.get(addDraft.material_shape)||[],placeholder:addDraft.material_shape?"Grade…":"Enter Shape first",invalidMessage:notInListMsg("Grade for this Shape","Grades"),style:{...inputStyle,padding:"6px 8px",fontSize:12,background:addDraft.material_shape?"#fff":"#f4f2ea"}})
+        ),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:3,minWidth:90}},
+          h("label",{style:{fontSize:10,color:colors.muted,fontWeight:500}},"Rate"),
+          h("input",{type:"number",value:addDraft.rate??"",onChange:e=>setAddDraft(d=>({...d,rate:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12},placeholder:"Rate…"})
+        ),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:3,minWidth:100}},
+          h("label",{style:{fontSize:10,color:colors.muted,fontWeight:500}},"UOM ",h("span",{style:{color:"#1c8c75",fontSize:9}},"▼ list")),
+          h(LimitToListCombo,{value:addDraft.uom||"",onChange:v=>setAddDraft(d=>({...d,uom:v})),options:mrUomOptions,placeholder:"UOM…",invalidMessage:notInListMsg("UOM","UOM"),style:{...inputStyle,padding:"6px 8px",fontSize:12}})
+        ),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:3,minWidth:160}},
+          h("label",{style:{fontSize:10,color:colors.muted,fontWeight:500}},"Spec+Grade ",h("span",{style:{color:colors.mutedLight,fontSize:9}},"(auto)")),
+          h("input",{value:((addDraft.material_spec||"")+" "+(addDraft.material_grade||"")).trim(),readOnly:true,style:{...inputStyle,padding:"6px 8px",fontSize:12,background:"#f4f2ea",color:colors.muted}})
+        ),
+        h("div",{style:{display:"flex",gap:6,paddingBottom:1}},
+          h("button",{onClick:saveAdd,style:{...btnPrimary,padding:"8px 16px",fontSize:12}},"Save"),
+          h("button",{onClick:()=>{setAdding(false);setAddDraft({});},style:{...btnSecondary,padding:"8px 12px",fontSize:12}},"Cancel")
+        )
+      )
+    ),
+    adding&&tableKey!=="material_rates"&&h("div",{style:{padding:"14px 16px",background:"#fff8e1",border:"1px solid #f0c060",borderRadius:8,marginBottom:14}},
       h("div",{style:{fontWeight:600,fontSize:12,color:"#7a5000",marginBottom:10}},addLabel),
       h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}},
         tableDef.columns.map(col=>h("div",{key:col,style:{display:"flex",flexDirection:"column",gap:3,minWidth:120,flex:1}},
@@ -2047,9 +2109,9 @@ function MasterEditor({ tableKey, user }) {
     tableKey==="material_rates"&&h("div",{style:{marginBottom:14}},
       h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
         h("span",{onClick:()=>{setMrShapeFocus("");setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");setPage(0);},style:{padding:"9px 14px",fontSize:12,fontWeight:600,borderRadius:6,cursor:"pointer",background:(!mrShapeFocus&&!search.trim())?colors.dark:"#fff",color:(!mrShapeFocus&&!search.trim())?"#fff":colors.muted,border:"1px solid "+((!mrShapeFocus&&!search.trim())?colors.dark:colors.border)}},"All rates"),
-        h(LimitToListCombo,{value:mrShapeFocus,onChange:v=>{setMrShapeFocus(v);setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");setPage(0);},options:mrShapeOptionsAll,placeholder:"1. Shape…",style:{...inputStyle,width:160}}),
-        h(LimitToListCombo,{value:mrSpecFilter,disabled:!mrShapeFocus,onChange:v=>{setMrSpecFilter(v);setMrGradeFilter("");setPage(0);},options:mrSpecOptionsScoped,placeholder:mrShapeFocus?"2. Spec…":"Pick a Shape first",style:{...inputStyle,width:190,background:mrShapeFocus?"#fff":"#f4f2ea",color:mrShapeFocus?colors.text:colors.mutedLight}}),
-        h(LimitToListCombo,{value:mrGradeFilter,disabled:!mrSpecFilter,onChange:v=>{setMrGradeFilter(v);setPage(0);},options:mrGradeOptionsScoped,placeholder:mrSpecFilter?"3. Grade…":"Pick a Spec first",style:{...inputStyle,width:150,background:mrSpecFilter?"#fff":"#f4f2ea",color:mrSpecFilter?colors.text:colors.mutedLight}}),
+        h(LimitToListCombo,{value:mrShapeFocus,onChange:v=>{setMrShapeFocus(v);setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");setPage(0);},options:mrShapeOptionsAll,placeholder:"1. Shape…",invalidMessage:notInListMsg("Shape","Materials Shape"),style:{...inputStyle,width:160}}),
+        h(LimitToListCombo,{value:mrSpecFilter,disabled:!mrShapeFocus,onChange:v=>{setMrSpecFilter(v);setPage(0);},options:specsByShape.get(mrShapeFocus)||[],placeholder:mrShapeFocus?"2. Spec…":"Pick a Shape first",invalidMessage:notInListMsg("Spec for this Shape","Material Specs"),style:{...inputStyle,width:190,background:mrShapeFocus?"#fff":"#f4f2ea",color:mrShapeFocus?colors.text:colors.mutedLight}}),
+        h(LimitToListCombo,{value:mrGradeFilter,disabled:!mrShapeFocus,onChange:v=>{setMrGradeFilter(v);setPage(0);},options:gradesByShape.get(mrShapeFocus)||[],placeholder:mrShapeFocus?"3. Grade…":"Pick a Shape first",invalidMessage:notInListMsg("Grade for this Shape","Grades"),style:{...inputStyle,width:150,background:mrShapeFocus?"#fff":"#f4f2ea",color:mrShapeFocus?colors.text:colors.mutedLight}}),
         (mrShapeFocus||mrSpecFilter||mrGradeFilter)&&h("button",{onClick:()=>{setMrShapeFocus("");setMrSpecFilter("");setMrGradeFilter("");setMrStepMsg("");setPage(0);},style:btnSecondary},"Clear filters"),
         h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
           canEditMR&&!mrEditAllMode&&mrFilteredRows.length>0&&h("button",{onClick:mrStartEditAll,style:btnPrimary},"Edit all lines"),
@@ -9018,6 +9080,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (38)", summary:"Material Rates fully reworked around the correct relationship: Shape is the one true parent, Spec (dimension) and Grade (M.O.C.) are independent siblings under it, not dependent on each other — applied consistently in the \"+ New rate\" form (now Shape, Spec, Grade, Rate, UOM, Spec+Grade order), both Edit forms, and the filter row. New Grade master table (grade_tbl, next to Material Specs in BOM setup), same interface as Material Specs (Shape + Grade), backfilled from every distinct Shape/Grade pair already in Material Rates. Every Shape/Spec/Grade/UOM field is Limit-to-List everywhere now — typing something that doesn't exist shows \"'X' isn't a recognized [Shape/Spec/Grade/UOM] — add it in Master Data → [the right master] first\" and reverts, instead of silently failing. Spec+Grade is now a locked, auto-built field (Spec + a space + Grade) — never manually typed anywhere." },
   { date:"17 Jul 2026 (37)", summary:"Notes and Datasheet — where the ghost-field pattern doesn't really apply (a list of notes, a form of many diverse field types) — now use coloring instead, same idea as BOM: on a revision, editing a note or a datasheet field and saving it highlights that note/field amber and logs old→new, persisting after reload. A new note added on a revision is logged and highlighted too, not just edits to existing ones." },
   { date:"17 Jul 2026 (36)", summary:"Commercial Terms now has the real ghost-field pattern on a revision, same as Header — every one of the 15 fields shows its existing value plus a blank field beside it (dropdown, combo, or text depending on the field), blank keeps it, filled overrides and logs old→new. Replaces the diff-on-save workaround from the previous round." },
   { date:"17 Jul 2026 (35)", summary:"Major amendment-system slice: Header now uses real ghost-field editing on a revision (existing value shown, blank field beside it — blank keeps it, filled overrides and logs old→new) — Customer is locked entirely (message tells you to create a new offer instead), Address is only pickable from that customer's saved Addresses list. Commercial Terms keeps its normal edit form but now diff-logs whatever actually changed against the pre-amendment values. BOM line edits on a revision now log every changed field and highlight that whole line (amber) the moment it's saved — persists after reload, not just live. New \"What changed in this revision\" report in the History panel, plus a matching Revision History page in the generated PDF (right after Notes) and a \"Revision N\" marker on the cover page." },
