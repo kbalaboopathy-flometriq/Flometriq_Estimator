@@ -89,13 +89,13 @@ const COMPANY_LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAABlCAYA
 const MASTER_TABLES = [
   { key: "model_tbl", label: "Models", columns: ["item","model","size","category"], addLabel:"New model", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"size",from:"size_tbl",field:"size"},{col:"category",from:"category_tbl",field:"category"}], freeText:["model"], groupBy:["model","size"], editAllEnabled:true },
   { key: "category_tbl", label: "Categories", columns: ["category"], addLabel:"New category", freeText:["category"] },
-  { key: "item_tbl", label: "Items", columns: ["item","hsn_code"], addLabel:"New item", freeText:["item","hsn_code"] },
+  { key: "item_tbl", label: "Items", columns: ["item","hsn_code"], addLabel:"New item", freeText:["item","hsn_code"], exportEnabled:true },
   { key: "size_tbl", label: "Sizes", columns: ["size"], addLabel:"New size", freeText:["size"], editAllEnabled:true },
-  { key: "component_item_tbl", label: "Components by item", columns: ["component","item"], addLabel:"New component", cascade:[{col:"item",from:"item_tbl",field:"item"}], freeText:["component"], editAllEnabled:true },
-  { key: "subassembly_tbl", label: "Sub-assemblies", columns: ["item","component","sub_assembly"], addLabel:"New sub-assembly", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"component",from:"component_item_tbl",field:"component",filterBy:"item"}], freeText:["sub_assembly"], groupBy:["item","component"], editAllEnabled:true },
+  { key: "component_item_tbl", label: "Components by item", columns: ["component","item"], addLabel:"New component", cascade:[{col:"item",from:"item_tbl",field:"item"}], freeText:["component"], editAllEnabled:true, exportEnabled:true },
+  { key: "subassembly_tbl", label: "Sub-assemblies", columns: ["item","component","sub_assembly"], addLabel:"New sub-assembly", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"component",from:"component_item_tbl",field:"component",filterBy:"item"}], freeText:["sub_assembly"], groupBy:["item","component"], editAllEnabled:true, exportEnabled:true },
   { key: "materials_shape", label: "Material shapes", columns: ["shape"], addLabel:"New shape", freeText:["shape"], editAllEnabled:true },
-  { key: "material_spec", label: "Material specs", columns: ["material_spec","material_shape"], addLabel:"New material spec", cascade:[{col:"material_shape",from:"materials_shape",field:"shape"}], freeText:["material_spec"] },
-  { key: "grade_tbl", label: "Grades", columns: ["material_grade","material_shape"], addLabel:"New grade", cascade:[{col:"material_shape",from:"materials_shape",field:"shape"}], freeText:["material_grade"], groupBy:["material_shape"], editAllEnabled:true },
+  { key: "material_spec", label: "Material specs", columns: ["material_spec","material_shape"], addLabel:"New material spec", cascade:[{col:"material_shape",from:"materials_shape",field:"shape"}], freeText:["material_spec"], exportEnabled:true },
+  { key: "grade_tbl", label: "Grades", columns: ["material_grade","material_shape"], addLabel:"New grade", cascade:[{col:"material_shape",from:"materials_shape",field:"shape"}], freeText:["material_grade"], groupBy:["material_shape"], editAllEnabled:true, exportEnabled:true },
   { key: "uom_tbl", label: "UOM", columns: ["uom"], addLabel:"New UOM", freeText:["uom"], editAllEnabled:true },
   { key: "material_rates", label: "Material rates", columns: ["material_shape","material_spec","material_grade","rate","uom","spec_grade"], addLabel:"New rate", cascade:[{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"material_grade",from:"grade_tbl",field:"material_grade"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"uom",from:"uom_tbl",field:"uom"}], freeText:["rate","spec_grade"] },
   { key: "bom", label: "BOM", columns: ["item","size","model","sub_assembly","component","material_shape","cutting_plan_layout_size","cutting_plan_qty","cutting_plan_uom","material_spec","qty_required","uom","spec_grade","rate","cost","sf","sales_price"], addLabel:"New BOM line", groupBy:["item","model"], cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"size",from:"size_tbl",field:"size"},{col:"model",from:"model_tbl",field:"model"},{col:"component",from:"component_item_tbl",field:"component"},{col:"sub_assembly",from:"subassembly_tbl",field:"sub_assembly"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"uom",from:"uom_tbl",field:"uom"},{col:"cutting_plan_uom",from:"uom_tbl",field:"uom"}], freeText:["cutting_plan_layout_size","cutting_plan_qty","spec_grade","qty_required","rate","cost","sf","sales_price"] },
@@ -1803,9 +1803,41 @@ function MasterEditor({ tableKey, user }) {
       setExportPreview({ rows:data||[], format, title:"Rates Missing a Value", filenameBase:"material_rates_missing" });
     } finally { setExportPreviewLoading(false); }
   };
+  const openGenericExportPreview = async(format)=>{
+    setExportPreviewLoading(true);
+    try{
+      let q = sb.from(tableKey).select("*");
+      if(search.trim()){
+        const s = search.trim();
+        const textCols = tableDef.columns.filter(c=>!NUMERIC_COLS.has(c));
+        if(textCols.length) q = q.or(textCols.map(c=>c+".ilike.%"+s+"%").join(","));
+      }
+      const { data } = await q.order("id",{ascending:true}).limit(5000);
+      setExportPreview({ rows:data||[], format, title:tableDef.label, filenameBase:tableKey, columns:tableDef.columns });
+    } finally { setExportPreviewLoading(false); }
+  };
   const confirmExportSave = ()=>{
     if(!exportPreview) return;
-    const { rows:r, format, title, filenameBase } = exportPreview;
+    const { rows:r, format, title, filenameBase, columns } = exportPreview;
+    if(columns){
+      const headers = columns.map(c=>colLabel(c));
+      if(format==="excel"){
+        const rowsOut=[headers];
+        r.forEach(row=>rowsOut.push(columns.map(c=>row[c]??"")));
+        const ws=XLSX.utils.aoa_to_sheet(rowsOut); ws["!cols"]=columns.map(()=>({wch:18}));
+        const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,title.slice(0,31));
+        XLSX.writeFile(wb,filenameBase+".xlsx");
+      } else {
+        generatePDF({
+          title, createdBy:user?.username||"",
+          headers,
+          rows:r.map(row=>columns.map(c=>String(row[c]??""))),
+          filename:filenameBase+".pdf",
+        });
+      }
+      setExportPreview(null);
+      return;
+    }
     if(format==="excel"){
       const rowsOut=[["Shape","Spec","Grade","Rate","UOM"]];
       r.forEach(row=>rowsOut.push([row.material_shape||"",row.material_spec||"",row.material_grade||"",Number(row.rate)||0,row.uom||""]));
@@ -2285,6 +2317,8 @@ function MasterEditor({ tableKey, user }) {
         tableKey==="material_rates"&&mrFilteredRows.length>0&&h("button",{onClick:()=>setMrZoomOpen(true),style:btnSecondary},"⤢ Zoom"),
         tableKey==="material_rates"&&h("button",{onClick:()=>openMrExportPreview("excel"),disabled:exportPreviewLoading,style:btnSecondary},"Export Excel"),
         tableKey==="material_rates"&&h("button",{onClick:()=>openMrExportPreview("pdf"),disabled:exportPreviewLoading,style:btnSecondary},"Export PDF"),
+        tableDef.exportEnabled&&h("button",{onClick:()=>openGenericExportPreview("excel"),disabled:exportPreviewLoading,style:btnSecondary},"Export Excel"),
+        tableDef.exportEnabled&&h("button",{onClick:()=>openGenericExportPreview("pdf"),disabled:exportPreviewLoading,style:btnSecondary},"Export PDF"),
         tableDef.editAllEnabled&&!genericEditAllMode&&sortedFilteredRows.length>0&&h("button",{onClick:startGenericEditAll,style:btnSecondary},"Edit all lines"),
         tableDef.editAllEnabled&&genericEditAllMode&&h(React.Fragment,null,
           h("button",{onClick:saveGenericAllEdits,disabled:genericSavingAll,style:{...btnPrimary,background:"#0f6e56"}},genericSavingAll?"Saving…":"Save all changes"),
@@ -2579,17 +2613,21 @@ function MasterEditor({ tableKey, user }) {
           ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"14px 0"}},"Nothing matches the current filter — nothing to export.")
           : h("table",{style:{width:"100%",fontSize:12,marginBottom:10}},
               h("thead",null,h("tr",{style:{textAlign:"left",borderBottom:"2px solid "+colors.dark}},
-                ["Shape","Spec","Grade","Rate","UOM"].map(c=>h("th",{key:c,style:{padding:"5px 7px"}},c))
+                (exportPreview.columns?exportPreview.columns.map(c=>colLabel(c)):["Shape","Spec","Grade","Rate","UOM"]).map(c=>h("th",{key:c,style:{padding:"5px 7px"}},c))
               )),
               h("tbody",null,
                 exportPreview.rows.slice(0,15).map((r,i)=>h("tr",{key:i,style:{borderBottom:"1px solid #eceae0"}},
-                  h("td",{style:{padding:"5px 7px"}},r.material_shape),
-                  h("td",{style:{padding:"5px 7px"}},r.material_spec),
-                  h("td",{style:{padding:"5px 7px"}},r.material_grade),
-                  h("td",{style:{padding:"5px 7px",textAlign:"right"}},fmt(Number(r.rate)||0)),
-                  h("td",{style:{padding:"5px 7px"}},r.uom)
+                  exportPreview.columns
+                    ? exportPreview.columns.map(c=>h("td",{key:c,style:{padding:"5px 7px",textAlign:NUMERIC_COLS.has(c)?"right":"left"}},NUMERIC_COLS.has(c)?fmt(Number(r[c])||0):String(r[c]??"")))
+                    : [
+                        h("td",{key:"shape",style:{padding:"5px 7px"}},r.material_shape),
+                        h("td",{key:"spec",style:{padding:"5px 7px"}},r.material_spec),
+                        h("td",{key:"grade",style:{padding:"5px 7px"}},r.material_grade),
+                        h("td",{key:"rate",style:{padding:"5px 7px",textAlign:"right"}},fmt(Number(r.rate)||0)),
+                        h("td",{key:"uom",style:{padding:"5px 7px"}},r.uom)
+                      ]
                 )),
-                exportPreview.rows.length>15 && h("tr",null,h("td",{colSpan:5,style:{padding:"6px 7px",color:colors.mutedLight,fontStyle:"italic"}},"… "+(exportPreview.rows.length-15)+" more row"+(exportPreview.rows.length-15===1?"":"s")+" …"))
+                exportPreview.rows.length>15 && h("tr",null,h("td",{colSpan:(exportPreview.columns?exportPreview.columns.length:5),style:{padding:"6px 7px",color:colors.mutedLight,fontStyle:"italic"}},"… "+(exportPreview.rows.length-15)+" more row"+(exportPreview.rows.length-15===1?"":"s")+" …"))
               )
             ),
         h("div",{style:{display:"flex",gap:8}},
@@ -9367,6 +9405,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Jul 2026 (43)", summary:"Fixed a real gap: Data Backup was a hand-maintained list, and had already silently missed 4 tables added this session (quote_notes, customer_addresses, revision_changes, rate_history) — none of them were being backed up. Backup now discovers tables live from the database itself (new list_public_tables() function) instead of depending on a list anyone has to remember to update — the screen shows whether it's using that live list or had to fall back to the old hardcoded one, so it's never silently wrong again. The 4 missing tables are also added to the fallback list as a safety net. Restore matches sheet names against the live list too." },
+  { date:"17 Jul 2026 (42)", summary:"Export Excel / Export PDF added to Item, Material Specs, Grades, Components, and Sub-assemblies — each follows whatever the Search box is currently filtering (or everything if blank), same preview-first pattern as Material Rates (row count + up to 15 sample rows, Save or Cancel, nothing downloads without that step)." },
   { date:"17 Jul 2026 (41)", summary:"New \"Bulk Rule\" tool on the BOM Entry Form (Super Admin only): match a set of BOM lines by Model prefix (e.g. \"YCP\" matches every YCP-series model) + Sub Assembly, then set a new Spec and/or UOM, with an option to refresh Rate (looked up via Shape + the new Spec + the line's existing Grade against Material Rates) and recompute Cost/Sales Price from it. Always previewed first — every matched line listed with a checkbox, unpick anything that looks wrong, and re-previewing after adjusting the match keeps your unchecks instead of resetting them. Spec/Sub Assembly/UOM are all Limit-to-List with the same \"not recognized — add it to the master first\" prompt used elsewhere." },
   { date:"17 Jul 2026 (40)", summary:"Fixed a real bug in every Master Data table's Search box (not just Models): it was only ever filtering the currently-loaded 50-row page, not the whole table — so whether a search \"worked\" depended purely on luck, whether a matching row happened to already be on that page. Search is now a proper server-side search across the whole table (capped at 200 results), same fix pattern as Material Rates got earlier." },
   { date:"17 Jul 2026 (39)", summary:"Edit all lines added to Models (grouped by Model → Size), Sizes, Components, and UOM (flat, sorted ascending, no grouping — they don't have Model/Size columns), Sub-assemblies (grouped by Item → Component), and Grades (grouped by Shape) — all sorted ascending. BOM (Master Data screen, when no model is focused) now groups by Item → Model too, sorted ascending, without Edit all lines as asked. \"⧉ New tab\" moved from just the Quotes screen into the shared toolbar — it now appears on every single screen in the app, same rule (opens a fresh tab of the app)." },
@@ -10802,13 +10842,16 @@ const BACKUP_EXTRA_TABLES = [
   "estimates","estimate_lines","contacts","datasheets","datasheet_master_fields",
   "quote_commercial_terms","company_master","description_master","zone_tbl",
   "authorization_codes","deletion_codes","audit_log","app_users",
-  "monthly_archive_prompts","login_history","calc_history","user_permissions"
+  "monthly_archive_prompts","login_history","calc_history","user_permissions",
+  "quote_notes","customer_addresses","revision_changes","rate_history"
 ];
 const BACKUP_ALL_TABLES = Array.from(new Set([...MASTER_TABLES.map(t=>t.key), ...BACKUP_EXTRA_TABLES]));
 
 function DataBackupScreen({ user }){
   const isSuperAdmin = user?.role==="super_admin";
   const [running,setRunning] = useState(false);
+  const [tableList,setTableList] = useState(BACKUP_ALL_TABLES); // replaced with the live DB list once fetched
+  const [tableListSource,setTableListSource] = useState("loading"); // "live" | "fallback" | "loading"
   const [progress,setProgress] = useState({done:0,total:BACKUP_ALL_TABLES.length,current:""});
   const [lastBackup,setLastBackup] = useState(null);
 
@@ -10821,16 +10864,28 @@ function DataBackupScreen({ user }){
       const { data } = await sb.from("audit_log").select("*").eq("action","EXPORT").eq("table_name","__backup__").order("performed_at",{ascending:false}).limit(1).maybeSingle();
       if(data) setLastBackup(data);
     })();
+    (async()=>{
+      // Live discovery — no maintained list, this is whatever tables
+      // actually exist in the database right now. Falls back to the
+      // hardcoded list only if the function itself can't be reached.
+      try{
+        const { data, error } = await sb.rpc("list_public_tables");
+        if(error) throw error;
+        const live = (data||[]).map(r=>r.table_name).filter(Boolean);
+        if(live.length){ setTableList(live); setTableListSource("live"); }
+        else { setTableListSource("fallback"); }
+      } catch(e){ console.error("list_public_tables failed, using fallback list",e); setTableListSource("fallback"); }
+    })();
   },[]);
 
   const runBackup = async()=>{
     setRunning(true);
-    setProgress({done:0,total:BACKUP_ALL_TABLES.length,current:""});
+    setProgress({done:0,total:tableList.length,current:""});
     const wb = XLSX.utils.book_new();
     let successCount = 0, failCount = 0;
-    for(let i=0;i<BACKUP_ALL_TABLES.length;i++){
-      const table = BACKUP_ALL_TABLES[i];
-      setProgress({done:i,total:BACKUP_ALL_TABLES.length,current:table});
+    for(let i=0;i<tableList.length;i++){
+      const table = tableList[i];
+      setProgress({done:i,total:tableList.length,current:table});
       try{
         const { data, error } = await sb.from(table).select("*");
         if(error) throw error;
@@ -10852,7 +10907,7 @@ function DataBackupScreen({ user }){
         failCount++;
       }
     }
-    setProgress({done:BACKUP_ALL_TABLES.length,total:BACKUP_ALL_TABLES.length,current:""});
+    setProgress({done:tableList.length,total:tableList.length,current:""});
     const filename = "Flometriq_Backup_"+new Date().toISOString().slice(0,10)+".xlsx";
     XLSX.writeFile(wb, filename);
     await logAudit("EXPORT","__backup__","full-backup","Manual data backup — "+successCount+" table(s) exported"+(failCount?", "+failCount+" failed":""),user?.username||"unknown",null,null);
@@ -10876,7 +10931,7 @@ function DataBackupScreen({ user }){
       const wb = XLSX.read(buf, {type:"array"});
       const results = [];
       for(const sheetName of wb.SheetNames){
-        const table = BACKUP_ALL_TABLES.find(t=>t.slice(0,31)===sheetName);
+        const table = tableList.find(t=>t.slice(0,31)===sheetName) || BACKUP_ALL_TABLES.find(t=>t.slice(0,31)===sheetName);
         if(!table){ results.push({table:sheetName,status:"skipped",detail:"Not a recognized table"}); setRestoreResults([...results]); continue; }
         const ws = wb.Sheets[sheetName];
         let rows = XLSX.utils.sheet_to_json(ws, {defval:null});
@@ -10926,8 +10981,13 @@ function DataBackupScreen({ user }){
     h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14,lineHeight:1.6}},"Downloads every table's current data as one Excel file, one sheet per table. Nothing scheduled — click whenever you want a snapshot. This is a data-only snapshot, not a restore point — see the note below before relying on it."),
     lastBackup && h("div",{style:{fontSize:11,color:colors.muted,marginBottom:14}},"Last backup: "+new Date(lastBackup.performed_at).toLocaleString()+" by "+lastBackup.performed_by),
     h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,background:"#fff",padding:"14px 16px",marginBottom:14,maxHeight:180,overflowY:"auto"}},
-      h("div",{style:{fontSize:10.5,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:6}},BACKUP_ALL_TABLES.length+" tables"),
-      BACKUP_ALL_TABLES.map(t=>h("div",{key:t,style:{fontSize:12,padding:"2px 0",color:progress.current===t?colors.accent:colors.text,fontWeight:progress.current===t?700:400}},t))
+      h("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:6}},
+        h("div",{style:{fontSize:10.5,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em"}},tableList.length+" tables"),
+        tableListSource==="live" && h("span",{style:{fontSize:9.5,fontWeight:700,padding:"1px 7px",borderRadius:8,background:"#e1f5ee",color:"#085041"}},"live from database"),
+        tableListSource==="fallback" && h("span",{style:{fontSize:9.5,fontWeight:700,padding:"1px 7px",borderRadius:8,background:"#fdecea",color:colors.danger}},"fallback list — couldn't reach the database's live table list"),
+        tableListSource==="loading" && h("span",{style:{fontSize:9.5,color:colors.mutedLight}},"checking…")
+      ),
+      tableList.map(t=>h("div",{key:t,style:{fontSize:12,padding:"2px 0",color:progress.current===t?colors.accent:colors.text,fontWeight:progress.current===t?700:400}},t))
     ),
     h("button",{onClick:runBackup,disabled:running,style:{...btnPrimary,width:"100%",opacity:running?0.7:1}},running?"Backing up…":"Backup Now"),
     running && h("div",{style:{marginTop:12}},
