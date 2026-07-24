@@ -761,6 +761,64 @@ function CompanySessionPicker({ user, onPicked }){
 }
 
 /* ---- TOP BAR ---- */
+// Passive notifications — reads notifications_tbl for whichever Employee
+// the logged-in user's login is linked to (Phase 4 link). Never blocks
+// anything; just a bell with a dropdown, mark-read on open.
+function NotificationBell({ user }){
+  const [open,setOpen] = useState(false);
+  const [items,setItems] = useState([]);
+  const [employeeName,setEmployeeName] = useState(null);
+  const rootRef = useRef(null);
+
+  const load = useCallback(async()=>{
+    if(!user?.id) return;
+    const { data: emp } = await sb.from("employee_tbl").select("employee_name").eq("app_user_id",user.id).limit(1).maybeSingle();
+    if(!emp){ setEmployeeName(null); setItems([]); return; }
+    setEmployeeName(emp.employee_name);
+    const { data } = await sb.from("notifications_tbl").select("*").eq("employee_name",emp.employee_name).order("created_at",{ascending:false}).limit(25);
+    setItems(data||[]);
+  },[user?.id]);
+  useEffect(()=>{ load(); const t=setInterval(load,60000); return ()=>clearInterval(t); },[load]);
+  useEffect(()=>{
+    const onDocClick = e => { if(rootRef.current && !rootRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onDocClick);
+    return ()=>document.removeEventListener("mousedown", onDocClick);
+  },[]);
+
+  const unreadCount = items.filter(i=>!i.is_read).length;
+  const markRead = async(id)=>{
+    await sb.from("notifications_tbl").update({is_read:true}).eq("id",id);
+    setItems(is=>is.map(i=>i.id===id?{...i,is_read:true}:i));
+  };
+  const markAllRead = async()=>{
+    const unreadIds = items.filter(i=>!i.is_read).map(i=>i.id);
+    if(!unreadIds.length) return;
+    await sb.from("notifications_tbl").update({is_read:true}).in("id",unreadIds);
+    setItems(is=>is.map(i=>({...i,is_read:true})));
+  };
+
+  if(!employeeName && !user?.id) return null;
+
+  return h("div",{ref:rootRef,style:{position:"relative"}},
+    h("button",{onClick:()=>setOpen(v=>!v),style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 10px",fontSize:12,cursor:"pointer",borderRadius:6,position:"relative"}},
+      "🔔",
+      unreadCount>0 && h("span",{style:{position:"absolute",top:-4,right:-4,background:"#e24b4a",color:"#fff",fontSize:9,borderRadius:8,padding:"1px 5px",fontWeight:700}},unreadCount)
+    ),
+    open && h("div",{style:{position:"absolute",top:"110%",right:0,width:300,maxHeight:360,overflowY:"auto",background:"#fff",color:colors.text,border:"1px solid "+colors.border,borderRadius:8,boxShadow:"0 4px 14px rgba(0,0,0,0.15)",zIndex:100}},
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderBottom:"1px solid "+colors.border}},
+        h("div",{style:{fontSize:12,fontWeight:700}},"Notifications"),
+        h("button",{onClick:markAllRead,style:{fontSize:10.5,color:colors.muted,background:"none",border:"none",cursor:"pointer"}},"Mark all read")
+      ),
+      !employeeName ? h("div",{style:{padding:"14px 12px",fontSize:11.5,color:colors.mutedLight}},"Your login isn't linked to an Employee record yet.") :
+      items.length===0 ? h("div",{style:{padding:"14px 12px",fontSize:11.5,color:colors.mutedLight}},"Nothing yet.") :
+      items.map(it=>h("div",{key:it.id,onClick:()=>!it.is_read&&markRead(it.id),style:{padding:"8px 12px",borderBottom:"1px solid #f0efe8",fontSize:11.5,cursor:it.is_read?"default":"pointer",background:it.is_read?"#fff":"#faf9f4"}},
+        h("div",null,it.message),
+        h("div",{style:{fontSize:10,color:colors.mutedLight,marginTop:2}},new Date(it.created_at).toLocaleString())
+      ))
+    )
+  );
+}
+
 function TopBar({ user, sessionCompanyId, onChangeCompany, onLogout }) {
   const [sessionCompanyName,setSessionCompanyName] = useState("");
   useEffect(()=>{
@@ -784,6 +842,7 @@ function TopBar({ user, sessionCompanyId, onChangeCompany, onLogout }) {
         h("button",{onClick:onChangeCompany,style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"4px 9px",fontSize:11,cursor:"pointer",borderRadius:6}},"Switch")
       ),
       h("span",{style:{fontSize:12,color:"#9a9d8f"}},user.username+" ("+user.role+")"),
+      h(NotificationBell,{user}),
       h("button",{onClick:()=>window.open(window.location.href,"_blank"),style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 12px",fontSize:12,cursor:"pointer",borderRadius:6}},"⧉ New tab"),
       h("button",{onClick:onLogout,style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 12px",fontSize:12,cursor:"pointer",borderRadius:6}},"Sign out")
     )
@@ -812,7 +871,6 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Sales", tabs:[
         {key:"estimator",label:"Estimator"},
         {key:"saved",label:"Quotes"},
-        {key:"my_worklist",label:"My Worklist"},
       ]},
       { label:"Engineering", tabs:[
         {key:"calcs",label:"Engineering Calcs"},
@@ -821,6 +879,9 @@ function MenuTabs({ user, active, onChange }) {
     { label:"CRM", subgroups:[
       { label:"Funnel", tabs:[
         {key:"crm_funnel",label:"Funnel"},
+      ]},
+      { label:"Daily", tabs:[
+        {key:"my_worklist",label:"My Worklist"},
       ]},
     ]},
     { label:"Reports", subgroups:[
@@ -838,6 +899,7 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports_masters",label:"Material Rates"},
         {key:"reports_missing_rates",label:"Missing Rates"},
         {key:"reports_audit",label:"Masters Audit"},
+        {key:"reports_overdue_calls",label:"Overdue Calls"},
       ]}]:[]),
     ]},
   ];
@@ -8478,7 +8540,14 @@ function MyWorklistScreen({ user }){
   useEffect(()=>{ load(); },[load]);
 
   const today = new Date().toISOString().slice(0,10);
-  const dueActivities = activities.filter(a=>a.next_followup_date && a.next_followup_date<=today)
+  // Only the MOST RECENT activity per company can represent an open
+  // follow-up — an older one's next_followup_date stays in the past
+  // forever once a newer activity has been logged against that company,
+  // but it's already been actioned, not still outstanding.
+  const latestPerCompany = new Map();
+  activities.forEach(a=>{ if(!latestPerCompany.has(a.company_name)) latestPerCompany.set(a.company_name,a); }); // activities is already newest-first
+  const dueActivities = Array.from(latestPerCompany.values())
+    .filter(a=>a.next_followup_date && a.next_followup_date<=today)
     .sort((a,b)=>(a.next_followup_date||"").localeCompare(b.next_followup_date||""));
 
   const openLog = (companyName)=>{ setLogFor(companyName); setLogDraft({activity_type:"Call",outcome:"",notes:"",next_followup_date:""}); };
@@ -9787,7 +9856,7 @@ const MANUAL_SECTIONS = [
           },
           {
             "type": "p",
-            "text": "Phase 3 completed the ownership engine and added two reports: Reports \u2192 Quote Status Review (filters: Owner, Zone, State, City, Status, value range, status-changed date range; stale flag past 20 days; status editable inline; 25 rows per page) and Reports \u2192 Won by Owner (pick which status(es) count as \"won\"; totals plus a per-owner breakdown \u2014 attribution follows the CURRENT owner, which can differ from who owned the account when it was actually won). Ownership auto-shifts to the Territory-mapped FSE the moment a brand-new Quote# is first saved for a customer (this counts as \"a Lead was generated\") \u2014 but only if the current owner isn't already an FSE; if they are, nothing changes, no prompt. Logging an Activity as an FSE against a still-Cold company claims ownership immediately, even before any Lead exists, overriding a Telecaller's provisional hold. Phase 4 added a real login-to-employee link \u2014 Master Data \u2192 HR \u2192 Employees now has a per-row \"+ Create login\" / \"Login: linked\" button, letting HR create a username/password/role right there (or link an existing one) without a separate trip to Admin \u2192 Users. The FSE-touch-wins rule above now checks this real link instead of matching login username against Employee name. Phase 5 added the daily transactional layer: Transaction \u2192 Sales \u2192 My Worklist (By date / By customer / All views, scoped to accounts you own, FSEs see live deal context inline), \"Mark not relevant\" / Restore on Customers (archived accounts drop out of My Worklist without being deleted), and duplicate-name warnings plus a Source field on the quick-add form. Not yet built: passive notifications actually surfacing in the app (they're being logged to a table already, no inbox screen reads it), a login-time overdue-calls prompt with follow-up color coding, a separate management-level overdue calls report, and the fuller Employee HR record (photo, restricted payroll section, HR events, address change log, effective-dated salary history)."
+            "text": "Phase 3 completed the ownership engine and added two reports: Reports \u2192 Quote Status Review (filters: Owner, Zone, State, City, Status, value range, status-changed date range; stale flag past 20 days; status editable inline; 25 rows per page) and Reports \u2192 Won by Owner (pick which status(es) count as \"won\"; totals plus a per-owner breakdown \u2014 attribution follows the CURRENT owner, which can differ from who owned the account when it was actually won). Ownership auto-shifts to the Territory-mapped FSE the moment a brand-new Quote# is first saved for a customer (this counts as \"a Lead was generated\") \u2014 but only if the current owner isn't already an FSE; if they are, nothing changes, no prompt. Logging an Activity as an FSE against a still-Cold company claims ownership immediately, even before any Lead exists, overriding a Telecaller's provisional hold. Phase 4 added a real login-to-employee link \u2014 Master Data \u2192 HR \u2192 Employees now has a per-row \"+ Create login\" / \"Login: linked\" button, letting HR create a username/password/role right there (or link an existing one) without a separate trip to Admin \u2192 Users. The FSE-touch-wins rule above now checks this real link instead of matching login username against Employee name. Phase 5 added the daily transactional layer: My Worklist (By date / By customer / All views, scoped to accounts you own, FSEs see live deal context inline), \"Mark not relevant\" / Restore on Customers (archived accounts drop out of My Worklist without being deleted), and duplicate-name warnings plus a Source field on the quick-add form. Phase 6 closed out the remaining CRM gaps: a notification bell in the TopBar (unread badge, mark-read, refreshes every 60s); a login-time overdue prompt, once per browser-day, color-coded by whether a follow-up is chained from an earlier call or a fresh touch, with a shortcut into My Worklist; and Reports \u2192 Admin only \u2192 Overdue Calls, a cross-team view filterable by Owner/Zone. Along the way, a real bug got fixed \u2014 an old, already-actioned follow-up date could otherwise keep showing as outstanding forever once a newer activity was logged against the same company; My Worklist, the login prompt, and this report all now only look at each company's MOST RECENT activity. With Phase 6, the CRM itself (funnel, ownership, activity tracking, worklists, notifications, reporting) is functionally complete. My Worklist itself lives under CRM \u2192 Daily (moved out of Transaction \u2192 Sales, where it was findable but not where anyone thinking \"CRM\" first would look) \u2014 Quote Status Review, Won by Owner, and Overdue Calls stay under Reports on purpose, keeping the CRM menu short and focused on daily-use screens. The Employee HR record (photo, DOB, blood group, Aadhaar, dual address with change log, tagged phones, restricted payroll, HR events, salary history) remains deliberately separate \u2014 HR/payroll scope, not CRM, with its own open decisions still to settle."
           }
         ]
       }
@@ -9946,6 +10015,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"24 Jul 2026 (7)", summary:"Moved My Worklist out of Transaction → Sales into the CRM menu (CRM → Daily → My Worklist), alongside Funnel — it was findable but in a non-obvious place for anyone thinking \"CRM\" first rather than \"Sales.\" Reports (Quote Status Review, Won by Owner, Overdue Calls) deliberately stay under Reports, per discussion — CRM menu stays short and focused on the daily-use screens, not a duplicate of Reports." },
+  { date:"24 Jul 2026 (6)", summary:"CRM Phase 6 — no new SQL, closes out the remaining CRM gaps. Notification bell in the TopBar (any screen): reads notifications_tbl for whoever's logged in, unread badge, mark-read on click, mark-all-read, refreshes every 60s. Login-time overdue prompt: once per browser-day, if the logged-in person's linked Employee owns any account with a due/overdue follow-up, shows them color-coded (darker left border = a follow-up chained from an earlier call; lighter = a fresh first touch), skippable, with a \"Go to My Worklist\" shortcut. New Reports → Admin only → Overdue Calls: cross-team view, filterable by Owner/Zone, days-overdue sorted, oldest/owners-affected summary cards. Fixed a real correctness gap discovered while building this: My Worklist, the login prompt, and this report were all at risk of treating an OLD, already-actioned follow-up date as still outstanding forever once a newer activity was logged against the same company — all three now only look at each company's MOST RECENT activity." },
   { date:"24 Jul 2026 (5)", summary:"CRM Phase 5 — no new SQL. New Transaction \u2192 Sales \u2192 My Worklist screen: scoped to accounts the logged-in person currently owns (via the Phase 4 login link), with three views \u2014 By date (everything due/overdue, oldest first, log-now inline; FSE role additionally shows the account's latest quote# and status), By customer (pick one, full activity history), All (flat combined log, 25/page). Customers screen gained \"Mark not relevant\" (with a reason: Not in target market / Went to competitor / Shut down / Other) and \"Restore\" \u2014 archived accounts drop out of My Worklist automatically without being deleted. Both the quick-add (used mid-quote) and full company forms now warn on blur if a company with that name already exists, and quick-add gained a Source field (Referral/Google Ads/Social media/Exhibition/Cold outreach/Other), matching what bulk upload already had." },
   { date:"24 Jul 2026 (4)", summary:"CRM Phase 4 — login-to-employee link. Master Data → HR → Employees: each row now has a \"+ Create login\" button (HR creates the username/password/role right there and it's linked automatically) or \"Link existing\" to attach an already-existing app_users account instead — one employee, one login, both sides optional. Login now carries its app_users id through the session, and the FSE-touch-wins-ownership rule (Customers → Activity) switched from matching login username against Employee name (fragile, text-based) to the real link — no behavior change for anyone already correctly matched, but it's no longer guessable-wrong for anyone whose username differs from their name." },
   { date:"24 Jul 2026 (3)", summary:"CRM Phase 3. Ownership engine completed: creating the first Sl No under a brand-new Quote# now counts as \"a Lead was generated\" — if the company's current CRM owner is an FSE, ownership stays put silently; otherwise it auto-shifts to whichever FSE the Territory Rules map to, logged to ownership history same as before. Logging an Activity (Customers screen) as an FSE against a still-Cold company now claims ownership immediately, overriding a Telecaller's provisional hold (matched by login username against Employee name — best effort until there's a real login-to-employee link, flagged as a known gap). New Reports: \"Quote Status Review\" (filter every quote by Owner/Zone/State/City/Status/value range/status-changed date range, stale flag past 20 days, inline status change, 25-row pagination) built on the existing quote_status/status_changed_at infrastructure rather than a parallel one; \"Won by Owner\" (pick which status(es) count as won, totals and per-owner value/count with a share bar — attribution follows the company's CURRENT owner, noted on-screen since it can differ from who owned it when it was won)." },
@@ -11526,6 +11597,94 @@ function QuoteStatusReview({ user }){
     authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action })
   );
 }
+
+function OverdueCallsReport(){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [fOwner,setFOwner] = useState(""); const [fZone,setFZone] = useState("");
+  const [owners,setOwners] = useState([]); const [zones,setZones] = useState([]);
+  const [page,setPage] = useState(0);
+  const pageSize = 25;
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data: cos } = await sb.from("companies").select("company_name,owner_employee_name,zone").eq("is_archived",false);
+    const names = (cos||[]).map(c=>c.company_name);
+    const { data: acts } = names.length
+      ? await sb.from("activity_log_tbl").select("*").in("company_name",names).not("next_followup_date","is",null).order("created_at",{ascending:false})
+      : { data: [] };
+    // Latest activity per company only — see note in My Worklist / login prompt.
+    const latestPerCompany = new Map();
+    (acts||[]).forEach(a=>{ if(!latestPerCompany.has(a.company_name)) latestPerCompany.set(a.company_name,a); });
+    const today = new Date().toISOString().slice(0,10);
+    const coByName = new Map((cos||[]).map(c=>[c.company_name,c]));
+    const out = Array.from(latestPerCompany.values())
+      .filter(a=>a.next_followup_date<=today)
+      .map(a=>{
+        const co = coByName.get(a.company_name);
+        const daysOverdue = Math.floor((Date.now()-new Date(a.next_followup_date).getTime())/86400000);
+        return { ...a, owner:co?co.owner_employee_name:"", zone:co?co.zone:"", daysOverdue };
+      })
+      .sort((a,b)=>b.daysOverdue-a.daysOverdue);
+    setOwners(Array.from(new Set(out.map(r=>r.owner).filter(Boolean))).sort());
+    setZones(Array.from(new Set(out.map(r=>r.zone).filter(Boolean))).sort());
+    setRows(out);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const filtered = rows.filter(r=>(!fOwner||r.owner===fOwner) && (!fZone||r.zone===fZone));
+  const pageRows = filtered.slice(page*pageSize,(page+1)*pageSize);
+  const oldestDays = filtered.length ? Math.max(...filtered.map(r=>r.daysOverdue)) : 0;
+  const ownersAffected = new Set(filtered.map(r=>r.owner).filter(Boolean)).size;
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:4}},"Overdue Calls Report"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Only each company's MOST RECENT logged activity counts \u2014 once a newer call/visit/email is logged, an older follow-up date is treated as actioned, not still outstanding."),
+    h("div",{style:{display:"flex",gap:8,marginBottom:14}},
+      h("select",{value:fOwner,onChange:e=>{setFOwner(e.target.value);setPage(0);},style:{...inputStyle,padding:"6px 8px",fontSize:12,width:180}},
+        h("option",{value:""},"All owners"),owners.map(o=>h("option",{key:o,value:o},o))
+      ),
+      h("select",{value:fZone,onChange:e=>{setFZone(e.target.value);setPage(0);},style:{...inputStyle,padding:"6px 8px",fontSize:12,width:150}},
+        h("option",{value:""},"All zones"),zones.map(z=>h("option",{key:z,value:z},z))
+      )
+    ),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):h(React.Fragment,null,
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:16}},
+        h("div",{style:{background:"#faf9f4",borderRadius:8,padding:"12px 16px"}},h("div",{style:{fontSize:11,color:colors.mutedLight}},"Overdue calls"),h("div",{style:{fontSize:20,fontWeight:700,color:colors.danger}},filtered.length)),
+        h("div",{style:{background:"#faf9f4",borderRadius:8,padding:"12px 16px"}},h("div",{style:{fontSize:11,color:colors.mutedLight}},"Oldest overdue"),h("div",{style:{fontSize:20,fontWeight:700}},oldestDays+" days")),
+        h("div",{style:{background:"#faf9f4",borderRadius:8,padding:"12px 16px"}},h("div",{style:{fontSize:11,color:colors.mutedLight}},"Owners affected"),h("div",{style:{fontSize:20,fontWeight:700}},ownersAffected))
+      ),
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Customer"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Owner"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Was due"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Days overdue"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Last outcome")
+        )),
+        h("tbody",null,
+          pageRows.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #eceae0"}},
+            h("td",{style:{padding:"7px 9px",fontWeight:600}},r.company_name),
+            h("td",{style:{padding:"7px 9px",color:colors.muted}},r.owner||"—"),
+            h("td",{style:{padding:"7px 9px",color:colors.muted}},r.next_followup_date),
+            h("td",{style:{padding:"7px 9px",color:colors.danger,fontWeight:700}},r.daysOverdue+" days"),
+            h("td",{style:{padding:"7px 9px",color:colors.muted}},r.outcome||r.notes||"—")
+          )),
+          pageRows.length===0 && h("tr",null,h("td",{colSpan:5,style:{padding:14,fontSize:12,color:colors.mutedLight}},"Nothing overdue."))
+        )
+      ),
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10,fontSize:11.5,color:colors.mutedLight}},
+        h("div",null,"Showing "+(filtered.length===0?0:page*pageSize+1)+"–"+Math.min((page+1)*pageSize,filtered.length)+" of "+filtered.length),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Prev"),
+          h("button",{onClick:()=>setPage(p=>((p+1)*pageSize<filtered.length)?p+1:p),disabled:(page+1)*pageSize>=filtered.length,style:btnSmall},"Next")
+        )
+      )
+    )
+  );
+}
+
 
 function WonByOwnerReport(){
   const [wonStatuses,setWonStatuses] = useState(["Won"]); // best-effort default; adjustable below
@@ -13286,6 +13445,64 @@ function MastersAuditReport({ user }){
   );
 }
 
+// Shown once per day (per browser session) right after login, if the
+// logged-in person's linked Employee owns any accounts with a due or
+// overdue follow-up. Color-coded: is_followup_of set = this call was
+// prompted by an earlier logged interaction; unset = a fresh first touch.
+// Skippable, never blocking — no repeat nag within the same day.
+function OverdueCallsPrompt({ user, onDone }){
+  const [loading,setLoading] = useState(true);
+  const [employee,setEmployee] = useState(null);
+  const [items,setItems] = useState([]); // {activity, company_name}
+
+  useEffect(()=>{
+    (async()=>{
+      if(!user?.id){ setLoading(false); return; }
+      const { data: emp } = await sb.from("employee_tbl").select("employee_name").eq("app_user_id",user.id).limit(1).maybeSingle();
+      if(!emp){ setLoading(false); return; }
+      setEmployee(emp);
+      const { data: cos } = await sb.from("companies").select("company_name").eq("owner_employee_name",emp.employee_name).eq("is_archived",false);
+      const names = (cos||[]).map(c=>c.company_name);
+      if(!names.length){ setLoading(false); return; }
+      const today = new Date().toISOString().slice(0,10);
+      const { data: acts } = await sb.from("activity_log_tbl").select("*").in("company_name",names).not("next_followup_date","is",null).order("created_at",{ascending:false});
+      const latestPerCompany = new Map();
+      (acts||[]).forEach(a=>{ if(!latestPerCompany.has(a.company_name)) latestPerCompany.set(a.company_name,a); });
+      const due = Array.from(latestPerCompany.values()).filter(a=>a.next_followup_date<=today).sort((a,b)=>(a.next_followup_date||"").localeCompare(b.next_followup_date||""));
+      setItems(due);
+      setLoading(false);
+    })();
+  },[user?.id]);
+
+  if(loading || items.length===0) return null;
+  const today = new Date().toISOString().slice(0,10);
+
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:520,maxWidth:"100%",maxHeight:"80vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:2}},"Good to see you, "+(employee?.employee_name||user.username)),
+      h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14}},items.length+" call"+(items.length===1?"":"s")+" due today, including any carried over."),
+      h("div",{style:{display:"flex",gap:14,marginBottom:12,fontSize:11}},
+        h("span",null,h("span",{style:{display:"inline-block",width:8,height:8,borderRadius:8,background:colors.dark,marginRight:5}}),"Follow-up from previous call"),
+        h("span",null,h("span",{style:{display:"inline-block",width:8,height:8,borderRadius:8,background:colors.mutedLight,marginRight:5}}),"Fresh touch")
+      ),
+      h("div",{style:{display:"flex",flexDirection:"column",gap:8,marginBottom:16}},
+        items.map(a=>{
+          const isFollowUp = !!a.is_followup_of;
+          const overdue = a.next_followup_date < today;
+          return h("div",{key:a.id,style:{borderLeft:"3px solid "+(isFollowUp?colors.dark:colors.mutedLight),border:"1px solid "+colors.border,borderRadius:"0 6px 6px 0",padding:"8px 10px",background:isFollowUp?"#faf9f4":"#fff"}},
+            h("div",{style:{fontWeight:700,fontSize:12.5}},a.company_name),
+            h("div",{style:{fontSize:11,color:overdue?colors.danger:colors.muted,marginTop:2}},(overdue?"Overdue — was due ":"Due ")+a.next_followup_date+(a.notes?" — "+a.notes:""))
+          );
+        })
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:()=>onDone(false),style:btnSecondary},"Skip for now"),
+        h("button",{onClick:()=>onDone(true),style:btnPrimary},"Go to My Worklist")
+      )
+    )
+  );
+}
+
 function App() {
   const [user,setUser]=useState(()=>{
     try{ const raw=sessionStorage.getItem("flometriq_user"); return raw?JSON.parse(raw):null; } catch(e){ return null; }
@@ -13309,6 +13526,14 @@ function App() {
   const [monthlyArchiveDone,setMonthlyArchiveDone]=useState(true); // suppressed on open — no form should show before the toolbar
   const [draftCount,setDraftCount]=useState(0); // fetched silently — surfaced as a toolbar badge, not a popup
   const [showDraftPanel,setShowDraftPanel]=useState(false);
+  const [showOverduePrompt,setShowOverduePrompt]=useState(()=>{
+    try{ return sessionStorage.getItem("flometriq_overdue_prompt_date")!==new Date().toISOString().slice(0,10); }catch(e){ return true; }
+  });
+  const dismissOverduePrompt = (goToWorklist)=>{
+    setShowOverduePrompt(false);
+    try{ sessionStorage.setItem("flometriq_overdue_prompt_date",new Date().toISOString().slice(0,10)); }catch(e){}
+    if(goToWorklist) setTab("my_worklist");
+  };
   const refreshDraftCount = useCallback(()=>{
     sb.from("estimates").select("id",{count:"exact",head:true}).eq("quote_status","Draft").then(({count})=>setDraftCount(count||0));
   },[]);
@@ -13328,6 +13553,7 @@ function App() {
 
   return h("div",{style:{minHeight:"100vh"}},
     user.role==="super_admin" && !monthlyArchiveDone && h(MonthlyArchivePrompt,{user,onDone:()=>setMonthlyArchiveDone(true)}),
+    showOverduePrompt && h(OverdueCallsPrompt,{user,onDone:dismissOverduePrompt}),
     showDraftPanel && h(DraftOfferReminder,{user,onDone:()=>{ setShowDraftPanel(false); refreshDraftCount(); }}),
     h(TopBar,{user,sessionCompanyId,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyIdPersisted(null)):null,onLogout:()=>{setUserPersisted(null);setSessionCompanyIdPersisted(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
     draftCount>0 && h("div",{onClick:()=>setShowDraftPanel(true),style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
@@ -13347,6 +13573,7 @@ function App() {
     tab==="reports_quote_status_review"?h(QuoteStatusReview,{user}):
     tab==="my_worklist"?h(MyWorklistScreen,{user}):
     tab==="reports_won_by_owner"?h(WonByOwnerReport,null):
+    tab==="reports_overdue_calls"?h(OverdueCallsReport,null):
     tab==="reports_status_history"?h(StatusChangeHistoryReport,null):
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="authorization_codes"?h(AuthorizationCodesScreen,{user}):
