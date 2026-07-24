@@ -111,7 +111,7 @@ const MASTER_TABLES = [
   { key: "incoterms_tbl", label: "Inco Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
   { key: "tax_terms_tbl", label: "Tax Terms", columns: ["value"], addLabel:"New entry", freeText:["value"] },
   { key: "warranty_coverage_tbl", label: "Warranty Coverage", columns: ["value"], addLabel:"New entry", freeText:["value"] },
-  { key: "companies", label: "Companies", columns: ["company_name","account_type","industry","rating","website","phone","billing_city","billing_country","gst_tax_id","account_owner","source"], addLabel:"New company", freeText:["company_name","account_type","industry","rating","website","phone","billing_city","billing_country","gst_tax_id","account_owner","source"] },
+  { key: "companies", label: "Companies", columns: ["company_name","account_type","industry","rating","website","phone","billing_city","billing_country","gst_tax_id","account_owner","source","crm_status","owner_employee_name"], addLabel:"New company", freeText:["company_name","account_type","industry","rating","website","phone","billing_city","billing_country","gst_tax_id","account_owner","source","crm_status","owner_employee_name"] },
   { key: "contacts", label: "Contacts", columns: ["company_name","contact_name","designation","email","phone","department","is_primary"], addLabel:"New contact", cascade:[{col:"company_name",from:"companies",field:"company_name"}], freeText:["contact_name","designation","email","phone","department","is_primary"] },
   { key: "department_tbl", label: "Departments", columns: ["department"], addLabel:"New department", freeText:["department"] },
   { key: "state_zone_tbl", label: "States and Zones (India)", columns: ["state","zone"], addLabel:"New state", freeText:["state","zone"], editAllEnabled:true, exportEnabled:true },
@@ -404,6 +404,70 @@ async function fetchAll(table, cols) {
   }
   return all;
 }
+
+/* ---- CRM: zone lookup + territory-based owner auto-assignment ----
+   Zone is never stored as a free choice on a company — it's always derived
+   from billing_state (India, via state_zone_tbl) or billing_country
+   (outside India, via country_zone_tbl). Owner assignment follows the same
+   two tables via territory_rule_state_tbl / territory_rule_country_tbl.
+   Both are best-effort: if nothing matches, they resolve to "" and the
+   existing manual Zone picker / manual ownership assignment remains the
+   fallback — nothing here is a hard requirement. */
+async function resolveZoneForAddress(billingState, billingCountry){
+  const state = (billingState||"").trim();
+  const country = (billingCountry||"").trim();
+  if(state){
+    const { data } = await sb.from("state_zone_tbl").select("zone").ilike("state",state).limit(1).maybeSingle();
+    if(data && data.zone) return data.zone;
+  }
+  if(country){
+    const { data } = await sb.from("country_zone_tbl").select("zone").ilike("country",country).limit(1).maybeSingle();
+    if(data && data.zone) return data.zone;
+  }
+  return "";
+}
+async function resolveOwnerForAddress(billingState, billingCountry){
+  const state = (billingState||"").trim();
+  const country = (billingCountry||"").trim();
+  if(state){
+    const { data } = await sb.from("territory_rule_state_tbl").select("employee_name").ilike("state",state).limit(1).maybeSingle();
+    if(data && data.employee_name) return data.employee_name;
+  }
+  if(country){
+    const { data } = await sb.from("territory_rule_country_tbl").select("employee_name").ilike("country",country).limit(1).maybeSingle();
+    if(data && data.employee_name) return data.employee_name;
+  }
+  return "";
+}
+async function logOwnershipChange(companyName, oldOwner, newOwner, reason, changedBy){
+  if((oldOwner||"")===(newOwner||"")) return;
+  await sb.from("ownership_history_tbl").insert({
+    company_name: companyName, old_owner: oldOwner||"", new_owner: newOwner||"",
+    reason: reason||"Auto", changed_by: changedBy||"system"
+  });
+  if(newOwner){
+    await sb.from("notifications_tbl").insert({ employee_name:newOwner, message:"You're now the owner of "+companyName+" ("+(reason||"Auto")+")", related_company:companyName });
+  }
+  if(oldOwner && oldOwner!==newOwner){
+    await sb.from("notifications_tbl").insert({ employee_name:oldOwner, message:"Ownership of "+companyName+" moved to "+(newOwner||"unassigned")+" ("+(reason||"Auto")+")", related_company:companyName });
+  }
+}
+// Applied whenever a new company is created (manual add, bulk upload) —
+// looks up zone + owner from the territory masters and returns the extra
+// fields to merge into the insert payload, plus logs the initial
+// ownership assignment. Doesn't overwrite a zone/owner the user already
+// typed in by hand.
+async function autoAssignNewCompany(payload, createdBy){
+  const out = { ...payload };
+  if(!out.zone) out.zone = await resolveZoneForAddress(out.billing_state, out.billing_country);
+  if(!out.owner_employee_name) out.owner_employee_name = await resolveOwnerForAddress(out.billing_state, out.billing_country);
+  if(!out.crm_status) out.crm_status = "Cold";
+  if(out.owner_employee_name){
+    out.owner_source = "Auto";
+  }
+  return out;
+}
+
 
 /* ---- PDF GENERATION ---- */
 function generatePDF({ title, refNumber, description, createdBy, createdAt, headers, rows, footerRows, filename }) {
@@ -738,9 +802,10 @@ function MenuTabs({ user, active, onChange }) {
       { label:"BOM setup", tabs:[{key:"bom_form",label:"BOM Entry Form"}, ...byKeys(bomSetupKeys)] },
       { label:"Commercial terms", tabs: byKeys(ctKeys) },
       { label:"Customers", tabs:[{key:"customers",label:"Customers"},{key:"customer_bulk_upload",label:"Customer Bulk Upload"}] },
-      { label:"CRM Setup", tabs: byKeys(["employee_tbl","department_tbl","state_zone_tbl","country_zone_tbl","territory_rule_state_tbl","territory_rule_country_tbl"]) },
+      { label:"CRM Setup", tabs: byKeys(["state_zone_tbl","country_zone_tbl","territory_rule_state_tbl","territory_rule_country_tbl"]) },
       { label:"Engineering", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"},{key:"description_master",label:"Description Master"}] },
       { label:"Company", tabs:[{key:"company_master",label:"Company Master"}] },
+      { label:"HR", tabs: byKeys(["employee_tbl","department_tbl"]) },
     ]});
     groups.push({ label:"Admin", subgroups:[
       { label:"Access control", tabs:[
@@ -4997,8 +5062,11 @@ function AddCustomerPanel({ onClose, onAdded }){
     if(!f.billing_country.trim()){ setErr("Country is required."); return; }
     setSaving(true); setErr("");
     try{
-      const { error } = await sb.from("companies").insert({...f, company_name:f.company_name.trim()});
+      let payload = {...f, company_name:f.company_name.trim()};
+      payload = await autoAssignNewCompany(payload, "quick_add");
+      const { error } = await sb.from("companies").insert(payload);
       if(error) throw error;
+      if(payload.owner_employee_name) await logOwnershipChange(payload.company_name, "", payload.owner_employee_name, "Auto", "quick_add");
       const address=[f.billing_street,f.billing_city,f.billing_state,f.billing_pin,f.billing_country].filter(Boolean).join("\n");
       onAdded({company_name:f.company_name.trim(), address, contact_name:"", contact_designation:""});
       onClose();
@@ -8037,6 +8105,15 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
     setZoneOptions((data||[]).map(r=>r.value));
   },[]);
   useEffect(()=>{ loadZones(); },[loadZones]);
+  useEffect(()=>{
+    if(f.id) return; // don't silently override zone on an existing, already-set record
+    if(!f.billing_state && !f.billing_country) return;
+    let cancelled=false;
+    resolveZoneForAddress(f.billing_state,f.billing_country).then(z=>{
+      if(!cancelled && z) setF(d=>({...d,zone:z}));
+    });
+    return ()=>{ cancelled=true; };
+  },[f.billing_state,f.billing_country,f.id]);
   const set = (k,v)=>setF(d=>({...d,[k]:v}));
   const save = async()=>{
     if(!f.company_name.trim()){ alert("Company name is required."); return; }
@@ -8049,8 +8126,15 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
       if(f.id){
         const {id,...rest} = f;
         await sb.from("companies").update(rest).eq("id",id);
+        if(initial && (initial.owner_employee_name||"")!==(f.owner_employee_name||"")){
+          await logOwnershipChange(f.company_name, initial.owner_employee_name||"", f.owner_employee_name||"", "Manual", user?.username||"unknown");
+        }
       } else {
-        await sb.from("companies").insert({...f,created_by:user?.username||"unknown"});
+        let payload = {...f, created_by:user?.username||"unknown"};
+        payload = await autoAssignNewCompany(payload, user?.username||"unknown");
+        const { error } = await sb.from("companies").insert(payload);
+        if(error) throw error;
+        if(payload.owner_employee_name) await logOwnershipChange(payload.company_name, "", payload.owner_employee_name, "Auto", user?.username||"unknown");
       }
       onSaved(f);
     } catch(e){ console.error("Save company failed",e); alert("Save failed: "+e.message); }
@@ -8082,6 +8166,19 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
       row2("State","shipping_state","Country","shipping_country"),
       row2("PIN / Zip","shipping_pin","Source","source"),
       row2("Account owner","account_owner","Notes","notes"),
+      h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,margin:"10px 0 6px"}},"CRM"),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"CRM status"),
+          h("select",{value:f.crm_status||"Cold",onChange:e=>set("crm_status",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+            h("option",{value:"Cold"},"Cold"),h("option",{value:"Lead"},"Lead")
+          )
+        ),
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Owner (employee) — Super Admin only to override"),
+          h("input",{value:f.owner_employee_name||"",disabled:user?.role!=="super_admin",onChange:e=>set("owner_employee_name",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,opacity:user?.role!=="super_admin"?0.6:1}})
+        )
+      ),
       h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
         h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
         h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save company")
@@ -8181,6 +8278,38 @@ function CustomersScreen({ user }){
     setLoadingAddresses(false);
   },[]);
   useEffect(()=>{ if(selected) loadAddresses(selected.company_name); },[selected,loadAddresses]);
+
+  const [activities,setActivities] = useState([]);
+  const [loadingActivities,setLoadingActivities] = useState(false);
+  const [newActivity,setNewActivity] = useState(null); // {activity_type,outcome,notes,next_followup_date}
+  const [savingActivity,setSavingActivity] = useState(false);
+  const loadActivities = useCallback(async(companyName)=>{
+    if(!companyName){ setActivities([]); return; }
+    setLoadingActivities(true);
+    const {data} = await sb.from("activity_log_tbl").select("*").eq("company_name",companyName).order("created_at",{ascending:false}).limit(25);
+    setActivities(data||[]);
+    setLoadingActivities(false);
+  },[]);
+  useEffect(()=>{ if(selected) loadActivities(selected.company_name); },[selected,loadActivities]);
+  const saveNewActivity = async()=>{
+    if(!newActivity.activity_type){ alert("Pick an activity type."); return; }
+    setSavingActivity(true);
+    try{
+      const lastFollowUp = activities.find(a=>a.next_followup_date);
+      await sb.from("activity_log_tbl").insert({
+        company_name:selected.company_name, activity_type:newActivity.activity_type,
+        outcome:newActivity.outcome||"", notes:newActivity.notes||"",
+        next_followup_date:newActivity.next_followup_date||null,
+        is_followup_of: lastFollowUp?lastFollowUp.id:null,
+        logged_by:user?.username||"unknown"
+      });
+      // Note: logging an activity does NOT auto-move crm_status from Cold to
+      // Lead — that transition is set by hand on the company record for now
+      // (Phase 2 doesn't yet define what counts as "a real enquiry").
+      setNewActivity(null);
+      await loadActivities(selected.company_name);
+    } finally { setSavingActivity(false); }
+  };
 
   const removeAddress = async(addr)=>{
     if(!confirm("Remove this address from "+selected.company_name+"?")) return;
@@ -8352,7 +8481,9 @@ function CustomersScreen({ user }){
           h("div",null,"Billing: ",h("span",{style:{color:colors.text}},[selected.billing_city,selected.billing_country].filter(Boolean).join(", ")||"—")),
           h("div",null,"Website: ",h("span",{style:{color:colors.text}},selected.website||"—")),
           h("div",null,"GST/Tax ID: ",h("span",{style:{color:colors.text}},selected.gst_tax_id||"—")),
-          h("div",null,"Account owner: ",h("span",{style:{color:colors.text}},selected.account_owner||"—"))
+          h("div",null,"Account owner: ",h("span",{style:{color:colors.text}},selected.account_owner||"—")),
+          h("div",null,"CRM status: ",h("span",{style:{color:colors.text}},selected.crm_status||"Cold")),
+          h("div",null,"Owner (CRM): ",h("span",{style:{color:selected.owner_employee_name?colors.text:colors.mutedLight}},selected.owner_employee_name||"Unassigned"))
         )
       ),
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}},
@@ -8443,6 +8574,43 @@ function CustomersScreen({ user }){
             )
           )
         )
+      ),
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",margin:"18px 0 8px"}},
+        h("div",{style:{fontWeight:700,fontSize:13}},"Activity ("+activities.length+")"),
+        h("button",{onClick:()=>setNewActivity({activity_type:"Call",outcome:"",notes:"",next_followup_date:""}),style:btnSmall},"+ Log activity")
+      ),
+      newActivity && h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px",marginBottom:10,background:"#faf9f4"}},
+        h("div",{style:{display:"flex",gap:8,marginBottom:8}},
+          h("select",{value:newActivity.activity_type,onChange:e=>setNewActivity({...newActivity,activity_type:e.target.value}),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:110}},
+            h("option",{value:"Call"},"Call"),h("option",{value:"Visit"},"Visit"),h("option",{value:"Email"},"Email")
+          ),
+          h("select",{value:newActivity.outcome,onChange:e=>setNewActivity({...newActivity,outcome:e.target.value}),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:140}},
+            h("option",{value:""},"Outcome…"),
+            h("option",{value:"Interested"},"Interested"),h("option",{value:"Not interested"},"Not interested"),
+            h("option",{value:"Call back later"},"Call back later"),h("option",{value:"No response"},"No response")
+          ),
+          h("input",{type:"date",value:newActivity.next_followup_date,onChange:e=>setNewActivity({...newActivity,next_followup_date:e.target.value}),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:150},title:"Next follow-up date"})
+        ),
+        h("textarea",{value:newActivity.notes,onChange:e=>setNewActivity({...newActivity,notes:e.target.value}),placeholder:"What was discussed…",style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%",minHeight:50,marginBottom:8}}),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setNewActivity(null),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Cancel"),
+          h("button",{onClick:saveNewActivity,disabled:savingActivity,style:{...btnSmall,fontSize:10,padding:"3px 8px"}},savingActivity?"Saving…":"Save activity")
+        )
+      ),
+      loadingActivities?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+      activities.length===0?h("div",{style:{fontSize:12,color:colors.mutedLight,padding:"10px 0"}},"No activity logged yet for this company."):
+      h("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+        activities.map(a=>h("div",{key:a.id,style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+          h("div",{style:{display:"flex",justifyContent:"space-between"}},
+            h("div",{style:{fontSize:12}},
+              h("span",{style:{fontWeight:700,marginRight:6}},a.activity_type),
+              a.outcome && h("span",{style:{color:colors.muted}},a.outcome)
+            ),
+            h("div",{style:{fontSize:10.5,color:colors.mutedLight}},a.logged_by+" — "+new Date(a.created_at).toLocaleDateString())
+          ),
+          a.notes && h("div",{style:{fontSize:12,color:colors.text,marginTop:3}},a.notes),
+          a.next_followup_date && h("div",{style:{fontSize:10.5,color:colors.danger,marginTop:3}},"Next follow-up: "+a.next_followup_date)
+        ))
       )
     ),
     companyFormOpen && h(CustomerCompanyForm,{
@@ -9179,26 +9347,27 @@ const MANUAL_SECTIONS = [
       },
       {
         "key": "crm_setup_masters",
-        "title": "CRM Setup masters (Employees, Territory Rules)",
-        "tag": "Master Data \u2192 CRM Setup",
+        "title": "CRM Setup, HR, and the Cold Customer engine",
+        "tag": "Master Data \u2192 CRM Setup / HR / Customers",
         "blocks": [
           {
             "type": "p",
-            "text": "Phase 1 of the CRM build \u2014 the foundation the rest of the CRM (Cold Customer tracking, ownership auto-assignment, activity logging) will be built on top of. Found under Master Data \u2192 CRM Setup."
+            "text": "The CRM is being built in phases. Phase 1 laid the foundation masters; Phase 2 wires them into Companies (your Cold Customer / Account record) with automatic zone and owner assignment plus activity logging."
           },
           {
             "type": "bullets",
             "items": [
-              "Employees \u2014 employee code is auto-generated. Department, Designation, and CRM Role (Telecaller/FSE/Sales Manager) are captured here; a fuller record with payroll and HR history is planned for a later phase.",
-              "Departments \u2014 a simple editable list (Sales, Marketing, Technical, Accounts, Admin, Production by default).",
-              "States and Zones (India) \u2014 every state mapped to a zone (South/North/East/West). This is the single source of truth for zone \u2014 nothing else stores zone directly.",
-              "Countries and Zones (outside India) \u2014 same idea, for FSEs covering overseas territory.",
-              "Territory Rules \u2014 by State and by Country \u2014 assigns one or more States (or Countries) to a named employee. One employee can cover several; City-level assignment was deliberately dropped in favor of State/Country only."
+              "Master Data \u2192 HR \u2192 Employees \u2014 employee code is auto-generated. Department, Designation, and CRM Role (Telecaller/FSE/Sales Manager) are captured here; a fuller record with payroll and HR history is planned for a later phase.",
+              "Master Data \u2192 HR \u2192 Departments \u2014 a simple editable list.",
+              "Master Data \u2192 CRM Setup \u2192 States and Zones (India) / Countries and Zones \u2014 the single source of truth for zone. Nothing else stores zone directly \u2014 it's always looked up from here.",
+              "Master Data \u2192 CRM Setup \u2192 Territory Rules (by State, by Country) \u2014 assigns one or more States or Countries to a named employee. City-level assignment was deliberately dropped.",
+              "Customers \u2192 New company / quick-add / bulk upload \u2014 Zone auto-fills from the State or Country you type (matched against the zone masters); Owner auto-fills from Territory Rules the same way. Both are overridable, not locked \u2014 if no rule matches, they're left blank for manual entry.",
+              "Customers \u2192 a selected company now shows CRM status (Cold/Lead) and CRM Owner, and has an Activity section \u2014 log a Call, Visit, or Email with an Outcome and a Next follow-up date; shown as a timeline, newest first."
             ]
           },
           {
             "type": "p",
-            "text": "Not yet built: Cold Customer bulk upload/manual entry with auto owner assignment from these Territory Rules, the Pre-Lead activity log, automatic ownership shift on Lead conversion, passive ownership-change notifications, and the Telecaller/FSE daily worklist screens. These follow in later phases."
+            "text": "Not yet built: automatic ownership shift to the Territory-mapped FSE when a Cold Customer converts to a Lead, the Telecaller-keeps-visibility rule, passive notifications actually surfacing in the app (they're being logged to a table already), Telecaller/FSE daily worklist screens, the login overdue-calls prompt, the overdue calls report, an enhanced Quote Status Review with owner/zone/value/stale filters, a Won-by-owner report, and the fuller Employee HR record (photo, restricted payroll section, HR events, address change log). These follow in later phases."
           }
         ]
       }
@@ -9357,6 +9526,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"24 Jul 2026 (2)", summary:"CRM Phase 2 — run crm_phase2_setup.sql after Phase 1's script. Employees and Departments moved out of CRM Setup into their own new Master Data → HR group (CRM Setup now only holds States/Zones, Countries/Zones, Territory Rules). Companies (the Cold Customer / Account record) gained CRM status (Cold/Lead), a CRM owner, and archive fields. Zone is no longer picked by hand on a new company — it's auto-derived from State (India) or Country (outside India) via the Phase 1 zone masters, with the old manual picker still there as a fallback. New companies (manual add, quick-add, and bulk upload) now auto-assign an owner from Territory Rules and log it to a new ownership history table, which also drops a passive notification for the new owner (no inbox UI reads these yet). Customers screen gained an Activity section per company — log Call/Visit/Email with an outcome, notes, and next follow-up date, shown as a timeline." },
   { date:"24 Jul 2026", summary:"CRM Phase 1 — foundation masters only, run crm_phase1_setup.sql first. New Master Data → CRM Setup group: Employees (auto-generated employee code, department, designation, CRM role, contact details, active/inactive), Departments, States and Zones (India, zone auto-derived from state), Countries and Zones (outside India), and Territory Rules by State and by Country (one FSE can cover several States or Countries — City-level assignment was deliberately dropped). These are the building blocks the rest of the CRM (Cold Customer tracking, ownership auto-assignment, activity logging, worklists) will be built on in the next phases — none of that is built yet." },
   { date:"17 Jul 2026 (47)", summary:"Fixed: session persistence used localStorage, which never expires — closing the browser without signing out left the login open indefinitely for anyone touching that device afterward. Switched to sessionStorage instead: still survives a refresh and still works for New Tab (browsers copy it into tabs opened via window.open), but it's genuinely cleared the moment the browser/tab is closed — no more indefinitely-open session." },
   { date:"17 Jul 2026 (46)", summary:"Fixed a real crash: the last round's readiness rework added a `categories` field to the readiness state, but two places that reset it (a readiness-check error, and \"no quote selected\") were missed — leaving `categories` undefined and crashing the new segmented progress bar's render, which blanked the whole Quotes screen. Both spots fixed, and the bar itself hardened so a missing/malformed categories object can never crash it again." },
@@ -10089,7 +10259,11 @@ function CustomerBulkUpload({ user }){
     if(!result) return;
     setCommitting(true);
     try {
-      if(result.newCompanies.length) await sb.from("companies").insert(result.newCompanies);
+      if(result.newCompanies.length){
+        const assigned = await Promise.all(result.newCompanies.map(c=>autoAssignNewCompany(c, user?.username||"bulk_upload")));
+        await sb.from("companies").insert(assigned);
+        await Promise.all(assigned.filter(c=>c.owner_employee_name).map(c=>logOwnershipChange(c.company_name,"",c.owner_employee_name,"Auto",user?.username||"bulk_upload")));
+      }
       if(result.newContacts.length) await sb.from("contacts").insert(result.newContacts);
       for(const rc of result.reviewContacts){
         const action = resolutions[rc._idx] || "keep";
