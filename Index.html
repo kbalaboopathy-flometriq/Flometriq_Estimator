@@ -452,6 +452,47 @@ async function logOwnershipChange(companyName, oldOwner, newOwner, reason, chang
     await sb.from("notifications_tbl").insert({ employee_name:oldOwner, message:"Ownership of "+companyName+" moved to "+(newOwner||"unassigned")+" ("+(reason||"Auto")+")", related_company:companyName });
   }
 }
+// Called the moment a brand-new Quote# (first Sl No) is created for a
+// customer — this IS "a Lead was generated" in CRM terms. Rule: if the
+// current owner is already an FSE, ownership stays put, no prompt, nothing
+// happens. If the current owner is anyone else (a Telecaller, or nobody),
+// ownership shifts silently to whichever FSE the Territory Rules map to,
+// logged as an Auto change. Best-effort: any lookup failure is swallowed
+// so it never blocks a quote from saving.
+async function promoteCompanyToLead(companyId, customerName){
+  try{
+    let company = null;
+    if(companyId){
+      const { data } = await sb.from("companies").select("*").eq("id",companyId).limit(1).maybeSingle();
+      company = data;
+    }
+    if(!company && customerName){
+      const { data } = await sb.from("companies").select("*").ilike("company_name",customerName.trim()).limit(1).maybeSingle();
+      company = data;
+    }
+    if(!company) return; // quote issued to a customer with no CRM company record yet — nothing to update
+    const updates = {};
+    if(company.crm_status!=="Lead") updates.crm_status = "Lead";
+    let ownerIsFse = false;
+    if(company.owner_employee_name){
+      const { data: emp } = await sb.from("employee_tbl").select("crm_role").eq("employee_name",company.owner_employee_name).limit(1).maybeSingle();
+      ownerIsFse = !!(emp && emp.crm_role==="FSE");
+    }
+    if(!ownerIsFse){
+      const newOwner = await resolveOwnerForAddress(company.billing_state, company.billing_country);
+      if(newOwner && newOwner!==company.owner_employee_name){
+        updates.owner_employee_name = newOwner;
+        updates.owner_source = "Auto";
+      }
+    }
+    if(Object.keys(updates).length){
+      await sb.from("companies").update(updates).eq("id",company.id);
+      if(updates.owner_employee_name){
+        await logOwnershipChange(company.company_name, company.owner_employee_name||"", updates.owner_employee_name, "Auto", "lead_conversion");
+      }
+    }
+  } catch(e){ console.error("promoteCompanyToLead failed (non-blocking)",e); }
+}
 // Applied whenever a new company is created (manual add, bulk upload) —
 // looks up zone + owner from the territory masters and returns the extra
 // fields to merge into the insert payload, plus logs the initial
@@ -619,7 +660,7 @@ function LoginScreen({ onLogin }) {
         status: success?"success":"failed"
       });
       if(!success) { setError("Incorrect username or password."); setLoading(false); return; }
-      onLogin({ username:data[0].username, role:data[0].role, company_id:data[0].company_id||null });
+      onLogin({ id:data[0].id, username:data[0].username, role:data[0].role, company_id:data[0].company_id||null });
     } catch(e2) { setError("Cannot reach database."); } finally { setLoading(false); }
   };
   return h("div",{style:{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}},
@@ -771,6 +812,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Sales", tabs:[
         {key:"estimator",label:"Estimator"},
         {key:"saved",label:"Quotes"},
+        {key:"my_worklist",label:"My Worklist"},
       ]},
       { label:"Engineering", tabs:[
         {key:"calcs",label:"Engineering Calcs"},
@@ -788,6 +830,8 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports_quotes",label:"Quotes"},
         {key:"reports_item_coverage",label:"Item Coverage"},
         {key:"reports_quote_status",label:"Quotes by Status"},
+        {key:"reports_quote_status_review",label:"Quote Status Review"},
+        {key:"reports_won_by_owner",label:"Won by Owner"},
         {key:"reports_status_history",label:"Status Change History"},
       ]},
       ...(isAdmin?[{ label:"Admin only", tabs:[
@@ -1470,6 +1514,7 @@ function MasterEditor({ tableKey, user }) {
   const isAdmin = user?.role==="admin" || isSuperAdmin;
   const [freshIds,setFreshIds]=useState(new Set());
   const [selectedIds,setSelectedIds]=useState(new Set());
+  const [employeeLoginRow,setEmployeeLoginRow]=useState(null); // employee row being linked to a login, or null
   const [pendingDeleteIds,setPendingDeleteIds]=useState(null); // array of ids awaiting a code
   const [codeInput,setCodeInput]=useState(""); const [codeMsg,setCodeMsg]=useState(""); const [codeBusy,setCodeBusy]=useState(false);
 
@@ -2256,7 +2301,9 @@ function MasterEditor({ tableKey, user }) {
       isProtectedStatusRow(row)
         ? h("span",{style:{fontSize:11,color:colors.mutedLight}},"🔒 system value — locked")
         : editingId===row.id?h(React.Fragment,null,h("button",{onClick:saveEdit,style:{...btnSecondary,marginRight:6}},"Save"),h("button",{onClick:()=>{setEditingId(null);setEditDraft({});},style:btnSecondary},"Cancel")):
-          h(React.Fragment,null,h("button",{onClick:()=>{setEditingId(row.id);setEditDraft({...row});},style:{...btnSecondary,marginRight:6}},"Edit"),h("button",{onClick:()=>deleteRow(row.id),style:btnDanger},freshIds.has(row.id)||isSuperAdmin?"Delete":"Delete 🔒"))
+          h(React.Fragment,null,
+            tableKey==="employee_tbl" && h("button",{onClick:()=>setEmployeeLoginRow(row),style:{...btnSecondary,marginRight:6,background:row.app_user_id?undefined:"#fff8e1"}},row.app_user_id?"Login: linked":"+ Create login"),
+            h("button",{onClick:()=>{setEditingId(row.id);setEditDraft({...row});},style:{...btnSecondary,marginRight:6}},"Edit"),h("button",{onClick:()=>deleteRow(row.id),style:btnDanger},freshIds.has(row.id)||isSuperAdmin?"Delete":"Delete 🔒"))
     )
   );
 
@@ -2623,9 +2670,128 @@ function MasterEditor({ tableKey, user }) {
               )))
             )
       )
+    ),
+    employeeLoginRow && h(EmployeeLoginModal,{
+      employee: employeeLoginRow, user,
+      onClose: ()=>setEmployeeLoginRow(null),
+      onLinked: (appUserId)=>{ setRows(rs=>rs.map(r=>r.id===employeeLoginRow.id?{...r,app_user_id:appUserId}:r)); setEmployeeLoginRow(null); }
+    })
+  );
+}
+
+// HR creates (or links) the login credentials for an employee, right from
+// the Employee master row — no separate trip to Admin -> Users needed.
+// One employee <-> one login, both sides optional: an employee with no
+// CRM/app need can stay unlinked, and app_users rows created elsewhere
+// (or a shared/legacy login) can still be picked as "existing" instead.
+function EmployeeLoginModal({ employee, user, onClose, onLinked }){
+  const [mode,setMode] = useState("create"); // "create" | "link"
+  const [username,setUsername] = useState("");
+  const [password,setPassword] = useState("");
+  const [role,setRole] = useState("user");
+  const [existingUsers,setExistingUsers] = useState([]);
+  const [pickUserId,setPickUserId] = useState("");
+  const [busy,setBusy] = useState(false);
+  const [err,setErr] = useState("");
+  const [linkedUsername,setLinkedUsername] = useState("");
+
+  useEffect(()=>{
+    (async()=>{
+      const { data: allUsers } = await sb.from("app_users").select("id,username,role");
+      const { data: allEmployees } = await sb.from("employee_tbl").select("app_user_id").not("app_user_id","is",null);
+      const takenIds = new Set((allEmployees||[]).map(e=>e.app_user_id));
+      setExistingUsers((allUsers||[]).filter(u=>!takenIds.has(u.id) || u.id===employee.app_user_id));
+      if(employee.app_user_id){
+        const match = (allUsers||[]).find(u=>u.id===employee.app_user_id);
+        if(match) setLinkedUsername(match.username);
+      }
+    })();
+  },[employee.app_user_id]);
+
+  const createAndLink = async()=>{
+    if(!username.trim()||!password.trim()){ setErr("Username and password are required."); return; }
+    setBusy(true); setErr("");
+    try{
+      const { data: created, error: err1 } = await sb.from("app_users").insert({username:username.trim(),password,role}).select().single();
+      if(err1) throw err1;
+      const { error: err2 } = await sb.from("employee_tbl").update({app_user_id:created.id}).eq("id",employee.id);
+      if(err2) throw err2;
+      await logAudit("CREATE","app_users",username.trim(),"Login created and linked to employee \""+employee.employee_name+"\" by HR",user?.username||"unknown",null,{username:username.trim(),role});
+      onLinked(created.id);
+    } catch(e){ setErr(e.message||"Could not create login."); }
+    finally{ setBusy(false); }
+  };
+  const linkExisting = async()=>{
+    if(!pickUserId){ setErr("Pick a login to link."); return; }
+    setBusy(true); setErr("");
+    try{
+      const { error } = await sb.from("employee_tbl").update({app_user_id:Number(pickUserId)}).eq("id",employee.id);
+      if(error) throw error;
+      await logAudit("UPDATE","employee_tbl",employee.employee_code||String(employee.id),"Linked existing login to employee \""+employee.employee_name+"\"",user?.username||"unknown",null,{app_user_id:pickUserId});
+      onLinked(Number(pickUserId));
+    } catch(e){ setErr(e.message||"Could not link login."); }
+    finally{ setBusy(false); }
+  };
+  const unlink = async()=>{
+    if(!confirm("Unlink "+employee.employee_name+"'s login? Their app_users account stays intact, just no longer tied to this employee.")) return;
+    setBusy(true);
+    try{
+      await sb.from("employee_tbl").update({app_user_id:null}).eq("id",employee.id);
+      await logAudit("UPDATE","employee_tbl",employee.employee_code||String(employee.id),"Unlinked login from employee \""+employee.employee_name+"\"",user?.username||"unknown",null,{app_user_id:null});
+      onLinked(null);
+    } finally{ setBusy(false); }
+  };
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:420,maxWidth:"100%"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"App login — "+employee.employee_name),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},employee.employee_code),
+      employee.app_user_id
+        ? h(React.Fragment,null,
+            h("div",{style:{padding:"10px 12px",background:"#eaf9f4",borderRadius:6,marginBottom:14,fontSize:12.5}},"Linked to login: ",h("strong",null,linkedUsername||"…")),
+            h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+              h("button",{onClick:onClose,style:btnSecondary},"Close"),
+              h("button",{onClick:unlink,disabled:busy,style:{...btnDanger,opacity:busy?0.6:1}},busy?"Working…":"Unlink")
+            )
+          )
+        : h(React.Fragment,null,
+            h("div",{style:{display:"flex",gap:6,marginBottom:14}},
+              h("button",{onClick:()=>setMode("create"),style:{...btnSmall,background:mode==="create"?colors.dark:"#fff",color:mode==="create"?"#fff":colors.text}},"Create new login"),
+              h("button",{onClick:()=>setMode("link"),style:{...btnSmall,background:mode==="link"?colors.dark:"#fff",color:mode==="link"?"#fff":colors.text}},"Link existing login")
+            ),
+            mode==="create" ? h(React.Fragment,null,
+              h("div",{style:{marginBottom:8}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Username"),h("input",{value:username,onChange:e=>setUsername(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+              h("div",{style:{marginBottom:8}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Password"),h("input",{type:"text",value:password,onChange:e=>setPassword(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+              h("div",{style:{marginBottom:14}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Role"),
+                h("select",{value:role,onChange:e=>setRole(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+                  h("option",{value:"user"},"User"),h("option",{value:"admin"},"Admin"),
+                  user?.role==="super_admin" && h("option",{value:"super_admin"},"Super Admin")
+                )
+              ),
+              err&&h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},err),
+              h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+                h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
+                h("button",{onClick:createAndLink,disabled:busy,style:{...btnPrimary,opacity:busy?0.6:1}},busy?"Creating…":"Create and link")
+              )
+            ) : h(React.Fragment,null,
+              h("div",{style:{marginBottom:14}},
+                h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Pick an unlinked login"),
+                h("select",{value:pickUserId,onChange:e=>setPickUserId(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+                  h("option",{value:""},"Select…"),
+                  existingUsers.map(u=>h("option",{key:u.id,value:u.id},u.username+" ("+u.role+")"))
+                )
+              ),
+              err&&h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},err),
+              h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+                h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
+                h("button",{onClick:linkExisting,disabled:busy,style:{...btnPrimary,opacity:busy?0.6:1}},busy?"Linking…":"Link login")
+              )
+            )
+          )
     )
   );
 }
+
 
 /* ---- USERS ---- */
 function UsersEditor({ user }) {
@@ -3496,6 +3662,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
         const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,company_id:resolvedCompanyId,created_by:user.username}).select().single();
         if(err) throw err;
         estimateId=created.id; createdNewHeader=true;
+        promoteCompanyToLead(resolvedCompanyId, headerPayload.customer_name);
       }
       const rows=cart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,show_in_moc:l.show_in_moc===true,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||""}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
@@ -5044,9 +5211,10 @@ function MasterSelect({ value, onChange, options, table, valueCol, fieldLabel, p
 // it" side panel, matching the same pattern as AddToMasterPanel but with the
 // extra address fields a customer actually needs.
 function AddCustomerPanel({ onClose, onAdded }){
-  const [f,setF] = useState({company_name:"",zone:"",billing_street:"",billing_city:"",billing_state:"",billing_pin:"",billing_country:""});
+  const [f,setF] = useState({company_name:"",zone:"",billing_street:"",billing_city:"",billing_state:"",billing_pin:"",billing_country:"",source:""});
   const [saving,setSaving] = useState(false);
   const [err,setErr] = useState("");
+  const [dupWarning,setDupWarning] = useState("");
   const [zoneOptions,setZoneOptions] = useState([]);
   const loadZones = useCallback(async()=>{
     const { data } = await sb.from("zone_tbl").select("value").order("value");
@@ -5054,6 +5222,11 @@ function AddCustomerPanel({ onClose, onAdded }){
   },[]);
   useEffect(()=>{ loadZones(); },[loadZones]);
   const fld = (key,placeholder)=>h("input",{value:f[key],onChange:e=>setF(d=>({...d,[key]:e.target.value})),placeholder,style:{...inputStyle,padding:"9px 11px",fontSize:13,marginBottom:8}});
+  const checkDup = async(name)=>{
+    if(!name.trim()){ setDupWarning(""); return; }
+    const { data } = await sb.from("companies").select("company_name").ilike("company_name",name.trim()).limit(1);
+    setDupWarning((data&&data.length>0) ? "\""+data[0].company_name+"\" already exists — check before adding a duplicate." : "");
+  };
   const save = async()=>{
     if(!f.company_name.trim()){ setErr("Enter a company name."); return; }
     if(!f.zone){ setErr("Zone is required."); return; }
@@ -5077,7 +5250,8 @@ function AddCustomerPanel({ onClose, onAdded }){
     h("div",{style:{width:340,maxWidth:"90vw",height:"100%",background:"#fff",boxShadow:"-2px 0 12px rgba(0,0,0,0.15)",padding:"20px 22px",display:"flex",flexDirection:"column"}},
       h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Add new customer"),
       h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"Adds a company to the Customers module and selects it for this quote."),
-      fld("company_name","Company name *"),
+      h("input",{value:f.company_name,onChange:e=>setF(d=>({...d,company_name:e.target.value})),onBlur:e=>checkDup(e.target.value),placeholder:"Company name *",style:{...inputStyle,padding:"9px 11px",fontSize:13,marginBottom:8}}),
+      dupWarning && h("div",{style:{fontSize:11,color:colors.danger,marginTop:-4,marginBottom:8}},dupWarning),
       h("div",{style:{marginBottom:8}},
         h(MasterSelect,{value:f.zone,onChange:v=>setF(d=>({...d,zone:v})),options:zoneOptions,table:"zone_tbl",valueCol:"value",fieldLabel:"Zone",placeholder:"Select zone… *",style:{padding:"9px 11px",fontSize:13},refreshOptions:loadZones})
       ),
@@ -5086,6 +5260,12 @@ function AddCustomerPanel({ onClose, onAdded }){
       fld("billing_state","State"),
       fld("billing_pin","PIN / Zip"),
       fld("billing_country","Country *"),
+      h("select",{value:f.source,onChange:e=>setF(d=>({...d,source:e.target.value})),style:{...inputStyle,padding:"9px 11px",fontSize:13,marginBottom:8}},
+        h("option",{value:""},"Source…"),
+        h("option",{value:"Referral"},"Referral"),h("option",{value:"Google Ads"},"Google Ads"),
+        h("option",{value:"Social media"},"Social media"),h("option",{value:"Exhibition"},"Exhibition"),
+        h("option",{value:"Cold outreach"},"Cold outreach"),h("option",{value:"Other"},"Other")
+      ),
       err&&h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},err),
       h("div",{style:{marginTop:"auto",display:"flex",justifyContent:"flex-end",gap:8}},
         h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
@@ -8115,6 +8295,12 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
     return ()=>{ cancelled=true; };
   },[f.billing_state,f.billing_country,f.id]);
   const set = (k,v)=>setF(d=>({...d,[k]:v}));
+  const [dupWarning,setDupWarning] = useState("");
+  const checkDup = async(name)=>{
+    if(f.id || !name.trim()){ setDupWarning(""); return; }
+    const { data } = await sb.from("companies").select("company_name").ilike("company_name",name.trim()).limit(1);
+    setDupWarning((data&&data.length>0) ? "\""+data[0].company_name+"\" already exists — check before adding a duplicate." : "");
+  };
   const save = async()=>{
     if(!f.company_name.trim()){ alert("Company name is required."); return; }
     if(!f.zone){ alert("Zone is required."); return; }
@@ -8147,7 +8333,17 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
   return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
       h("div",{style:{fontWeight:700,fontSize:14,marginBottom:14}},f.id?"Edit company":"New company"),
-      row2("Company name *","company_name","Account type","account_type"),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Company name *"),
+          h("input",{value:f.company_name||"",onChange:e=>set("company_name",e.target.value),onBlur:e=>checkDup(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})
+        ),
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Account type"),
+          h("input",{value:f.account_type||"",onChange:e=>set("account_type",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})
+        )
+      ),
+      dupWarning && h("div",{style:{fontSize:11,color:colors.danger,marginTop:-4,marginBottom:8}},dupWarning),
       row2("Industry","industry","Rating","rating"),
       row2("Website","website","Phone","phone"),
       h("div",{style:{display:"flex",gap:10,marginBottom:8}},
@@ -8230,6 +8426,176 @@ function CustomerContactForm({ companyName, initial, onCancel, onSaved, user }){
   );
 }
 
+// The day-to-day transactional screen — what a Telecaller or FSE actually
+// opens each morning to log calls/visits/emails and see what's due. Scoped
+// to companies THEY currently own (owner_employee_name === their linked
+// Employee record). Three views: By date (what's due, oldest first — flat
+// for a Telecaller, card-with-deal-context for an FSE), By customer (pick
+// one, see its full history), All (flat combined log, 25 per page).
+function MyWorklistScreen({ user }){
+  const [employee,setEmployee] = useState(undefined); // undefined = loading, null = no link
+  const [myCompanies,setMyCompanies] = useState([]);
+  const [activities,setActivities] = useState([]);
+  const [openQuotesByCompany,setOpenQuotesByCompany] = useState(new Map());
+  const [loading,setLoading] = useState(true);
+  const [view,setView] = useState("date"); // "date" | "customer" | "all"
+  const [selectedCompany,setSelectedCompany] = useState("");
+  const [page,setPage] = useState(0);
+  const pageSize = 25;
+  const [logFor,setLogFor] = useState(null); // company_name being logged against, or null
+  const [logDraft,setLogDraft] = useState({activity_type:"Call",outcome:"",notes:"",next_followup_date:""});
+  const [saving,setSaving] = useState(false);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    if(!user?.id){ setEmployee(null); setLoading(false); return; }
+    const { data: emp } = await sb.from("employee_tbl").select("*").eq("app_user_id",user.id).limit(1).maybeSingle();
+    if(!emp){ setEmployee(null); setLoading(false); return; }
+    setEmployee(emp);
+    const { data: cos } = await sb.from("companies").select("*").eq("owner_employee_name",emp.employee_name).eq("is_archived",false);
+    setMyCompanies(cos||[]);
+    const names = (cos||[]).map(c=>c.company_name);
+    const { data: acts } = names.length
+      ? await sb.from("activity_log_tbl").select("*").in("company_name",names).order("created_at",{ascending:false})
+      : { data: [] };
+    setActivities(acts||[]);
+    if(emp.crm_role==="FSE" && names.length){
+      const { data: ests } = await sb.from("estimates").select("reference_number,customer_name,quote_status,company_id,order_qty").in("company_id",(cos||[]).map(c=>c.id));
+      const refNums = Array.from(new Set((ests||[]).map(e=>e.reference_number)));
+      const { data: lines } = refNums.length ? await sb.from("estimate_lines").select("reference_number,sales_price").in("reference_number",refNums) : { data: [] };
+      const byCompany = new Map();
+      (ests||[]).forEach(e=>{
+        const co = (cos||[]).find(c=>c.id===e.company_id);
+        if(!co) return;
+        const value = (lines||[]).filter(l=>l.reference_number===e.reference_number).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+        const existing = byCompany.get(co.company_name);
+        if(!existing || e.reference_number>existing.reference_number) byCompany.set(co.company_name,{reference_number:e.reference_number,quote_status:e.quote_status,value});
+      });
+      setOpenQuotesByCompany(byCompany);
+    }
+    setLoading(false);
+  },[user?.id]);
+  useEffect(()=>{ load(); },[load]);
+
+  const today = new Date().toISOString().slice(0,10);
+  const dueActivities = activities.filter(a=>a.next_followup_date && a.next_followup_date<=today)
+    .sort((a,b)=>(a.next_followup_date||"").localeCompare(b.next_followup_date||""));
+
+  const openLog = (companyName)=>{ setLogFor(companyName); setLogDraft({activity_type:"Call",outcome:"",notes:"",next_followup_date:""}); };
+  const saveLog = async()=>{
+    setSaving(true);
+    try{
+      const relevant = activities.filter(a=>a.company_name===logFor && a.next_followup_date);
+      const lastFollowUp = relevant.length ? relevant[0] : null;
+      await sb.from("activity_log_tbl").insert({
+        company_name:logFor, activity_type:logDraft.activity_type, outcome:logDraft.outcome||"",
+        notes:logDraft.notes||"", next_followup_date:logDraft.next_followup_date||null,
+        is_followup_of: lastFollowUp?lastFollowUp.id:null, logged_by:user?.username||"unknown"
+      });
+      setLogFor(null);
+      await load();
+    } finally{ setSaving(false); }
+  };
+
+  if(loading) return h("div",{style:{padding:"20px 24px",fontSize:12,color:colors.mutedLight}},"Loading…");
+  if(!employee) return h("div",{style:{padding:"20px 24px"}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:8}},"My Worklist"),
+    h("div",{style:{fontSize:13,color:colors.mutedLight}},"Your login isn't linked to an Employee record yet — ask HR to link it under Master Data \u2192 HR \u2192 Employees, then come back here.")
+  );
+
+  const logPanel = (companyName)=> logFor===companyName && h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px",margin:"8px 0",background:"#faf9f4"}},
+    h("div",{style:{display:"flex",gap:8,marginBottom:8}},
+      h("select",{value:logDraft.activity_type,onChange:e=>setLogDraft(d=>({...d,activity_type:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:110}},
+        h("option",{value:"Call"},"Call"),h("option",{value:"Visit"},"Visit"),h("option",{value:"Email"},"Email")
+      ),
+      h("select",{value:logDraft.outcome,onChange:e=>setLogDraft(d=>({...d,outcome:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:140}},
+        h("option",{value:""},"Outcome…"),h("option",{value:"Interested"},"Interested"),h("option",{value:"Not interested"},"Not interested"),
+        h("option",{value:"Call back later"},"Call back later"),h("option",{value:"No response"},"No response")
+      ),
+      h("input",{type:"date",value:logDraft.next_followup_date,onChange:e=>setLogDraft(d=>({...d,next_followup_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:150}})
+    ),
+    h("textarea",{value:logDraft.notes,onChange:e=>setLogDraft(d=>({...d,notes:e.target.value})),placeholder:"What was discussed…",style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%",minHeight:44,marginBottom:8}}),
+    h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+      h("button",{onClick:()=>setLogFor(null),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Cancel"),
+      h("button",{onClick:saveLog,disabled:saving,style:{...btnSmall,fontSize:10,padding:"3px 8px"}},saving?"Saving…":"Save")
+    )
+  );
+
+  const viewBtn = (key,label)=>h("button",{onClick:()=>setView(key),style:{...btnSmall,marginRight:6,background:view===key?colors.dark:"#fff",color:view===key?"#fff":colors.text}},label);
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:900}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+      h("div",{style:{fontWeight:700,fontSize:16}},"My Worklist — "+employee.employee_name+" ("+(employee.crm_role||"—")+")")
+    ),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Scoped to the "+myCompanies.length+" account(s) you currently own."),
+    h("div",{style:{marginBottom:14}},viewBtn("date","By date"),viewBtn("customer","By customer"),viewBtn("all","All")),
+
+    view==="date" && h(React.Fragment,null,
+      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:10}},dueActivities.length+" due (including overdue)."),
+      dueActivities.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"Nothing due — you're caught up."),
+      dueActivities.map(a=>{
+        const overdue = a.next_followup_date < today;
+        const deal = openQuotesByCompany.get(a.company_name);
+        return h("div",{key:a.id},
+          h("div",{style:{border:"1px solid "+(overdue?colors.danger:colors.border),borderRadius:6,padding:"10px 12px",marginBottom:8,background:overdue?"#fdeeee":"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
+              h("div",null,
+                h("div",{style:{fontWeight:700,fontSize:13}},a.company_name),
+                h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},(overdue?"Overdue — was due ":"Due ")+a.next_followup_date+(a.notes?" — "+a.notes:"")),
+                deal && h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},deal.reference_number+" · "+deal.quote_status+" · INR "+fmtR(deal.value))
+              ),
+              h("button",{onClick:()=>openLog(a.company_name),style:{...btnSmall,fontSize:10,padding:"4px 10px"}},"Log now")
+            )
+          ),
+          logPanel(a.company_name)
+        );
+      })
+    ),
+
+    view==="customer" && h(React.Fragment,null,
+      h("select",{value:selectedCompany,onChange:e=>setSelectedCompany(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,marginBottom:12,width:280}},
+        h("option",{value:""},"Select a company…"),
+        myCompanies.map(c=>h("option",{key:c.id,value:c.company_name},c.company_name))
+      ),
+      selectedCompany && h(React.Fragment,null,
+        h("button",{onClick:()=>openLog(selectedCompany),style:{...btnSmall,marginBottom:10}},"+ Log activity"),
+        logPanel(selectedCompany),
+        activities.filter(a=>a.company_name===selectedCompany).map(a=>
+          h("div",{key:a.id,style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",marginBottom:6}},
+            h("div",{style:{display:"flex",justifyContent:"space-between"}},
+              h("div",{style:{fontSize:12}},h("span",{style:{fontWeight:700,marginRight:6}},a.activity_type),a.outcome&&h("span",{style:{color:colors.muted}},a.outcome)),
+              h("div",{style:{fontSize:10.5,color:colors.mutedLight}},new Date(a.created_at).toLocaleDateString())
+            ),
+            a.notes && h("div",{style:{fontSize:12,marginTop:3}},a.notes),
+            a.next_followup_date && h("div",{style:{fontSize:10.5,color:colors.danger,marginTop:3}},"Next follow-up: "+a.next_followup_date)
+          )
+        ),
+        activities.filter(a=>a.company_name===selectedCompany).length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"No activity logged yet.")
+      )
+    ),
+
+    view==="all" && h(React.Fragment,null,
+      activities.slice(page*pageSize,(page+1)*pageSize).map(a=>
+        h("div",{key:a.id,style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",marginBottom:6}},
+          h("div",{style:{display:"flex",justifyContent:"space-between"}},
+            h("div",{style:{fontSize:12}},h("span",{style:{fontWeight:700,marginRight:6}},a.company_name),h("span",{style:{color:colors.muted}},a.activity_type+(a.outcome?" — "+a.outcome:""))),
+            h("div",{style:{fontSize:10.5,color:colors.mutedLight}},new Date(a.created_at).toLocaleDateString())
+          ),
+          a.notes && h("div",{style:{fontSize:12,marginTop:3}},a.notes)
+        )
+      ),
+      activities.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"No activity logged yet."),
+      h("div",{style:{display:"flex",justifyContent:"space-between",marginTop:10,fontSize:11.5,color:colors.mutedLight}},
+        h("div",null,"Showing "+(activities.length===0?0:page*pageSize+1)+"–"+Math.min((page+1)*pageSize,activities.length)+" of "+activities.length),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Prev"),
+          h("button",{onClick:()=>setPage(p=>((p+1)*pageSize<activities.length)?p+1:p),disabled:(page+1)*pageSize>=activities.length,style:btnSmall},"Next")
+        )
+      )
+    )
+  );
+}
+
 function CustomersScreen({ user }){
   const [companies,setCompanies] = useState([]);
   const [loading,setLoading] = useState(true);
@@ -8307,6 +8673,19 @@ function CustomersScreen({ user }){
       // Lead — that transition is set by hand on the company record for now
       // (Phase 2 doesn't yet define what counts as "a real enquiry").
       setNewActivity(null);
+      // FSE-touch-wins rule: if the person logging this activity is an FSE
+      // (matched by employee name against their login username — best
+      // effort until there's a real login-to-employee link) and the
+      // company is still Cold (pre-Lead), they become owner immediately,
+      // overriding whatever Telecaller was provisionally attached.
+      if(selected.crm_status!=="Lead" && user?.id){
+        const { data: emp } = await sb.from("employee_tbl").select("employee_name,crm_role").eq("app_user_id",user.id).limit(1).maybeSingle();
+        if(emp && emp.crm_role==="FSE" && emp.employee_name!==selected.owner_employee_name){
+          await sb.from("companies").update({owner_employee_name:emp.employee_name, owner_source:"Auto"}).eq("id",selected.id);
+          await logOwnershipChange(selected.company_name, selected.owner_employee_name||"", emp.employee_name, "Auto", "fse_touch");
+          setSelected(s=>({...s, owner_employee_name:emp.employee_name, owner_source:"Auto"}));
+        }
+      }
       await loadActivities(selected.company_name);
     } finally { setSavingActivity(false); }
   };
@@ -8338,6 +8717,28 @@ function CustomersScreen({ user }){
     await sb.from("customer_addresses").update(payload).eq("id",addr.id);
     setAddressFormOpen(null);
     await loadAddresses(selected.company_name);
+  };
+
+  const [archiving,setArchiving] = useState(false);
+  const [archiveReason,setArchiveReason] = useState("");
+  const [showArchivePanel,setShowArchivePanel] = useState(false);
+  const doArchive = async()=>{
+    if(!archiveReason){ alert("Pick a reason."); return; }
+    setArchiving(true);
+    try{
+      await sb.from("companies").update({is_archived:true,archived_reason:archiveReason}).eq("id",selected.id);
+      await logAudit("UPDATE","companies",selected.company_name,"Marked not relevant / archived — "+archiveReason,user?.username||"unknown",null,{is_archived:true,archived_reason:archiveReason});
+      setSelected(s=>({...s,is_archived:true,archived_reason:archiveReason}));
+      setShowArchivePanel(false); setArchiveReason("");
+    } finally { setArchiving(false); }
+  };
+  const doRestore = async()=>{
+    setArchiving(true);
+    try{
+      await sb.from("companies").update({is_archived:false,archived_reason:null}).eq("id",selected.id);
+      await logAudit("UPDATE","companies",selected.company_name,"Restored from archive",user?.username||"unknown",null,{is_archived:false});
+      setSelected(s=>({...s,is_archived:false,archived_reason:null}));
+    } finally { setArchiving(false); }
   };
 
   const filtered = companies.filter(c=>!search||(c.company_name||"").toLowerCase().includes(search.toLowerCase()));
@@ -8471,8 +8872,27 @@ function CustomersScreen({ user }){
     h(React.Fragment,null,
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px",background:"#fff",marginBottom:16}},
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}},
-          h("div",{style:{fontWeight:700,fontSize:16}},selected.company_name),
-          h("button",{onClick:()=>setCompanyFormOpen(selected),style:btnSmall},"Edit company")
+          h("div",null,
+            h("div",{style:{fontWeight:700,fontSize:16}},selected.company_name),
+            selected.is_archived && h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#f0efe8",color:colors.mutedLight,marginTop:4,display:"inline-block"}},"Archived — "+(selected.archived_reason||""))
+          ),
+          h("div",{style:{display:"flex",gap:6}},
+            h("button",{onClick:()=>setCompanyFormOpen(selected),style:btnSmall},"Edit company"),
+            selected.is_archived
+              ? h("button",{onClick:doRestore,disabled:archiving,style:btnSmall},archiving?"Working…":"Restore")
+              : h("button",{onClick:()=>setShowArchivePanel(v=>!v),style:{...btnSmall,color:colors.danger}},"Mark not relevant")
+          )
+        ),
+        showArchivePanel && !selected.is_archived && h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:10,padding:"8px 10px",background:"#faf9f4",borderRadius:6}},
+          h("select",{value:archiveReason,onChange:e=>setArchiveReason(e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+            h("option",{value:""},"Reason…"),
+            h("option",{value:"Not in target market"},"Not in target market"),
+            h("option",{value:"Went to competitor"},"Went to competitor"),
+            h("option",{value:"Company shut down / unreachable"},"Company shut down / unreachable"),
+            h("option",{value:"Other"},"Other")
+          ),
+          h("button",{onClick:doArchive,disabled:archiving,style:{...btnSmall,fontSize:11}},archiving?"Working…":"Confirm archive"),
+          h("button",{onClick:()=>setShowArchivePanel(false),style:{...btnSmall,fontSize:11}},"Cancel")
         ),
         h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"4px 20px",fontSize:11.5,color:colors.muted}},
           h("div",null,"Type: ",h("span",{style:{color:colors.text}},selected.account_type||"—")),
@@ -9367,7 +9787,7 @@ const MANUAL_SECTIONS = [
           },
           {
             "type": "p",
-            "text": "Not yet built: automatic ownership shift to the Territory-mapped FSE when a Cold Customer converts to a Lead, the Telecaller-keeps-visibility rule, passive notifications actually surfacing in the app (they're being logged to a table already), Telecaller/FSE daily worklist screens, the login overdue-calls prompt, the overdue calls report, an enhanced Quote Status Review with owner/zone/value/stale filters, a Won-by-owner report, and the fuller Employee HR record (photo, restricted payroll section, HR events, address change log). These follow in later phases."
+            "text": "Phase 3 completed the ownership engine and added two reports: Reports \u2192 Quote Status Review (filters: Owner, Zone, State, City, Status, value range, status-changed date range; stale flag past 20 days; status editable inline; 25 rows per page) and Reports \u2192 Won by Owner (pick which status(es) count as \"won\"; totals plus a per-owner breakdown \u2014 attribution follows the CURRENT owner, which can differ from who owned the account when it was actually won). Ownership auto-shifts to the Territory-mapped FSE the moment a brand-new Quote# is first saved for a customer (this counts as \"a Lead was generated\") \u2014 but only if the current owner isn't already an FSE; if they are, nothing changes, no prompt. Logging an Activity as an FSE against a still-Cold company claims ownership immediately, even before any Lead exists, overriding a Telecaller's provisional hold. Phase 4 added a real login-to-employee link \u2014 Master Data \u2192 HR \u2192 Employees now has a per-row \"+ Create login\" / \"Login: linked\" button, letting HR create a username/password/role right there (or link an existing one) without a separate trip to Admin \u2192 Users. The FSE-touch-wins rule above now checks this real link instead of matching login username against Employee name. Phase 5 added the daily transactional layer: Transaction \u2192 Sales \u2192 My Worklist (By date / By customer / All views, scoped to accounts you own, FSEs see live deal context inline), \"Mark not relevant\" / Restore on Customers (archived accounts drop out of My Worklist without being deleted), and duplicate-name warnings plus a Source field on the quick-add form. Not yet built: passive notifications actually surfacing in the app (they're being logged to a table already, no inbox screen reads it), a login-time overdue-calls prompt with follow-up color coding, a separate management-level overdue calls report, and the fuller Employee HR record (photo, restricted payroll section, HR events, address change log, effective-dated salary history)."
           }
         ]
       }
@@ -9526,6 +9946,9 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"24 Jul 2026 (5)", summary:"CRM Phase 5 — no new SQL. New Transaction \u2192 Sales \u2192 My Worklist screen: scoped to accounts the logged-in person currently owns (via the Phase 4 login link), with three views \u2014 By date (everything due/overdue, oldest first, log-now inline; FSE role additionally shows the account's latest quote# and status), By customer (pick one, full activity history), All (flat combined log, 25/page). Customers screen gained \"Mark not relevant\" (with a reason: Not in target market / Went to competitor / Shut down / Other) and \"Restore\" \u2014 archived accounts drop out of My Worklist automatically without being deleted. Both the quick-add (used mid-quote) and full company forms now warn on blur if a company with that name already exists, and quick-add gained a Source field (Referral/Google Ads/Social media/Exhibition/Cold outreach/Other), matching what bulk upload already had." },
+  { date:"24 Jul 2026 (4)", summary:"CRM Phase 4 — login-to-employee link. Master Data → HR → Employees: each row now has a \"+ Create login\" button (HR creates the username/password/role right there and it's linked automatically) or \"Link existing\" to attach an already-existing app_users account instead — one employee, one login, both sides optional. Login now carries its app_users id through the session, and the FSE-touch-wins-ownership rule (Customers → Activity) switched from matching login username against Employee name (fragile, text-based) to the real link — no behavior change for anyone already correctly matched, but it's no longer guessable-wrong for anyone whose username differs from their name." },
+  { date:"24 Jul 2026 (3)", summary:"CRM Phase 3. Ownership engine completed: creating the first Sl No under a brand-new Quote# now counts as \"a Lead was generated\" — if the company's current CRM owner is an FSE, ownership stays put silently; otherwise it auto-shifts to whichever FSE the Territory Rules map to, logged to ownership history same as before. Logging an Activity (Customers screen) as an FSE against a still-Cold company now claims ownership immediately, overriding a Telecaller's provisional hold (matched by login username against Employee name — best effort until there's a real login-to-employee link, flagged as a known gap). New Reports: \"Quote Status Review\" (filter every quote by Owner/Zone/State/City/Status/value range/status-changed date range, stale flag past 20 days, inline status change, 25-row pagination) built on the existing quote_status/status_changed_at infrastructure rather than a parallel one; \"Won by Owner\" (pick which status(es) count as won, totals and per-owner value/count with a share bar — attribution follows the company's CURRENT owner, noted on-screen since it can differ from who owned it when it was won)." },
   { date:"24 Jul 2026 (2)", summary:"CRM Phase 2 — run crm_phase2_setup.sql after Phase 1's script. Employees and Departments moved out of CRM Setup into their own new Master Data → HR group (CRM Setup now only holds States/Zones, Countries/Zones, Territory Rules). Companies (the Cold Customer / Account record) gained CRM status (Cold/Lead), a CRM owner, and archive fields. Zone is no longer picked by hand on a new company — it's auto-derived from State (India) or Country (outside India) via the Phase 1 zone masters, with the old manual picker still there as a fallback. New companies (manual add, quick-add, and bulk upload) now auto-assign an owner from Territory Rules and log it to a new ownership history table, which also drops a passive notification for the new owner (no inbox UI reads these yet). Customers screen gained an Activity section per company — log Call/Visit/Email with an outcome, notes, and next follow-up date, shown as a timeline." },
   { date:"24 Jul 2026", summary:"CRM Phase 1 — foundation masters only, run crm_phase1_setup.sql first. New Master Data → CRM Setup group: Employees (auto-generated employee code, department, designation, CRM role, contact details, active/inactive), Departments, States and Zones (India, zone auto-derived from state), Countries and Zones (outside India), and Territory Rules by State and by Country (one FSE can cover several States or Countries — City-level assignment was deliberately dropped). These are the building blocks the rest of the CRM (Cold Customer tracking, ownership auto-assignment, activity logging, worklists) will be built on in the next phases — none of that is built yet." },
   { date:"17 Jul 2026 (47)", summary:"Fixed: session persistence used localStorage, which never expires — closing the browser without signing out left the login open indefinitely for anyone touching that device afterward. Switched to sessionStorage instead: still survives a refresh and still works for New Tab (browsers copy it into tabs opened via window.open), but it's genuinely cleared the moment the browser/tab is closed — no more indefinitely-open session." },
@@ -10965,6 +11388,220 @@ function QuoteStatusReport(){
     )
   );
 }
+
+function QuoteStatusReview({ user }){
+  const STALE_DAYS = 20; // fixed for now — not yet configurable per status
+  const [statuses,setStatuses] = useState([]);
+  const [owners,setOwners] = useState([]);
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [fOwner,setFOwner] = useState(""); const [fZone,setFZone] = useState("");
+  const [fState,setFState] = useState(""); const [fCity,setFCity] = useState("");
+  const [fStatus,setFStatus] = useState(""); const [fValueMin,setFValueMin] = useState("");
+  const [fValueMax,setFValueMax] = useState(""); const [fFrom,setFFrom] = useState(""); const [fTo,setFTo] = useState("");
+  const [page,setPage] = useState(0);
+  const pageSize = 25;
+  const [authGate,setAuthGate] = useState(null);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const [{data:statusRows},{data:empRows},{data:estRows},{data:coRows}] = await Promise.all([
+      sb.from("quote_status_tbl").select("status").order("status"),
+      sb.from("employee_tbl").select("employee_name").eq("status","Active").order("employee_name"),
+      sb.from("estimates").select("id,reference_number,item_sl_no,customer_name,description,quote_status,order_qty,company_id,status_changed_by,status_changed_at"),
+      sb.from("companies").select("id,company_name,zone,billing_state,billing_city,owner_employee_name")
+    ]);
+    const coById = new Map((coRows||[]).map(c=>[c.id,c]));
+    const refNums = Array.from(new Set((estRows||[]).map(r=>r.reference_number)));
+    const { data:lineRows } = refNums.length
+      ? await sb.from("estimate_lines").select("reference_number,item_sl_no,sales_price").in("reference_number",refNums)
+      : { data: [] };
+    const now = Date.now();
+    const out = (estRows||[]).map(est=>{
+      const co = est.company_id ? coById.get(est.company_id) : null;
+      const totalValue = (lineRows||[]).filter(l=>l.reference_number===est.reference_number && l.item_sl_no===est.item_sl_no)
+        .reduce((s,l)=>s+(Number(l.sales_price)||0)*(est.order_qty||1),0);
+      const changedAt = est.status_changed_at ? new Date(est.status_changed_at) : null;
+      const daysInStatus = changedAt ? Math.floor((now-changedAt.getTime())/86400000) : null;
+      return {
+        ...est, totalValue, daysInStatus,
+        owner: co?co.owner_employee_name:"", zone: co?co.zone:"", state: co?co.billing_state:"", city: co?co.billing_city:""
+      };
+    });
+    setStatuses((statusRows||[]).map(r=>r.status).filter(Boolean));
+    setOwners((empRows||[]).map(r=>r.employee_name).filter(Boolean));
+    setRows(out);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const filtered = rows.filter(r=>{
+    if(fOwner && r.owner!==fOwner) return false;
+    if(fZone && r.zone!==fZone) return false;
+    if(fState && (r.state||"").toLowerCase()!==fState.toLowerCase()) return false;
+    if(fCity && (r.city||"").toLowerCase()!==fCity.toLowerCase()) return false;
+    if(fStatus && r.quote_status!==fStatus) return false;
+    if(fValueMin && r.totalValue < Number(fValueMin)) return false;
+    if(fValueMax && r.totalValue > Number(fValueMax)) return false;
+    if(fFrom && (!r.status_changed_at || r.status_changed_at.slice(0,10) < fFrom)) return false;
+    if(fTo && (!r.status_changed_at || r.status_changed_at.slice(0,10) > fTo)) return false;
+    return true;
+  });
+  const pageRows = filtered.slice(page*pageSize,(page+1)*pageSize);
+  const staleCount = filtered.filter(r=>r.daysInStatus!==null && r.daysInStatus>STALE_DAYS).length;
+  const zones = Array.from(new Set(rows.map(r=>r.zone).filter(Boolean))).sort();
+
+  const doChangeStatus = async(row,newStatus)=>{
+    const now = new Date().toISOString();
+    const by = user?.username||"unknown";
+    await sb.from("estimates").update({quote_status:newStatus,status_changed_by:by,status_changed_at:now}).eq("id",row.id);
+    await logAudit("UPDATE","estimates",row.reference_number+"-"+row.item_sl_no,"Status changed from "+row.quote_status+" to "+newStatus+" via Quote Status Review",by,{quote_status:row.quote_status},{quote_status:newStatus});
+    load();
+  };
+  const changeStatus = (row,newStatus)=>{
+    if(row.quote_status===newStatus) return;
+    if(isQuoteLocked(row.quote_status,user)){ setAuthGate({requiredType:"edit",action:()=>doChangeStatus(row,newStatus)}); return; }
+    doChangeStatus(row,newStatus);
+  };
+
+  const sel = (val,onChange,opts,placeholder)=>h("select",{value:val,onChange:e=>{onChange(e.target.value);setPage(0);},style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+    h("option",{value:""},placeholder), opts.map(o=>h("option",{key:o,value:o},o))
+  );
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+      h("div",{style:{fontWeight:700,fontSize:16}},"Quote Status Review")
+    ),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Owner and Zone come from the quote's linked company (Customers screen) — quotes with no linked company won't match an owner/zone filter. Stale = more than "+STALE_DAYS+" days in its current status."),
+    h("div",{style:{background:"#faf9f4",borderRadius:8,padding:"10px 12px",marginBottom:14,display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8}},
+      sel(fOwner,setFOwner,owners,"All owners"),
+      sel(fZone,setFZone,zones,"All zones"),
+      h("input",{value:fState,onChange:e=>{setFState(e.target.value);setPage(0);},placeholder:"State",style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+      h("input",{value:fCity,onChange:e=>{setFCity(e.target.value);setPage(0);},placeholder:"City",style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+      sel(fStatus,setFStatus,statuses,"All statuses"),
+      h("input",{value:fValueMin,onChange:e=>{setFValueMin(e.target.value);setPage(0);},placeholder:"Value min",style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+      h("input",{value:fValueMax,onChange:e=>{setFValueMax(e.target.value);setPage(0);},placeholder:"Value max",style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+      h("input",{type:"date",value:fFrom,onChange:e=>{setFFrom(e.target.value);setPage(0);},style:{...inputStyle,padding:"6px 8px",fontSize:12},title:"Status changed from"}),
+      h("input",{type:"date",value:fTo,onChange:e=>{setFTo(e.target.value);setPage(0);},style:{...inputStyle,padding:"6px 8px",fontSize:12},title:"Status changed to"})
+    ),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:8}},filtered.length+" quotes match, "+staleCount+" stale"),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+      h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Quote#"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Customer"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Owner"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Zone"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5,textAlign:"right"}},"Value (INR)"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Days in status"),
+        h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Status")
+      )),
+      h("tbody",null,
+        pageRows.map(r=>{
+          const stale = r.daysInStatus!==null && r.daysInStatus>STALE_DAYS;
+          return h("tr",{key:r.id,style:{borderTop:"1px solid #eceae0"}},
+            h("td",{style:{padding:"7px 9px",fontWeight:600}},r.reference_number+" / "+r.item_sl_no),
+            h("td",{style:{padding:"7px 9px"}},r.customer_name||"—"),
+            h("td",{style:{padding:"7px 9px",color:colors.muted}},r.owner||"—"),
+            h("td",{style:{padding:"7px 9px",color:colors.muted}},r.zone||"—"),
+            h("td",{style:{padding:"7px 9px",textAlign:"right"}},"INR "+fmtR(r.totalValue)),
+            h("td",{style:{padding:"7px 9px",color:stale?colors.danger:colors.muted,fontWeight:stale?700:400}},r.daysInStatus===null?"—":r.daysInStatus+" days"),
+            h("td",{style:{padding:"5px 9px"}},
+              h("select",{value:r.quote_status,onChange:e=>changeStatus(r,e.target.value),style:{...inputStyle,padding:"4px 6px",fontSize:11.5}},
+                statuses.map(s=>h("option",{key:s,value:s},s))
+              )
+            )
+          );
+        }),
+        pageRows.length===0 && h("tr",null,h("td",{colSpan:7,style:{padding:14,fontSize:12,color:colors.mutedLight}},"No quotes match these filters."))
+      )
+    ),
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10,fontSize:11.5,color:colors.mutedLight}},
+      h("div",null,"Showing "+(filtered.length===0?0:page*pageSize+1)+"–"+Math.min((page+1)*pageSize,filtered.length)+" of "+filtered.length),
+      h("div",{style:{display:"flex",gap:8}},
+        h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Prev"),
+        h("button",{onClick:()=>setPage(p=>((p+1)*pageSize<filtered.length)?p+1:p),disabled:(page+1)*pageSize>=filtered.length,style:btnSmall},"Next")
+      )
+    ),
+    authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action })
+  );
+}
+
+function WonByOwnerReport(){
+  const [wonStatuses,setWonStatuses] = useState(["Won"]); // best-effort default; adjustable below
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [statuses,setStatuses] = useState([]);
+
+  const load = useCallback(async(statusesToUse)=>{
+    setLoading(true);
+    const [{data:allStatusRows},{data:estRows},{data:coRows}] = await Promise.all([
+      sb.from("quote_status_tbl").select("status").order("status"),
+      sb.from("estimates").select("id,reference_number,item_sl_no,quote_status,order_qty,company_id"),
+      sb.from("companies").select("id,owner_employee_name")
+    ]);
+    setStatuses((allStatusRows||[]).map(r=>r.status).filter(Boolean));
+    const coById = new Map((coRows||[]).map(c=>[c.id,c]));
+    const won = (estRows||[]).filter(e=>statusesToUse.includes(e.quote_status));
+    const refNums = Array.from(new Set(won.map(r=>r.reference_number)));
+    const { data:lineRows } = refNums.length
+      ? await sb.from("estimate_lines").select("reference_number,item_sl_no,sales_price").in("reference_number",refNums)
+      : { data: [] };
+    const byOwner = new Map();
+    won.forEach(est=>{
+      const co = est.company_id ? coById.get(est.company_id) : null;
+      const owner = (co && co.owner_employee_name) ? co.owner_employee_name : "Unassigned";
+      const value = (lineRows||[]).filter(l=>l.reference_number===est.reference_number && l.item_sl_no===est.item_sl_no)
+        .reduce((s,l)=>s+(Number(l.sales_price)||0)*(est.order_qty||1),0);
+      if(!byOwner.has(owner)) byOwner.set(owner,{owner,count:0,value:0});
+      const rec = byOwner.get(owner); rec.count+=1; rec.value+=value;
+    });
+    setRows(Array.from(byOwner.values()).sort((a,b)=>b.value-a.value));
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(wonStatuses); },[]);
+
+  const totalValue = rows.reduce((s,r)=>s+r.value,0);
+  const totalCount = rows.reduce((s,r)=>s+r.count,0);
+  const topOwner = rows.length ? rows[0].owner : "—";
+  const maxValue = rows.length ? Math.max(...rows.map(r=>r.value)) : 0;
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:900}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:4}},"Won by Owner"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Counts quotes whose current status is treated as \"won\" — pick the status(es) below. Attribution uses the company's CURRENT CRM owner — if ownership moved after the quote was won, credit follows the current owner, not who owned it at the time."),
+    h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:14}},
+      h("div",{style:{fontSize:11.5,color:colors.muted}},"\"Won\" status(es):"),
+      h("select",{multiple:true,value:wonStatuses,onChange:e=>{ const vals=Array.from(e.target.selectedOptions).map(o=>o.value); setWonStatuses(vals); load(vals); },style:{...inputStyle,padding:"4px 6px",fontSize:12,height:60}},
+        statuses.map(s=>h("option",{key:s,value:s},s))
+      )
+    ),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):h(React.Fragment,null,
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:16}},
+        h("div",{style:{background:"#faf9f4",borderRadius:8,padding:"12px 16px"}},h("div",{style:{fontSize:11,color:colors.mutedLight}},"Total won value"),h("div",{style:{fontSize:20,fontWeight:700}},"INR "+fmtR(totalValue))),
+        h("div",{style:{background:"#faf9f4",borderRadius:8,padding:"12px 16px"}},h("div",{style:{fontSize:11,color:colors.mutedLight}},"Quotes won"),h("div",{style:{fontSize:20,fontWeight:700}},totalCount)),
+        h("div",{style:{background:"#faf9f4",borderRadius:8,padding:"12px 16px"}},h("div",{style:{fontSize:11,color:colors.mutedLight}},"Top owner"),h("div",{style:{fontSize:20,fontWeight:700}},topOwner))
+      ),
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Owner"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5,textAlign:"right"}},"Quotes won"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5,textAlign:"right"}},"Value won (INR)"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5,width:"30%"}},"Share")
+        )),
+        h("tbody",null,
+          rows.map(r=>h("tr",{key:r.owner,style:{borderTop:"1px solid #eceae0"}},
+            h("td",{style:{padding:"7px 9px",fontWeight:600}},r.owner),
+            h("td",{style:{padding:"7px 9px",textAlign:"right"}},r.count),
+            h("td",{style:{padding:"7px 9px",textAlign:"right"}},fmtR(r.value)),
+            h("td",{style:{padding:"7px 9px"}},h("div",{style:{background:"#faf9f4",borderRadius:4,height:8,overflow:"hidden"}},h("div",{style:{background:colors.dark,width:(maxValue?Math.round(r.value/maxValue*100):0)+"%",height:"100%"}})))
+          )),
+          rows.length===0 && h("tr",null,h("td",{colSpan:4,style:{padding:14,fontSize:12,color:colors.mutedLight}},"No won quotes for the selected status(es)."))
+        )
+      )
+    )
+  );
+}
+
 
 // Every table currently in the database — master tables come straight from
 // MASTER_TABLES (the same list Master Data itself is built from), plus the
@@ -12707,6 +13344,9 @@ function App() {
     tab==="reports_audit"?h(MastersAuditReport,{user}):
     tab==="reports_item_coverage"?h(ItemCoverageReport,null):
     tab==="reports_quote_status"?h(QuoteStatusReport,null):
+    tab==="reports_quote_status_review"?h(QuoteStatusReview,{user}):
+    tab==="my_worklist"?h(MyWorklistScreen,{user}):
+    tab==="reports_won_by_owner"?h(WonByOwnerReport,null):
     tab==="reports_status_history"?h(StatusChangeHistoryReport,null):
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="authorization_codes"?h(AuthorizationCodesScreen,{user}):
