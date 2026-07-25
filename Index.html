@@ -871,9 +871,9 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Quotes", tabs:[
         {key:"saved",label:"Quotes"},
       ]},
-      { label:"Engineering", tabs:[
-        {key:"calcs",label:"Engineering Calcs"},
-      ]},
+    ]},
+    { label:"Engineering Calc", tabs:[
+      {key:"calcs",label:"Engineering Calc"},
     ]},
     { label:"CRM", subgroups:[
       { label:"Funnel", tabs:[
@@ -2939,7 +2939,7 @@ async function loadMasterData(setMasterData) {
 }
 
 /* ---- ESTIMATOR ---- */
-function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote, initialModel, onConsumedInitialModel, pendingNewSlNo, onConsumedPendingNewSlNo }) {
+function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote, initialModel, onConsumedInitialModel, pendingNewSlNo, onConsumedPendingNewSlNo, onGoToTab }) {
   const { models, customModelName, itemOptions, gradesBySpec, rateBySpecGrade, allSpecs, uoms, allComponents, subAssembliesByComponent, loadingMaster } = masterData;
   const [isCustomModel,setIsCustomModel]=useState(false);
   const [directPriceLine,setDirectPriceLine]=useState(null); // {item,description,qty,uom,sales_price,recordAs,customModelText,excel_file_name,excel_file_path,no_excel_code}
@@ -2952,6 +2952,14 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
   const [lines,setLines]=useState([]); const [overrides,setOverrides]=useState({});
   const [loadingLines,setLoadingLines]=useState(false); const [error,setError]=useState("");
   const [cart,setCart]=useState([]); const [showSave,setShowSave]=useState(false);
+  // The cart is this screen's "unsaved work" — feed it into the app-wide
+  // guard so both browser-level navigation and the Close/New buttons below
+  // know there's something to lose.
+  useEffect(()=>{
+    setUnsavedGuard(cart.length>0, "You have "+cart.length+" unsaved line(s) in the cart. Leave anyway?");
+  },[cart.length]);
+  const [closeAction,setCloseAction]=useState(null); // "close" | "new" | null — set when Close/New is clicked with unsaved cart
+  const [closeActionBusy,setCloseActionBusy]=useState(false);
   const [showAddGateway,setShowAddGateway]=useState(false);
   const [gatewayStep,setGatewayStep]=useState("quote"); // "quote" | "newConfirm" | "existingChoice" | "slNo"
   const [gatewayRef,setGatewayRef]=useState("");
@@ -3695,6 +3703,50 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
     })();
   },[pendingNewSlNo]);
 
+  // Close / New — the same reset the stale-cart bug fix already applies on
+  // a fresh Sl No, now also reachable on demand rather than only
+  // automatically. Both funnel through the same unsaved-cart check; the
+  // only difference is where they land afterward.
+  const resetCart = ()=>{
+    setCart([]); setSelectedModel(null); setLines([]); setOverrides({});
+    setShowMOC(false); setMocSelections({}); setMocLines([]); setMocMode("shape");
+    setFreeText(""); setParsedMatches(null); setModelFilter("");
+    setIsCustomModel(false); setDirectPriceLine(null); setHoldingNewSlNo(null);
+    setUnsavedGuard(false);
+  };
+  const attemptCloseOrNew = (kind)=>{ // kind: "close" | "new"
+    if(cart.length>0){ setCloseAction(kind); return; }
+    resetCart();
+    if(onGoToTab) onGoToTab(kind==="close"?"home":"saved");
+  };
+  const discardAndNavigate = async()=>{
+    const kind = closeAction;
+    await logAudit("UPDATE","estimates",(refNumber||"unsaved"),"Clicked '"+kind+"' with "+cart.length+" unsaved cart line(s) discarded",user?.username||"unknown",{cart_lines:cart.length},null);
+    setCloseAction(null);
+    resetCart();
+    if(onGoToTab) onGoToTab(kind==="close"?"home":"saved");
+  };
+  const saveAllAndNavigate = async()=>{
+    const kind = closeAction;
+    setCloseActionBusy(true);
+    try{
+      let ok = false;
+      if(holdingNewSlNo && !holdingNewSlNo.isNewQuote){
+        ok = await saveExistingSlNoDirect(true); // true = skip afterNewSlNoSave's datasheet prompt, we're navigating away anyway
+      } else {
+        alert("This new offer still needs its header details (Customer, Enquiry#, etc.) before it can be saved — use \"Save to estimate\" above to fill those in, or discard instead.");
+        setCloseActionBusy(false);
+        return;
+      }
+      if(ok){
+        await logAudit("UPDATE","estimates",refNumber,"Closed '"+kind+"' after saving "+cart.length+" cart line(s) first",user?.username||"unknown",null,{cart_lines:cart.length});
+        setCloseAction(null);
+        resetCart();
+        if(onGoToTab) onGoToTab(kind==="close"?"home":"saved");
+      }
+    } finally { setCloseActionBusy(false); }
+  };
+
   // After a successful save that came through the "+ New Sl No" / "+ Add new"
   // flow: check whether a datasheet exists yet for this Sl No, and if not,
   // ask whether to build it now or skip (flagging the skip so it isn't
@@ -3715,13 +3767,14 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
       if(onOpenQuote) onOpenQuote(reference_number, item_sl_no, false);
     }
   };
-  const saveExistingSlNoDirect = async()=>{
-    if(cart.length===0){ alert("Add at least one model's lines to the cart first."); return; }
-    if(!refDesc.trim()){ alert("Description is required — it should have auto-filled once the model loaded; enter one manually if this item has no Description Master entry yet."); return; }
+  const saveExistingSlNoDirect = async(skipDatasheetPrompt)=>{
+    if(cart.length===0){ alert("Add at least one model's lines to the cart first."); return false; }
+    if(!refDesc.trim()){ alert("Description is required — it should have auto-filled once the model loaded; enter one manually if this item has no Description Master entry yet."); return false; }
     setSimpleSaving(true);
     const ok = await saveReference();
     setSimpleSaving(false);
-    if(ok && holdingNewSlNo) await afterNewSlNoSave();
+    if(ok && holdingNewSlNo && !skipDatasheetPrompt) await afterNewSlNoSave();
+    return ok;
   };
   // Populate the Quote# combo box with every saved quote + its customer, so the
   // person can either pick an existing one or type a brand new Quote#.
@@ -3848,14 +3901,30 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
           ? "Select a model below to create Quote# "+holdingNewSlNo.reference_number
           : "Adding Sl No "+holdingNewSlNo.item_sl_no+" to Quote# "+holdingNewSlNo.reference_number+" — build the BOM below, then Save to estimate."
       ),
-      h("button",{
-        onClick:()=>{
-          if(cart.length===0){ alert("Add at least one model's lines to the cart first."); return; }
-          if(holdingNewSlNo.isNewQuote) setShowSave(true); else saveExistingSlNoDirect();
-        },
-        disabled:cart.length===0||simpleSaving,
-        style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"none",cursor:(cart.length===0||simpleSaving)?"not-allowed":"pointer",background:(cart.length===0||simpleSaving)?"#b5d4f4":"#0c447c",color:"#fff"}
-      },simpleSaving?"Saving…":"Save to estimate")
+      h("div",{style:{display:"flex",gap:8}},
+        h("button",{
+          onClick:()=>{
+            if(cart.length===0){ alert("Add at least one model's lines to the cart first."); return; }
+            if(holdingNewSlNo.isNewQuote) setShowSave(true); else saveExistingSlNoDirect();
+          },
+          disabled:cart.length===0||simpleSaving,
+          style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"none",cursor:(cart.length===0||simpleSaving)?"not-allowed":"pointer",background:(cart.length===0||simpleSaving)?"#b5d4f4":"#0c447c",color:"#fff"}
+        },simpleSaving?"Saving…":"Save to estimate"),
+        h("button",{onClick:()=>attemptCloseOrNew("new"),style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"1px solid #85b7eb",background:"#fff",color:"#0c447c",cursor:"pointer"}},"New"),
+        h("button",{onClick:()=>attemptCloseOrNew("close"),style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"1px solid #85b7eb",background:"#fff",color:"#0c447c",cursor:"pointer"}},"Close")
+      )
+    ),
+    closeAction && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1100}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 22px",width:400,maxWidth:"94vw"}},
+        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:6}},"Unsaved changes"),
+        h("div",{style:{fontSize:12.5,color:colors.mutedLight,marginBottom:16}},cart.length+" line(s) in the cart haven't been saved to this Sl No yet."),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+          h("button",{onClick:saveAllAndNavigate,disabled:closeActionBusy,style:{width:"100%",padding:"9px",fontSize:13,fontWeight:600,borderRadius:6,border:"none",background:"#0c447c",color:"#fff",cursor:"pointer",opacity:closeActionBusy?0.6:1}},closeActionBusy?"Saving…":"Save all and "+closeAction),
+          h("button",{onClick:()=>setCloseAction(null),disabled:closeActionBusy,style:{width:"100%",padding:"9px",fontSize:13,fontWeight:600,borderRadius:6,border:"1px solid "+colors.border,background:"#fff",cursor:"pointer"}},"Go back"),
+          h("button",{onClick:discardAndNavigate,disabled:closeActionBusy,style:{width:"100%",padding:"9px",fontSize:13,fontWeight:600,borderRadius:6,border:"1px solid #f0997b",background:"#fff",color:colors.danger,cursor:"pointer"}},closeAction==="close"?"Close without saving":"Start new without saving")
+        ),
+        h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:10}},"Either choice is logged.")
+      )
     ),
     // MOC Selection Popup
     showMOC && h("div", {style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"40px 16px",overflowY:"auto"}},
@@ -7596,11 +7665,23 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
           h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Quotes"),
           refFilter && quoteHeaderRow && h("div",{style:{border:"2px solid "+(readiness.ready?"#1c8c56":"#e0b325"),borderRadius:10,padding:"6px 14px",background:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#eafaf1":"#eaf2fb"):"#fffbea",display:"flex",alignItems:"center",gap:8}},
             h("span",{style:{fontSize:9.5,color:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c"):"#7a5000",fontWeight:600}},"QUOTE STATUS"),
-            h("span",{style:{fontSize:15,fontWeight:800,color:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c"):"#7a5000"}},
-              !readiness.ready ? "🔒 "+(quoteHeaderRow.quote_status||"Draft").toUpperCase()
-              : quoteHeaderRow.quote_status==="Draft" ? "✓ READY TO GO"
-              : (quoteHeaderRow.quote_status||"").toUpperCase()
-            )
+            !readiness.ready
+              ? h("span",{style:{fontSize:15,fontWeight:800,color:"#7a5000"}},"🔒 "+(quoteHeaderRow.quote_status||"Draft").toUpperCase()+" — complete readiness to change")
+              : h("select",{
+                  value:quoteHeaderRow.quote_status||"Draft",
+                  onChange:e=>{
+                    const newStatus=e.target.value;
+                    const doChange=async()=>{
+                      await sb.from("estimates").update({quote_status:newStatus,status_changed_by:user.username,status_changed_at:new Date().toISOString()}).eq("id",openRef.id);
+                      await logAudit("UPDATE","estimates",refFilter+"-"+openRef.item_sl_no,"Status changed from "+(quoteHeaderRow.quote_status||"Draft")+" to "+newStatus+" via Quote form",user.username,{quote_status:quoteHeaderRow.quote_status},{quote_status:newStatus});
+                      setOpenRef(r=>({...r,quote_status:newStatus}));
+                      setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,quote_status:newStatus}:r));
+                    };
+                    if(isQuoteLocked(quoteHeaderRow.quote_status,user)){ setAuthGate({requiredType:"edit",action:doChange}); return; }
+                    doChange();
+                  },
+                  style:{fontSize:14,fontWeight:800,color:quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c",background:"transparent",border:"none",fontFamily:"inherit"}
+                },quoteStatuses.map(s=>h("option",{key:s,value:s},s)))
           ),
           refFilter && h("div",{style:{width:280}},
             renderReadinessBar(readiness.categories, {height:36, onClick: readiness.ready?undefined:()=>alert(readiness.missing.map(m=>m.section+": "+m.items.join(", ")).join("\n"))})
@@ -7611,6 +7692,17 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
           h("datalist",{id:"quote-search-datalist"},refOptionsList.map(o=>h("option",{key:o.rn,value:o.label}))),
           h("button",{onClick:()=>{ setAddNewInput(""); setAddNewMsg(null); setShowAddNewModal(true); },style:{...btnSmall,fontWeight:600}},"+ Add new"),
           refFilter && h("button",{onClick:()=>{setRefFilter("");setRefSearchDisplay("");setSlNoFilter("");},style:btnSmall},"All quotes"),
+          refFilter && h("button",{onClick:()=>{
+              if(!confirmLeaveIfDirty()) return;
+              setUnsavedGuard(false);
+              setOpenRef(null); setOpenLines([]); setRefFilter(""); setRefSearchDisplay(""); setSlNoFilter("");
+              setShowEntryGate(true);
+            },style:{...btnSmall,border:"1px solid #85b7eb",color:"#0c447c"}},"New"),
+          refFilter && h("button",{onClick:()=>{
+              if(!confirmLeaveIfDirty()) return;
+              setUnsavedGuard(false);
+              if(onGoToTab) onGoToTab("home");
+            },style:{...btnSmall,border:"1px solid #85b7eb",color:"#0c447c"}},"Close"),
           h("select",{value:slNoFilter,onChange:e=>{
             const val=e.target.value; setSlNoFilter(val);
             if(refFilter && val){ const match=refs.find(r=>r.reference_number===refFilter&&String(r.item_sl_no)===String(val)); if(match) openEstimate(match); }
@@ -10362,6 +10454,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (8)", summary:"Blank landing screen now shows the actual company logo (COMPANY_LOGO — already used in the TopBar and PDF letterheads, not a new asset) instead of a plain \"Nothing open\" text message." },
+  { date:"25 Jul 2026 (7)", summary:"Built the Close/New/status-dropdown set that had been mocked (and re-mocked) across several earlier rounds without actually shipping. Login now lands on a genuinely blank screen (\"Nothing open — pick Quotes from Sales, or Engineering Calc above\") instead of the Estimator's model list. Engineering Calc moved out from under Sales into its own flat top-level toolbar button. The Quote form's status badge is now a real dropdown once every readiness segment is green (locked with the same 🔒 display as before while it isn't) — same edit-code authorization rule as the Kanban board and Quote Status Review, neither of which were touched. Close and New buttons: in the Estimator, shown whenever a Sl No is being built, checking the cart via the app's existing unsaved-changes guard (window.__unsavedGuard — previously the cart never actually fed into this, a real gap now closed) — with unsaved lines, both offer Save all / Go back / discard-without-saving, logged either way; New drops you back at the Quotes entry prompt, Close goes to the blank home screen. In the Quotes screen itself, New and Close use the same existing guard the app already relies on elsewhere (header/description edits already set it) rather than a second parallel mechanism." },
   { date:"25 Jul 2026 (6)", summary:"Fixed a bug the previous round's retry fix inadvertently surfaced: opening a just-saved Sl No was narrowing the Sl No list to an exact match on that one number, so a new Sl No 2 replaced Sl No 1 in the visible list instead of sitting alongside it — same underlying cause as \"the cart addition should be simultaneous,\" just a different symptom once the earlier discard bug stopped hiding it. Every other place in the app that opens a quote deliberately clears this filter to show every Sl No; this one code path didn't. Now it does." },
   { date:"25 Jul 2026 (5)", summary:"Two bugs found from a live screenshot. (1) Adding a Direct Price / Custom line always blocked \"Save to estimate\" with \"Description is required\", even after the user had typed one on the line — because Custom lines never load a BOM, so the quote-level Description (which normally auto-fills from Description Master once BOM lines load) stayed empty forever. Fixed: adding a Direct Price line now auto-fills the quote's Description from the line's own description if it's still blank. (2) A newly-saved Sl No sometimes didn't show up until leaving Quotes and coming back — traced to the code that opens a just-saved Sl No: it was unconditionally marking the handoff \"consumed\" even on a pass where the fresh row hadn't shown up in that render's data yet, discarding it permanently with no retry. Now it retries once (re-fetching) before giving up, so a same-render timing gap self-heals instead of silently losing the target." },
   { date:"25 Jul 2026 (4)", summary:"Removed a leftover, broken popup: adding a new Sl No to an existing quote used to immediately show a \"Description required\" prompt before anything had even been built (screenshot showed \"0 line(s) across 0 model(s)\") — a holdover from before Description auto-filled from Description Master. Now it goes straight to the model picker as intended, matching the banner's own text (\"build the BOM below, then Save to estimate\"). Fixed the actual gap this exposed: the \"Save to estimate\" button in that banner only ever existed for brand-new quotes — existing-quote Sl No adds had no equivalent visible button at all, they depended entirely on the now-removed popup. It's there now for both cases; existing-quote saves go straight through (no header re-prompt, matches everything already inherited), new-quote saves still open the full header form as before." },
@@ -13934,7 +14028,7 @@ function App() {
   const [user,setUser]=useState(()=>{
     try{ const raw=sessionStorage.getItem("flometriq_user"); return raw?JSON.parse(raw):null; } catch(e){ return null; }
   });
-  const [tab,setTab]=useState("estimator");
+  const [tab,setTab]=useState("home");
   const [sessionCompanyId,setSessionCompanyId]=useState(()=>{
     try{ return sessionStorage.getItem("flometriq_session_company")||null; } catch(e){ return null; }
   });
@@ -13987,7 +14081,7 @@ function App() {
       "⚠ "+draftCount+" quote"+(draftCount===1?"":"s")+" still in Draft — click to review and update status"
     ),
     h(MenuTabs,{user,active:tab,onChange:setTab}),
-    h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo,openDatasheet)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo,openDatasheet:!!openDatasheet});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null),pendingNewSlNo,onConsumedPendingNewSlNo:()=>setPendingNewSlNo(null)})),
+    h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,onRefresh:refresh,onOpenQuote:(ref,slNo,openDatasheet)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo,openDatasheet:!!openDatasheet});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null),pendingNewSlNo,onConsumedPendingNewSlNo:()=>setPendingNewSlNo(null),onGoToTab:setTab})),
     tab==="saved"?h(SavedEstimates,{user,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo});setTab("estimator");}}):
     tab==="reports"?h(ReportsScreen,{user,onOpenModel:(m)=>{setOpenModelTarget(m);setTab("estimator");}}):
     tab==="reports_activity"?h(ActivityByUserReport,{user}):
@@ -14025,7 +14119,11 @@ function App() {
     tab==="login_history"?h(LoginHistoryViewer,null):
     tab==="audit_log"?h(AuditLogViewer,null):
     tab==="change_password"?h(ChangePassword,{user}):
-    (tab!=="estimator"?h(MasterEditor,{tableKey:tab,key:tab,user}):null)
+    tab==="home"?h("div",{style:{padding:"60px 24px",textAlign:"center"}},
+      h("img",{src:COMPANY_LOGO,alt:"Flometriq",style:{height:64,width:"auto",objectFit:"contain",marginBottom:14}}),
+      h("div",{style:{fontSize:11,color:colors.mutedLight}},"Pick Quotes from Sales, or Engineering Calc above, to get started.")
+    ):
+    (tab!=="estimator" && tab!=="home"?h(MasterEditor,{tableKey:tab,key:tab,user}):null)
   );
 }
 
