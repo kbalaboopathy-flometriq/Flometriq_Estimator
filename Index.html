@@ -2959,7 +2959,6 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
   const [gatewaySlNoInput,setGatewaySlNoInput]=useState("");
   const [gatewaySlNoWarn,setGatewaySlNoWarn]=useState(false);
   const [gatewayBusy,setGatewayBusy]=useState(false);
-  const [showSimpleSave,setShowSimpleSave]=useState(false);
   const [simpleSaving,setSimpleSaving]=useState(false);
   const [gatewayConfirmedNewSlNo,setGatewayConfirmedNewSlNo]=useState(false);
   const [saveMaximised,setSaveMaximised]=useState(false);
@@ -3653,7 +3652,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
     setRefNumber(ref); setItemSlNo(String(slNo)); setRefDesc("");
     setExistingQuoteHeader({ usedSlNos: gatewaySiblings.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
     setGatewayConfirmedNewSlNo(true);
-    setShowAddGateway(false); setShowSimpleSave(true);
+    setShowAddGateway(false);
   };
   const [holdingNewSlNo,setHoldingNewSlNo]=useState(null); // {reference_number,item_sl_no,isNewQuote} banner shown while building this line
   useEffect(()=>{
@@ -3682,12 +3681,11 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
       setRefNumber(ref); setItemSlNo(String(pendingNewSlNo.item_sl_no)); setRefDesc("");
       setGatewayConfirmedNewSlNo(true);
       setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no, isNewQuote});
-      // Existing quote: the shortened form (Description only) is enough, since
-      // everything else already carries over — show it right away. Brand new
-      // quote: nothing to inherit, so just show the banner and let them pick a
-      // model first; "Save to estimate" in the banner opens the full form once
-      // there's something in the cart.
-      if(!isNewQuote) setShowSimpleSave(true);
+      // Existing quote: header already carries over, and Description will
+      // auto-fill once a model's BOM loads — no separate popup needed here.
+      // Just land on the model picker (the banner above shows what's
+      // happening); "Save to estimate" appears once there's something in
+      // the cart.
       if(onConsumedPendingNewSlNo) onConsumedPendingNewSlNo();
     })();
   },[pendingNewSlNo]);
@@ -3712,14 +3710,14 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
       if(onOpenQuote) onOpenQuote(reference_number, item_sl_no, false);
     }
   };
-  const simpleSaveConfirm = async()=>{
-    if(!refDesc.trim()){ alert("Description is required."); return; }
+  const saveExistingSlNoDirect = async()=>{
+    if(cart.length===0){ alert("Add at least one model's lines to the cart first."); return; }
+    if(!refDesc.trim()){ alert("Description is required — it should have auto-filled once the model loaded; enter one manually if this item has no Description Master entry yet."); return; }
     setSimpleSaving(true);
     const ok = await saveReference();
     setSimpleSaving(false);
-    if(ok){ setShowSimpleSave(false); if(holdingNewSlNo) await afterNewSlNoSave(); } // on failure, stay open so the error in saveMsg is visible
+    if(ok && holdingNewSlNo) await afterNewSlNoSave();
   };
-
   // Populate the Quote# combo box with every saved quote + its customer, so the
   // person can either pick an existing one or type a brand new Quote#.
   const loadQuoteOptions = async()=>{
@@ -3845,11 +3843,14 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
           ? "Select a model below to create Quote# "+holdingNewSlNo.reference_number
           : "Adding Sl No "+holdingNewSlNo.item_sl_no+" to Quote# "+holdingNewSlNo.reference_number+" — build the BOM below, then Save to estimate."
       ),
-      holdingNewSlNo.isNewQuote && h("button",{
-        onClick:()=>{ if(cart.length===0){ alert("Add at least one model's lines to the cart first."); return; } setShowSave(true); },
-        disabled:cart.length===0,
-        style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"none",cursor:cart.length===0?"not-allowed":"pointer",background:cart.length===0?"#b5d4f4":"#0c447c",color:"#fff"}
-      },"Save to estimate")
+      h("button",{
+        onClick:()=>{
+          if(cart.length===0){ alert("Add at least one model's lines to the cart first."); return; }
+          if(holdingNewSlNo.isNewQuote) setShowSave(true); else saveExistingSlNoDirect();
+        },
+        disabled:cart.length===0||simpleSaving,
+        style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"none",cursor:(cart.length===0||simpleSaving)?"not-allowed":"pointer",background:(cart.length===0||simpleSaving)?"#b5d4f4":"#0c447c",color:"#fff"}
+      },simpleSaving?"Saving…":"Save to estimate")
     ),
     // MOC Selection Popup
     showMOC && h("div", {style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"40px 16px",overflowY:"auto"}},
@@ -4347,25 +4348,6 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
 
     // Simple Save — new Sl No on an existing quote. Everything else already
     // carries over from the gateway step, so this is just Description + Save.
-    showSimpleSave && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1050,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
-      h("div",{style:{background:"#fff",borderRadius:12,width:440,maxWidth:"94vw",boxShadow:"0 8px 32px rgba(0,0,0,0.2)",overflow:"hidden"}},
-        h("div",{style:{background:colors.dark,padding:"12px 16px"}},
-          h("div",{style:{fontWeight:600,fontSize:14,color:"#fff"}},"Sl No "+itemSlNo+" — "+refNumber),
-          h("div",{style:{fontSize:11,color:"#9a9d8f",marginTop:2}},cart.length+" line(s) across "+Array.from(new Set(cart.map(c=>c.model))).length+" model(s)")
-        ),
-        h("div",{style:{padding:"18px 20px"}},
-          h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14,lineHeight:1.5}},"Customer, Currency, Address, Attention, and Signatory already carry over from this quote — nothing to re-enter."),
-          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Description ",h("span",{style:{color:colors.danger}},"*required")),
-          h("input",{value:refDesc,onChange:e=>setRefDesc(e.target.value),placeholder:"e.g. 150nb Y Strainer",autoFocus:true,style:inputStyle}),
-          saveMsg&&h("div",{style:{fontSize:12,marginTop:10,color:saveMsg.startsWith("Save failed")||saveMsg.startsWith("Save cancelled")?colors.danger:"#2d7a4f"}},saveMsg),
-          h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16}},
-            h("button",{onClick:()=>{ setShowSimpleSave(false); setGatewayConfirmedNewSlNo(false); },style:btnSecondary},"Cancel"),
-            h("button",{onClick:simpleSaveConfirm,disabled:simpleSaving,style:{...btnPrimary,opacity:simpleSaving?0.6:1}},simpleSaving?"Saving…":"Save")
-          )
-        )
-      )
-    ),
-
     // Save Estimate Popup Modal
     showSave&&h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{id:"save-modal",style:{background:"#fff",borderRadius:12,width:"100%",maxWidth:saveMaximised?("calc(100vw - 40px)"):620,maxHeight:saveMaximised?"calc(100vh - 40px)":"85vh",boxShadow:"0 8px 32px rgba(0,0,0,0.2)",overflow:"hidden",display:"flex",flexDirection:"column",transition:"max-width 0.15s"}},
@@ -10358,6 +10340,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (4)", summary:"Removed a leftover, broken popup: adding a new Sl No to an existing quote used to immediately show a \"Description required\" prompt before anything had even been built (screenshot showed \"0 line(s) across 0 model(s)\") — a holdover from before Description auto-filled from Description Master. Now it goes straight to the model picker as intended, matching the banner's own text (\"build the BOM below, then Save to estimate\"). Fixed the actual gap this exposed: the \"Save to estimate\" button in that banner only ever existed for brand-new quotes — existing-quote Sl No adds had no equivalent visible button at all, they depended entirely on the now-removed popup. It's there now for both cases; existing-quote saves go straight through (no header re-prompt, matches everything already inherited), new-quote saves still open the full header form as before." },
   { date:"25 Jul 2026 (3)", summary:"Quotes entry-flow redesign and nav cleanup. Sales (renamed from Transaction) now only holds Quotes and Engineering Calcs — Estimator is no longer a standalone nav destination at all, only ever reached by going through Quotes. Opening Quotes now shows a New offer / Existing offer popup first (closable, to search/browse directly instead if preferred): New offer reuses the existing quote-number-with-duplicate-check flow straight into the model picker; Existing offer is a dropdown that opens the quote's Sl No 1 view — fixed to always land on Sl No 1 specifically (previously, opening a quote with more than one Sl No via search or \"+ Add new\" silently did nothing at all, since the code only auto-opened when exactly one Sl No existed). \"+ New Sl No\" is now a prominent full-width button; its popup shows the existing Sl Nos alongside the input, still blocks duplicates with a message and lets you re-enter, and now has an explicit \"Are you sure — add Sl No N to Quote# X?\" confirm step before handing off to the model picker, which is unchanged as the actual start point (datasheet prompt, description auto-fill from Description Master, and header/Notes/Commercial Terms inheriting automatically for an existing offer are all unchanged, already-correct behavior). No changes to the Amendment/Revision workflow — this is a Rev0 entry-flow redesign only." },
   { date:"25 Jul 2026 (2)", summary:"Fixed a real, pre-existing data-integrity bug: the Estimator screen never unmounts when you switch to Quotes and back (just hidden), so cart/selected-model/BOM-lines state stayed alive across sessions. Clicking \"+ New Sl No\" on an existing quote reset the header fields but never cleared that leftover state — meaning whatever model/cart data was sitting there from earlier could silently ride along into a brand-new Sl No's save (reported as \"random model data\" appearing). Now fully cleared (cart, selected model, BOM lines, overrides, MOC state) the moment a new Sl No starts, and the same clear was added to the \"Open BOM\" bridge from Reports for the same reason. Also: \"Add this model to the cart\" no longer fails silently — it now says exactly why (no model selected, or no BOM lines loaded) instead of doing nothing. And the MOC popup gained a proper close (✕) button plus Escape-key support that fully deselects the model and returns to the empty state — distinct from the existing \"Cancel — select per line\" button, which still does its own, different, intentional thing (drop into manual per-line grading without losing the model)." },
   { date:"25 Jul 2026", summary:"Direct Price Line feature — run crm_phase7_direct_price_setup.sql first (adds model_tbl.is_custom flag + seed row, estimate_lines validation/reference fields, a new 'direct_price' authorization code type, and a direct-price-excels storage bucket). Estimator: the Model list now includes a flagged \u201cCustom \u2014 no BOM\u201d entry (a real is_custom flag, never a text match) \u2014 picking it skips BOM loading entirely and opens a Direct Price panel: Item (required), Description, Qty, UOM, Sales Price, then either Attach Excel or a no-Excel authorization code from an Admin/Super Admin (who can also self-authorize without a code). What gets recorded as \u201cModel\u201d on the quote is either literal \u201cCustom\u201d or a typed name \u2014 free text only, never written back to the Models master. Every Direct Price line saves as Pending validation. The same Direct Price mode is now also available from the Quotes screen's \u201cAdd line item\u201d modal (a \u201cCosted line\u201d / \u201cDirect price line\u201d toggle), so it works on existing quotes and revisions/amendments too, not just fresh Estimator builds \u2014 revision adds also log to Revision History. New Reports \u2192 Admin only \u2192 Pending Validation: lists every Pending line with who added it and how it was authorized, lets an Admin/Super Admin attach the Excel late or mark it Validated. The readiness bar gained a 4th segment, Validation, reusing the exact same Commercial Terms/Datasheets/Descriptions machinery \u2014 any Pending line blocks that Quote#'s PDF (note: PDF generation is per-Quote#, combining all its Sl Nos, not per-Sl-No \u2014 a correction from what was discussed while designing this). The Custom model row is deletion-locked the same way Draft status is (a UI-level check, not a database constraint, matching this app's existing pattern for that kind of protection)." },
