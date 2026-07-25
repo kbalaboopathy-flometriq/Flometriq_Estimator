@@ -5743,6 +5743,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const quoteTopScrollRef=useRef(null); const quoteBottomScrollRef=useRef(null);
   const [quoteMeasuredWidth,setQuoteMeasuredWidth]=useState(0);
   const [globalSfInput,setGlobalSfInput]=useState("");
+  const [lastGlobalSfSnapshot,setLastGlobalSfSnapshot]=useState(null); // {refFilter, lines:[{reference_number,item_sl_no,sl_no,sf,sales_price}], appliedValue}
+  const [restoringGlobalSf,setRestoringGlobalSf]=useState(false);
   const [applyingGlobalSf,setApplyingGlobalSf]=useState(false);
   useEffect(()=>{
     const onKey=(e)=>{ if(e.key==="Escape") setFullScreenBOM(false); };
@@ -6478,6 +6480,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     setApplyingGlobalSf(true);
     try{
       const { data: rows } = await sb.from("estimate_lines").select("*").eq("reference_number",refFilter);
+      setLastGlobalSfSnapshot({
+        refFilter,
+        appliedValue: v,
+        lines: (rows||[]).map(r=>({reference_number:r.reference_number,item_sl_no:r.item_sl_no,sl_no:r.sl_no,sf:r.sf,sales_price:r.sales_price}))
+      });
       for(const r of rows||[]){
         const newSales = (Number(r.cost)||0) * v;
         await sb.from("estimate_lines").update({sf:v, sales_price:newSales}).eq("reference_number",r.reference_number).eq("item_sl_no",r.item_sl_no).eq("sl_no",r.sl_no);
@@ -6488,9 +6495,28 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         setOpenLines(data||[]);
       }
       setGlobalSfInput("");
-      alert("Sf updated on "+(rows?rows.length:0)+" line(s) across Quote# "+refFilter+".");
+      alert("Sf updated on "+(rows?rows.length:0)+" line(s) across Quote# "+refFilter+". Made a mistake? Use \"Restore previous Sf\" next to the field.");
     } catch(e){ alert("Failed to update Sf: "+(e.message||e)); }
     finally{ setApplyingGlobalSf(false); }
+  };
+  const restorePreviousGlobalSf = async()=>{
+    const snap = lastGlobalSfSnapshot;
+    if(!snap || snap.refFilter!==refFilter) return;
+    if(!confirm("Restore Sf (and sales price) on all "+snap.lines.length+" line(s) of Quote# \""+refFilter+"\" back to what they were before the last global Sf change ("+snap.appliedValue+")? This cannot be undone either.")) return;
+    setRestoringGlobalSf(true);
+    try{
+      for(const r of snap.lines){
+        await sb.from("estimate_lines").update({sf:r.sf, sales_price:r.sales_price}).eq("reference_number",r.reference_number).eq("item_sl_no",r.item_sl_no).eq("sl_no",r.sl_no);
+      }
+      await logAudit("UPDATE","estimate_lines",refFilter,"Restored Sf on "+snap.lines.length+" line(s) to values from before the last global Sf change (was set to "+snap.appliedValue+")",user?.username||"unknown",null,null);
+      if(openRef && openRef.reference_number===refFilter){
+        const{data}=await sb.from("estimate_lines").select("*").eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no).order("sl_no");
+        setOpenLines(data||[]);
+      }
+      setLastGlobalSfSnapshot(null);
+      alert("Restored.");
+    } catch(e){ alert("Restore failed: "+(e.message||e)); }
+    finally{ setRestoringGlobalSf(false); }
   };
   const applyGlobalSf = ()=>{
     const v = Number(globalSfInput);
@@ -7724,11 +7750,73 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}},
             h("button",{onClick:openCommercialTerms,style:{...btnSmall,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Commercial Terms"),
             h("div",{style:{display:"flex",gap:4,alignItems:"center"}},
-              h("input",{type:"number",step:"0.1",value:globalSfInput,onChange:e=>setGlobalSfInput(e.target.value),placeholder:"New Sf",style:{...inputStyle,width:70}}),
-              h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf")
+              h("input",{type:"number",step:"0.1",value:globalSfInput,onChange:e=>setGlobalSfInput(e.target.value),placeholder:"New Sf",style:{...inputStyle,width:110}}),
+              h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf"),
+              lastGlobalSfSnapshot && lastGlobalSfSnapshot.refFilter===refFilter && h("button",{onClick:restorePreviousGlobalSf,disabled:restoringGlobalSf,title:"Undo the last global Sf change — restores each line's Sf and sales price to what they were before it was set to "+lastGlobalSfSnapshot.appliedValue,style:{...btnSmall,fontSize:10.5,color:colors.danger,border:"1px solid #f0997b",opacity:restoringGlobalSf?0.6:1}},restoringGlobalSf?"Restoring…":"↺ Restore previous Sf")
             ),
             h("button",{onClick:()=>setHistoryOpen(true),style:btnSmall},"History"),
             isAdmin && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete quote")
+          )
+        )
+      ),
+      h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
+        h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},"Export full quote"),
+        h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}},
+          h("div",{style:{fontSize:11.5,color:colors.muted}},
+            "Exporting: ",
+            h("strong",{style:{color:colors.text}},quoteExportRef||"—"),
+            h("span",{style:{fontSize:10,color:colors.mutedLight,marginLeft:6}},"(follows the Quote# selector above)")
+          )
+        ),
+        h("div",{style:{display:"flex",gap:16,flexWrap:"wrap"}},
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"BOM ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(per Sl No)")),
+            h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:colors.muted,marginBottom:6,cursor:"pointer"}},
+              h("input",{type:"checkbox",checked:includeSalesPrice,onChange:e=>setIncludeSalesPrice(e.target.checked)}),
+              "Include Sf + Sales price"
+            ),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:()=>exportQuoteBOMExcel(includeSalesPrice),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:()=>exportQuoteBOMPDF(includeSalesPrice),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-pdf"?"Working…":"PDF")
+            )
+          ),
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Datasheets ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(grouped by item)")),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:exportQuoteDatasheetsExcel,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="ds-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:exportQuoteDatasheetsPDF,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="ds-pdf"?"Working…":"PDF")
+            )
+          ),
+          h("div",{style:{border:"1px solid #8fd0bf",borderRadius:6,padding:"8px 10px",background:"#eaf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:"#085041",textTransform:"uppercase",marginBottom:6}},"Summary ",h("span",{style:{fontWeight:400,color:"#4a8d78"}},"(whole quote, by spec + grade)")),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:exportQuoteSummaryExcel,disabled:!quoteExportRef||!!exportingQuote,style:{...btnSmall,border:"1px solid #1c8c75",color:"#085041"}},exportingQuote==="sum-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:exportQuoteSummaryPDF,disabled:!quoteExportRef||!!exportingQuote,style:{...btnSmall,border:"1px solid #1c8c75",color:"#085041"}},exportingQuote==="sum-pdf"?"Working…":"PDF")
+            )
+          ),
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Cutting Plan ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(whole quote)")),
+            h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden",marginBottom:6,width:"fit-content"}},
+              h("button",{onClick:()=>setQuoteCuttingPlanIncludeCost(true),style:{padding:"3px 10px",fontSize:10.5,border:"none",cursor:"pointer",background:quoteCuttingPlanIncludeCost?colors.dark:"#fff",color:quoteCuttingPlanIncludeCost?"#fff":colors.text,fontFamily:"inherit"}},"With cost"),
+              h("button",{onClick:()=>setQuoteCuttingPlanIncludeCost(false),style:{padding:"3px 10px",fontSize:10.5,border:"none",cursor:"pointer",background:!quoteCuttingPlanIncludeCost?colors.dark:"#fff",color:!quoteCuttingPlanIncludeCost?"#fff":colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Without cost")
+            ),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:()=>exportQuoteCuttingPlanExcel(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:()=>exportQuoteCuttingPlanPDF(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-pdf"?"Working…":"PDF")
+            )
+          ),
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Commercial Terms"),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"One set per quote"),
+            h("button",{onClick:openCommercialTerms,disabled:!quoteExportRef,style:{...btnSmall,width:"100%"}},"Edit terms")
+          ),
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
+              h("div",{style:{fontSize:10,fontWeight:700,color:colors.dark,textTransform:"uppercase"}},"Generate Quote PDF"),
+              quoteExportRef && quoteExportRef===refFilter && !readiness.loading && !readiness.ready && h("span",{style:{fontSize:9.5,fontWeight:700,color:"#854f0b"}},readiness.missing.reduce((s,m)=>s+m.items.length,0)+" items missing")
+            ),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Cover + index + summary + terms + datasheets"),
+            renderReadinessBar(readiness.categories, {height:38, doneLabel: generatingQuotePdf?"Generating…":"✓ Generate Quote PDF", onClick: (quoteExportRef&&!generatingQuotePdf)?generateQuotePdf:undefined})
           )
         )
       ),
@@ -7858,67 +7946,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{display:"flex",gap:8,marginTop:14}},
             h("button",{onClick:startAmendment,disabled:amendBusy||!Object.values(amendAreas).some(Boolean),style:{...btnPrimary,flex:1}},amendBusy?"Creating…":"Start next revision"),
             h("button",{onClick:()=>setShowAmendPicker(false),disabled:amendBusy,style:{...btnSecondary,flex:1}},"Cancel")
-          )
-        )
-      ),
-      h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
-        h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},"Export full quote"),
-        h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}},
-          h("div",{style:{fontSize:11.5,color:colors.muted}},
-            "Exporting: ",
-            h("strong",{style:{color:colors.text}},quoteExportRef||"—"),
-            h("span",{style:{fontSize:10,color:colors.mutedLight,marginLeft:6}},"(follows the Quote# selector above)")
-          )
-        ),
-        h("div",{style:{display:"flex",gap:16,flexWrap:"wrap"}},
-          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"BOM ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(per Sl No)")),
-            h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:colors.muted,marginBottom:6,cursor:"pointer"}},
-              h("input",{type:"checkbox",checked:includeSalesPrice,onChange:e=>setIncludeSalesPrice(e.target.checked)}),
-              "Include Sf + Sales price"
-            ),
-            h("div",{style:{display:"flex",gap:6}},
-              h("button",{onClick:()=>exportQuoteBOMExcel(includeSalesPrice),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-xlsx"?"Working…":"Excel"),
-              h("button",{onClick:()=>exportQuoteBOMPDF(includeSalesPrice),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-pdf"?"Working…":"PDF")
-            )
-          ),
-          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Datasheets ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(grouped by item)")),
-            h("div",{style:{display:"flex",gap:6}},
-              h("button",{onClick:exportQuoteDatasheetsExcel,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="ds-xlsx"?"Working…":"Excel"),
-              h("button",{onClick:exportQuoteDatasheetsPDF,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="ds-pdf"?"Working…":"PDF")
-            )
-          ),
-          h("div",{style:{border:"1px solid #8fd0bf",borderRadius:6,padding:"8px 10px",background:"#eaf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:"#085041",textTransform:"uppercase",marginBottom:6}},"Summary ",h("span",{style:{fontWeight:400,color:"#4a8d78"}},"(whole quote, by spec + grade)")),
-            h("div",{style:{display:"flex",gap:6}},
-              h("button",{onClick:exportQuoteSummaryExcel,disabled:!quoteExportRef||!!exportingQuote,style:{...btnSmall,border:"1px solid #1c8c75",color:"#085041"}},exportingQuote==="sum-xlsx"?"Working…":"Excel"),
-              h("button",{onClick:exportQuoteSummaryPDF,disabled:!quoteExportRef||!!exportingQuote,style:{...btnSmall,border:"1px solid #1c8c75",color:"#085041"}},exportingQuote==="sum-pdf"?"Working…":"PDF")
-            )
-          ),
-          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Cutting Plan ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(whole quote)")),
-            h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden",marginBottom:6,width:"fit-content"}},
-              h("button",{onClick:()=>setQuoteCuttingPlanIncludeCost(true),style:{padding:"3px 10px",fontSize:10.5,border:"none",cursor:"pointer",background:quoteCuttingPlanIncludeCost?colors.dark:"#fff",color:quoteCuttingPlanIncludeCost?"#fff":colors.text,fontFamily:"inherit"}},"With cost"),
-              h("button",{onClick:()=>setQuoteCuttingPlanIncludeCost(false),style:{padding:"3px 10px",fontSize:10.5,border:"none",cursor:"pointer",background:!quoteCuttingPlanIncludeCost?colors.dark:"#fff",color:!quoteCuttingPlanIncludeCost?"#fff":colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Without cost")
-            ),
-            h("div",{style:{display:"flex",gap:6}},
-              h("button",{onClick:()=>exportQuoteCuttingPlanExcel(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-xlsx"?"Working…":"Excel"),
-              h("button",{onClick:()=>exportQuoteCuttingPlanPDF(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-pdf"?"Working…":"PDF")
-            )
-          ),
-          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Commercial Terms"),
-            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"One set per quote"),
-            h("button",{onClick:openCommercialTerms,disabled:!quoteExportRef,style:{...btnSmall,width:"100%"}},"Edit terms")
-          ),
-          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
-            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
-              h("div",{style:{fontSize:10,fontWeight:700,color:colors.dark,textTransform:"uppercase"}},"Generate Quote PDF"),
-              quoteExportRef && quoteExportRef===refFilter && !readiness.loading && !readiness.ready && h("span",{style:{fontSize:9.5,fontWeight:700,color:"#854f0b"}},readiness.missing.reduce((s,m)=>s+m.items.length,0)+" items missing")
-            ),
-            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Cover + index + summary + terms + datasheets"),
-            renderReadinessBar(readiness.categories, {height:38, doneLabel: generatingQuotePdf?"Generating…":"✓ Generate Quote PDF", onClick: (quoteExportRef&&!generatingQuotePdf)?generateQuotePdf:undefined})
           )
         )
       ),
@@ -10478,6 +10505,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (10)", summary:"Global Sf now has an undo. Applying it was previously irreversible (the confirm dialog even said so) — it now captures every line's Sf and sales price right before overwriting, and a \"↺ Restore previous Sf\" button appears next to the field afterward, scoped to that quote, that puts every line back exactly as it was (also logged, also confirmed before running, since it's still a real bulk change). Widened the Sf input itself (was uncomfortably narrow at 70px, now 110px). Also moved \"Export full quote\" to sit before the Quote Header block instead of after it." },
   { date:"25 Jul 2026 (9)", summary:"Five fixes from screenshots, built together. (1) \"Engineering Calc\" no longer shows twice in the nav — a flat nav group was rendering both its own decorative label and its single tab's button with the same text; flat groups now render as one clickable item. (2) Nav dropdown-exclusivity hardened with a functional state update (couldn't reproduce a concrete defect from code alone, so this is a defensive tightening rather than a confirmed root-cause fix — flag if it recurs). (3) Quotes toolbar redesigned: quote identity + status + New/Close grouped and prominent up top (Close is now solid red, not a faint outline), filters and secondary actions (Commercial Terms, History, Sf tools, Delete quote) grouped separately below instead of one long row. (4) \"New\" now runs through the exact same validation as \"Close\" before showing the New/Existing offer popup — built a matching Save-all/Go-back/Discard-logged modal for the Quotes screen (the Estimator already had one), and extended the shared unsaved-changes guard to optionally carry a real save function so \"Save all\" isn't just discard-with-extra-steps. (5) Per-company branding: found this was a much bigger gap than first scoped — 9 separate hardcoded Flometriq letterhead blocks across different PDF generators (Cutting Plan, BOM Summary, Datasheet exports, both Estimator-side and Quotes-screen-side), not just 2. Built one shared drawPdfLetterhead() helper and pointed every one of them, plus the TopBar and blank landing screen, at whichever company the current session actually belongs to — falling back to \"Authored by K.Bala Boopathy\" (not Flometriq's own branding) wherever a company hasn't uploaded a logo yet. Login screen is now generic (no company known before authentication); User Manual/Tour PDFs deliberately stay Flometriq-branded since they document the software itself." },
   { date:"25 Jul 2026 (8)", summary:"Blank landing screen now shows the actual company logo (COMPANY_LOGO — already used in the TopBar and PDF letterheads, not a new asset) instead of a plain \"Nothing open\" text message." },
   { date:"25 Jul 2026 (7)", summary:"Built the Close/New/status-dropdown set that had been mocked (and re-mocked) across several earlier rounds without actually shipping. Login now lands on a genuinely blank screen (\"Nothing open — pick Quotes from Sales, or Engineering Calc above\") instead of the Estimator's model list. Engineering Calc moved out from under Sales into its own flat top-level toolbar button. The Quote form's status badge is now a real dropdown once every readiness segment is green (locked with the same 🔒 display as before while it isn't) — same edit-code authorization rule as the Kanban board and Quote Status Review, neither of which were touched. Close and New buttons: in the Estimator, shown whenever a Sl No is being built, checking the cart via the app's existing unsaved-changes guard (window.__unsavedGuard — previously the cart never actually fed into this, a real gap now closed) — with unsaved lines, both offer Save all / Go back / discard-without-saving, logged either way; New drops you back at the Quotes entry prompt, Close goes to the blank home screen. In the Quotes screen itself, New and Close use the same existing guard the app already relies on elsewhere (header/description edits already set it) rather than a second parallel mechanism." },
