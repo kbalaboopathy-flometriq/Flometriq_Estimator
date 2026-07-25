@@ -867,9 +867,8 @@ function MenuTabs({ user, active, onChange }) {
   const byKeys = keys => MASTER_TABLES.filter(t=>keys.includes(t.key)).map(t=>({key:t.key,label:t.label}));
 
   const groups = [
-    { label:"Transaction", subgroups:[
-      { label:"Sales", tabs:[
-        {key:"estimator",label:"Estimator"},
+    { label:"Sales", subgroups:[
+      { label:"Quotes", tabs:[
         {key:"saved",label:"Quotes"},
       ]},
       { label:"Engineering", tabs:[
@@ -3078,7 +3077,7 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
 
   // Bridge from Reports > BOM Coverage's "Open BOM" button: jump straight to a model.
   useEffect(()=>{
-    if(initialModel){ selectModel(initialModel); onConsumedInitialModel && onConsumedInitialModel(); }
+    if(initialModel){ setCart([]); selectModel(initialModel); onConsumedInitialModel && onConsumedInitialModel(); }
   },[initialModel]);
 
   // Manual line item: cascades the same way Master Data does (Component -> Sub Assembly,
@@ -3202,6 +3201,20 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
   };
 
   const cancelMOC = ()=>{ setShowMOC(false); setMocMode("shape"); setFreeText(""); setParsedMatches(null); };
+  // Distinct from cancelMOC above: that one deliberately keeps the model
+  // selected and drops you into manual per-line grading. This one fully
+  // abandons the model pick and returns to "no model selected" — Escape
+  // always does this; the popup also gets an explicit close button for it.
+  const abandonModelSelection = ()=>{
+    setShowMOC(false); setSelectedModel(null); setLines([]); setOverrides({});
+    setMocSelections({}); setMocLines([]); setMocMode("shape"); setFreeText(""); setParsedMatches(null);
+  };
+  useEffect(()=>{
+    if(!showMOC) return;
+    const onKey=(e)=>{ if(e.key==="Escape") abandonModelSelection(); };
+    document.addEventListener("keydown",onKey);
+    return ()=>document.removeEventListener("keydown",onKey);
+  },[showMOC]);
 
   const setOverride = (rowId,field,value)=>{
     setOverrides(o=>{ 
@@ -3586,7 +3599,8 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
   };
 
   const addCurrentModelToCart = ()=>{
-    if(!selectedModel||computedLines.length===0) return;
+    if(!selectedModel){ alert("Select a model first."); return; }
+    if(computedLines.length===0){ alert("This model has no BOM lines loaded — nothing to add. Try reselecting it, or Refresh from the sidebar."); return; }
     const toAdd=computedLines.map(l=>({model:selectedModel,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec||"",grade:l.selGrade||(l.hasSpec?"":""),qty_required:l.qty,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.salesPrice,show_in_moc:l.showInMoc,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||""}));
     setCart(c=>c.concat(toAdd));
     if(holdingNewSlNo) return; // already know the Quote#/Sl No — no need to ask again
@@ -3649,6 +3663,17 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
       const { data } = await sb.from("estimates").select("enquiry_number,enquiry_date,quote_date,currency,conversion_rate,customer_name,customer_address,contact_name,contact_designation,signatory_name,signatory_designation").eq("reference_number",ref).order("item_sl_no").limit(1);
       const head = (data&&data[0])||{};
       const isNewQuote = !(data&&data.length>0);
+      // Critical: the Estimator stays mounted (just hidden) when you switch to
+      // Quotes and back, so whatever was in the cart / selected model / BOM
+      // lines from earlier in this session is still sitting in memory. Every
+      // one of these must be cleared before starting a new Sl No, or stale
+      // data from an unrelated earlier model silently rides along into the
+      // save — this was a real bug (reported as "random model data" landing
+      // in a new Sl No), not intentional carry-over.
+      setCart([]); setSelectedModel(null); setLines([]); setOverrides({});
+      setShowMOC(false); setMocSelections({}); setMocLines([]); setMocMode("shape");
+      setFreeText(""); setParsedMatches(null); setModelFilter("");
+      setIsCustomModel(false); setDirectPriceLine(null);
       setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
       setCurrency(head.currency||"INR"); setConversionRate(String(head.conversion_rate||1));
       setCustomerName(head.customer_name||""); setCustomerAddress(head.customer_address||"");
@@ -3835,7 +3860,12 @@ function Estimator({ user, masterData, sessionCompanyId, onRefresh, onOpenQuote,
             h("div", {style:{fontWeight:600,fontSize:14,color:"#fff"}}, mocMode==="freetext"?"Free text MOC entry":"Select MOC — Material of Construction"),
             h("div", {style:{fontSize:11,color:"#6fa99a",marginTop:2}}, mocMode==="freetext"?"Type grades in plain language — app parses and matches":"Choose grade per shape — all matching BOM lines auto-fill")
           ),
-          h("span", {style:{background:"rgba(29,158,117,0.25)",color:"#6fa99a",fontSize:12,padding:"4px 10px",borderRadius:20}}, selectedModel)
+          h("div",{style:{display:"flex",alignItems:"center"}},
+            h("span", {style:{background:"rgba(29,158,117,0.25)",color:"#6fa99a",fontSize:12,padding:"4px 10px",borderRadius:20}}, selectedModel),
+            h("button",{onClick:abandonModelSelection,title:"Cancel — deselect this model entirely (same as pressing Esc)",style:{background:"rgba(184,71,47,0.25)",border:"none",borderRadius:6,width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",color:"#f09595",fontSize:14,marginLeft:10}},
+              h("i",{className:"ti ti-x","aria-hidden":"true"})
+            )
+          )
         ),
 
         // SHAPE MODE body
@@ -5570,6 +5600,12 @@ function QuoteNotesPanel({ referenceNumber, user }){
 function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSlNo }) {
   const [refs,setRefs]=useState([]); const [loading,setLoading]=useState(true);
   const [refFilter,setRefFilter]=useState(""); const [slNoFilter,setSlNoFilter]=useState(""); const [descSearch,setDescSearch]=useState(""); const [openRef,setOpenRef]=useState(null);
+  // Entry gate: New offer / Existing offer, shown every time this screen is
+  // reached directly. Skipped when arriving via a deep link (e.g. returning
+  // from the Estimator's save flow, or a bridge from another report) —
+  // openTarget being set means the destination is already known.
+  const [showEntryGate,setShowEntryGate]=useState(!openTarget);
+  const [entryGateExistingPick,setEntryGateExistingPick]=useState("");
 
   // Wildcard quote search — "quote# — client", picking one loads it filtered;
   // typing a number that doesn't exist offers to create it as a new quote.
@@ -5597,7 +5633,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       const target = latestRefForBase(hit.rn);
       setRefFilter(target); setSlNoFilter("");
       const pool = refs.filter(r=>r.reference_number===target);
-      if(pool.length===1) openEstimate(pool[0]);
+      if(pool.length>0){ const slNo1 = pool.find(r=>r.item_sl_no===1) || pool[0]; openEstimate(slNo1); }
     }
   };
   const handleRefSearchBlur = (e)=>{
@@ -5715,7 +5751,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
   const jumpToRevision = (ref)=>{
     const pool = refs.filter(r=>r.reference_number===ref);
     setRefFilter(ref); setSlNoFilter("");
-    if(pool.length===1) openEstimate(pool[0]); else if(pool.length>1) openEstimate(pool[0]);
+    if(pool.length>0){ const slNo1 = pool.find(r=>r.item_sl_no===1) || pool[0]; openEstimate(slNo1); }
   };
 
   const startAmendment = async()=>{
@@ -5757,13 +5793,17 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
   const [showNewSlNoModal,setShowNewSlNoModal]=useState(false);
   const [newSlNoInput,setNewSlNoInput]=useState("");
   const [newSlNoError,setNewSlNoError]=useState("");
+  const [newSlNoStep,setNewSlNoStep]=useState("input"); // "input" | "confirm"
   const confirmNewSlNo = ()=>{
     const n = Number(newSlNoInput);
     if(!newSlNoInput.trim() || !Number.isInteger(n) || n<=0){ setNewSlNoError("Enter a whole number greater than 0."); return; }
     const existingSlNos = refs.filter(r=>r.reference_number===refFilter).map(r=>r.item_sl_no);
     if(existingSlNos.includes(n)){ setNewSlNoError("Sl No "+n+" already exists for Quote# "+refFilter+". Pick a different number."); return; }
-    setShowNewSlNoModal(false);
-    if(onNewSlNo) onNewSlNo(refFilter, n);
+    setNewSlNoError(""); setNewSlNoStep("confirm");
+  };
+  const finalizeNewSlNo = ()=>{
+    setShowNewSlNoModal(false); setNewSlNoStep("input");
+    if(onNewSlNo) onNewSlNo(refFilter, Number(newSlNoInput));
   };
 
   // "+ Add new" — prompts for a quote number, checks if it's taken, and
@@ -5788,7 +5828,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     const target = latestRefForBase(addNewMsg.rn);
     setRefFilter(target); setSlNoFilter("");
     const pool = refs.filter(r=>r.reference_number===target);
-    if(pool.length===1) openEstimate(pool[0]);
+    if(pool.length>0){ const slNo1 = pool.find(r=>r.item_sl_no===1) || pool[0]; openEstimate(slNo1); }
   };
   const [pdfPreview,setPdfPreview]=useState(null); // {doc, filename} — Quote/BOM PDFs preview before download
   const [editingDescSlNo,setEditingDescSlNo]=useState(false);
@@ -6168,7 +6208,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
   useEffect(()=>{
     if(!openTarget || loading || refs.length===0) return;
     const match = refs.find(r=>r.reference_number===openTarget.reference_number && (openTarget.item_sl_no==null || r.item_sl_no===openTarget.item_sl_no));
-    if(match){ setRefFilter(match.reference_number); setSlNoFilter(String(match.item_sl_no)); openEstimate(match); if(openTarget.openDatasheet) setPendingOpenDatasheet(true); }
+    if(match){ setShowEntryGate(false); setRefFilter(match.reference_number); setSlNoFilter(String(match.item_sl_no)); openEstimate(match); if(openTarget.openDatasheet) setPendingOpenDatasheet(true); }
     if(onConsumedTarget) onConsumedTarget();
   },[openTarget, loading, refs]);
   useEffect(()=>{
@@ -7801,7 +7841,7 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
             filtered.length===0&&h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No quotes yet.")
           ),
           refFilter && h("div",{style:{marginTop:8,textAlign:"center"}},
-            h("button",{onClick:()=>{ setNewSlNoInput(""); setNewSlNoError(""); setShowNewSlNoModal(true); },style:{...btnSmall,width:"100%"}},"+ New Sl No for "+refFilter)
+            h("button",{onClick:()=>{ setNewSlNoInput(""); setNewSlNoError(""); setNewSlNoStep("input"); setShowNewSlNoModal(true); },style:{width:"100%",padding:"12px",fontSize:13.5,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:6,cursor:"pointer"}},"+ Add new Sl No")
           )
         ),
         h("div",{style:{flex:"1 1 400px",minWidth:0}},
@@ -8246,6 +8286,41 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
     ),
     showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>{ setShowDatasheet(false); refreshAll(); } }),
     historyOpen && refFilter && h(QuoteHistoryPanel,{ referenceNumber:refFilter, onClose:()=>setHistoryOpen(false) }),
+    showEntryGate && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:250}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:420,padding:"22px 24px"}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:2}},
+          h("div",{style:{fontSize:15,fontWeight:700}},"Quotes"),
+          h("button",{onClick:()=>setShowEntryGate(false),title:"Close and search/browse directly",style:{background:"none",border:"none",cursor:"pointer",color:colors.mutedLight,fontSize:16,padding:0}},"✕")
+        ),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:16}},"New offer, or continue an existing one?"),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:8,marginBottom:14}},
+          h("button",{onClick:()=>{ setShowEntryGate(false); setAddNewInput(""); setAddNewMsg(null); setShowAddNewModal(true); },
+            style:{textAlign:"left",padding:"14px 16px",border:"1px solid "+colors.border,borderRadius:8,background:"#fff",cursor:"pointer",display:"flex",alignItems:"center",gap:12}},
+            h("span",{style:{fontSize:18}},"➕"),
+            h("div",null,h("div",{style:{fontSize:13.5,fontWeight:600}},"New offer"),h("div",{style:{fontSize:11.5,color:colors.muted}},"Start a brand new Quote#"))
+          ),
+          h("div",{style:{padding:"14px 16px",border:"1px solid "+colors.border,borderRadius:8}},
+            h("div",{style:{fontSize:13.5,fontWeight:600,marginBottom:8}},"Existing offer"),
+            h("select",{value:entryGateExistingPick,onChange:e=>setEntryGateExistingPick(e.target.value),style:{...inputStyle,width:"100%",marginBottom:8}},
+              h("option",{value:""},"Select a quote…"),
+              refOptionsList.map(o=>h("option",{key:o.rn,value:o.rn},o.label))
+            ),
+            h("button",{onClick:()=>{
+                if(!entryGateExistingPick) return;
+                const hit = refOptionsList.find(o=>o.rn===entryGateExistingPick);
+                if(!hit) return;
+                setShowEntryGate(false);
+                setRefSearchDisplay(hit.label);
+                const target = latestRefForBase(hit.rn);
+                setRefFilter(target); setSlNoFilter("");
+                const pool = refs.filter(r=>r.reference_number===target);
+                if(pool.length>0){ const slNo1 = pool.find(r=>r.item_sl_no===1) || pool[0]; openEstimate(slNo1); }
+              },disabled:!entryGateExistingPick,style:{...btnPrimary,width:"100%",opacity:entryGateExistingPick?1:0.5}},"Open")
+          )
+        ),
+        h("div",{style:{fontSize:11,color:colors.mutedLight}},"Or close this and search/browse directly below.")
+      )
+    ),
     showAddNewModal && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
       h("div",{style:{background:"#fff",borderRadius:8,width:360,padding:"20px 22px"}},
         h("div",{style:{fontSize:14,fontWeight:700,marginBottom:10}},"New quote number"),
@@ -8266,13 +8341,30 @@ function SavedEstimates({ user, openTarget, onConsumedTarget, onGoToTab, onNewSl
       )
     ),
     showNewSlNoModal && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
-      h("div",{style:{background:"#fff",borderRadius:8,width:340,padding:"20px 22px"}},
-        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:10}},"New Sl No for "+refFilter),
-        h("input",{type:"number",value:newSlNoInput,autoFocus:true,onChange:e=>{setNewSlNoInput(e.target.value);setNewSlNoError("");},onKeyDown:e=>{ if(e.key==="Enter") confirmNewSlNo(); },style:{...inputStyle,width:"100%",marginBottom:8}}),
-        newSlNoError && h("div",{style:{fontSize:12,color:colors.danger,marginBottom:8}},newSlNoError),
-        h("div",{style:{display:"flex",gap:8}},
-          h("button",{onClick:confirmNewSlNo,style:{...btnPrimary,flex:1}},"Continue"),
-          h("button",{onClick:()=>setShowNewSlNoModal(false),style:{...btnSecondary,flex:1}},"Cancel")
+      h("div",{style:{background:"#fff",borderRadius:8,width:420,padding:"20px 22px",display:"flex",gap:16}},
+        h("div",{style:{width:100,flexShrink:0,borderRight:"1px solid "+colors.border,paddingRight:12}},
+          h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"EXISTING"),
+          h("div",{style:{display:"flex",flexDirection:"column",gap:5}},
+            refs.filter(r=>r.reference_number===refFilter).map(r=>h("span",{key:r.item_sl_no,style:{fontSize:12,padding:"3px 7px",background:"#f4f2ea",borderRadius:5}},"Sl No "+r.item_sl_no))
+          )
+        ),
+        h("div",{style:{flex:1}},
+          newSlNoStep==="input" ? h(React.Fragment,null,
+            h("div",{style:{fontSize:14,fontWeight:700,marginBottom:10}},"New Sl No for "+refFilter),
+            h("input",{type:"number",value:newSlNoInput,autoFocus:true,onChange:e=>{setNewSlNoInput(e.target.value);setNewSlNoError("");},onKeyDown:e=>{ if(e.key==="Enter") confirmNewSlNo(); },style:{...inputStyle,width:"100%",marginBottom:8}}),
+            newSlNoError && h("div",{style:{fontSize:12,color:colors.danger,marginBottom:8}},newSlNoError),
+            h("div",{style:{display:"flex",gap:8}},
+              h("button",{onClick:confirmNewSlNo,style:{...btnPrimary,flex:1}},"Continue"),
+              h("button",{onClick:()=>{setShowNewSlNoModal(false);setNewSlNoStep("input");},style:{...btnSecondary,flex:1}},"Cancel")
+            )
+          ) : h(React.Fragment,null,
+            h("div",{style:{fontSize:14,fontWeight:700,marginBottom:6}},"Add Sl No "+newSlNoInput+" to "+refFilter+"?"),
+            h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14}},"Header, Notes, and Commercial Terms carry over automatically. You'll pick a model next."),
+            h("div",{style:{display:"flex",gap:8}},
+              h("button",{onClick:finalizeNewSlNo,style:{...btnPrimary,flex:1}},"Yes, add it"),
+              h("button",{onClick:()=>setNewSlNoStep("input"),style:{...btnSecondary,flex:1}},"Back")
+            )
+          )
         )
       )
     ),
@@ -9418,7 +9510,7 @@ const MANUAL_SECTIONS = [
         "blocks": [
           {
             "type": "p",
-            "text": "Sign in with the username and password your admin gave you. The top menu bar is grouped into Transaction, Reports, Master Data, and Admin \u2014 Master Data and Admin only show up if your account has admin rights."
+            "text": "Sign in with the username and password your admin gave you. The top menu bar is grouped into Sales, CRM, Reports, Master Data, and Admin \u2014 Master Data and Admin only show up if your account has admin rights."
           },
           {
             "type": "steps",
@@ -9442,12 +9534,12 @@ const MANUAL_SECTIONS = [
     ]
   },
   {
-    "group": "Transaction",
+    "group": "Sales",
     "articles": [
       {
         "key": "estimator",
         "title": "Estimator \u2014 building a BOM",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -9474,7 +9566,7 @@ const MANUAL_SECTIONS = [
       {
         "key": "quotes_overview",
         "title": "Quotes \u2014 overview and Sl Nos",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -9500,7 +9592,7 @@ const MANUAL_SECTIONS = [
       {
         "key": "quotes_cutting",
         "title": "Quotes \u2014 Detail, Summary, and Cutting Plan",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -9539,7 +9631,7 @@ const MANUAL_SECTIONS = [
       {
         "key": "quotes_terms",
         "title": "Quotes \u2014 Commercial Terms",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -9568,7 +9660,7 @@ const MANUAL_SECTIONS = [
       {
         "key": "quotes_pdf",
         "title": "Quotes \u2014 Generate Quote PDF and Ready to go",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -9591,7 +9683,7 @@ const MANUAL_SECTIONS = [
       {
         "key": "eng_calcs",
         "title": "Engineering Calcs",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -9610,7 +9702,7 @@ const MANUAL_SECTIONS = [
       {
         "key": "quote_header",
         "title": "Quote Header — shared fields",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -9634,7 +9726,7 @@ const MANUAL_SECTIONS = [
       {
         "key": "description_autofill",
         "title": "Description — auto-fill and manual edit",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -9653,7 +9745,7 @@ const MANUAL_SECTIONS = [
       {
         "key": "sf_change",
         "title": "Changing Sf on saved lines",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -9675,7 +9767,7 @@ const MANUAL_SECTIONS = [
       {
         "key": "non_draft_auth",
         "title": "Editing and deleting on non-Draft quotes",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -9698,7 +9790,7 @@ const MANUAL_SECTIONS = [
       {
         "key": "quote_history",
         "title": "Quote History",
-        "tag": "Transaction",
+        "tag": "Sales",
         "blocks": [
           {
             "type": "p",
@@ -10011,7 +10103,7 @@ const MANUAL_SECTIONS = [
         "blocks": [
           {
             "type": "p",
-            "text": "Powers the non-Draft editing/delete rule (see Transaction \u2192 \"Editing and deleting on non-Draft quotes\"). Two code types, each single-use and valid 15 minutes."
+            "text": "Powers the non-Draft editing/delete rule (see Sales \u2192 \"Editing and deleting on non-Draft quotes\"). Two code types, each single-use and valid 15 minutes."
           },
           {
             "type": "bullets",
@@ -10266,6 +10358,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (3)", summary:"Quotes entry-flow redesign and nav cleanup. Sales (renamed from Transaction) now only holds Quotes and Engineering Calcs — Estimator is no longer a standalone nav destination at all, only ever reached by going through Quotes. Opening Quotes now shows a New offer / Existing offer popup first (closable, to search/browse directly instead if preferred): New offer reuses the existing quote-number-with-duplicate-check flow straight into the model picker; Existing offer is a dropdown that opens the quote's Sl No 1 view — fixed to always land on Sl No 1 specifically (previously, opening a quote with more than one Sl No via search or \"+ Add new\" silently did nothing at all, since the code only auto-opened when exactly one Sl No existed). \"+ New Sl No\" is now a prominent full-width button; its popup shows the existing Sl Nos alongside the input, still blocks duplicates with a message and lets you re-enter, and now has an explicit \"Are you sure — add Sl No N to Quote# X?\" confirm step before handing off to the model picker, which is unchanged as the actual start point (datasheet prompt, description auto-fill from Description Master, and header/Notes/Commercial Terms inheriting automatically for an existing offer are all unchanged, already-correct behavior). No changes to the Amendment/Revision workflow — this is a Rev0 entry-flow redesign only." },
+  { date:"25 Jul 2026 (2)", summary:"Fixed a real, pre-existing data-integrity bug: the Estimator screen never unmounts when you switch to Quotes and back (just hidden), so cart/selected-model/BOM-lines state stayed alive across sessions. Clicking \"+ New Sl No\" on an existing quote reset the header fields but never cleared that leftover state — meaning whatever model/cart data was sitting there from earlier could silently ride along into a brand-new Sl No's save (reported as \"random model data\" appearing). Now fully cleared (cart, selected model, BOM lines, overrides, MOC state) the moment a new Sl No starts, and the same clear was added to the \"Open BOM\" bridge from Reports for the same reason. Also: \"Add this model to the cart\" no longer fails silently — it now says exactly why (no model selected, or no BOM lines loaded) instead of doing nothing. And the MOC popup gained a proper close (✕) button plus Escape-key support that fully deselects the model and returns to the empty state — distinct from the existing \"Cancel — select per line\" button, which still does its own, different, intentional thing (drop into manual per-line grading without losing the model)." },
   { date:"25 Jul 2026", summary:"Direct Price Line feature — run crm_phase7_direct_price_setup.sql first (adds model_tbl.is_custom flag + seed row, estimate_lines validation/reference fields, a new 'direct_price' authorization code type, and a direct-price-excels storage bucket). Estimator: the Model list now includes a flagged \u201cCustom \u2014 no BOM\u201d entry (a real is_custom flag, never a text match) \u2014 picking it skips BOM loading entirely and opens a Direct Price panel: Item (required), Description, Qty, UOM, Sales Price, then either Attach Excel or a no-Excel authorization code from an Admin/Super Admin (who can also self-authorize without a code). What gets recorded as \u201cModel\u201d on the quote is either literal \u201cCustom\u201d or a typed name \u2014 free text only, never written back to the Models master. Every Direct Price line saves as Pending validation. The same Direct Price mode is now also available from the Quotes screen's \u201cAdd line item\u201d modal (a \u201cCosted line\u201d / \u201cDirect price line\u201d toggle), so it works on existing quotes and revisions/amendments too, not just fresh Estimator builds \u2014 revision adds also log to Revision History. New Reports \u2192 Admin only \u2192 Pending Validation: lists every Pending line with who added it and how it was authorized, lets an Admin/Super Admin attach the Excel late or mark it Validated. The readiness bar gained a 4th segment, Validation, reusing the exact same Commercial Terms/Datasheets/Descriptions machinery \u2014 any Pending line blocks that Quote#'s PDF (note: PDF generation is per-Quote#, combining all its Sl Nos, not per-Sl-No \u2014 a correction from what was discussed while designing this). The Custom model row is deletion-locked the same way Draft status is (a UI-level check, not a database constraint, matching this app's existing pattern for that kind of protection)." },
   { date:"24 Jul 2026 (7)", summary:"Moved My Worklist out of Transaction → Sales into the CRM menu (CRM → Daily → My Worklist), alongside Funnel — it was findable but in a non-obvious place for anyone thinking \"CRM\" first rather than \"Sales.\" Reports (Quote Status Review, Won by Owner, Overdue Calls) deliberately stay under Reports, per discussion — CRM menu stays short and focused on the daily-use screens, not a duplicate of Reports." },
   { date:"24 Jul 2026 (6)", summary:"CRM Phase 6 — no new SQL, closes out the remaining CRM gaps. Notification bell in the TopBar (any screen): reads notifications_tbl for whoever's logged in, unread badge, mark-read on click, mark-all-read, refreshes every 60s. Login-time overdue prompt: once per browser-day, if the logged-in person's linked Employee owns any account with a due/overdue follow-up, shows them color-coded (darker left border = a follow-up chained from an earlier call; lighter = a fresh first touch), skippable, with a \"Go to My Worklist\" shortcut. New Reports → Admin only → Overdue Calls: cross-team view, filterable by Owner/Zone, days-overdue sorted, oldest/owners-affected summary cards. Fixed a real correctness gap discovered while building this: My Worklist, the login prompt, and this report were all at risk of treating an OLD, already-actioned follow-up date as still outstanding forever once a newer activity was logged against the same company — all three now only look at each company's MOST RECENT activity." },
@@ -10712,7 +10806,7 @@ const TOUR_SLIDES = [
     "title": "Finding your way around",
     "tag": "Menu bar",
     "bullets": [
-      "Grouped into Transaction, Reports, Master Data, and Admin",
+      "Grouped into Sales, CRM, Reports, Master Data, and Admin",
       "Click a group to open its dropdown, pick a screen \u2014 it closes automatically",
       "The active group stays highlighted so you always know where you are",
       "User Manual and Change Password sit on their own, top-right"
@@ -10720,7 +10814,7 @@ const TOUR_SLIDES = [
   },
   {
     "key": "estimator",
-    "group": "Transaction",
+    "group": "Sales",
     "title": "Estimator \u2014 building a BOM",
     "tag": "Where quotes start",
     "bullets": [
@@ -10732,7 +10826,7 @@ const TOUR_SLIDES = [
   },
   {
     "key": "quotes",
-    "group": "Transaction",
+    "group": "Sales",
     "title": "Quotes \u2014 one quote, many line items",
     "tag": "Quote# + Sl No",
     "bullets": [
@@ -10744,7 +10838,7 @@ const TOUR_SLIDES = [
   },
   {
     "key": "cutting_plan",
-    "group": "Transaction",
+    "group": "Sales",
     "title": "Detail, Summary, and Cutting Plan",
     "tag": "Three views, one Sl No",
     "bullets": [
@@ -10756,7 +10850,7 @@ const TOUR_SLIDES = [
   },
   {
     "key": "terms",
-    "group": "Transaction",
+    "group": "Sales",
     "title": "Commercial terms",
     "tag": "One set per quote",
     "bullets": [
@@ -10768,7 +10862,7 @@ const TOUR_SLIDES = [
   },
   {
     "key": "ready",
-    "group": "Transaction",
+    "group": "Sales",
     "title": "Ready to go, and Generate Quote PDF",
     "tag": "The final step",
     "bullets": [
