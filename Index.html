@@ -5815,7 +5815,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [revisionSiblings,setRevisionSiblings]=useState([]); // [{ref,label,revNum}] for the currently open quote's family
   const [showAmendGate,setShowAmendGate]=useState(false);
   const [showAmendPicker,setShowAmendPicker]=useState(false);
-  const [amendAreas,setAmendAreas]=useState({header:true,commercial_terms:false,notes:false,datasheet:false,bom:false});
+  const [amendAreas,setAmendAreas]=useState({header:true,commercial_terms:false,notes:false,datasheet:false,bom:false,documents:false});
   const [amendBusy,setAmendBusy]=useState(false);
 
   const loadRevisionSiblings = useCallback(async(ref)=>{
@@ -5859,6 +5859,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       if(termsRows?.length) await sb.from("quote_commercial_terms").insert(termsRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(noteRows?.length) await sb.from("quote_notes").insert(noteRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(dsRows?.length) await sb.from("datasheets").insert(dsRows.map(r=>({...stripId(r), reference_number:newRef})));
+      if(amendAreas.documents){
+        const { data: docRows } = await sb.from("quote_documents").select("*").eq("reference_number",latestRef).eq("is_archived",false);
+        if(docRows?.length) await sb.from("quote_documents").insert(docRows.map(r=>({...stripId(r), reference_number:newRef, file_path:null, lives_in_supabase:false})));
+      }
 
       await logAudit("CREATE","estimates",newRef,"Amendment: created "+newRef+" as a clone of "+latestRef+" ("+Object.entries(amendAreas).filter(([k,v])=>v).map(([k])=>k).join(", ")+")",user?.username||"unknown",null,{cloned_from:latestRef,areas:amendAreas});
 
@@ -5868,7 +5872,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       setRefFilter(newRef); setSlNoFilter("");
       const newPool = (await sb.from("estimates").select("*").eq("reference_number",newRef)).data||[];
       if(newPool.length) openEstimate(newPool[0]);
-      alert(newRef+" created (status: Draft). Ghost-field editing for Header/Commercial Terms/Notes/Datasheet and BOM coloring are the next piece being built — for now, edit this new revision the same way you'd edit any Draft quote.");
+      if(amendAreas.documents){ await loadQuoteDocuments(newRef); openDocumentsPanel(); }
+      alert(newRef+" created (status: Draft). Ghost-field editing for Header/Commercial Terms/Notes/Datasheet and BOM coloring are the next piece being built — for now, edit this new revision the same way you'd edit any Draft quote."+(amendAreas.documents?" Documents panel is open — update the link/upload a new version for anything that changed, or add new ones.":""));
     } catch(e){
       alert("Amendment failed: "+e.message);
     } finally { setAmendBusy(false); }
@@ -6014,7 +6019,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   };
   // Documents (Drawings, Procedures, ITP, etc.) — shared across all Sl Nos
   // of the quote, same scope as Commercial Terms. PDF only, since these get
-  // merged as running pages into the generated Quote PDF.
+  // requires a permanent link (e.g. OneDrive) and purges from Supabase once
+  // the quote leaves Draft — see updateQuoteStatusForQuote.
   const DOC_CATEGORIES = ["Drawing","Procedure","ITP","Other"];
   const DOC_PREFIX = {Drawing:"DWG",Procedure:"PRC",ITP:"ITP",Other:"DOC"};
   const [quoteDocuments,setQuoteDocuments]=useState([]);
@@ -6024,6 +6030,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     setQuoteDocuments(data||[]);
   },[]);
   useEffect(()=>{ if(quoteExportRef) loadQuoteDocuments(quoteExportRef); },[quoteExportRef,loadQuoteDocuments]);
+  const [quoteHasTerms,setQuoteHasTerms]=useState(false);
+  useEffect(()=>{
+    if(!quoteExportRef){ setQuoteHasTerms(false); return; }
+    sb.from("quote_commercial_terms").select("id").eq("reference_number",quoteExportRef).maybeSingle().then(({data})=>setQuoteHasTerms(!!data));
+  },[quoteExportRef,showCommercialTerms]);
   const [showDocumentsPanel,setShowDocumentsPanel]=useState(false);
   const [docUploadStep,setDocUploadStep]=useState("list"); // "list" | "mode" | "form"
   const [docUploadMode,setDocUploadMode]=useState(""); // "combined" | "separate"
@@ -6037,12 +6048,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const pickDocMode = (mode)=>{
     setDocUploadMode(mode);
     const nextSeq = quoteDocuments.filter(d=>!d.is_archived).length+1;
-    setDocDrafts([{category:"Drawing",docNumber:suggestedDocNumber("Drawing",nextSeq),title:"",file:null}]);
+    setDocDrafts([{category:"Drawing",docNumber:suggestedDocNumber("Drawing",nextSeq),title:"",link:"",file:null}]);
     setDocUploadStep("form");
   };
   const addAnotherDocDraft = ()=>{
     const nextSeq = quoteDocuments.filter(d=>!d.is_archived).length+docDrafts.length+1;
-    setDocDrafts(ds=>ds.concat([{category:"Drawing",docNumber:suggestedDocNumber("Drawing",nextSeq),title:"",file:null}]));
+    setDocDrafts(ds=>ds.concat([{category:"Drawing",docNumber:suggestedDocNumber("Drawing",nextSeq),title:"",link:"",file:null}]));
   };
   const updateDocDraft = (idx,patch)=>{
     setDocDrafts(ds=>ds.map((d,i)=>{
@@ -6061,7 +6072,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     for(const d of docDrafts){
       if(!d.file){ alert("Choose a PDF file for every document before uploading."); return; }
       if(!d.docNumber.trim()){ alert("Every document needs a doc number."); return; }
-      if(d.file.type!=="application/pdf"){ alert("\""+d.file.name+"\" isn't a PDF. Only PDF files can be uploaded here — everything in this list gets merged into the generated Quote PDF, and only PDFs can be merged that way."); return; }
+      if(!d.link.trim()){ alert("Every document needs its permanent link (e.g. OneDrive) before uploading — the file in Supabase is only temporary and gets removed once this quote leaves Draft; the link is what stays."); return; }
+      if(d.file.type!=="application/pdf"){ alert("\""+d.file.name+"\" isn't a PDF. Only PDF files are accepted here."); return; }
     }
     setDocUploading(true);
     try{
@@ -6071,8 +6083,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const { error:err } = await sb.storage.from("quote-documents").upload(path,d.file);
         if(err) throw err;
         const { data:inserted, error:insErr } = await sb.from("quote_documents").insert({
-          reference_number:quoteExportRef, category:d.category, doc_number:d.docNumber.trim(), title:d.title.trim(),
-          file_name:d.file.name, file_path:path, is_combined:docUploadMode==="combined", group_id:groupId,
+          reference_number:quoteExportRef, category:d.category, doc_number:d.docNumber.trim(), title:d.title.trim(), link:d.link.trim(),
+          file_name:d.file.name, file_path:path, lives_in_supabase:true, is_combined:docUploadMode==="combined", group_id:groupId,
           uploaded_by:user?.username||"unknown"
         }).select().single();
         if(insErr) throw insErr;
@@ -6088,8 +6100,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [docHistoryRows,setDocHistoryRows]=useState([]);
   const [docNewVersionFile,setDocNewVersionFile]=useState(null);
   const [docNewVersionNote,setDocNewVersionNote]=useState("");
+  const [docNewVersionLink,setDocNewVersionLink]=useState("");
   const openDocHistory = async(docRow)=>{
-    setDocHistoryFor(docRow); setDocNewVersionFile(null); setDocNewVersionNote("");
+    setDocHistoryFor(docRow); setDocNewVersionFile(null); setDocNewVersionNote(""); setDocNewVersionLink(docRow.link||"");
     const { data } = await sb.from("quote_document_history").select("*").eq("document_id",docRow.id).order("changed_at",{ascending:false});
     setDocHistoryRows(data||[]);
   };
@@ -6097,13 +6110,14 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(!docNewVersionFile){ alert("Choose the new PDF file first."); return; }
     if(docNewVersionFile.type!=="application/pdf"){ alert("Only PDF files can be uploaded here."); return; }
     if(!docNewVersionNote.trim()){ alert("Say what changed in this version."); return; }
+    if(!docNewVersionLink.trim()){ alert("The link is required for this version too."); return; }
     setDocUploading(true);
     try{
       const oldPath = docHistoryFor.file_path;
       const path = "quote_"+quoteExportRef+"_"+Date.now()+"_"+docNewVersionFile.name.replace(/[^a-zA-Z0-9._-]/g,"_");
       const { error:err } = await sb.storage.from("quote-documents").upload(path,docNewVersionFile);
       if(err) throw err;
-      await sb.from("quote_documents").update({file_path:path,file_name:docNewVersionFile.name,uploaded_at:new Date().toISOString(),uploaded_by:user?.username||"unknown"}).eq("id",docHistoryFor.id);
+      await sb.from("quote_documents").update({file_path:path,file_name:docNewVersionFile.name,link:docNewVersionLink.trim(),lives_in_supabase:true,uploaded_at:new Date().toISOString(),uploaded_by:user?.username||"unknown"}).eq("id",docHistoryFor.id);
       await sb.from("quote_document_history").insert({document_id:docHistoryFor.id,reference_number:quoteExportRef,doc_number:docHistoryFor.doc_number,what_changed:docNewVersionNote.trim(),changed_by:user?.username||"unknown",old_file_path:oldPath,new_file_path:path});
       await logAudit("UPDATE","quote_documents",quoteExportRef,"New version of "+docHistoryFor.doc_number+": "+docNewVersionNote.trim(),user?.username||"unknown",{file_path:oldPath},{file_path:path});
       await loadQuoteDocuments(quoteExportRef);
@@ -7820,10 +7834,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                     onChange:e=>{
                       const newStatus=e.target.value;
                       const doChange=async()=>{
-                        await sb.from("estimates").update({quote_status:newStatus,status_changed_by:user.username,status_changed_at:new Date().toISOString()}).eq("id",openRef.id);
-                        await logAudit("UPDATE","estimates",refFilter+"-"+openRef.item_sl_no,"Status changed from "+(quoteHeaderRow.quote_status||"Draft")+" to "+newStatus+" via Quote form",user.username,{quote_status:quoteHeaderRow.quote_status},{quote_status:newStatus});
+                        await updateQuoteStatusForQuote(refFilter,newStatus,user.username,"Quote form");
                         setOpenRef(r=>({...r,quote_status:newStatus}));
-                        setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,quote_status:newStatus}:r));
+                        setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,quote_status:newStatus}:r));
                       };
                       if(isQuoteLocked(quoteHeaderRow.quote_status,user)){ setAuthGate({requiredType:"edit",action:doChange}); return; }
                       doChange();
@@ -7865,6 +7878,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       ),
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
         h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},"Export full quote"),
+        quoteExportRef && quoteDocuments.filter(d=>!d.is_archived).length===0 && h("div",{style:{border:"1px solid #d4901f",background:"#fffaf0",borderRadius:6,padding:"8px 12px",marginBottom:10,fontSize:11.5,color:"#8a5a10"}},
+          "⚠ No documents attached to this quote. If drawings, ITP, or procedures are relevant, add them before sending."
+        ),
         h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}},
           h("div",{style:{fontSize:11.5,color:colors.muted}},
             "Exporting: ",
@@ -7909,15 +7925,21 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("button",{onClick:()=>exportQuoteCuttingPlanPDF(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-pdf"?"Working…":"PDF")
             )
           ),
-          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Commercial Terms"),
-            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"One set per quote"),
-            h("button",{onClick:openCommercialTerms,disabled:!quoteExportRef,style:{...btnSmall,width:"100%"}},"Edit terms")
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Commercial Terms"),
+              h("span",{style:{fontSize:9,fontWeight:700,color:quoteHasTerms?"#0f6e3f":"#8a5a10",border:"1px solid "+(quoteHasTerms?"#0f6e3f":"#d4901f"),padding:"1px 6px",borderRadius:9}},quoteHasTerms?"Set":"Not set")
+            ),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"One set per quote — required before sending"),
+            h("button",{onClick:openCommercialTerms,disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Edit terms")
           ),
-          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Documents ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"("+quoteDocuments.filter(d=>!d.is_archived).length+")")),
-            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Drawings, procedures, ITP — PDF only"),
-            h("button",{onClick:openDocumentsPanel,disabled:!quoteExportRef,style:{...btnSmall,width:"100%"}},"Manage documents")
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Documents"),
+              h("span",{style:{fontSize:9,fontWeight:700,color:quoteDocuments.filter(d=>!d.is_archived).length?"#0f6e3f":colors.muted,border:"1px solid "+(quoteDocuments.filter(d=>!d.is_archived).length?"#0f6e3f":colors.border),padding:"1px 6px",borderRadius:9}},quoteDocuments.filter(d=>!d.is_archived).length+" attached")
+            ),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Drawings, procedures, ITP — optional"),
+            h("button",{onClick:openDocumentsPanel,disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Manage documents")
           ),
           h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
@@ -8046,7 +8068,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{background:"#fff",borderRadius:8,width:420,padding:"20px 22px"}},
           h("div",{style:{fontSize:14,fontWeight:700,marginBottom:4}},"Amend "+refFilter),
           h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:12}},"What are you amending? Creates a new revision — the rest stays untouched."),
-          [["header","Header"],["commercial_terms","Commercial Terms"],["notes","Notes"],["datasheet","Datasheet"],["bom","BOM / Line items"]].map(([key,label])=>
+          [["header","Header"],["commercial_terms","Commercial Terms"],["notes","Notes"],["datasheet","Datasheet"],["bom","BOM / Line items"],["documents","Documents"]].map(([key,label])=>
             h("label",{key,style:{display:"flex",alignItems:"center",gap:8,padding:"6px 0",fontSize:13,cursor:"pointer"}},
               h("input",{type:"checkbox",checked:amendAreas[key],onChange:e=>setAmendAreas(a=>({...a,[key]:e.target.checked}))}),
               label
@@ -8146,17 +8168,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   h("label",{style:{fontSize:11,color:"#0f6e56",fontWeight:600,whiteSpace:"nowrap"}},"Order Qty (units):"),
                   h("input",{type:"number",value:orderQty,min:1,onChange:e=>updateOrderQty(e.target.value),style:{width:70,padding:"5px 8px",fontSize:14,fontWeight:700,textAlign:"center",border:"0.5px solid #1c8c75",borderRadius:6,color:"#085041",background:"#fff",fontFamily:"inherit"}}),
                   h("span",{style:{fontSize:10,color:"#0f6e56"}},`→ Qty by Order/Quote updates live`)
-                ),
-                h("div",{style:{display:"flex",alignItems:"center",gap:8,padding:"6px 12px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:8}},
-                  h("label",{style:{fontSize:11,color:colors.muted,fontWeight:600,whiteSpace:"nowrap"}},"Quote Status:"),
-                  h("select",{value:openRef.quote_status||"Draft",onChange:async e=>{
-                    const v=e.target.value;
-                    await sb.from("estimates").update({quote_status:v}).eq("id",openRef.id);
-                    setOpenRef(r=>({...r,quote_status:v}));
-                    setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,quote_status:v}:r));
-                  },style:{padding:"5px 8px",fontSize:12,fontWeight:600,border:"0.5px solid "+colors.border,borderRadius:6,color:colors.text,background:"#fff",fontFamily:"inherit"}},
-                    quoteStatuses.map(s=>h("option",{key:s,value:s},s))
-                  )
                 ),
                 h("button",{onClick:()=>setShowDatasheet(true),style:{...btnSecondary,background:"#b8590a",color:"#fff",border:"none",fontWeight:600}},"Datasheet"),
                 h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line"),
@@ -8645,7 +8656,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{fontWeight:700,fontSize:15}},"Documents — "+quoteExportRef),
           h("button",{onClick:()=>setShowDocumentsPanel(false),style:{background:"none",border:"none",fontSize:16,cursor:"pointer",color:colors.mutedLight}},"✕")
         ),
-        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:16}},"Drawings, procedures, ITP — PDF only. These merge into the generated Quote PDF as their own pages."),
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:16}},"Drawings, procedures, ITP — PDF only, with a required link (e.g. OneDrive). The uploaded file here is temporary and is removed once this quote leaves Draft; the link is what stays."),
 
         docUploadStep==="list" && h(React.Fragment,null,
           DOC_CATEGORIES.map(cat=>{
@@ -8656,10 +8667,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               rows.map(d=>h("div",{key:d.id,style:{border:"1px solid "+colors.border,borderRadius:8,padding:"9px 12px",marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center"}},
                 h("div",null,
                   h("div",{style:{fontSize:12.5,fontWeight:600}},d.doc_number+(d.title?" — "+d.title:"")),
-                  h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:2}},"Uploaded "+(d.uploaded_at||"").slice(0,10)+" by "+(d.uploaded_by||"—"))
+                  h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:2}},
+                    "Uploaded "+(d.uploaded_at||"").slice(0,10)+" by "+(d.uploaded_by||"—")+" · ",
+                    d.lives_in_supabase
+                      ? h("span",{style:{color:"#0f6e3f"}},"file still in Supabase")
+                      : h("span",{style:{color:colors.mutedLight}},"file purged — link only")
+                  ),
+                  d.link && h("a",{href:d.link,target:"_blank",rel:"noreferrer",style:{fontSize:10.5,color:"#0c447c"}},d.link)
                 ),
                 h("div",{style:{display:"flex",gap:6}},
-                  h("button",{onClick:()=>downloadDocument(d),style:{...btnSmall,fontSize:11}},"View"),
+                  d.lives_in_supabase && h("button",{onClick:()=>downloadDocument(d),style:{...btnSmall,fontSize:11}},"View file"),
                   h("button",{onClick:()=>openDocHistory(d),style:{...btnSmall,fontSize:11}},"History")
                 )
               ))
@@ -8692,6 +8709,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("input",{value:d.docNumber,onChange:e=>updateDocDraft(idx,{docNumber:e.target.value}),style:{...inputStyle,width:"100%",marginBottom:8}}),
             h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Title / description"),
             h("input",{value:d.title,onChange:e=>updateDocDraft(idx,{title:e.target.value}),placeholder:"e.g. GA drawing — strainer assembly",style:{...inputStyle,width:"100%",marginBottom:8}}),
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Link (OneDrive etc.) ",h("span",{style:{color:colors.danger}},"*required")),
+            h("input",{value:d.link,onChange:e=>updateDocDraft(idx,{link:e.target.value}),placeholder:"https://…",style:{...inputStyle,width:"100%",marginBottom:4}}),
+            h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginBottom:8}},"The uploaded PDF here is temporary — it's removed once this quote leaves Draft. This link is what stays."),
             h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"PDF file"),
             h("input",{type:"file",accept:"application/pdf",onChange:e=>updateDocDraft(idx,{file:e.target.files[0]||null}),style:{width:"100%"}})
           )),
@@ -8714,6 +8734,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           ))),
           h("div",{style:{fontSize:11.5,fontWeight:600,marginBottom:6}},"Upload a new version"),
           h("input",{type:"file",accept:"application/pdf",onChange:e=>setDocNewVersionFile(e.target.files[0]||null),style:{width:"100%",marginBottom:8}}),
+          h("input",{value:docNewVersionLink,onChange:e=>setDocNewVersionLink(e.target.value),placeholder:"Link (OneDrive etc.)",style:{...inputStyle,width:"100%",marginBottom:8}}),
           h("input",{value:docNewVersionNote,onChange:e=>setDocNewVersionNote(e.target.value),placeholder:"What changed? e.g. Updated nozzle orientation",style:{...inputStyle,width:"100%",marginBottom:8}}),
           h("button",{onClick:uploadNewDocVersion,disabled:docUploading,style:{...btnPrimary,width:"100%",opacity:docUploading?0.6:1}},docUploading?"Uploading…":"Upload new version")
         )
@@ -8848,6 +8869,39 @@ async function logAudit(action, tableName, recordId, recordSummary, performedBy,
       old_data:oldData||null, new_data:newData||null
     });
   } catch(e) { console.error("Audit log failed:", e); }
+}
+
+// Quote status is one value per Quote#, shared across every Sl No — same as
+// the Quote Header fields already work in this app. Every place that
+// changes status (the Quote form dropdown, Kanban, Quote Status Review, the
+// login reminder) must go through this so none of them can leave one Sl No
+// out of sync with the rest. Also fires the Documents purge once every Sl
+// No under this Quote# is out of Draft (Documents living in Supabase are
+// meant to be temporary — see purgeQuoteDocumentsIfLeavingDraft).
+async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source){
+  const now = new Date().toISOString();
+  const { data: allRows } = await sb.from("estimates").select("id,item_sl_no,quote_status").eq("reference_number",referenceNumber);
+  const oldStatus = allRows && allRows[0] ? allRows[0].quote_status : null;
+  await sb.from("estimates").update({quote_status:newStatus,status_changed_by:changedBy,status_changed_at:now}).eq("reference_number",referenceNumber);
+  await logAudit("UPDATE","estimates",referenceNumber,"Status changed from "+(oldStatus||"Draft")+" to "+newStatus+" via "+source+" (applies to all "+(allRows?allRows.length:0)+" Sl No(s) on this quote)",changedBy,{quote_status:oldStatus},{quote_status:newStatus});
+  if(newStatus!=="Draft"){
+    try{ await purgeQuoteDocumentsIfLeavingDraft(referenceNumber, changedBy); } catch(e){ console.error("Document purge failed:",e); }
+  }
+  return { oldStatus };
+}
+
+// Documents live in Supabase only while the quote is being actively worked
+// on. The moment every Sl No is out of Draft, the real files get deleted —
+// the row (doc number, category, link, history) stays, only the stored
+// file itself goes. Safe to call even if nothing needs purging.
+async function purgeQuoteDocumentsIfLeavingDraft(referenceNumber, performedBy){
+  const { data: docs } = await sb.from("quote_documents").select("*").eq("reference_number",referenceNumber).eq("lives_in_supabase",true).eq("is_archived",false);
+  if(!docs || docs.length===0) return;
+  for(const d of docs){
+    try{ await sb.storage.from("quote-documents").remove([d.file_path]); } catch(e){ console.error("Storage delete failed for",d.doc_number,e); }
+    await sb.from("quote_documents").update({lives_in_supabase:false}).eq("id",d.id);
+  }
+  await logAudit("DELETE","quote_documents",referenceNumber,"Purged "+docs.length+" document file(s) from storage — quote left Draft; links and history remain",performedBy||"system",null,{purged_count:docs.length});
 }
 
 // Checks a deletion-approval code: must exist, be unused, and not expired.
@@ -10694,6 +10748,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (12)", summary:"Big batch, all confirmed together in one long conversation. (1) Quote status is now genuinely global per Quote#, not per Sl No — the dropdown, Kanban, and Quote Status Review all write status across every Sl No of a quote at once via one shared function (updateQuoteStatusForQuote), so none of the three can leave one Sl No out of sync. Removed a redundant second status dropdown that existed elsewhere on the Quote form. Kanban now shows one card per Quote# instead of one per Sl No (summing value across all Sl Nos), since duplicate identical cards would've been the only alternative once status stopped varying per row. The login Draft-reminder list is deduplicated to one row per quote too. (2) Documents feature redesigned around the storage-flooding risk raised earlier: PDF-merge-into-the-generated-PDF is dropped entirely (no pdf-lib, no Annexures, no per-doc Revision History page) — Documents is now a lightweight tracker. Every document requires a permanent link (e.g. OneDrive) at upload, and the Supabase copy of the file is purged automatically the moment a quote's status leaves Draft (hooked into the same global status change above) — the row, link, and full version history stay forever, only the actual file goes. New-version uploads can update the link and require their own \"what changed\" note. The document list shows the link and whether the file's still in Supabase or already purged. (3) \"Documents\" added to the amendment area-picker; checking it clones the previous revision's document rows (link/metadata carried forward) into the new revision and opens the Documents panel automatically so anything that changed can get a new version logged. (4) Commercial Terms and Documents cards restyled to the same visual weight as Generate Quote PDF (dark border, outlined status badge — \"Not set\"/\"Set\", \"N attached\") instead of small muted boxes easy to miss. (5) A non-blocking warning banner shows when a quote has zero documents attached — informational only, doesn't block generation, since most quotes in normal use won't have any." },
   { date:"25 Jul 2026 (11)", summary:"Documents feature — core built, PDF-merge and amendment-checklist integration still to come (see below). Run crm_phase8_documents_setup.sql first (quote_documents + quote_document_history tables, quote-documents storage bucket). New \"Documents\" card on the Quotes screen next to Commercial Terms: upload prompts one combined PDF vs several separate documents first, then Category + a suggested-but-editable Doc# (DWG-/PRC-/ITP-/DOC- + quote# + sequence) + title per document. PDF-only, enforced on file type, not just the file picker's accept filter, since anything uploaded here needs to be mergeable into the generated Quote PDF later. Each document has its own version history — uploading a new version requires a required \"what changed\" note, keeps the prior file's path in quote_document_history, doesn't delete anything. NOT YET DONE, flagged rather than rushed: (1) merging the uploaded PDFs into the generated Quote PDF as running pages — needs pdf-lib layered on top of this app's existing jsPDF, since jsPDF can only draw content, not embed an existing PDF's real pages; (2) adding each document as its own Annexure row in the Index/TOC; (3) a per-document Revision History page (same Area/Field/Old/New/By format as the quote's own) when documents were uploaded as separate; (4) prompting for document changes as part of starting an amendment — checklist with a required change note per existing document, or a simple yes/no when there are none yet. All four are real, scoped work, not small — next round." },
   { date:"25 Jul 2026 (10)", summary:"Global Sf now has an undo. Applying it was previously irreversible (the confirm dialog even said so) — it now captures every line's Sf and sales price right before overwriting, and a \"↺ Restore previous Sf\" button appears next to the field afterward, scoped to that quote, that puts every line back exactly as it was (also logged, also confirmed before running, since it's still a real bulk change). Widened the Sf input itself (was uncomfortably narrow at 70px, now 110px). Also moved \"Export full quote\" to sit before the Quote Header block instead of after it." },
   { date:"25 Jul 2026 (9)", summary:"Five fixes from screenshots, built together. (1) \"Engineering Calc\" no longer shows twice in the nav — a flat nav group was rendering both its own decorative label and its single tab's button with the same text; flat groups now render as one clickable item. (2) Nav dropdown-exclusivity hardened with a functional state update (couldn't reproduce a concrete defect from code alone, so this is a defensive tightening rather than a confirmed root-cause fix — flag if it recurs). (3) Quotes toolbar redesigned: quote identity + status + New/Close grouped and prominent up top (Close is now solid red, not a faint outline), filters and secondary actions (Commercial Terms, History, Sf tools, Delete quote) grouped separately below instead of one long row. (4) \"New\" now runs through the exact same validation as \"Close\" before showing the New/Existing offer popup — built a matching Save-all/Go-back/Discard-logged modal for the Quotes screen (the Estimator already had one), and extended the shared unsaved-changes guard to optionally carry a real save function so \"Save all\" isn't just discard-with-extra-steps. (5) Per-company branding: found this was a much bigger gap than first scoped — 9 separate hardcoded Flometriq letterhead blocks across different PDF generators (Cutting Plan, BOM Summary, Datasheet exports, both Estimator-side and Quotes-screen-side), not just 2. Built one shared drawPdfLetterhead() helper and pointed every one of them, plus the TopBar and blank landing screen, at whichever company the current session actually belongs to — falling back to \"Authored by K.Bala Boopathy\" (not Flometriq's own branding) wherever a company hasn't uploaded a logo yet. Login screen is now generic (no company known before authentication); User Manual/Tour PDFs deliberately stay Flometriq-branded since they document the software itself." },
@@ -11669,7 +11724,12 @@ function DraftOfferReminder({ user, onDone }){
         sb.from("estimates").select("id,reference_number,item_sl_no,customer_name,quote_status").eq("quote_status","Draft").order("reference_number"),
         sb.from("quote_status_tbl").select("status").order("status")
       ]);
-      setRows(draftRows||[]);
+      // Status is now one value per Quote#, shared across every Sl No — so
+      // this list shows one row per Quote#, not one per Sl No (which would
+      // otherwise duplicate every quote once per Sl No, all identical).
+      const byQuote = new Map();
+      (draftRows||[]).forEach(r=>{ if(!byQuote.has(r.reference_number)) byQuote.set(r.reference_number,r); });
+      setRows(Array.from(byQuote.values()));
       setStatuses((statusRows||[]).map(r=>r.status).filter(Boolean));
       setLoading(false);
     })();
@@ -11677,10 +11737,8 @@ function DraftOfferReminder({ user, onDone }){
 
   const changeStatus = async(row,newStatus)=>{
     setSaving(s=>({...s,[row.id]:true}));
-    const now = new Date().toISOString();
     const by = user?.username||"unknown";
-    await sb.from("estimates").update({quote_status:newStatus,status_changed_by:by,status_changed_at:now}).eq("id",row.id);
-    await logAudit("UPDATE","estimates",row.reference_number+"-"+row.item_sl_no,"Status changed from Draft to "+newStatus+" via login reminder",by,{quote_status:"Draft"},{quote_status:newStatus});
+    await updateQuoteStatusForQuote(row.reference_number,newStatus,by,"login reminder");
     setRows(rs=>rs.filter(r=>r.id!==row.id));
     setSaving(s=>({...s,[row.id]:false}));
   };
@@ -11954,10 +12012,22 @@ function CrmFunnelKanban({ user }){
     const { data: linesRows } = refNums.length
       ? await sb.from("estimate_lines").select("reference_number,item_sl_no,sales_price").in("reference_number",refNums)
       : { data: [] };
-    const out = (estimatesRows||[]).map(est=>{
+    // One card per Quote#, not per Sl No — status, customer, and
+    // description are shared across every Sl No now, and showing the same
+    // quote as several identical cards would just be clutter. Value sums
+    // every Sl No's lines, not just one.
+    const byQuote = new Map();
+    (estimatesRows||[]).forEach(est=>{
+      if(!byQuote.has(est.reference_number)) byQuote.set(est.reference_number, {...est, slNoCount:0});
+      byQuote.get(est.reference_number).slNoCount++;
+    });
+    const out = Array.from(byQuote.values()).map(est=>{
       const totalValue = (linesRows||[])
-        .filter(l=>l.reference_number===est.reference_number && l.item_sl_no===est.item_sl_no)
-        .reduce((s,l)=>s+(Number(l.sales_price)||0)*(est.order_qty||1),0);
+        .filter(l=>l.reference_number===est.reference_number)
+        .reduce((s,l)=>{
+          const parentEst = (estimatesRows||[]).find(e=>e.reference_number===l.reference_number && e.item_sl_no===l.item_sl_no);
+          return s+(Number(l.sales_price)||0)*((parentEst&&parentEst.order_qty)||1);
+        },0);
       return { ...est, totalValue };
     });
     setStatuses((statusRows||[]).map(r=>r.status).filter(Boolean));
@@ -11967,11 +12037,9 @@ function CrmFunnelKanban({ user }){
   useEffect(()=>{ load(); },[load]);
 
   const doMoveCard = async(card, newStatus)=>{
-    const now = new Date().toISOString();
     const by = user?.username||"unknown";
-    await sb.from("estimates").update({quote_status:newStatus,status_changed_by:by,status_changed_at:now}).eq("id",card.id);
-    await logAudit("UPDATE","estimates",card.reference_number+"-"+card.item_sl_no,"Status changed from "+card.quote_status+" to "+newStatus+" via CRM funnel board",by,{quote_status:card.quote_status},{quote_status:newStatus});
-    setCards(cs=>cs.map(c=>c.id===card.id?{...c,quote_status:newStatus,status_changed_by:by,status_changed_at:now}:c));
+    await updateQuoteStatusForQuote(card.reference_number,newStatus,by,"CRM funnel board");
+    setCards(cs=>cs.map(c=>c.reference_number===card.reference_number?{...c,quote_status:newStatus,status_changed_by:by,status_changed_at:new Date().toISOString()}:c));
   };
   const moveCard = (card, newStatus)=>{
     if(card.quote_status===newStatus) return;
@@ -12214,10 +12282,8 @@ function QuoteStatusReview({ user }){
   const zones = Array.from(new Set(rows.map(r=>r.zone).filter(Boolean))).sort();
 
   const doChangeStatus = async(row,newStatus)=>{
-    const now = new Date().toISOString();
     const by = user?.username||"unknown";
-    await sb.from("estimates").update({quote_status:newStatus,status_changed_by:by,status_changed_at:now}).eq("id",row.id);
-    await logAudit("UPDATE","estimates",row.reference_number+"-"+row.item_sl_no,"Status changed from "+row.quote_status+" to "+newStatus+" via Quote Status Review",by,{quote_status:row.quote_status},{quote_status:newStatus});
+    await updateQuoteStatusForQuote(row.reference_number,newStatus,by,"Quote Status Review");
     load();
   };
   const changeStatus = (row,newStatus)=>{
