@@ -61,6 +61,55 @@ function LimitToListCombo({ value, onChange, options, placeholder, style, disabl
   );
 }
 
+// A real <select> for Master Data's cascade ("limit to list") fields —
+// genuinely impossible to type free text into, unlike LimitToListCombo's
+// input+datalist (which is functionally limit-to-list but reads as a plain
+// text box at a glance). Deliberately separate from LimitToListCombo rather
+// than changing that shared component, since LimitToListCombo is reused in
+// 30+ places across BOM/Estimator pickers and search filters where an
+// "add new master value" affordance would make no sense. This one is only
+// used by Master Data's own cascade fields.
+// canAdd/onAddNew are optional — pass them only for admin/super_admin, per
+// this app's rule that master data is otherwise read-only-to-pick-from for
+// a plain user.
+function MasterCascadeSelect({ value, onChange, options, placeholder, style, disabled, canAdd, onAddNew }){
+  const ADD_SENTINEL = "__add_new__";
+  const [showAdd,setShowAdd] = useState(false);
+  const [newVal,setNewVal] = useState("");
+  const [adding,setAdding] = useState(false);
+  return h(React.Fragment,null,
+    h("select",{
+      value: value||"", disabled,
+      onChange:e=>{
+        if(e.target.value===ADD_SENTINEL){ setNewVal(""); setShowAdd(true); return; }
+        onChange(e.target.value);
+      },
+      style
+    },
+      h("option",{value:""},placeholder||"Select…"),
+      (options||[]).map(o=>h("option",{key:o,value:o},o)),
+      canAdd && h("option",{value:ADD_SENTINEL,style:{fontStyle:"italic"}},"+ Add new…")
+    ),
+    showAdd && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"18px 20px",width:320,maxWidth:"92vw"}},
+        h("div",{style:{fontSize:13,fontWeight:700,marginBottom:10}},"Add new value"),
+        h("input",{value:newVal,onChange:e=>setNewVal(e.target.value),autoFocus:true,style:{...(style||{}),width:"100%",marginBottom:10,boxSizing:"border-box"}}),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{disabled:adding,onClick:async()=>{
+              const v=newVal.trim(); if(!v) return;
+              setAdding(true);
+              try{
+                const ok = onAddNew ? await onAddNew(v) : true;
+                if(ok!==false){ onChange(v); setShowAdd(false); }
+              } finally { setAdding(false); }
+            },style:{padding:"7px 10px",fontSize:12.5,fontWeight:600,borderRadius:6,border:"none",background:"#1c1f1a",color:"#fff",cursor:"pointer",flex:1,opacity:adding?0.6:1}},adding?"Adding…":"Add and select"),
+          h("button",{disabled:adding,onClick:()=>setShowAdd(false),style:{padding:"7px 10px",fontSize:12.5,fontWeight:600,borderRadius:6,border:"1px solid #d8d5c9",background:"#fff",cursor:"pointer",flex:1}},"Cancel")
+        )
+      )
+    )
+  );
+}
+
 // Lightweight, app-wide "you have unsaved changes" guard. Any editing screen
 // calls setUnsavedGuard(true/false) as it opens/closes an edit session; both
 // browser-level navigation (closing the tab/refreshing) and in-app tab
@@ -2349,12 +2398,21 @@ function MasterEditor({ tableKey, user }) {
       setGenericEditAllMode(false); setGenericEditAllDrafts({});
     } finally { setGenericSavingAll(false); }
   };
+  const addCascadeValue = async(col, cascadeDef, value)=>{
+    try{
+      const { error } = await sb.from(cascadeDef.from).insert({[cascadeDef.field]: value});
+      if(error){ alert("Couldn't add \""+value+"\": "+error.message); return false; }
+      await logAudit("INSERT",cascadeDef.from,value,"Added new "+col.replace(/_/g," ")+" value \""+value+"\" from the "+tableDef.label+" form",user?.username||"unknown",null,{[cascadeDef.field]:value});
+      setCascadeOptions(o=>({...o,[col]:Array.from(new Set([...(o[col]||[]),value])).sort()}));
+      return true;
+    } catch(e){ alert("Couldn't add \""+value+"\": "+e.message); return false; }
+  };
   const renderGenericCascadeField = (col,value,onChange)=>{
     const cascadeDef = tableDef.cascade?.find(c=>c.col===col);
     const isFree = !cascadeDef || (tableDef.freeText||[]).includes(col);
     if(cascadeDef && !isFree){
       const opts = cascadeOptions[col]||[];
-      return h(LimitToListCombo,{value:value||"",onChange,options:opts,placeholder:"Select "+col.replace(/_/g," ")+"…",style:{...inputStyle,padding:"5px 7px",fontSize:12}});
+      return h(MasterCascadeSelect,{value:value||"",onChange,options:opts,placeholder:"Select "+col.replace(/_/g," ")+"…",style:{...inputStyle,padding:"5px 7px",fontSize:12},canAdd:isAdmin,onAddNew:(v)=>addCascadeValue(col,cascadeDef,v)});
     }
     const isNumeric = NUMERIC_COLS.has(col);
     return h("input",{type:isNumeric?"number":"text",value:value??"",onChange:e=>onChange(e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12}});
@@ -7229,6 +7287,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // numbers filled in after the rest of the document exists), commercial
   // terms, a per-Sl-No price summary, then every Sl No's datasheet — all in
   // a single file, matching the section layout of the reference template.
+  const [showNoDocsGenerateConfirm,setShowNoDocsGenerateConfirm]=useState(false);
+  const attemptGenerateQuotePdf = ()=>{
+    if(!quoteExportRef) return;
+    if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setShowNoDocsGenerateConfirm(true); return; }
+    generateQuotePdf();
+  };
   const generateQuotePdf = async()=>{
     if(!quoteExportRef) return;
     setGeneratingQuotePdf(true);
@@ -7947,7 +8011,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               quoteExportRef && quoteExportRef===refFilter && !readiness.loading && !readiness.ready && h("span",{style:{fontSize:9.5,fontWeight:700,color:"#854f0b"}},readiness.missing.reduce((s,m)=>s+m.items.length,0)+" items missing")
             ),
             h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Cover + index + summary + terms + datasheets"),
-            renderReadinessBar(readiness.categories, {height:38, doneLabel: generatingQuotePdf?"Generating…":"✓ Generate Quote PDF", onClick: (quoteExportRef&&!generatingQuotePdf)?generateQuotePdf:undefined})
+            renderReadinessBar(readiness.categories, {height:38, doneLabel: generatingQuotePdf?"Generating…":"✓ Generate Quote PDF", onClick: (quoteExportRef&&!generatingQuotePdf)?attemptGenerateQuotePdf:undefined})
           )
         )
       ),
@@ -8647,6 +8711,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
           h("button",{onClick:()=>setShowDeleteQuoteModal(false),style:btnSecondary},"Cancel"),
           h("button",{onClick:confirmDeleteQuote,disabled:deletingQuote||deleteQuoteConfirmText.trim()!==refFilter,style:{...btnPrimary,background:colors.danger,opacity:(deletingQuote||deleteQuoteConfirmText.trim()!==refFilter)?0.5:1}},deletingQuote?"Deleting…":"Delete quote")
+        )
+      )
+    ),
+    showNoDocsGenerateConfirm && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1050,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 22px",width:360,maxWidth:"94vw"}},
+        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:6}},"No documents attached"),
+        h("div",{style:{fontSize:12.5,color:colors.mutedLight,marginBottom:16}},"Do you want to attach documents before generating this quote?"),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); openDocumentsPanel(); },style:{...btnPrimary,flex:1}},"Yes"),
+          h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); generateQuotePdf(); },style:{...btnSecondary,flex:1}},"No, generate anyway")
         )
       )
     ),
@@ -10748,6 +10822,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (16)", summary:"Master Data's cascade (\"limit to list\") fields — Category on the Models table and every other table's list-limited columns — now use a real <select> dropdown instead of a text input with a hidden autocomplete list, which is why Category still looked like plain text even after last round's fix: it WAS already limit-to-list underneath, it just didn't visually read as a combo box. Admin and Super Admin now also get a \"+ Add new…\" option in these dropdowns — picking it prompts for the new value, inserts it straight into the real master table (e.g. category_tbl), logs it, and selects it. Regular users see the plain dropdown only, genuinely unable to type a value that isn't already on the list. Scoped deliberately narrow: built as a new component (MasterCascadeSelect) used only by Master Data's own cascade fields, NOT a change to the shared LimitToListCombo component used in 30+ other places across BOM/Estimator pickers and search filters, where prompting to add a new master value would make no sense. Assumption made without full reconfirmation: this only governs the add-new capability inside these dropdowns — existing Edit/Add/Delete button visibility elsewhere on Master Data screens for regular users was left untouched, not broadened or narrowed." },
+  { date:"25 Jul 2026 (15)", summary:"Clicking \"Generate Quote PDF\" with zero documents attached now shows a Yes/No prompt (\"No documents attached — do you want to attach documents before generating?\") in addition to the existing on-screen warning banner, which is unchanged. Yes cancels generation and opens the Documents panel directly; No proceeds with generation as normal." },
   { date:"25 Jul 2026 (14)", summary:"Models table columns reordered to Item, Size, Model, Category (was Item, Model, Size, Category). Also fixed the same free-text-instead-of-dropdown gap in the \"New model\" add-row form that single-row edit had — Item, Size, and Category now use the proper cascade/limit-to-list dropdowns there too, not just when editing an existing row. Model stays free text everywhere, since it's a typed name rather than a list. No history tracking for model renames — discussed, user confirmed not needed." },
   { date:"25 Jul 2026 (13)", summary:"Fixed a real inconsistency in Master Data table editing: the app already has a proper \"limit to list\" cascade dropdown for fields like Category (used correctly in the bulk \"Edit all lines\" mode), but editing a single row the normal way showed every field, including Category, as a plain free-text box instead. Single-row edit now uses the exact same cascade/dropdown logic bulk edit already used. Investigated but could NOT reproduce or find a code-level cause for the separately-reported \"editing one row affects other rows/fields\" — the update queries are correctly scoped to one row's id throughout what was checked (the dedicated \"Rename model\" tool's cross-row update is intentional by design, not this bug). Needs a screenshot of the actual repro to pin down further. \"Edit\" per row and \"Edit all lines\" both already exist for the Models table in the code — flagged in case they're not actually visible in practice." },
   { date:"25 Jul 2026 (12)", summary:"Big batch, all confirmed together in one long conversation. (1) Quote status is now genuinely global per Quote#, not per Sl No — the dropdown, Kanban, and Quote Status Review all write status across every Sl No of a quote at once via one shared function (updateQuoteStatusForQuote), so none of the three can leave one Sl No out of sync. Removed a redundant second status dropdown that existed elsewhere on the Quote form. Kanban now shows one card per Quote# instead of one per Sl No (summing value across all Sl Nos), since duplicate identical cards would've been the only alternative once status stopped varying per row. The login Draft-reminder list is deduplicated to one row per quote too. (2) Documents feature redesigned around the storage-flooding risk raised earlier: PDF-merge-into-the-generated-PDF is dropped entirely (no pdf-lib, no Annexures, no per-doc Revision History page) — Documents is now a lightweight tracker. Every document requires a permanent link (e.g. OneDrive) at upload, and the Supabase copy of the file is purged automatically the moment a quote's status leaves Draft (hooked into the same global status change above) — the row, link, and full version history stay forever, only the actual file goes. New-version uploads can update the link and require their own \"what changed\" note. The document list shows the link and whether the file's still in Supabase or already purged. (3) \"Documents\" added to the amendment area-picker; checking it clones the previous revision's document rows (link/metadata carried forward) into the new revision and opens the Documents panel automatically so anything that changed can get a new version logged. (4) Commercial Terms and Documents cards restyled to the same visual weight as Generate Quote PDF (dark border, outlined status badge — \"Not set\"/\"Set\", \"N attached\") instead of small muted boxes easy to miss. (5) A non-blocking warning banner shows when a quote has zero documents attached — informational only, doesn't block generation, since most quotes in normal use won't have any." },
