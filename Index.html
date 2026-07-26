@@ -6012,6 +6012,110 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     order_cancellation_charges:"Cancellation of order will not be accepted once order acceptance is sent by us and Engineering/Production clearance is received from customer.",
     jurisdiction:"Any dispute arising out of or relating to this Purchase Order / Contract shall be subject to the exclusive jurisdiction of the competent courts in Chennai, Tamil Nadu, India only."
   };
+  // Documents (Drawings, Procedures, ITP, etc.) — shared across all Sl Nos
+  // of the quote, same scope as Commercial Terms. PDF only, since these get
+  // merged as running pages into the generated Quote PDF.
+  const DOC_CATEGORIES = ["Drawing","Procedure","ITP","Other"];
+  const DOC_PREFIX = {Drawing:"DWG",Procedure:"PRC",ITP:"ITP",Other:"DOC"};
+  const [quoteDocuments,setQuoteDocuments]=useState([]);
+  const loadQuoteDocuments = useCallback(async(ref)=>{
+    if(!ref) return;
+    const { data } = await sb.from("quote_documents").select("*").eq("reference_number",ref).order("uploaded_at",{ascending:false});
+    setQuoteDocuments(data||[]);
+  },[]);
+  useEffect(()=>{ if(quoteExportRef) loadQuoteDocuments(quoteExportRef); },[quoteExportRef,loadQuoteDocuments]);
+  const [showDocumentsPanel,setShowDocumentsPanel]=useState(false);
+  const [docUploadStep,setDocUploadStep]=useState("list"); // "list" | "mode" | "form"
+  const [docUploadMode,setDocUploadMode]=useState(""); // "combined" | "separate"
+  const [docDrafts,setDocDrafts]=useState([]); // [{category,docNumber,title,file}] — one entry when combined, several when separate
+  const [docUploading,setDocUploading]=useState(false);
+  const suggestedDocNumber = (category, seq)=> DOC_PREFIX[category]+"-"+(quoteExportRef||"QUOTE")+"-"+String(seq).padStart(3,"0");
+  const openDocumentsPanel = ()=>{ setShowDocumentsPanel(true); setDocUploadStep("list"); };
+  const startDocUpload = ()=>{
+    setDocUploadStep("mode"); setDocUploadMode(""); setDocDrafts([]);
+  };
+  const pickDocMode = (mode)=>{
+    setDocUploadMode(mode);
+    const nextSeq = quoteDocuments.filter(d=>!d.is_archived).length+1;
+    setDocDrafts([{category:"Drawing",docNumber:suggestedDocNumber("Drawing",nextSeq),title:"",file:null}]);
+    setDocUploadStep("form");
+  };
+  const addAnotherDocDraft = ()=>{
+    const nextSeq = quoteDocuments.filter(d=>!d.is_archived).length+docDrafts.length+1;
+    setDocDrafts(ds=>ds.concat([{category:"Drawing",docNumber:suggestedDocNumber("Drawing",nextSeq),title:"",file:null}]));
+  };
+  const updateDocDraft = (idx,patch)=>{
+    setDocDrafts(ds=>ds.map((d,i)=>{
+      if(i!==idx) return d;
+      const merged = {...d,...patch};
+      // Re-suggest the doc number if the category changed and the user hasn't hand-edited it away from the old suggestion.
+      if(patch.category && patch.category!==d.category && d.docNumber===suggestedDocNumber(d.category,idx+quoteDocuments.filter(x=>!x.is_archived).length+1)){
+        merged.docNumber = suggestedDocNumber(patch.category,idx+quoteDocuments.filter(x=>!x.is_archived).length+1);
+      }
+      return merged;
+    }));
+  };
+  const removeDocDraft = (idx)=> setDocDrafts(ds=>ds.filter((_,i)=>i!==idx));
+  const submitDocUpload = async()=>{
+    if(!quoteExportRef) return;
+    for(const d of docDrafts){
+      if(!d.file){ alert("Choose a PDF file for every document before uploading."); return; }
+      if(!d.docNumber.trim()){ alert("Every document needs a doc number."); return; }
+      if(d.file.type!=="application/pdf"){ alert("\""+d.file.name+"\" isn't a PDF. Only PDF files can be uploaded here — everything in this list gets merged into the generated Quote PDF, and only PDFs can be merged that way."); return; }
+    }
+    setDocUploading(true);
+    try{
+      const groupId = docUploadMode==="combined" ? (quoteExportRef+"_"+Date.now()) : null;
+      for(const d of docDrafts){
+        const path = "quote_"+quoteExportRef+"_"+Date.now()+"_"+d.file.name.replace(/[^a-zA-Z0-9._-]/g,"_");
+        const { error:err } = await sb.storage.from("quote-documents").upload(path,d.file);
+        if(err) throw err;
+        const { data:inserted, error:insErr } = await sb.from("quote_documents").insert({
+          reference_number:quoteExportRef, category:d.category, doc_number:d.docNumber.trim(), title:d.title.trim(),
+          file_name:d.file.name, file_path:path, is_combined:docUploadMode==="combined", group_id:groupId,
+          uploaded_by:user?.username||"unknown"
+        }).select().single();
+        if(insErr) throw insErr;
+        await logAudit("INSERT","quote_documents",quoteExportRef,"Uploaded document "+d.docNumber+" ("+d.category+") to Quote# "+quoteExportRef,user?.username||"unknown",null,{doc_number:d.docNumber,category:d.category});
+      }
+      await loadQuoteDocuments(quoteExportRef);
+      setDocUploadStep("list");
+      alert("Uploaded "+docDrafts.length+" document(s).");
+    } catch(e){ alert("Upload failed: "+(e.message||e)); }
+    finally { setDocUploading(false); }
+  };
+  const [docHistoryFor,setDocHistoryFor]=useState(null); // document row being viewed/versioned
+  const [docHistoryRows,setDocHistoryRows]=useState([]);
+  const [docNewVersionFile,setDocNewVersionFile]=useState(null);
+  const [docNewVersionNote,setDocNewVersionNote]=useState("");
+  const openDocHistory = async(docRow)=>{
+    setDocHistoryFor(docRow); setDocNewVersionFile(null); setDocNewVersionNote("");
+    const { data } = await sb.from("quote_document_history").select("*").eq("document_id",docRow.id).order("changed_at",{ascending:false});
+    setDocHistoryRows(data||[]);
+  };
+  const uploadNewDocVersion = async()=>{
+    if(!docNewVersionFile){ alert("Choose the new PDF file first."); return; }
+    if(docNewVersionFile.type!=="application/pdf"){ alert("Only PDF files can be uploaded here."); return; }
+    if(!docNewVersionNote.trim()){ alert("Say what changed in this version."); return; }
+    setDocUploading(true);
+    try{
+      const oldPath = docHistoryFor.file_path;
+      const path = "quote_"+quoteExportRef+"_"+Date.now()+"_"+docNewVersionFile.name.replace(/[^a-zA-Z0-9._-]/g,"_");
+      const { error:err } = await sb.storage.from("quote-documents").upload(path,docNewVersionFile);
+      if(err) throw err;
+      await sb.from("quote_documents").update({file_path:path,file_name:docNewVersionFile.name,uploaded_at:new Date().toISOString(),uploaded_by:user?.username||"unknown"}).eq("id",docHistoryFor.id);
+      await sb.from("quote_document_history").insert({document_id:docHistoryFor.id,reference_number:quoteExportRef,doc_number:docHistoryFor.doc_number,what_changed:docNewVersionNote.trim(),changed_by:user?.username||"unknown",old_file_path:oldPath,new_file_path:path});
+      await logAudit("UPDATE","quote_documents",quoteExportRef,"New version of "+docHistoryFor.doc_number+": "+docNewVersionNote.trim(),user?.username||"unknown",{file_path:oldPath},{file_path:path});
+      await loadQuoteDocuments(quoteExportRef);
+      setDocHistoryFor(null);
+    } catch(e){ alert("Failed: "+(e.message||e)); }
+    finally { setDocUploading(false); }
+  };
+  const downloadDocument = async(docRow)=>{
+    const { data } = await sb.storage.from("quote-documents").createSignedUrl(docRow.file_path,60);
+    if(data?.signedUrl) window.open(data.signedUrl,"_blank");
+  };
+
   const openCommercialTerms=async()=>{
     if(!quoteExportRef) return;
     setCtLoading(true); setShowCommercialTerms(true); setCtAllowMismatch(false); setCtMismatchBlocked(false); setCtGhostDraft({});
@@ -7810,6 +7914,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"One set per quote"),
             h("button",{onClick:openCommercialTerms,disabled:!quoteExportRef,style:{...btnSmall,width:"100%"}},"Edit terms")
           ),
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Documents ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"("+quoteDocuments.filter(d=>!d.is_archived).length+")")),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Drawings, procedures, ITP — PDF only"),
+            h("button",{onClick:openDocumentsPanel,disabled:!quoteExportRef,style:{...btnSmall,width:"100%"}},"Manage documents")
+          ),
           h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
               h("div",{style:{fontSize:10,fontWeight:700,color:colors.dark,textTransform:"uppercase"}},"Generate Quote PDF"),
@@ -8527,6 +8636,86 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
           h("button",{onClick:()=>setShowDeleteQuoteModal(false),style:btnSecondary},"Cancel"),
           h("button",{onClick:confirmDeleteQuote,disabled:deletingQuote||deleteQuoteConfirmText.trim()!==refFilter,style:{...btnPrimary,background:colors.danger,opacity:(deletingQuote||deleteQuoteConfirmText.trim()!==refFilter)?0.5:1}},deletingQuote?"Deleting…":"Delete quote")
+        )
+      )
+    ),
+    showDocumentsPanel && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:12,width:"100%",maxWidth:640,maxHeight:"85vh",overflow:"auto",padding:"20px 24px"}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+          h("div",{style:{fontWeight:700,fontSize:15}},"Documents — "+quoteExportRef),
+          h("button",{onClick:()=>setShowDocumentsPanel(false),style:{background:"none",border:"none",fontSize:16,cursor:"pointer",color:colors.mutedLight}},"✕")
+        ),
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:16}},"Drawings, procedures, ITP — PDF only. These merge into the generated Quote PDF as their own pages."),
+
+        docUploadStep==="list" && h(React.Fragment,null,
+          DOC_CATEGORIES.map(cat=>{
+            const rows = quoteDocuments.filter(d=>!d.is_archived && d.category===cat);
+            if(!rows.length) return null;
+            return h("div",{key:cat,style:{marginBottom:14}},
+              h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",letterSpacing:"0.03em",marginBottom:6}},cat),
+              rows.map(d=>h("div",{key:d.id,style:{border:"1px solid "+colors.border,borderRadius:8,padding:"9px 12px",marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+                h("div",null,
+                  h("div",{style:{fontSize:12.5,fontWeight:600}},d.doc_number+(d.title?" — "+d.title:"")),
+                  h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:2}},"Uploaded "+(d.uploaded_at||"").slice(0,10)+" by "+(d.uploaded_by||"—"))
+                ),
+                h("div",{style:{display:"flex",gap:6}},
+                  h("button",{onClick:()=>downloadDocument(d),style:{...btnSmall,fontSize:11}},"View"),
+                  h("button",{onClick:()=>openDocHistory(d),style:{...btnSmall,fontSize:11}},"History")
+                )
+              ))
+            );
+          }),
+          quoteDocuments.filter(d=>!d.is_archived).length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},"No documents uploaded yet."),
+          h("button",{onClick:startDocUpload,style:{...btnPrimary,width:"100%"}},"+ Upload document")
+        ),
+
+        docUploadStep==="mode" && h(React.Fragment,null,
+          h("div",{style:{fontSize:13,fontWeight:600,marginBottom:10}},"Is this one combined PDF, or several separate documents?"),
+          h("div",{style:{display:"flex",gap:8,marginBottom:14}},
+            h("button",{onClick:()=>pickDocMode("combined"),style:{flex:1,padding:"12px",border:"1px solid "+colors.border,borderRadius:8,background:"#fff",cursor:"pointer"}},"One combined PDF"),
+            h("button",{onClick:()=>pickDocMode("separate"),style:{flex:1,padding:"12px",border:"1px solid "+colors.border,borderRadius:8,background:"#faf9f4",cursor:"pointer"}},"Several separate documents")
+          ),
+          h("button",{onClick:()=>setDocUploadStep("list"),style:btnSecondary},"Cancel")
+        ),
+
+        docUploadStep==="form" && h(React.Fragment,null,
+          docDrafts.map((d,idx)=>h("div",{key:idx,style:{border:"1px solid "+colors.border,borderRadius:8,padding:"12px",marginBottom:10}},
+            docDrafts.length>1 && h("div",{style:{display:"flex",justifyContent:"space-between",marginBottom:8}},
+              h("div",{style:{fontSize:11.5,fontWeight:600,color:colors.muted}},"Document "+(idx+1)),
+              h("button",{onClick:()=>removeDocDraft(idx),style:{background:"none",border:"none",color:colors.danger,cursor:"pointer",fontSize:11}},"Remove")
+            ),
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Category"),
+            h("select",{value:d.category,onChange:e=>updateDocDraft(idx,{category:e.target.value}),style:{...inputStyle,width:"100%",marginBottom:8}},
+              DOC_CATEGORIES.map(c=>h("option",{key:c,value:c},c))
+            ),
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Doc number"),
+            h("input",{value:d.docNumber,onChange:e=>updateDocDraft(idx,{docNumber:e.target.value}),style:{...inputStyle,width:"100%",marginBottom:8}}),
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Title / description"),
+            h("input",{value:d.title,onChange:e=>updateDocDraft(idx,{title:e.target.value}),placeholder:"e.g. GA drawing — strainer assembly",style:{...inputStyle,width:"100%",marginBottom:8}}),
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"PDF file"),
+            h("input",{type:"file",accept:"application/pdf",onChange:e=>updateDocDraft(idx,{file:e.target.files[0]||null}),style:{width:"100%"}})
+          )),
+          docUploadMode==="separate" && h("button",{onClick:addAnotherDocDraft,style:{...btnSmall,width:"100%",marginBottom:12}},"+ Add another document"),
+          h("div",{style:{display:"flex",gap:8}},
+            h("button",{onClick:submitDocUpload,disabled:docUploading,style:{...btnPrimary,flex:1,opacity:docUploading?0.6:1}},docUploading?"Uploading…":"Upload"),
+            h("button",{onClick:()=>setDocUploadStep("list"),disabled:docUploading,style:btnSecondary},"Cancel")
+          )
+        ),
+
+        docHistoryFor && h("div",{style:{marginTop:16,borderTop:"1px solid "+colors.border,paddingTop:14}},
+          h("div",{style:{display:"flex",justifyContent:"space-between",marginBottom:8}},
+            h("div",{style:{fontSize:13,fontWeight:600}},"History — "+docHistoryFor.doc_number),
+            h("button",{onClick:()=>setDocHistoryFor(null),style:{background:"none",border:"none",cursor:"pointer",color:colors.mutedLight}},"✕")
+          ),
+          docHistoryRows.length===0 ? h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:12}},"No prior versions — this is the original upload.") :
+          h("div",{style:{marginBottom:12}}, docHistoryRows.map(h2=>h("div",{key:h2.id,style:{fontSize:11.5,padding:"6px 0",borderBottom:"1px solid #eceae0"}},
+            h("span",{style:{color:colors.muted}},(h2.changed_at||"").slice(0,10)+" — "+(h2.changed_by||"—")+": "),
+            h2.what_changed
+          ))),
+          h("div",{style:{fontSize:11.5,fontWeight:600,marginBottom:6}},"Upload a new version"),
+          h("input",{type:"file",accept:"application/pdf",onChange:e=>setDocNewVersionFile(e.target.files[0]||null),style:{width:"100%",marginBottom:8}}),
+          h("input",{value:docNewVersionNote,onChange:e=>setDocNewVersionNote(e.target.value),placeholder:"What changed? e.g. Updated nozzle orientation",style:{...inputStyle,width:"100%",marginBottom:8}}),
+          h("button",{onClick:uploadNewDocVersion,disabled:docUploading,style:{...btnPrimary,width:"100%",opacity:docUploading?0.6:1}},docUploading?"Uploading…":"Upload new version")
         )
       )
     ),
@@ -10505,6 +10694,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (11)", summary:"Documents feature — core built, PDF-merge and amendment-checklist integration still to come (see below). Run crm_phase8_documents_setup.sql first (quote_documents + quote_document_history tables, quote-documents storage bucket). New \"Documents\" card on the Quotes screen next to Commercial Terms: upload prompts one combined PDF vs several separate documents first, then Category + a suggested-but-editable Doc# (DWG-/PRC-/ITP-/DOC- + quote# + sequence) + title per document. PDF-only, enforced on file type, not just the file picker's accept filter, since anything uploaded here needs to be mergeable into the generated Quote PDF later. Each document has its own version history — uploading a new version requires a required \"what changed\" note, keeps the prior file's path in quote_document_history, doesn't delete anything. NOT YET DONE, flagged rather than rushed: (1) merging the uploaded PDFs into the generated Quote PDF as running pages — needs pdf-lib layered on top of this app's existing jsPDF, since jsPDF can only draw content, not embed an existing PDF's real pages; (2) adding each document as its own Annexure row in the Index/TOC; (3) a per-document Revision History page (same Area/Field/Old/New/By format as the quote's own) when documents were uploaded as separate; (4) prompting for document changes as part of starting an amendment — checklist with a required change note per existing document, or a simple yes/no when there are none yet. All four are real, scoped work, not small — next round." },
   { date:"25 Jul 2026 (10)", summary:"Global Sf now has an undo. Applying it was previously irreversible (the confirm dialog even said so) — it now captures every line's Sf and sales price right before overwriting, and a \"↺ Restore previous Sf\" button appears next to the field afterward, scoped to that quote, that puts every line back exactly as it was (also logged, also confirmed before running, since it's still a real bulk change). Widened the Sf input itself (was uncomfortably narrow at 70px, now 110px). Also moved \"Export full quote\" to sit before the Quote Header block instead of after it." },
   { date:"25 Jul 2026 (9)", summary:"Five fixes from screenshots, built together. (1) \"Engineering Calc\" no longer shows twice in the nav — a flat nav group was rendering both its own decorative label and its single tab's button with the same text; flat groups now render as one clickable item. (2) Nav dropdown-exclusivity hardened with a functional state update (couldn't reproduce a concrete defect from code alone, so this is a defensive tightening rather than a confirmed root-cause fix — flag if it recurs). (3) Quotes toolbar redesigned: quote identity + status + New/Close grouped and prominent up top (Close is now solid red, not a faint outline), filters and secondary actions (Commercial Terms, History, Sf tools, Delete quote) grouped separately below instead of one long row. (4) \"New\" now runs through the exact same validation as \"Close\" before showing the New/Existing offer popup — built a matching Save-all/Go-back/Discard-logged modal for the Quotes screen (the Estimator already had one), and extended the shared unsaved-changes guard to optionally carry a real save function so \"Save all\" isn't just discard-with-extra-steps. (5) Per-company branding: found this was a much bigger gap than first scoped — 9 separate hardcoded Flometriq letterhead blocks across different PDF generators (Cutting Plan, BOM Summary, Datasheet exports, both Estimator-side and Quotes-screen-side), not just 2. Built one shared drawPdfLetterhead() helper and pointed every one of them, plus the TopBar and blank landing screen, at whichever company the current session actually belongs to — falling back to \"Authored by K.Bala Boopathy\" (not Flometriq's own branding) wherever a company hasn't uploaded a logo yet. Login screen is now generic (no company known before authentication); User Manual/Tour PDFs deliberately stay Flometriq-branded since they document the software itself." },
   { date:"25 Jul 2026 (8)", summary:"Blank landing screen now shows the actual company logo (COMPANY_LOGO — already used in the TopBar and PDF letterheads, not a new asset) instead of a plain \"Nothing open\" text message." },
