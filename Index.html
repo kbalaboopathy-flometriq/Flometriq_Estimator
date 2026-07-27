@@ -333,13 +333,9 @@ function isSlNoLabel(label){
 // Mirrors DatasheetModal's getSectionRows, but as a standalone function so the
 // quote-wide export can rebuild a datasheet's sections without mounting the modal.
 // mocLines must be the ticked ("Show in MOC") lines for that one Sl No only.
-function buildDatasheetSectionRows(template, fieldValues, mocLines, model, slNo){
+function buildDatasheetSectionRows(template, fieldValues, mocRow, slLines, model, slNo){
   const values = fieldValues || {};
-  const materialDataRows = (mocLines||[]).map(l=>({
-    key: "moc-"+(l.reference_number||"")+"-"+l.sl_no,
-    label: l.sub_assembly || l.component || "(unnamed)",
-    value: l.grade || "—"
-  }));
+  const materialDataRows = buildMocMaterialDataRows(mocRow, slLines||[]);
   return template.sections.map(section=>{
     const deleted = new Set((values.__deletedKeys && values.__deletedKeys[section.no]) || []);
     let base;
@@ -4641,33 +4637,30 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   // Which sub-assemblies are relevant for this item's Material Data — from
   // Item MOC Rules (set once per item under Master Data), not a per-line
   // tick box anymore. Grades still come from the real line data below.
-  const [mocRuleSet,setMocRuleSet] = useState(null); // null=loading, else Set of sub_assembly values
+  const [mocRow,setMocRow] = useState(null); // null=loading, else {parameters:[...]}
   useEffect(()=>{
     let cancelled=false;
-    if(!itemName){ setMocRuleSet(new Set()); return; }
-    sb.from("item_moc_rules").select("sub_assembly").eq("item",itemName).then(({data})=>{
-      if(!cancelled) setMocRuleSet(new Set((data||[]).map(r=>r.sub_assembly)));
+    if(!itemName){ setMocRow({parameters:[]}); return; }
+    sb.from("item_moc_rules").select("*").eq("item",itemName).maybeSingle().then(({data})=>{
+      if(!cancelled) setMocRow(data||{parameters:[]});
     });
     return ()=>{ cancelled=true; };
   },[itemName]);
   const mocLines = useMemo(()=>{
-    if(!mocRuleSet) return [];
-    return (openLines||[]).filter(l=>mocRuleSet.has(l.sub_assembly||l.component));
-  }, [openLines, mocRuleSet]);
+    if(!mocRow) return [];
+    const params = mocRow.parameters||[];
+    return (openLines||[]).filter(l=> params.some(p=> (p.match_field==="sub_assembly"?l.sub_assembly:l.component)===p.match_value));
+  }, [openLines, mocRow]);
   const bomMatches = useMemo(()=>{
     if(!template) return {};
     const used = new Set(); const out = {};
     template.sections.forEach(sec=>sec.fields.forEach(f=>{ if(f.type==="bom") out[f.key] = matchDatasheetBomLine(f, mocLines, used); }));
     return out;
   }, [template, mocLines]);
-  // Material Data is always rebuilt straight from the lines matching this
-  // item's MOC rules — whatever field list the uploaded Excel defined for
-  // this section is ignored. Sub-assembly is the label, Grade is the value.
-  const materialDataRows = useMemo(()=> (mocLines||[]).map(l=>({
-    key: "moc-"+(l.reference_number||"")+"-"+l.sl_no,
-    label: l.sub_assembly || l.component || "(unnamed)",
-    value: l.grade || "—"
-  })), [mocLines]);
+  // Material Data is always rebuilt straight from Item MOC Rules matched
+  // against the real BOM/estimate lines — whatever field list the
+  // uploaded Excel defined for this section is ignored.
+  const materialDataRows = useMemo(()=> buildMocMaterialDataRows(mocRow, openLines||[]), [mocRow, openLines]);
   // Per-section "add line" draft inputs, keyed by section number: {label, value}
   const [addDraft,setAddDraft] = useState({});
 
@@ -5155,70 +5148,203 @@ function buildMasterRowsFromParse(item, sections, helperFields){
    Drag-and-drop an Excel file (sheet 1 = the datasheet layout, sheet 2 = optional
    helper sheet of dropdown option lists) to build or replace an item's datasheet
    master in one go. Fields can also be added or removed by hand below. */
-// Item MOC Rules — which sub-assemblies matter for a given item's Material
-// Data. Replaces the old per-line "show in MOC" tick box, which lived on
-// individual estimate_lines and had to be re-set every single time someone
-// built a quote. This is set once per item and applies everywhere that
-// item shows up — the Datasheet screen and the actual generated Quote PDF
-// both read the same rule set. No grade values live here; grades still
-// come live from the real BOM/estimate line at build time, this table only
-// decides which sub-assemblies are relevant to show at all.
+// Item MOC Rules — which BOM lines show under an item's Material Data, and
+// what label each one gets. Deliberately built as a close mirror of
+// Description Master (same parameters-array shape, same Label/Match on/
+// Matched value/Value from table, same card view and copy-to-other-items
+// flow) — the two are conceptually the same kind of per-item rule set, just
+// governing different output. No grade/spec values live here; those still
+// come live from the real BOM/estimate line at build time, this only
+// decides which lines are relevant and what to call them.
 function ItemMocRulesEditor({ user }){
   const [itemMasterList,setItemMasterList] = useState([]);
   const [selectedItem,setSelectedItem] = useState("");
-  const [subAssemblies,setSubAssemblies] = useState([]); // this item's known sub-assemblies, from subassembly_tbl
-  const [rules,setRules] = useState(new Set()); // sub_assembly values currently checked/included for this item
+  const [parameters,setParameters] = useState([]); // [{label, match_field, match_value, value_source}]
   const [loading,setLoading] = useState(false);
-  const [saving,setSaving] = useState(new Set()); // sub_assembly values mid-toggle, for a disabled/pending look
+  const [saving,setSaving] = useState(false);
+  const [existingRowId,setExistingRowId] = useState(null);
+  const [bomComponents,setBomComponents] = useState([]);
+  const [bomSubAssemblies,setBomSubAssemblies] = useState([]);
+  const [viewMode,setViewMode] = useState("table");
+  const [dragIdx,setDragIdx] = useState(null);
+  const [showCopyPanel,setShowCopyPanel] = useState(false);
+  const [copyTargets,setCopyTargets] = useState(new Set());
+  const [copying,setCopying] = useState(false);
+  const [copyWarnings,setCopyWarnings] = useState([]);
 
   useEffect(()=>{
-    sb.from("item_tbl").select("item").order("item").then(({data})=>setItemMasterList(data||[]));
+    sb.from("item_tbl").select("item").order("item").then(({data})=>setItemMasterList((data||[]).map(r=>r.item)));
+  },[]);
+
+  const loadBomValues = useCallback(async(item)=>{
+    if(!item){ setBomComponents([]); setBomSubAssemblies([]); return; }
+    const { data } = await sb.from("bom").select("component,sub_assembly").eq("item",item);
+    setBomComponents(Array.from(new Set((data||[]).map(r=>r.component).filter(Boolean))).sort());
+    setBomSubAssemblies(Array.from(new Set((data||[]).map(r=>r.sub_assembly).filter(Boolean))).sort());
   },[]);
 
   const loadForItem = useCallback(async(item)=>{
-    if(!item){ setSubAssemblies([]); setRules(new Set()); return; }
+    if(!item){ setParameters([]); setExistingRowId(null); return; }
     setLoading(true);
-    const [{ data: subRows },{ data: ruleRows }] = await Promise.all([
-      sb.from("subassembly_tbl").select("sub_assembly").eq("item",item),
-      sb.from("item_moc_rules").select("sub_assembly").eq("item",item),
+    const [{ data }] = await Promise.all([
+      sb.from("item_moc_rules").select("*").eq("item",item).maybeSingle(),
+      loadBomValues(item)
     ]);
-    setSubAssemblies(Array.from(new Set((subRows||[]).map(r=>r.sub_assembly).filter(Boolean))).sort());
-    setRules(new Set((ruleRows||[]).map(r=>r.sub_assembly)));
+    setParameters(data?data.parameters||[]:[]);
+    setExistingRowId(data?data.id:null);
     setLoading(false);
-  },[]);
+  },[loadBomValues]);
   useEffect(()=>{ loadForItem(selectedItem); },[selectedItem,loadForItem]);
 
-  const toggle = async(subAssembly, checked)=>{
-    setSaving(s=>new Set(s).add(subAssembly));
-    try{
-      if(checked){
-        await sb.from("item_moc_rules").insert({item:selectedItem,sub_assembly:subAssembly,created_by:user?.username||"unknown"});
-        await logAudit("INSERT","item_moc_rules",selectedItem+" — "+subAssembly,"Added \""+subAssembly+"\" to MOC rules for \""+selectedItem+"\"",user?.username||"unknown",null,{item:selectedItem,sub_assembly:subAssembly});
-        setRules(r=>new Set(r).add(subAssembly));
-      } else {
-        await sb.from("item_moc_rules").delete().eq("item",selectedItem).eq("sub_assembly",subAssembly);
-        await logAudit("DELETE","item_moc_rules",selectedItem+" — "+subAssembly,"Removed \""+subAssembly+"\" from MOC rules for \""+selectedItem+"\"",user?.username||"unknown",{item:selectedItem,sub_assembly:subAssembly},null);
-        setRules(r=>{ const n=new Set(r); n.delete(subAssembly); return n; });
-      }
-    } catch(e){ alert("Couldn't save: "+e.message); }
-    finally { setSaving(s=>{ const n=new Set(s); n.delete(subAssembly); return n; }); }
+  const reorder = (fromIdx, toIdx)=>{
+    setUnsavedGuard(true,"You have unsaved Item MOC Rules changes. Leave anyway?");
+    setParameters(p=>{
+      const next = p.slice();
+      const [moved] = next.splice(fromIdx,1);
+      next.splice(toIdx,0,moved);
+      return next;
+    });
   };
 
-  return h("div",{style:{padding:"20px 24px",maxWidth:640}},
-    h("h2",{style:{margin:"0 0 4px",fontSize:18,fontWeight:700}},"Item MOC Rules"),
-    h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:16}},"Which sub-assemblies show under Material Data for each item — grades still come live from the real BOM line, this only decides which ones are relevant."),
-    h("select",{value:selectedItem,onChange:e=>setSelectedItem(e.target.value),style:{...inputStyle,width:280,marginBottom:16}},
+  const copyRuleToItems = async()=>{
+    if(copyTargets.size===0){ alert("Pick at least one item to copy to."); return; }
+    setCopying(true);
+    const warnings = [];
+    try{
+      for(const targetItem of copyTargets){
+        const { data: targetBom } = await sb.from("bom").select("component,sub_assembly").eq("item",targetItem);
+        const targetComponents = new Set((targetBom||[]).map(r=>r.component).filter(Boolean));
+        const targetSubAssemblies = new Set((targetBom||[]).map(r=>r.sub_assembly).filter(Boolean));
+        parameters.forEach(p=>{
+          const pool = p.match_field==="sub_assembly" ? targetSubAssemblies : targetComponents;
+          if(p.match_value && !pool.has(p.match_value)) warnings.push({item:targetItem,label:p.label||"(unlabeled)"});
+        });
+        const { data: existing } = await sb.from("item_moc_rules").select("id").eq("item",targetItem).maybeSingle();
+        if(existing){
+          await sb.from("item_moc_rules").update({parameters,updated_at:new Date().toISOString()}).eq("id",existing.id);
+        } else {
+          await sb.from("item_moc_rules").insert({item:targetItem,parameters,updated_by:user?.username||"unknown"});
+        }
+      }
+      setCopyWarnings(warnings);
+      setShowCopyPanel(false);
+      setCopyTargets(new Set());
+      if(warnings.length===0) alert("Rule copied to "+copyTargets.size+" item(s).");
+    } catch(e){ alert("Copy failed: "+e.message); }
+    finally{ setCopying(false); }
+  };
+
+  const addParam = ()=> { setUnsavedGuard(true,"You have unsaved Item MOC Rules changes. Leave anyway?"); setParameters(p=>[...p,{label:"",match_field:"sub_assembly",match_value:"",value_source:"grade"}]); };
+  const updateParam = (idx,patch)=> { setUnsavedGuard(true,"You have unsaved Item MOC Rules changes. Leave anyway?"); setParameters(p=>p.map((row,i)=>i===idx?{...row,...patch}:row)); };
+  const removeParam = (idx)=> { setUnsavedGuard(true,"You have unsaved Item MOC Rules changes. Leave anyway?"); setParameters(p=>p.filter((_,i)=>i!==idx)); };
+
+  const save = async()=>{
+    if(!selectedItem){ alert("Pick an item first."); return; }
+    if(parameters.some(p=>!p.label.trim()||!p.match_value.trim())){ alert("Every parameter needs a label and a matched component/sub-assembly value."); return; }
+    setSaving(true);
+    try{
+      const payload = { item:selectedItem, parameters, updated_at:new Date().toISOString() };
+      if(existingRowId){
+        await sb.from("item_moc_rules").update(payload).eq("id",existingRowId);
+      } else {
+        const { data } = await sb.from("item_moc_rules").insert({...payload,updated_by:user?.username||"unknown"}).select().single();
+        setExistingRowId(data.id);
+      }
+      await logAudit("UPDATE","item_moc_rules",selectedItem,"Saved MOC rule ("+parameters.length+" parameter(s)) for \""+selectedItem+"\"",user?.username||"unknown",null,{item:selectedItem,parameter_count:parameters.length});
+      alert("Saved.");
+      setUnsavedGuard(false);
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally{ setSaving(false); }
+  };
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:900}},
+    h("h2",{style:{margin:"0 0 4px",fontSize:18,fontWeight:700}},"Datasheet MOC Rules"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"One rule set per item — defines which BOM lines show under Material Data on that item's Datasheet, and what each row is labeled. Grades and specs still come live from the real BOM line at build time."),
+    h("select",{value:selectedItem,onChange:e=>{ if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false); setSelectedItem(e.target.value); },style:{...inputStyle,width:260,marginBottom:16}},
       h("option",{value:""},"Select an item…"),
-      itemMasterList.map(r=>h("option",{key:r.item,value:r.item},r.item))
+      itemMasterList.map(it=>h("option",{key:it,value:it},it))
     ),
-    !selectedItem && h("div",{style:{fontSize:12,color:colors.mutedLight}},"Pick an item to see and edit its rules."),
-    selectedItem && loading && h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"),
-    selectedItem && !loading && subAssemblies.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"No sub-assemblies found for \""+selectedItem+"\" — add them under Sub-assemblies first."),
-    selectedItem && !loading && subAssemblies.length>0 && h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,background:"#fff"}},
-      subAssemblies.map((sa,i)=>h("label",{key:sa,style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 14px",borderBottom:i<subAssemblies.length-1?"1px solid #eceae0":"none",cursor:saving.has(sa)?"wait":"pointer",opacity:saving.has(sa)?0.6:1}},
-        h("span",{style:{fontSize:13}},sa),
-        h("input",{type:"checkbox",checked:rules.has(sa),disabled:saving.has(sa),onChange:e=>toggle(sa,e.target.checked),style:{width:16,height:16,cursor:"pointer"}})
-      ))
+    copyWarnings.length>0 && h("div",{style:{background:"#fdf6e3",border:"1px solid #f0d896",borderRadius:6,padding:"8px 10px",fontSize:11,color:"#8a6d1f",marginBottom:12}},
+      copyWarnings.map((w,i)=>h("div",{key:i},"⚠ \""+w.label+"\" wasn't found on "+w.item+"'s BOM — copied over but will show empty until fixed there."))
+    ),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    selectedItem && h(React.Fragment,null,
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginBottom:10}},
+        h("button",{onClick:()=>setViewMode(v=>v==="table"?"cards":"table"),style:btnSecondary},viewMode==="table"?"Switch to card view":"Switch to table view"),
+        h("button",{onClick:()=>setShowCopyPanel(true),style:btnSecondary},"Copy to other items")
+      ),
+      viewMode==="table"
+        ? h("table",{style:{width:"100%",fontSize:12.5,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden",marginBottom:10}},
+            h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"#"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Label"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Match on"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Matched value"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Value from"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"")
+            )),
+            h("tbody",null,
+              parameters.map((p,idx)=>h("tr",{key:idx,style:{borderTop:"1px solid #eceae0"}},
+                h("td",{style:{padding:"6px 9px",color:colors.mutedLight}},idx+1),
+                h("td",{style:{padding:"6px 9px"}},h("input",{value:p.label,onChange:e=>updateParam(idx,{label:e.target.value}),placeholder:"e.g. Body",style:{...inputStyle,padding:"5px 7px",fontSize:12}})),
+                h("td",{style:{padding:"6px 9px"}},h("select",{value:p.match_field,onChange:e=>updateParam(idx,{match_field:e.target.value,match_value:""}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:"component"},"Component"),h("option",{value:"sub_assembly"},"Sub Assembly"))),
+                h("td",{style:{padding:"6px 9px"}},
+                  h(LimitToListCombo,{value:p.match_value,onChange:v=>updateParam(idx,{match_value:v}),options:(p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents),placeholder:"Select…",style:{...inputStyle,padding:"5px 7px",fontSize:12}}),
+                  (p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents).length===0 && h("div",{style:{fontSize:9.5,color:colors.danger,marginTop:2}},"No "+(p.match_field==="sub_assembly"?"Sub Assembly":"Component")+" values found in this item's BOM.")
+                ),
+                h("td",{style:{padding:"6px 9px"}},
+                  h("label",{style:{marginRight:10,fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="grade",onChange:()=>updateParam(idx,{value_source:"grade"}),style:{marginRight:4}}),"Grade"),
+                  h("label",{style:{fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="spec",onChange:()=>updateParam(idx,{value_source:"spec"}),style:{marginRight:4}}),"Spec")
+                ),
+                h("td",{style:{padding:"6px 9px"}},h("button",{onClick:()=>removeParam(idx),style:{...btnSmall,fontSize:10.5,padding:"3px 8px",color:colors.danger}},"Remove"))
+              ))
+            )
+          )
+        : h("div",{style:{background:"#f4f2ea",borderRadius:8,padding:12,display:"flex",flexDirection:"column",gap:8,marginBottom:10}},
+            parameters.map((p,idx)=>h("div",{
+              key:idx, draggable:true,
+              onDragStart:()=>setDragIdx(idx),
+              onDragOver:e=>e.preventDefault(),
+              onDrop:()=>{ if(dragIdx!==null && dragIdx!==idx) reorder(dragIdx,idx); setDragIdx(null); },
+              style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"grab",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}
+            },
+              h("div",{style:{display:"flex",alignItems:"center",gap:10}},
+                h("span",{style:{color:colors.mutedLight,fontSize:14}},"⠿"),
+                h("div",null,
+                  h("div",{style:{fontWeight:600,fontSize:12.5}},(idx+1)+". "+(p.label||"(unlabeled)")),
+                  h("div",{style:{fontSize:11,color:colors.muted}},(p.match_field==="sub_assembly"?"Sub Assembly":"Component")+" = "+(p.match_value||"—")+" · from "+(p.value_source==="spec"?"Spec":"Grade"))
+                )
+              ),
+              h("div",{style:{display:"flex",gap:4}},
+                h("button",{onClick:()=>idx>0&&reorder(idx,idx-1),disabled:idx===0,style:{...btnSmall,fontSize:11,padding:"3px 8px"}},"↑"),
+                h("button",{onClick:()=>idx<parameters.length-1&&reorder(idx,idx+1),disabled:idx===parameters.length-1,style:{...btnSmall,fontSize:11,padding:"3px 8px"}},"↓"),
+                h("button",{onClick:()=>removeParam(idx),style:{...btnSmall,fontSize:11,padding:"3px 8px",color:colors.danger}},"Remove")
+              )
+            )),
+            parameters.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight,padding:8}},"No parameters yet.")
+          ),
+      h("div",{style:{display:"flex",gap:8}},
+        h("button",{onClick:addParam,style:btnSecondary},"+ Add parameter"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save rule")
+      )
+    ),
+    showCopyPanel && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.4)",zIndex:1310,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 24px",width:420,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},"Copy this rule to other items"),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:12}},"Applies these "+parameters.length+" parameter(s) to whichever items you check below. Overwrites any existing rule those items already have."),
+        h("div",{style:{maxHeight:180,overflowY:"auto",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",marginBottom:12}},
+          itemMasterList.filter(it=>it!==selectedItem).map(it=>h("label",{key:it,style:{display:"block",fontSize:12,marginBottom:4}},
+            h("input",{type:"checkbox",checked:copyTargets.has(it),onChange:e=>{
+              setCopyTargets(s=>{ const next=new Set(s); if(e.target.checked) next.add(it); else next.delete(it); return next; });
+            },style:{marginRight:6}}),
+            it
+          ))
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>{ setShowCopyPanel(false); setCopyTargets(new Set()); },style:btnSecondary},"Cancel"),
+          h("button",{onClick:copyRuleToItems,disabled:copying,style:{...btnPrimary,opacity:copying?0.6:1}},copying?"Copying…":"Copy to "+copyTargets.size+" item(s)")
+        )
+      )
     )
   );
 }
@@ -7341,7 +7467,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // dropped entirely (e.g. an unused "Design Data" section).
   const buildQuoteDatasheetsBySlNo = async(estimatesRows, linesRows, datasheetsRows)=>{
     const list = [];
-    const mocRuleCache = new Map(); // itemName -> Set(sub_assembly) — avoids refetching per Sl No when several share an item
+    const mocRuleCache = new Map(); // itemName -> {parameters:[...]} — avoids refetching per Sl No when several share an item
     for(const est of estimatesRows){
       const itemName = modelItemMap.get(est.model) || est.model || "Unknown item";
       const template = await loadDatasheetMaster(itemName);
@@ -7349,12 +7475,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const ds = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.template_key===normalizeItemName(itemName));
       const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
       if(!mocRuleCache.has(itemName)){
-        const { data:ruleRows } = await sb.from("item_moc_rules").select("sub_assembly").eq("item",itemName);
-        mocRuleCache.set(itemName, new Set((ruleRows||[]).map(r=>r.sub_assembly)));
+        const { data:ruleRow } = await sb.from("item_moc_rules").select("*").eq("item",itemName).maybeSingle();
+        mocRuleCache.set(itemName, ruleRow||{parameters:[]});
       }
-      const ruleSet = mocRuleCache.get(itemName);
-      const mocLines = slLines.filter(l=>ruleSet.has(l.sub_assembly||l.component));
-      const allSections = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocLines, est.model, est.item_sl_no);
+      const mocRow = mocRuleCache.get(itemName);
+      const allSections = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocRow, slLines, est.model, est.item_sl_no);
       const sectionsRows = allSections.filter(sec=>sec.rows.some(r=>r.value!==undefined && r.value!==null && String(r.value).trim()!==""));
       const totalSalesValue = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
       sectionsRows.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
@@ -10875,6 +11000,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (21)", summary:"Rebuilt Item MOC Rules from scratch — the checkbox-list version from last round wasn't what was actually wanted. Now mirrors Description Master exactly: one parameter row per rule (Label, Match on Component/Sub Assembly, Matched value validated against that item's real BOM, Value from Grade/Spec radio), same table/card view toggle, same \"copy to other items\" flow, same drag-to-reorder. Schema changed to match — item_moc_rules is now one row per item with a parameters jsonb array (was one row per item+sub_assembly before; safe to replace since nothing's been deployed yet). New shared function buildMocMaterialDataRows mirrors the existing buildAutoDescription matching logic exactly, just returning structured {label,value} rows instead of a joined string. Found and fixed a THIRD, previously-missed copy of the old raw materialDataRows logic living inside buildDatasheetSectionRows (used by the actual PDF generator) — would have silently kept using the old flat sub-assembly-as-label behavior even after the Datasheet screen and the outer PDF-generator call site were both fixed." },
   { date:"25 Jul 2026 (20)", summary:"Nav reorganized. Master Data's old flat \"BOM setup\" subgroup split into Item Master (Items, Sizes, Models, Category, Components, Sub-assemblies) and Raw Material Master (Material Shapes, Material Dim Specs, Grades, U.O.M, Material Rates Update). New flat top-level \"Rules\" toolbar (admin-gated, same as before): Datasheet MOC (the Item MOC Rules screen) and Description (Description Master) — the intended home for any future rule-type screen. Allowable Stress and Datasheet Master stayed behind in Master Data's Engineering subgroup — only the two genuinely rule-governing screens moved out. BOM (the actual editable BOM entry table, not a summary) moved out of Master Data into Reports — kept in the admin-only Reports subgroup specifically, not the general one regular users can already see, so this doesn't loosen the existing read-only-for-user rule on master data." },
   { date:"25 Jul 2026 (19)", summary:"Big one — retired the old per-line \"show in MOC\" tick box entirely, replaced with item-wise MOC Rules. Run crm_phase9_item_moc_rules_setup.sql (backfills Category on Models into category_tbl, since it used to be free text and those values never made it into the real master table; creates item_moc_rules; drops estimate_lines.show_in_moc — sequenced last, don't run until this file is actually deployed). New Master Data screen, Item MOC Rules (Engineering, next to Datasheet Master): pick an item, check which of its known sub-assemblies (from Sub-assemblies master) should show under Material Data — set once per item, applies to every quote of that item from then on, not re-decided every time someone builds one. Grades are never stored in the rule; they still come live from the real BOM/estimate line at build time. Both places that used to read show_in_moc now read this instead — the Datasheet screen and, separately, the actual Quote PDF generator's own Material Data section, which had its own independent copy of this logic that would've silently gone stale if only one had been fixed. Retired everywhere the old flag was set or shown: the Estimator's MOC popup Select-all/Deselect-all/Reset-to-No bar and its per-line checkbox column, and the equivalent post-save editing bar and checkbox column in the Quotes screen's BOM view. The existing generic add/delete-row mechanism in the Datasheet (works on every section already, Material Data included) is untouched and still the way to add a one-off row or hide something the rule doesn't cover — deliberately no new manual-entry UI needed for that." },
   { date:"25 Jul 2026 (18)", summary:"Generate Quote PDF's move under the status row had stretched it full-width, losing its original compact card look — fixed back to its original width (220px), same new position." },
@@ -11280,6 +11406,22 @@ function buildAutoDescription(masterRow, lines, itemName, sizeText){
   }).filter(Boolean);
   if(parts.length===0) return prefix;
   return prefix+" "+parts.join(", ");
+}
+
+// Same matching logic as buildAutoDescription, but for Item MOC Rules —
+// returns structured {key,label,value} rows for Material Data instead of
+// a joined description string. One row per parameter that actually found
+// a match; multiple matching lines combine their values with " / ".
+function buildMocMaterialDataRows(mocRow, lines){
+  if(!mocRow || !lines || lines.length===0) return [];
+  return (mocRow.parameters||[]).map((p,idx)=>{
+    const matches = lines.filter(l=> (p.match_field==="sub_assembly" ? l.sub_assembly : l.component) === p.match_value);
+    if(matches.length===0) return null;
+    const vals = matches.map(l=> p.value_source==="spec" ? (l.material_spec||"") : (l.grade||l.selGrade||"")).filter(Boolean);
+    if(vals.length===0) return null;
+    const uniqueVals = Array.from(new Set(vals));
+    return { key:"moc-"+idx+"-"+(p.label||""), label:p.label||"(unlabeled)", value:uniqueVals.join(" / ") };
+  }).filter(Boolean);
 }
 
 function UserManualScreen(){
