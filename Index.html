@@ -962,14 +962,13 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports_audit",label:"Masters Audit"},
         {key:"reports_overdue_calls",label:"Overdue Calls"},
         {key:"reports_pending_validation",label:"Pending Validation"},
-        {key:"bom_form",label:"BOM Entry Form"},
         {key:"bom",label:"BOM"},
       ]}]:[]),
     ]},
   ];
   if(isAdmin) {
     groups.push({ label:"Master Data", subgroups:[
-      { label:"Item Master", tabs: byKeys(itemMasterKeys) },
+      { label:"Item Master", tabs: (()=>{ const t = byKeys(itemMasterKeys); const idx = t.findIndex(x=>x.key==="item_tbl"); t.splice(idx+1,0,{key:"bom_form",label:"BOM Entry Form"}); return t; })() },
       { label:"Raw Material Master", tabs: byKeys(rawMaterialKeys) },
       { label:"Commercial terms", tabs: byKeys(ctKeys) },
       { label:"Customers", tabs:[{key:"customers",label:"Customers"},{key:"customer_bulk_upload",label:"Customer Bulk Upload"}] },
@@ -978,7 +977,9 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Company", tabs:[{key:"company_master",label:"Company Master"}] },
       { label:"HR", tabs: byKeys(["employee_tbl","department_tbl"]) },
     ]});
-    groups.push({ label:"Rules", tabs:[{key:"item_moc_rules",label:"Datasheet MOC"},{key:"description_master",label:"Description"}] });
+    groups.push({ label:"Rules", subgroups:[
+      { label:"Rules", tabs:[{key:"item_moc_rules",label:"Datasheet MOC"},{key:"description_master",label:"Description"}] }
+    ]});
     groups.push({ label:"Admin", subgroups:[
       { label:"Access control", tabs:[
         {key:"users",label:"Users"},
@@ -2093,17 +2094,24 @@ function MasterEditor({ tableKey, user }) {
     if(!newName){ setRenameMsg("Enter the new model name."); return; }
     if(newName===renameOld){ setRenameMsg("New name is the same as the old one."); return; }
     if(allModelNamesForRename.includes(newName)){ setRenameMsg("A model with that name already exists."); return; }
-    if(!confirm("Rename model \""+renameOld+"\" to \""+newName+"\" everywhere (Models + BOM), and on Draft quotes only? Non-Draft quotes will keep \""+renameOld+"\".")) return;
+    if(!confirm("Rename model \""+renameOld+"\" to \""+newName+"\" everywhere (Models + BOM), and on Draft quotes only — headers and their saved BOM lines? Non-Draft quotes will keep \""+renameOld+"\".")) return;
     setRenameBusy(true);
     try{
-      const { data: draftEstimates } = await sb.from("estimates").select("id").eq("model",renameOld).eq("quote_status","Draft");
+      const { data: draftEstimates } = await sb.from("estimates").select("id,reference_number,item_sl_no").eq("model",renameOld).eq("quote_status","Draft");
       await sb.from("model_tbl").update({model:newName}).eq("model",renameOld);
       await sb.from("bom").update({model:newName}).eq("model",renameOld);
       if(draftEstimates && draftEstimates.length){
         await sb.from("estimates").update({model:newName}).eq("model",renameOld).eq("quote_status","Draft");
+        // Also update the saved line items themselves — the header alone
+        // used to get renamed while every line under it silently kept the
+        // old model name, which is exactly the kind of drift this tool
+        // exists to prevent everywhere else.
+        for(const est of draftEstimates){
+          await sb.from("estimate_lines").update({model:newName}).eq("reference_number",est.reference_number).eq("item_sl_no",est.item_sl_no).eq("model",renameOld);
+        }
       }
-      await logAudit("UPDATE","model_tbl",newName,"Renamed model \""+renameOld+"\" to \""+newName+"\" (Models + BOM + "+(draftEstimates?.length||0)+" Draft quote(s))",user?.username||"unknown",{model:renameOld},{model:newName});
-      setRenameMsg("Renamed. "+(draftEstimates?.length||0)+" Draft quote(s) updated; non-Draft quotes kept \""+renameOld+"\".");
+      await logAudit("UPDATE","model_tbl",newName,"Renamed model \""+renameOld+"\" to \""+newName+"\" (Models + BOM + "+(draftEstimates?.length||0)+" Draft quote(s), headers and lines)",user?.username||"unknown",{model:renameOld},{model:newName});
+      setRenameMsg("Renamed. "+(draftEstimates?.length||0)+" Draft quote(s) updated (headers and lines); non-Draft quotes kept \""+renameOld+"\".");
       setAllModelNamesForRename(names=>names.map(n=>n===renameOld?newName:n).sort());
       setAllModels(m=>m.map(n=>n===renameOld?newName:n).sort());
       setRenameOld(""); setRenameNew("");
@@ -2423,7 +2431,14 @@ function MasterEditor({ tableKey, user }) {
     const draft = genericEditAllDrafts[row.id]||row;
     return h("tr",{key:row.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
       h("td",{style:{padding:"4px 6px"}}),
-      tableDef.columns.map(c=>h("td",{key:c,style:{padding:"4px 6px"}},renderGenericCascadeField(c,draft[c],v=>setGenericAllField(row.id,c,v)))),
+      tableDef.columns.map(c=>h("td",{key:c,style:{padding:"4px 6px"}},
+        (tableKey==="model_tbl" && c==="model")
+          ? h("div",null,
+              h("div",{style:{padding:"5px 7px",background:"#f4f2ea",borderRadius:5,fontSize:12,color:colors.muted}},row.model),
+              h("div",{style:{fontSize:9,color:colors.mutedLight,marginTop:2}},"Use \"Rename model\" above")
+            )
+          : renderGenericCascadeField(c,draft[c],v=>setGenericAllField(row.id,c,v))
+      )),
       h("td",{style:{padding:"4px 6px",whiteSpace:"nowrap"}},h("button",{onClick:()=>deleteRow(row.id),style:btnDanger},freshIds.has(row.id)||isSuperAdmin?"Delete":"Delete 🔒"))
     );
   };
@@ -2433,7 +2448,12 @@ function MasterEditor({ tableKey, user }) {
   const renderRow = (row)=>h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
     h("td",{style:{padding:"7px 9px"}},h("input",{type:"checkbox",checked:selectedIds.has(row.id),disabled:isProtectedStatusRow(row),onChange:e=>setSelectedIds(prev=>{ const next=new Set(prev); if(e.target.checked) next.add(row.id); else next.delete(row.id); return next; })})),
     tableDef.columns.map(c=>h("td",{key:c,style:{padding:"7px 9px"}},
-      editingId===row.id?renderGenericCascadeField(c,editDraft[c],v=>setEditDraft(d=>({...d,[c]:v}))):
+      (editingId===row.id && tableKey==="model_tbl" && c==="model")
+        ? h("div",null,
+            h("div",{style:{padding:"5px 7px",background:"#f4f2ea",borderRadius:5,fontSize:12,color:colors.muted}},row.model),
+            h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginTop:2}},"Use \"Rename model\" above to change this")
+          )
+      : editingId===row.id?renderGenericCascadeField(c,editDraft[c],v=>setEditDraft(d=>({...d,[c]:v}))):
       (NUMERIC_COLS.has(c)?fmt(Number(row[c])||0):String(row[c]??""))
     )),
     h("td",{style:{padding:"7px 9px",whiteSpace:"nowrap"}},
@@ -8127,13 +8147,31 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("button",{onClick:()=>attemptCloseOrNewQuotes("close"),style:{padding:"6px 14px",fontSize:12,fontWeight:600,borderRadius:5,border:"none",background:colors.danger,color:"#fff",cursor:"pointer"}},"Close")
           )
         ),
-        h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff",marginBottom:12,width:220}},
-          h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:colors.dark,textTransform:"uppercase"}},"Generate Quote PDF"),
-            quoteExportRef && quoteExportRef===refFilter && !readiness.loading && !readiness.ready && h("span",{style:{fontSize:9.5,fontWeight:700,color:"#854f0b"}},readiness.missing.reduce((s,m)=>s+m.items.length,0)+" items missing")
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,minmax(0,1fr))",gap:10,marginBottom:12}},
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Commercial Terms"),
+              h("span",{style:{fontSize:9,fontWeight:700,color:quoteHasTerms?"#0f6e3f":"#8a5a10",border:"1px solid "+(quoteHasTerms?"#0f6e3f":"#d4901f"),padding:"1px 6px",borderRadius:9}},quoteHasTerms?"Set":"Not set")
+            ),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"One set per quote — required before sending"),
+            h("button",{onClick:openCommercialTerms,disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Edit terms")
           ),
-          h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Cover + index + summary + terms + datasheets"),
-          renderReadinessBar(readiness.categories, {height:38, doneLabel: generatingQuotePdf?"Generating…":"✓ Generate Quote PDF", onClick: (quoteExportRef&&!generatingQuotePdf)?attemptGenerateQuotePdf:undefined})
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Documents"),
+              h("span",{style:{fontSize:9,fontWeight:700,color:quoteDocuments.filter(d=>!d.is_archived).length?"#0f6e3f":colors.muted,border:"1px solid "+(quoteDocuments.filter(d=>!d.is_archived).length?"#0f6e3f":colors.border),padding:"1px 6px",borderRadius:9}},quoteDocuments.filter(d=>!d.is_archived).length+" attached")
+            ),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Drawings, procedures, ITP — optional"),
+            h("button",{onClick:openDocumentsPanel,disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Manage documents")
+          ),
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
+              h("div",{style:{fontSize:10,fontWeight:700,color:colors.dark,textTransform:"uppercase"}},"Generate Quote PDF"),
+              quoteExportRef && quoteExportRef===refFilter && !readiness.loading && !readiness.ready && h("span",{style:{fontSize:9.5,fontWeight:700,color:"#854f0b"}},readiness.missing.reduce((s,m)=>s+m.items.length,0)+" items missing")
+            ),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Cover + index + summary + terms + datasheets"),
+            renderReadinessBar(readiness.categories, {height:38, doneLabel: generatingQuotePdf?"Generating…":"✓ Generate Quote PDF", onClick: (quoteExportRef&&!generatingQuotePdf)?attemptGenerateQuotePdf:undefined})
+          )
         ),
         h("div",{style:{borderTop:"1px solid #eceae0",paddingTop:10,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}},
           h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}},
@@ -8206,22 +8244,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("button",{onClick:()=>exportQuoteCuttingPlanExcel(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-xlsx"?"Working…":"Excel"),
               h("button",{onClick:()=>exportQuoteCuttingPlanPDF(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-pdf"?"Working…":"PDF")
             )
-          ),
-          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
-            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
-              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Commercial Terms"),
-              h("span",{style:{fontSize:9,fontWeight:700,color:quoteHasTerms?"#0f6e3f":"#8a5a10",border:"1px solid "+(quoteHasTerms?"#0f6e3f":"#d4901f"),padding:"1px 6px",borderRadius:9}},quoteHasTerms?"Set":"Not set")
-            ),
-            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"One set per quote — required before sending"),
-            h("button",{onClick:openCommercialTerms,disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Edit terms")
-          ),
-          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
-            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
-              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Documents"),
-              h("span",{style:{fontSize:9,fontWeight:700,color:quoteDocuments.filter(d=>!d.is_archived).length?"#0f6e3f":colors.muted,border:"1px solid "+(quoteDocuments.filter(d=>!d.is_archived).length?"#0f6e3f":colors.border),padding:"1px 6px",borderRadius:9}},quoteDocuments.filter(d=>!d.is_archived).length+" attached")
-            ),
-            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Drawings, procedures, ITP — optional"),
-            h("button",{onClick:openDocumentsPanel,disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Manage documents")
           )
         )
       ),
@@ -11004,6 +11026,9 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (25)", summary:"\"Rules\" is now a proper dropdown menu (same style as Master Data/Reports) instead of two separate flat buttons crowding the toolbar — Datasheet MOC and Description now sit as sub-items inside one \"Rules\" click." },
+  { date:"25 Jul 2026 (24)", summary:"Commercial Terms and Documents cards moved up to sit in a row next to Generate Quote PDF, right under the status row — previously they lived down in the Export panel grid, separate from Generate Quote PDF's own compact box. All three now share the same row and card styling." },
+  { date:"25 Jul 2026 (23)", summary:"Three fixes. (1) BOM Entry Form moved out of Reports into Master Data → Item Master, right after Items — BOM itself (the report/table view) stays in Reports as confirmed correct. (2) Rename Model's cascade now also updates the saved BOM lines on Draft quotes (estimate_lines), not just the Sl No header (estimates) — previously a renamed model would show correctly at the header level while every line underneath silently kept the old name. (3) Closed the real gap that made (2) possible to bypass in the first place: \"Model\" is now read-only in both single-row Edit and bulk \"Edit all lines\" on the Models table, with a note pointing to the dedicated Rename tool — editing it directly used to update only that one model_tbl row with no cascade at all, silently breaking the link to BOM and Draft quotes. Renaming is now only possible through the one tool built to handle its consequences correctly. Adding a brand new model is unaffected — Model stays freely editable there, since nothing references a new model yet." },
   { date:"25 Jul 2026 (22)", summary:"Fixed \"Save failed: Cannot read properties of null (reading 'id')\" on Item MOC Rules — the insert/update wasn't checking for a Supabase error before reading the result, so any real database failure (most likely: the table still has last round's old schema, since this database probably hasn't had the updated crm_phase9_item_moc_rules_setup.sql re-run yet) crashed uninformatively instead of showing what actually went wrong. Now surfaces the real error message, with a hint about the schema mismatch specifically. Same fix applied to \"Copy to other items.\" This is very likely a re-run-the-SQL issue, not a new code bug — re-run the latest crm_phase9_item_moc_rules_setup.sql (safe, nothing depends on the old shape yet) and this should go away; if the real error message says something else, that tells us the actual cause." },
   { date:"25 Jul 2026 (21)", summary:"Rebuilt Item MOC Rules from scratch — the checkbox-list version from last round wasn't what was actually wanted. Now mirrors Description Master exactly: one parameter row per rule (Label, Match on Component/Sub Assembly, Matched value validated against that item's real BOM, Value from Grade/Spec radio), same table/card view toggle, same \"copy to other items\" flow, same drag-to-reorder. Schema changed to match — item_moc_rules is now one row per item with a parameters jsonb array (was one row per item+sub_assembly before; safe to replace since nothing's been deployed yet). New shared function buildMocMaterialDataRows mirrors the existing buildAutoDescription matching logic exactly, just returning structured {label,value} rows instead of a joined string. Found and fixed a THIRD, previously-missed copy of the old raw materialDataRows logic living inside buildDatasheetSectionRows (used by the actual PDF generator) — would have silently kept using the old flat sub-assembly-as-label behavior even after the Datasheet screen and the outer PDF-generator call site were both fixed." },
   { date:"25 Jul 2026 (20)", summary:"Nav reorganized. Master Data's old flat \"BOM setup\" subgroup split into Item Master (Items, Sizes, Models, Category, Components, Sub-assemblies) and Raw Material Master (Material Shapes, Material Dim Specs, Grades, U.O.M, Material Rates Update). New flat top-level \"Rules\" toolbar (admin-gated, same as before): Datasheet MOC (the Item MOC Rules screen) and Description (Description Master) — the intended home for any future rule-type screen. Allowable Stress and Datasheet Master stayed behind in Master Data's Engineering subgroup — only the two genuinely rule-governing screens moved out. BOM (the actual editable BOM entry table, not a summary) moved out of Master Data into Reports — kept in the admin-only Reports subgroup specifically, not the general one regular users can already see, so this doesn't loosen the existing read-only-for-user rule on master data." },
