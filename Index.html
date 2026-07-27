@@ -203,8 +203,9 @@ const NUMERIC_COLS = new Set(["rate","cost","sf","sales_price","qty_required","c
    Field types: "auto_model" (from the estimate), "bom" (auto-matched to a BOM
    line by keyword on the component name), "dropdown" (options from the master),
    "text" (free entry). A section with section_is_bom=true is auto-filled from
-   estimate_lines where show_in_moc = true; everything else is filled via the
-   popup form. */
+   estimate_lines matching that item's MOC Rules (which sub-assemblies are
+   relevant for the item, set once under Master Data — not a per-line tick
+   box); everything else is filled via the popup form. */
 function normalizeItemName(s){ return (s||"").replace(/\s+/g," ").trim().toLowerCase(); }
 
 // Casting vs Fabricated classifier for a model, per Flometriq's naming convention.
@@ -973,7 +974,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Commercial terms", tabs: byKeys(ctKeys) },
       { label:"Customers", tabs:[{key:"customers",label:"Customers"},{key:"customer_bulk_upload",label:"Customer Bulk Upload"}] },
       { label:"CRM Setup", tabs: byKeys(["state_zone_tbl","country_zone_tbl","territory_rule_state_tbl","territory_rule_country_tbl"]) },
-      { label:"Engineering", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"},{key:"description_master",label:"Description Master"}] },
+      { label:"Engineering", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"},{key:"item_moc_rules",label:"Item MOC Rules"},{key:"description_master",label:"Description Master"}] },
       { label:"Company", tabs:[{key:"company_master",label:"Company Master"}] },
       { label:"HR", tabs: byKeys(["employee_tbl","department_tbl"]) },
     ]});
@@ -3184,7 +3185,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       qty_required:Number(manualLine.qty_required)||0, uom:manualLine.uom||"Nos",
       sf:Number(manualLine.sf)||3.1,
       cutting_plan_layout_size:"", cutting_plan_qty:0, cutting_plan_uom:"",
-      show_in_moc:false, _manual:true
+      _manual:true
     };
     setLines(prev=>[...prev,newLine]);
     if(manualLine.grade){
@@ -3230,7 +3231,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       material_shape:"", material_spec:"", grade:"",
       qty_required:Number(dp.qty)||1, uom:dp.uom||"Nos",
       rate:0, cost:0, sf:0, sales_price:Number(dp.sales_price)||0,
-      show_in_moc:false, cutting_plan_layout_size:"", cutting_plan_qty:0, cutting_plan_uom:"",
+      cutting_plan_layout_size:"", cutting_plan_qty:0, cutting_plan_uom:"",
       is_direct_price:true, validation_status:"Pending",
       excel_file_name:dp.excel_file_name||"", excel_file_path:dp.excel_file_path||"",
       no_excel_code_used: dp.excel_file_path?"":(dpAuthorizedCode||(isAdminOrAbove?"self-authorized ("+user.username+")":"")),
@@ -3331,11 +3332,10 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       else{rate=0;}
       const cost=qty*rate; const sf=ov.sf!==undefined?Number(ov.sf)||0:(l.sf||3.1);
       const salesPrice=sf*cost; const isZeroPrice=!cost||cost===0;
-      const showInMoc=overrides[l.id]?.show_in_moc!==undefined?overrides[l.id].show_in_moc:(l.show_in_moc===true);
       const cuttingPlan=ov.cutting_plan_layout_size!==undefined?ov.cutting_plan_layout_size:(l.cutting_plan_layout_size||"");
       const cutPlanQty=ov.cutting_plan_qty!==undefined?Number(ov.cutting_plan_qty)||0:(Number(l.cutting_plan_qty)||0);
       const cuttingUom=ov.cutting_plan_uom!==undefined?ov.cutting_plan_uom:(l.cutting_plan_uom||"");
-      return {...l,material_spec:spec,hasSpec,gradeOptions,selGrade,qty,uom,rate,cost,sf,salesPrice,isZeroPrice,showInMoc,cutting_plan_layout_size:cuttingPlan,cutting_plan_qty:cutPlanQty,cutting_plan_uom:cuttingUom};
+      return {...l,material_spec:spec,hasSpec,gradeOptions,selGrade,qty,uom,rate,cost,sf,salesPrice,isZeroPrice,cutting_plan_layout_size:cuttingPlan,cutting_plan_qty:cutPlanQty,cutting_plan_uom:cuttingUom};
     });
   },[lines,overrides,gradesBySpec,rateBySpecGrade]);
 
@@ -3673,7 +3673,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const addCurrentModelToCart = ()=>{
     if(!selectedModel){ alert("Select a model first."); return; }
     if(computedLines.length===0){ alert("This model has no BOM lines loaded — nothing to add. Try reselecting it, or Refresh from the sidebar."); return; }
-    const toAdd=computedLines.map(l=>({model:selectedModel,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec||"",grade:l.selGrade||(l.hasSpec?"":""),qty_required:l.qty,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.salesPrice,show_in_moc:l.showInMoc,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||""}));
+    const toAdd=computedLines.map(l=>({model:selectedModel,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec||"",grade:l.selGrade||(l.hasSpec?"":""),qty_required:l.qty,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.salesPrice,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||""}));
     setCart(c=>c.concat(toAdd));
     if(holdingNewSlNo) return; // already know the Quote#/Sl No — no need to ask again
     setTimeout(()=>{ setShowAddGateway(true); setGatewayStep("quote"); setGatewayRef(""); setGatewaySiblings(null); setGatewaySlNoInput(""); setGatewaySlNoWarn(false); loadQuoteOptions(); }, 0);
@@ -3934,7 +3934,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         estimateId=created.id; createdNewHeader=true;
         promoteCompanyToLead(resolvedCompanyId, headerPayload.customer_name);
       }
-      const rows=cart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,show_in_moc:l.show_in_moc===true,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||"",is_direct_price:l.is_direct_price===true,validation_status:l.validation_status||null,excel_file_name:l.excel_file_name||null,excel_file_path:l.excel_file_path||null,no_excel_code_used:l.no_excel_code_used||null,added_by:l.added_by||null,custom_item:l.custom_item||null,custom_model_recorded:l.custom_model_recorded||null}));
+      const rows=cart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||"",is_direct_price:l.is_direct_price===true,validation_status:l.validation_status||null,excel_file_name:l.excel_file_name||null,excel_file_path:l.excel_file_path||null,no_excel_code_used:l.no_excel_code_used||null,added_by:l.added_by||null,custom_item:l.custom_item||null,custom_model_recorded:l.custom_model_recorded||null}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
       setSaveMsg("Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).");
       setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setConversionRate("1"); setCustomerName(""); setCustomerAddress(""); setContactName(""); setContactDesignation(""); setSignatoryName(""); setSignatoryDesignation(""); setExistingQuoteHeader(null); setShowSave(false);
@@ -4207,16 +4207,6 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
             )
           )
         ),
-        // MOC toggle header bar
-        !showSummary&&!showCuttingPlan&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,padding:"8px 12px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:6,flexWrap:"wrap"}},
-          h("span",{style:{fontSize:11,color:colors.muted,fontWeight:600}},"Show in MOC:"),
-          h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden"}},
-            h("button",{onClick:()=>{ const o={...overrides}; computedLines.forEach(l=>{o[l.id]={...o[l.id],show_in_moc:true};}); setOverrides(o); },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,fontFamily:"inherit"}},"Select all"),
-            h("button",{onClick:()=>{ const o={...overrides}; computedLines.forEach(l=>{o[l.id]={...o[l.id],show_in_moc:false};}); setOverrides(o); },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Deselect all")
-          ),
-          h("button",{onClick:()=>{ const o={...overrides}; computedLines.forEach(l=>{o[l.id]={...o[l.id],show_in_moc:false};}); setOverrides(o); },style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"Reset to No"),
-          h("span",{style:{fontSize:10,color:colors.mutedLight}},computedLines.filter(l=>l.showInMoc).length+" of "+computedLines.length+" ticked")
-        ),
         pendingCount>0&&!showSummary&&!showCuttingPlan&&h("div",{style:{fontSize:12,color:colors.danger,margin:"6px 0"}},pendingCount+" item(s) need a grade."),
 
         // DETAIL VIEW
@@ -4274,7 +4264,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           h("div",{ref:detailBottomScrollRef,onScroll:syncScrollFromBottom,style:{overflowX:"auto",overflowY:"hidden",border:"1px solid "+colors.border,borderRadius:6,marginTop:2}},
           h("table",{style:{fontSize:12,minWidth:1420,width:"100%",borderCollapse:"collapse"}},
             h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left",background:"#faf9f4"}},
-              (detailWithCuttingPlan?["Sl","Component","Material spec","Grade (MOC)","Cutting Plan","Cut Plan Qty","Cutting UOM","Qty Reqd Per Item","UOM","Rate","Cost","Sf","Sales price","Show in MOC",""]:["Sl","Component","Material spec","Grade (MOC)","Qty Reqd Per Item","UOM","Rate","Cost","Sf","Sales price","Show in MOC",""]).map((c,ci)=>h("th",{key:c,onClick:()=>setSelectedColIdx(ci),style:{padding:"8px 10px",textAlign:["Cut Plan Qty","Qty Reqd Per Item","Rate","Cost","Sales price"].includes(c)?"right":"left",cursor:"pointer",background:selectedColIdx===ci?"#eee0c0":(frozenColIdx!==null&&ci<=frozenColIdx?"#faf9f4":"#faf9f4"),position:(frozenColIdx!==null&&ci<=frozenColIdx)?"sticky":"static",left:(frozenColIdx!==null&&ci<=frozenColIdx)?detailColLeft(ci):"auto",zIndex:(frozenColIdx!==null&&ci<=frozenColIdx)?3:1}},c))
+              (detailWithCuttingPlan?["Sl","Component","Material spec","Grade (MOC)","Cutting Plan","Cut Plan Qty","Cutting UOM","Qty Reqd Per Item","UOM","Rate","Cost","Sf","Sales price",""]:["Sl","Component","Material spec","Grade (MOC)","Qty Reqd Per Item","UOM","Rate","Cost","Sf","Sales price",""]).map((c,ci)=>h("th",{key:c,onClick:()=>setSelectedColIdx(ci),style:{padding:"8px 10px",textAlign:["Cut Plan Qty","Qty Reqd Per Item","Rate","Cost","Sales price"].includes(c)?"right":"left",cursor:"pointer",background:selectedColIdx===ci?"#eee0c0":(frozenColIdx!==null&&ci<=frozenColIdx?"#faf9f4":"#faf9f4"),position:(frozenColIdx!==null&&ci<=frozenColIdx)?"sticky":"static",left:(frozenColIdx!==null&&ci<=frozenColIdx)?detailColLeft(ci):"auto",zIndex:(frozenColIdx!==null&&ci<=frozenColIdx)?3:1}},c))
             )),
             h("tbody",null,
               computedLines.map((l,idx)=>h("tr",{key:l.id,style:{borderBottom:"1px solid #eceae0",background:l.isZeroPrice?"#fdecea":(l._manual?"#faf6ea":"transparent")}},
@@ -4294,9 +4284,6 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
                 h("td",{style:{padding:"8px 10px",textAlign:"right",fontWeight:700,verticalAlign:"top"}},fmtR(l.cost)),
                 h("td",{style:{padding:"8px 6px",textAlign:"right",verticalAlign:"top"}},h("input",{type:"number",step:"0.1",value:overrides[l.id]?.sf!==undefined?overrides[l.id].sf:l.sf,onChange:e=>setOverride(l.id,"sf",e.target.value),style:{width:52,padding:"5px 6px",fontSize:12,textAlign:"right",border:"1px solid "+colors.border,borderRadius:4}})),
                 h("td",{style:{padding:"8px 10px",textAlign:"right",fontWeight:700,verticalAlign:"top",color:colors.accent}},fmtR(l.salesPrice)),
-                h("td",{style:{padding:"8px 10px",textAlign:"center",verticalAlign:"top"}},
-                  h("input",{type:"checkbox",checked:l.showInMoc,onChange:e=>setOverride(l.id,"show_in_moc",e.target.checked),style:{width:15,height:15,cursor:"pointer",accentColor:"#1c8c75"}})
-                ),
                 h("td",{style:{padding:"8px 6px",verticalAlign:"top"}},h("button",{onClick:()=>deleteLineItem(l.id),style:btnDanger},"✕"))
               ))
             )
@@ -4646,16 +4633,31 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   const [fillOpen,setFillOpen] = useState(false);
   const [sectionIdx,setSectionIdx] = useState(0);
 
-  const mocLines = useMemo(()=> (openLines||[]).filter(l=>l.show_in_moc===true), [openLines]);
+  // Which sub-assemblies are relevant for this item's Material Data — from
+  // Item MOC Rules (set once per item under Master Data), not a per-line
+  // tick box anymore. Grades still come from the real line data below.
+  const [mocRuleSet,setMocRuleSet] = useState(null); // null=loading, else Set of sub_assembly values
+  useEffect(()=>{
+    let cancelled=false;
+    if(!itemName){ setMocRuleSet(new Set()); return; }
+    sb.from("item_moc_rules").select("sub_assembly").eq("item",itemName).then(({data})=>{
+      if(!cancelled) setMocRuleSet(new Set((data||[]).map(r=>r.sub_assembly)));
+    });
+    return ()=>{ cancelled=true; };
+  },[itemName]);
+  const mocLines = useMemo(()=>{
+    if(!mocRuleSet) return [];
+    return (openLines||[]).filter(l=>mocRuleSet.has(l.sub_assembly||l.component));
+  }, [openLines, mocRuleSet]);
   const bomMatches = useMemo(()=>{
     if(!template) return {};
     const used = new Set(); const out = {};
     template.sections.forEach(sec=>sec.fields.forEach(f=>{ if(f.type==="bom") out[f.key] = matchDatasheetBomLine(f, mocLines, used); }));
     return out;
   }, [template, mocLines]);
-  // Material Data is always rebuilt straight from the ticked ("Show in MOC") lines —
-  // whatever field list the uploaded Excel defined for this section is ignored.
-  // Sub-assembly is the label, Grade is the value.
+  // Material Data is always rebuilt straight from the lines matching this
+  // item's MOC rules — whatever field list the uploaded Excel defined for
+  // this section is ignored. Sub-assembly is the label, Grade is the value.
   const materialDataRows = useMemo(()=> (mocLines||[]).map(l=>({
     key: "moc-"+(l.reference_number||"")+"-"+l.sl_no,
     label: l.sub_assembly || l.component || "(unnamed)",
@@ -5148,6 +5150,74 @@ function buildMasterRowsFromParse(item, sections, helperFields){
    Drag-and-drop an Excel file (sheet 1 = the datasheet layout, sheet 2 = optional
    helper sheet of dropdown option lists) to build or replace an item's datasheet
    master in one go. Fields can also be added or removed by hand below. */
+// Item MOC Rules — which sub-assemblies matter for a given item's Material
+// Data. Replaces the old per-line "show in MOC" tick box, which lived on
+// individual estimate_lines and had to be re-set every single time someone
+// built a quote. This is set once per item and applies everywhere that
+// item shows up — the Datasheet screen and the actual generated Quote PDF
+// both read the same rule set. No grade values live here; grades still
+// come live from the real BOM/estimate line at build time, this table only
+// decides which sub-assemblies are relevant to show at all.
+function ItemMocRulesEditor({ user }){
+  const [itemMasterList,setItemMasterList] = useState([]);
+  const [selectedItem,setSelectedItem] = useState("");
+  const [subAssemblies,setSubAssemblies] = useState([]); // this item's known sub-assemblies, from subassembly_tbl
+  const [rules,setRules] = useState(new Set()); // sub_assembly values currently checked/included for this item
+  const [loading,setLoading] = useState(false);
+  const [saving,setSaving] = useState(new Set()); // sub_assembly values mid-toggle, for a disabled/pending look
+
+  useEffect(()=>{
+    sb.from("item_tbl").select("item").order("item").then(({data})=>setItemMasterList(data||[]));
+  },[]);
+
+  const loadForItem = useCallback(async(item)=>{
+    if(!item){ setSubAssemblies([]); setRules(new Set()); return; }
+    setLoading(true);
+    const [{ data: subRows },{ data: ruleRows }] = await Promise.all([
+      sb.from("subassembly_tbl").select("sub_assembly").eq("item",item),
+      sb.from("item_moc_rules").select("sub_assembly").eq("item",item),
+    ]);
+    setSubAssemblies(Array.from(new Set((subRows||[]).map(r=>r.sub_assembly).filter(Boolean))).sort());
+    setRules(new Set((ruleRows||[]).map(r=>r.sub_assembly)));
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ loadForItem(selectedItem); },[selectedItem,loadForItem]);
+
+  const toggle = async(subAssembly, checked)=>{
+    setSaving(s=>new Set(s).add(subAssembly));
+    try{
+      if(checked){
+        await sb.from("item_moc_rules").insert({item:selectedItem,sub_assembly:subAssembly,created_by:user?.username||"unknown"});
+        await logAudit("INSERT","item_moc_rules",selectedItem+" — "+subAssembly,"Added \""+subAssembly+"\" to MOC rules for \""+selectedItem+"\"",user?.username||"unknown",null,{item:selectedItem,sub_assembly:subAssembly});
+        setRules(r=>new Set(r).add(subAssembly));
+      } else {
+        await sb.from("item_moc_rules").delete().eq("item",selectedItem).eq("sub_assembly",subAssembly);
+        await logAudit("DELETE","item_moc_rules",selectedItem+" — "+subAssembly,"Removed \""+subAssembly+"\" from MOC rules for \""+selectedItem+"\"",user?.username||"unknown",{item:selectedItem,sub_assembly:subAssembly},null);
+        setRules(r=>{ const n=new Set(r); n.delete(subAssembly); return n; });
+      }
+    } catch(e){ alert("Couldn't save: "+e.message); }
+    finally { setSaving(s=>{ const n=new Set(s); n.delete(subAssembly); return n; }); }
+  };
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:640}},
+    h("h2",{style:{margin:"0 0 4px",fontSize:18,fontWeight:700}},"Item MOC Rules"),
+    h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:16}},"Which sub-assemblies show under Material Data for each item — grades still come live from the real BOM line, this only decides which ones are relevant."),
+    h("select",{value:selectedItem,onChange:e=>setSelectedItem(e.target.value),style:{...inputStyle,width:280,marginBottom:16}},
+      h("option",{value:""},"Select an item…"),
+      itemMasterList.map(r=>h("option",{key:r.item,value:r.item},r.item))
+    ),
+    !selectedItem && h("div",{style:{fontSize:12,color:colors.mutedLight}},"Pick an item to see and edit its rules."),
+    selectedItem && loading && h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"),
+    selectedItem && !loading && subAssemblies.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"No sub-assemblies found for \""+selectedItem+"\" — add them under Sub-assemblies first."),
+    selectedItem && !loading && subAssemblies.length>0 && h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,background:"#fff"}},
+      subAssemblies.map((sa,i)=>h("label",{key:sa,style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 14px",borderBottom:i<subAssemblies.length-1?"1px solid #eceae0":"none",cursor:saving.has(sa)?"wait":"pointer",opacity:saving.has(sa)?0.6:1}},
+        h("span",{style:{fontSize:13}},sa),
+        h("input",{type:"checkbox",checked:rules.has(sa),disabled:saving.has(sa),onChange:e=>toggle(sa,e.target.checked),style:{width:16,height:16,cursor:"pointer"}})
+      ))
+    )
+  );
+}
+
 function DatasheetMasterEditor({ onGoToTab }){
   const [itemMasterList,setItemMasterList] = useState([]); // [{item, hsn_code}] from item_tbl
   const [itemsWithMaster,setItemsWithMaster] = useState(new Set());
@@ -7266,13 +7336,19 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // dropped entirely (e.g. an unused "Design Data" section).
   const buildQuoteDatasheetsBySlNo = async(estimatesRows, linesRows, datasheetsRows)=>{
     const list = [];
+    const mocRuleCache = new Map(); // itemName -> Set(sub_assembly) — avoids refetching per Sl No when several share an item
     for(const est of estimatesRows){
       const itemName = modelItemMap.get(est.model) || est.model || "Unknown item";
       const template = await loadDatasheetMaster(itemName);
       if(!template) continue;
       const ds = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.template_key===normalizeItemName(itemName));
       const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
-      const mocLines = slLines.filter(l=>l.show_in_moc===true);
+      if(!mocRuleCache.has(itemName)){
+        const { data:ruleRows } = await sb.from("item_moc_rules").select("sub_assembly").eq("item",itemName);
+        mocRuleCache.set(itemName, new Set((ruleRows||[]).map(r=>r.sub_assembly)));
+      }
+      const ruleSet = mocRuleCache.get(itemName);
+      const mocLines = slLines.filter(l=>ruleSet.has(l.sub_assembly||l.component));
       const allSections = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocLines, est.model, est.item_sl_no);
       const sectionsRows = allSections.filter(sec=>sec.rows.some(r=>r.value!==undefined && r.value!==null && String(r.value).trim()!==""));
       const totalSalesValue = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
@@ -8275,24 +8351,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 )
               )
             ),
-            !showSummarySaved&&!showCuttingPlan&&h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8,padding:"8px 12px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:6,flexWrap:"wrap"}},
-              h("span",{style:{fontSize:11,color:colors.muted,fontWeight:600}},"Show in MOC:"),
-              h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden"}},
-                h("button",{onClick:async()=>{
-                  await sb.from("estimate_lines").update({show_in_moc:true}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
-                  setOpenLines(ls=>ls.map(l=>({...l,show_in_moc:true})));
-                },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,fontFamily:"inherit"}},"Select all"),
-                h("button",{onClick:async()=>{
-                  await sb.from("estimate_lines").update({show_in_moc:false}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
-                  setOpenLines(ls=>ls.map(l=>({...l,show_in_moc:false})));
-                },style:{padding:"4px 12px",fontSize:11,border:"none",cursor:"pointer",background:"#fff",color:colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Deselect all")
-              ),
-              h("button",{onClick:async()=>{
-                await sb.from("estimate_lines").update({show_in_moc:false}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
-                setOpenLines(ls=>ls.map(l=>({...l,show_in_moc:false})));
-              },style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"Reset to No"),
-              h("span",{style:{fontSize:10,color:colors.mutedLight}},openLines.filter(l=>l.show_in_moc===true).length+" of "+openLines.length+" ticked")
-            ),
             !showSummarySaved&&!showCuttingPlan&&h("div",{style:fullScreenBOM?{position:"fixed",inset:0,zIndex:1000,background:"#f4f2ea",padding:20,overflowY:"auto"}:{}},
               h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
                 h("div",{style:{fontSize:13,fontWeight:700}}, fullScreenBOM?("BOM — "+(openRef?openRef.reference_number+" · Sl No "+openRef.item_sl_no:"")):""),
@@ -8304,7 +8362,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("div",{ref:quoteBottomScrollRef,onScroll:syncQuoteScrollFromBottom,style:{overflow:"auto",maxHeight:fullScreenBOM?"calc(100vh - 90px)":"65vh",border:"1px solid "+colors.border,borderRadius:6,marginTop:2}},
               h("table",{style:{fontSize:12,minWidth:1560,borderCollapse:"separate",borderSpacing:0}},
                 h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
-                  (detailWithCuttingPlan?["Sl","Component","Material spec","Grade","Cutting Plan","Cut Plan Qty","Cutting UOM","Qty Reqd Per Item","UOM","Qty by Order/Quote","Rate","Sf","Cost","Sales price","Show in MOC",""]:["Sl","Component","Material spec","Grade","Qty Reqd Per Item","UOM","Qty by Order/Quote","Rate","Sf","Cost","Sales price","Show in MOC",""]).map((c,ci)=>h("th",{key:c,style:{padding:"7px 9px",fontSize:10.5,letterSpacing:"0.03em",whiteSpace:"nowrap",background:c==="Qty by Order/Quote"?"#e8f5ee":"#faf9f4",color:c==="Qty by Order/Quote"?"#085041":"inherit",position:"sticky",top:0,zIndex:ci<2?3:2,left:ci===0?0:ci===1?30:"auto",borderBottom:"2px solid "+colors.dark}},c))
+                  (detailWithCuttingPlan?["Sl","Component","Material spec","Grade","Cutting Plan","Cut Plan Qty","Cutting UOM","Qty Reqd Per Item","UOM","Qty by Order/Quote","Rate","Sf","Cost","Sales price",""]:["Sl","Component","Material spec","Grade","Qty Reqd Per Item","UOM","Qty by Order/Quote","Rate","Sf","Cost","Sales price",""]).map((c,ci)=>h("th",{key:c,style:{padding:"7px 9px",fontSize:10.5,letterSpacing:"0.03em",whiteSpace:"nowrap",background:c==="Qty by Order/Quote"?"#e8f5ee":"#faf9f4",color:c==="Qty by Order/Quote"?"#085041":"inherit",position:"sticky",top:0,zIndex:ci<2?3:2,left:ci===0?0:ci===1?30:"auto",borderBottom:"2px solid "+colors.dark}},c))
                 )),
                 h("tbody",null,openLines.map(l=>{
                   const key=l.reference_number+"-"+l.sl_no;
@@ -8322,7 +8380,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   const sf=Number(getLineVal(l,"sf"))||3.1;
                   const sales=cost*sf;
                   const isZero=!cost||cost===0;
-                  const showMoc=lineEdits[key]?.show_in_moc!==undefined?lineEdits[key].show_in_moc:(l.show_in_moc===true);
                   const isChangedInRevision = bomChangedRows.has(l.item_sl_no+"|"+l.sl_no);
                   const rowBg=isZero?"#fdecea":(isChangedInRevision?"#fff8e1":"transparent");
                   const stickyBg=isZero?"#fdecea":(isChangedInRevision?"#fff8e1":"#fff");
@@ -8380,15 +8437,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                     ),
                     h("td",{style:{padding:"7px 9px",textAlign:"right",fontWeight:700,whiteSpace:"nowrap",color:isZero?colors.danger:colors.accent}},
                       isSaving?"":fmtR(sales)
-                    ),
-                    h("td",{style:{padding:"7px 9px",textAlign:"center"}},
-                      h("input",{type:"checkbox",checked:showMoc,
-                        onChange:e=>{
-                          setLineEdit(l.reference_number,l.sl_no,"show_in_moc",e.target.checked);
-                          sb.from("estimate_lines").update({show_in_moc:e.target.checked}).eq("reference_number",l.reference_number).eq("item_sl_no",l.item_sl_no).eq("sl_no",l.sl_no);
-                        },
-                        style:{width:15,height:15,cursor:"pointer",accentColor:"#1c8c75"}
-                      })
                     ),
                     h("td",{style:{padding:"5px 6px",whiteSpace:"nowrap"}},
                       h("div",{style:{display:"flex",gap:4}},
@@ -10822,6 +10870,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (19)", summary:"Big one — retired the old per-line \"show in MOC\" tick box entirely, replaced with item-wise MOC Rules. Run crm_phase9_item_moc_rules_setup.sql (backfills Category on Models into category_tbl, since it used to be free text and those values never made it into the real master table; creates item_moc_rules; drops estimate_lines.show_in_moc — sequenced last, don't run until this file is actually deployed). New Master Data screen, Item MOC Rules (Engineering, next to Datasheet Master): pick an item, check which of its known sub-assemblies (from Sub-assemblies master) should show under Material Data — set once per item, applies to every quote of that item from then on, not re-decided every time someone builds one. Grades are never stored in the rule; they still come live from the real BOM/estimate line at build time. Both places that used to read show_in_moc now read this instead — the Datasheet screen and, separately, the actual Quote PDF generator's own Material Data section, which had its own independent copy of this logic that would've silently gone stale if only one had been fixed. Retired everywhere the old flag was set or shown: the Estimator's MOC popup Select-all/Deselect-all/Reset-to-No bar and its per-line checkbox column, and the equivalent post-save editing bar and checkbox column in the Quotes screen's BOM view. The existing generic add/delete-row mechanism in the Datasheet (works on every section already, Material Data included) is untouched and still the way to add a one-off row or hide something the rule doesn't cover — deliberately no new manual-entry UI needed for that." },
   { date:"25 Jul 2026 (18)", summary:"Generate Quote PDF's move under the status row had stretched it full-width, losing its original compact card look — fixed back to its original width (220px), same new position." },
   { date:"25 Jul 2026 (17)", summary:"Moved \"Generate Quote PDF\" up to sit directly under the Quote Status/readiness row at the top of an open quote, instead of down in the Export full quote grid alongside BOM/Datasheets/Summary/Cutting Plan exports." },
   { date:"25 Jul 2026 (16)", summary:"Master Data's cascade (\"limit to list\") fields — Category on the Models table and every other table's list-limited columns — now use a real <select> dropdown instead of a text input with a hidden autocomplete list, which is why Category still looked like plain text even after last round's fix: it WAS already limit-to-list underneath, it just didn't visually read as a combo box. Admin and Super Admin now also get a \"+ Add new…\" option in these dropdowns — picking it prompts for the new value, inserts it straight into the real master table (e.g. category_tbl), logs it, and selects it. Regular users see the plain dropdown only, genuinely unable to type a value that isn't already on the list. Scoped deliberately narrow: built as a new component (MasterCascadeSelect) used only by Master Data's own cascade fields, NOT a change to the shared LimitToListCombo component used in 30+ other places across BOM/Estimator pickers and search filters, where prompting to add a new master value would make no sense. Assumption made without full reconfirmation: this only governs the add-new capability inside these dropdowns — existing Edit/Add/Delete button visibility elsewhere on Master Data screens for regular users was left untouched, not broadened or narrowed." },
@@ -14513,6 +14562,7 @@ function App() {
     tab==="version_history"?h(VersionHistoryScreen,null):
     tab==="allowable_stress"?h(AllowableStressEditor,{user}):
     tab==="datasheet_master"?h(DatasheetMasterEditor,{onGoToTab:setTab}):
+    tab==="item_moc_rules"?h(ItemMocRulesEditor,{user}):
     tab==="company_master"?h(CompanyMasterEditor,{user}):
     tab==="description_master"?h(DescriptionMasterEditor,{user}):
     tab==="users"?h(UsersEditor,{user}):
