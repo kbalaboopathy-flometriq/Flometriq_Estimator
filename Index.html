@@ -5221,9 +5221,11 @@ function ItemMocRulesEditor({ user }){
         });
         const { data: existing } = await sb.from("item_moc_rules").select("id").eq("item",targetItem).maybeSingle();
         if(existing){
-          await sb.from("item_moc_rules").update({parameters,updated_at:new Date().toISOString()}).eq("id",existing.id);
+          const { error } = await sb.from("item_moc_rules").update({parameters,updated_at:new Date().toISOString()}).eq("id",existing.id);
+          if(error) throw new Error(error.message+" (on "+targetItem+")");
         } else {
-          await sb.from("item_moc_rules").insert({item:targetItem,parameters,updated_by:user?.username||"unknown"});
+          const { error } = await sb.from("item_moc_rules").insert({item:targetItem,parameters,updated_by:user?.username||"unknown"});
+          if(error) throw new Error(error.message+" (on "+targetItem+")");
         }
       }
       setCopyWarnings(warnings);
@@ -5245,9 +5247,11 @@ function ItemMocRulesEditor({ user }){
     try{
       const payload = { item:selectedItem, parameters, updated_at:new Date().toISOString() };
       if(existingRowId){
-        await sb.from("item_moc_rules").update(payload).eq("id",existingRowId);
+        const { error } = await sb.from("item_moc_rules").update(payload).eq("id",existingRowId);
+        if(error) throw new Error(error.message+" — if this mentions a missing column, the item_moc_rules table on this database still has the old schema; re-run the latest crm_phase9_item_moc_rules_setup.sql.");
       } else {
-        const { data } = await sb.from("item_moc_rules").insert({...payload,updated_by:user?.username||"unknown"}).select().single();
+        const { data, error } = await sb.from("item_moc_rules").insert({...payload,updated_by:user?.username||"unknown"}).select().single();
+        if(error) throw new Error(error.message+" — if this mentions a missing column, the item_moc_rules table on this database still has the old schema; re-run the latest crm_phase9_item_moc_rules_setup.sql.");
         setExistingRowId(data.id);
       }
       await logAudit("UPDATE","item_moc_rules",selectedItem,"Saved MOC rule ("+parameters.length+" parameter(s)) for \""+selectedItem+"\"",user?.username||"unknown",null,{item:selectedItem,parameter_count:parameters.length});
@@ -11000,6 +11004,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (22)", summary:"Fixed \"Save failed: Cannot read properties of null (reading 'id')\" on Item MOC Rules — the insert/update wasn't checking for a Supabase error before reading the result, so any real database failure (most likely: the table still has last round's old schema, since this database probably hasn't had the updated crm_phase9_item_moc_rules_setup.sql re-run yet) crashed uninformatively instead of showing what actually went wrong. Now surfaces the real error message, with a hint about the schema mismatch specifically. Same fix applied to \"Copy to other items.\" This is very likely a re-run-the-SQL issue, not a new code bug — re-run the latest crm_phase9_item_moc_rules_setup.sql (safe, nothing depends on the old shape yet) and this should go away; if the real error message says something else, that tells us the actual cause." },
   { date:"25 Jul 2026 (21)", summary:"Rebuilt Item MOC Rules from scratch — the checkbox-list version from last round wasn't what was actually wanted. Now mirrors Description Master exactly: one parameter row per rule (Label, Match on Component/Sub Assembly, Matched value validated against that item's real BOM, Value from Grade/Spec radio), same table/card view toggle, same \"copy to other items\" flow, same drag-to-reorder. Schema changed to match — item_moc_rules is now one row per item with a parameters jsonb array (was one row per item+sub_assembly before; safe to replace since nothing's been deployed yet). New shared function buildMocMaterialDataRows mirrors the existing buildAutoDescription matching logic exactly, just returning structured {label,value} rows instead of a joined string. Found and fixed a THIRD, previously-missed copy of the old raw materialDataRows logic living inside buildDatasheetSectionRows (used by the actual PDF generator) — would have silently kept using the old flat sub-assembly-as-label behavior even after the Datasheet screen and the outer PDF-generator call site were both fixed." },
   { date:"25 Jul 2026 (20)", summary:"Nav reorganized. Master Data's old flat \"BOM setup\" subgroup split into Item Master (Items, Sizes, Models, Category, Components, Sub-assemblies) and Raw Material Master (Material Shapes, Material Dim Specs, Grades, U.O.M, Material Rates Update). New flat top-level \"Rules\" toolbar (admin-gated, same as before): Datasheet MOC (the Item MOC Rules screen) and Description (Description Master) — the intended home for any future rule-type screen. Allowable Stress and Datasheet Master stayed behind in Master Data's Engineering subgroup — only the two genuinely rule-governing screens moved out. BOM (the actual editable BOM entry table, not a summary) moved out of Master Data into Reports — kept in the admin-only Reports subgroup specifically, not the general one regular users can already see, so this doesn't loosen the existing read-only-for-user rule on master data." },
   { date:"25 Jul 2026 (19)", summary:"Big one — retired the old per-line \"show in MOC\" tick box entirely, replaced with item-wise MOC Rules. Run crm_phase9_item_moc_rules_setup.sql (backfills Category on Models into category_tbl, since it used to be free text and those values never made it into the real master table; creates item_moc_rules; drops estimate_lines.show_in_moc — sequenced last, don't run until this file is actually deployed). New Master Data screen, Item MOC Rules (Engineering, next to Datasheet Master): pick an item, check which of its known sub-assemblies (from Sub-assemblies master) should show under Material Data — set once per item, applies to every quote of that item from then on, not re-decided every time someone builds one. Grades are never stored in the rule; they still come live from the real BOM/estimate line at build time. Both places that used to read show_in_moc now read this instead — the Datasheet screen and, separately, the actual Quote PDF generator's own Material Data section, which had its own independent copy of this logic that would've silently gone stale if only one had been fixed. Retired everywhere the old flag was set or shown: the Estimator's MOC popup Select-all/Deselect-all/Reset-to-No bar and its per-line checkbox column, and the equivalent post-save editing bar and checkbox column in the Quotes screen's BOM view. The existing generic add/delete-row mechanism in the Datasheet (works on every section already, Material Data included) is untouched and still the way to add a one-off row or hide something the rule doesn't cover — deliberately no new manual-entry UI needed for that." },
