@@ -712,13 +712,18 @@ function LoginScreen({ onLogin }) {
     try {
       const { data, error:err } = await sb.from("app_users").select("*").eq("username",username.trim()).limit(1);
       if(err) throw err;
-      const success = data&&data.length>0&&data[0].password===password;
-      // Log login attempt
+      const credsOk = data&&data.length>0&&data[0].password===password;
+      const isActive = data&&data.length>0 ? data[0].is_active!==false : true;
+      const success = credsOk && isActive;
+      // Log login attempt — a correct-password-but-deactivated attempt is
+      // logged distinctly from a genuinely wrong password, since those mean
+      // very different things when reviewing login history later.
       await sb.from("login_history").insert({
         username: username.trim()||"unknown",
         user_agent: navigator.userAgent.substring(0,200),
-        status: success?"success":"failed"
+        status: success?"success":(credsOk&&!isActive?"blocked (inactive)":"failed")
       });
+      if(credsOk && !isActive){ setError("This account has been deactivated. Contact your Super Admin."); setLoading(false); return; }
       if(!success) { setError("Incorrect username or password."); setLoading(false); return; }
       onLogin({ id:data[0].id, username:data[0].username, role:data[0].role, company_id:data[0].company_id||null });
     } catch(e2) { setError("Cannot reach database."); } finally { setLoading(false); }
@@ -2958,10 +2963,36 @@ function UsersEditor({ user }) {
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
   const [adding,setAdding]=useState(false); const [draft,setDraft]=useState({username:"",password:"",role:"user"});
   const [companies,setCompanies]=useState([]);
+  const [revealed,setRevealed]=useState(new Set()); // ids currently showing their real password
+  const [resetTarget,setResetTarget]=useState(null); // row being reset
+  const [resetVal,setResetVal]=useState("");
   const load = useCallback(async()=>{ setLoading(true); const {data}=await sb.from("app_users").select("*").order("id"); setRows(data||[]); setLoading(false); },[]);
   useEffect(()=>{load();},[load]);
   useEffect(()=>{ (async()=>{ const {data}=await sb.from("company_master").select("id,company_name").order("company_name"); setCompanies(data||[]); })(); },[]);
-  const addUser=async()=>{ if(!draft.username.trim()||!draft.password.trim()){alert("Username and password required.");return;} const{error:err}=await sb.from("app_users").insert({username:draft.username.trim(),password:draft.password,role:draft.role}); if(err){alert("Failed: "+err.message);return;} setAdding(false);setDraft({username:"",password:"",role:"user"});load(); };
+  const toggleReveal = async(row)=>{
+    const willReveal = !revealed.has(row.id);
+    setRevealed(s=>{ const n=new Set(s); if(willReveal) n.add(row.id); else n.delete(row.id); return n; });
+    if(willReveal) await logAudit("READ","app_users",row.username,"Viewed the stored password for \""+row.username+"\"",user?.username||"unknown",null,null);
+  };
+  const toggleActive = async(row)=>{
+    if(row.username==="Babu"){ alert("Cannot deactivate the primary admin."); return; }
+    const nextActive = row.is_active===false; // currently inactive -> reactivating; currently active -> deactivating
+    if(!confirm((nextActive?"Reactivate ":"Deactivate ")+row.username+"? "+(nextActive?"They'll be able to log in again.":"This blocks all login rights immediately — they won't be able to sign in again, even with the correct password, until reactivated."))) return;
+    const { error:err } = await sb.from("app_users").update({is_active:nextActive}).eq("id",row.id);
+    if(err){ alert("Failed: "+err.message); return; }
+    await logAudit("UPDATE","app_users",row.username,(nextActive?"Reactivated":"Deactivated")+" user \""+row.username+"\" by "+(user?.username||"unknown"),user?.username||"unknown",{is_active:row.is_active!==false},{is_active:nextActive});
+    load();
+  };
+  const startReset = (row)=>{ setResetTarget(row); setResetVal(""); };
+  const confirmReset = async()=>{
+    if(!resetVal.trim()){ alert("Enter a new password."); return; }
+    if(!confirm("Reset "+resetTarget.username+"'s password? They'll need the new one to sign in next time.")) return;
+    const { error:err } = await sb.from("app_users").update({password:resetVal}).eq("id",resetTarget.id);
+    if(err){ alert("Failed: "+err.message); return; }
+    await logAudit("UPDATE","app_users",resetTarget.username,"Password reset for \""+resetTarget.username+"\" by "+(user?.username||"unknown"),user?.username||"unknown",null,null);
+    setResetTarget(null); setResetVal(""); load();
+  };
+  const addUser=async()=>{ if(!draft.username.trim()||!draft.password.trim()){alert("Username and password required.");return;} const{error:err}=await sb.from("app_users").insert({username:draft.username.trim(),password:draft.password,role:draft.role}); if(err){alert("Failed: "+err.message);return;} await logAudit("CREATE","app_users",draft.username.trim(),"New user \""+draft.username.trim()+"\" created with role "+draft.role+" and an initial password set",user?.username||"unknown",null,{username:draft.username.trim(),role:draft.role}); setAdding(false);setDraft({username:"",password:"",role:"user"});load(); };
   const deleteUser=async(id,username)=>{ if(username==="Babu"){alert("Cannot delete primary admin.");return;} if(!confirm("Delete user "+username+"?"))return; await sb.from("app_users").delete().eq("id",id); await logAudit("DELETE","app_users",String(id),"Deleted user \""+username+"\"",user?.username||"unknown",{username},null); load(); };
   const setUserCompany=async(id,companyId)=>{
     await sb.from("app_users").update({company_id:companyId?Number(companyId):null}).eq("id",id);
@@ -2979,11 +3010,20 @@ function UsersEditor({ user }) {
       h("button",{onClick:addUser,style:btnSecondary},"Save"),h("button",{onClick:()=>setAdding(false),style:btnSecondary},"Cancel")
     ),
     loading?h("div",{style:{color:colors.mutedLight}},"Loading…"):
-    h("table",{style:{fontSize:13,maxWidth:650}},
-      h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left"}},h("th",{style:{padding:"8px 10px"}},"Username"),h("th",{style:{padding:"8px 10px"}},"Role"),h("th",{style:{padding:"8px 10px"}},"Company (used on their PDFs)"),h("th",{style:{padding:"8px 10px"}},""  ))),
+    h("table",{style:{fontSize:13,maxWidth:750}},
+      h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left"}},h("th",{style:{padding:"8px 10px"}},"Username"),h("th",{style:{padding:"8px 10px"}},"Role"),isSuperAdmin&&h("th",{style:{padding:"8px 10px"}},"Password"),isSuperAdmin&&h("th",{style:{padding:"8px 10px"}},"Status"),h("th",{style:{padding:"8px 10px"}},"Company (used on their PDFs)"),h("th",{style:{padding:"8px 10px"}},""  ))),
       h("tbody",null,rows.map(r=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
         h("td",{style:{padding:"8px 10px"}},r.username),
         h("td",{style:{padding:"8px 10px"}},r.role),
+        isSuperAdmin && h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
+          h("span",{style:{fontFamily:"monospace",fontSize:12,marginRight:8}},revealed.has(r.id)?r.password:"••••••••"),
+          h("button",{onClick:()=>toggleReveal(r),style:{...btnSmall,fontSize:10.5,padding:"3px 8px",marginRight:4}},revealed.has(r.id)?"Hide":"Show"),
+          h("button",{onClick:()=>startReset(r),style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Reset")
+        ),
+        isSuperAdmin && h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
+          h("span",{style:{fontSize:10.5,fontWeight:700,padding:"2px 9px",borderRadius:9,background:r.is_active===false?"#fdecea":"#eafaf1",color:r.is_active===false?colors.danger:"#0f6e3f",marginRight:6}},r.is_active===false?"Inactive":"Active"),
+          h("button",{onClick:()=>toggleActive(r),style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},r.is_active===false?"Reactivate":"Deactivate")
+        ),
         h("td",{style:{padding:"8px 10px"}},
           isSuperAdmin
             ? h("select",{value:r.company_id||"",onChange:e=>setUserCompany(r.id,e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12}},
@@ -2995,7 +3035,18 @@ function UsersEditor({ user }) {
         h("td",{style:{padding:"8px 10px"}},h("button",{onClick:()=>deleteUser(r.id,r.username),style:btnDanger},"Delete"))
       )))
     ),
-    !isSuperAdmin && h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:10}},"Only a Super Admin can change which company is assigned to a user.")
+    isSuperAdmin && h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:10,lineHeight:1.6}},"Every reveal and every reset is logged to the Audit Log, including who did it and which account it was."),
+    !isSuperAdmin && h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:10}},"Only a Super Admin can change which company is assigned to a user."),
+    resetTarget && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 22px",width:340}},
+        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:10}},"Reset password — "+resetTarget.username),
+        h("input",{value:resetVal,onChange:e=>setResetVal(e.target.value),placeholder:"New password",autoFocus:true,style:{...inputStyle,width:"100%",marginBottom:10}}),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:confirmReset,style:{...btnPrimary,flex:1}},"Reset"),
+          h("button",{onClick:()=>setResetTarget(null),style:{...btnSecondary,flex:1}},"Cancel")
+        )
+      )
+    )
   );
 }
 
@@ -11048,6 +11099,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (30)", summary:"Active/Inactive users. Run crm_phase10_user_active_status.sql (adds app_users.is_active, defaults true, nothing else changes). Admin → Users gets a Status column (Super Admin only, same gating as the password column) with a Deactivate/Reactivate button — deactivating blocks that username from logging in entirely, even with the correct password, checked at login time (not a live-session kick — someone already logged in stays logged in until their session ends normally). A blocked login attempt is logged distinctly in Login History (\"blocked (inactive)\") rather than lumped in with a genuinely wrong password, since those mean different things when reviewing history later. Every deactivate/reactivate is logged to the Audit Log same as the password reset. Primary admin (\"Babu\") can't be deactivated, same protection the existing delete-user rule already had." },
+  { date:"25 Jul 2026 (29)", summary:"Super Admin can now see and reset any user's password from Admin → Users — a Show/Hide toggle per row plus a Reset action, both logged to the Audit Log with who did it and which account. Also logged a real pre-existing gap: creating a new user with its initial password was never logged before, only deletions were. While building this, found something more urgent: passwords are stored in plain text (a pre-existing condition, not something this round introduced), and Data Backup — which was just hardened a couple rounds ago — was exporting every user's real password into the downloadable Excel file every time anyone ran a backup, since app_users is in the full table list. Fixed proactively: the backup now redacts that column, pointing to the new logged reveal/reset flow instead. Flagging clearly, not silently: the underlying plaintext storage itself is still there — passwords should really be hashed, not stored in the clear at all — this round made the exposure smaller (visible only through one logged, gated screen instead of also leaking into every backup file) but didn't fix the root cause." },
   { date:"25 Jul 2026 (28)", summary:"Quote PDF restructured, verified with real generated test files before shipping (not just reasoning about it) — built the exact same page-flow logic in a standalone script, ran it, and checked the actual page-by-page text output for three cases (short/medium/long Notes) before porting into the real generator. (1) Revision History now sits right after the Cover Page — effectively page 2 — instead of after Notes; Index shifts down accordingly and its own listing now reflects the new physical order with dynamic S.No numbering, since Revision History is conditional (only present on a revision with logged changes). (2) Notes placement is now all-or-nothing: it's measured on a disposable scratch PDF first, using the exact same table settings, before anything is drawn for real — if it fits entirely below Commercial Terms, it's drawn right there with just a plain \"NOTES\" heading; if it doesn't fit in full, none of it starts on the Terms page at all, it begins completely fresh on its own page with the full Annexure-IB letterhead. Previous approach just started drawing and let the table library split content across the boundary, which looked broken — this fixed that by deciding once, atomically, rather than reacting after the fact." },
   { date:"25 Jul 2026 (27)", summary:"Data Backup: fixed \"Text length must not exceed 32767 characters\" — Excel's own hard per-cell limit, most likely tripped by a large jsonb column (the parameters array on Description Master/Item MOC Rules, or a big Datasheet field_values blob) getting flattened into one giant JSON string. This only ever surfaces at final file-write time, well outside any single table's own per-table try/catch, so a fix there wouldn't have caught it — capped every cell's length proactively before it's ever written instead, truncating anything over 32,000 characters with a note pointing back to the live table for the full value." },
   { date:"25 Jul 2026 (26)", summary:"Data Backup: found and fixed the real cause of it getting stuck at \"Finishing…\" forever — runBackup had no top-level try/catch, so any failure past the per-table fetch loop (writing the file, the closing audit log entry) left the button stuck showing \"Backing up…\" with no error and no way out short of reloading. Now fully wrapped — any failure pops up a message and resets the button, nothing is downloaded silently-broken. Also: audit_log, login_history, and calc_history grow forever and were being pulled in full every time, which is plausibly what was actually stalling it — these three are now trimmed to a \"days to keep\" number (default 90, persisted as your last choice) in every backup, except DELETE and EXPORT actions in Audit Log specifically, which are always kept in full regardless of the window, since those are the two categories with real accountability value. Added a live percentage next to the progress bar and a wait/hourglass cursor while a backup is running." },
@@ -13012,6 +13065,10 @@ function DataBackupScreen({ user }){
                 const flat = {};
                 Object.keys(r).forEach(k=>{
                   const v=r[k];
+                  // Never let a plaintext password sit in a downloadable
+                  // file — Users management has a proper logged reveal/
+                  // reset flow for the rare times anyone actually needs it.
+                  if(table==="app_users" && k==="password"){ flat[k]="[redacted — see Admin → Users, logged there]"; return; }
                   let out = (v&&typeof v==="object") ? JSON.stringify(v) : v;
                   if(typeof out==="string" && out.length>32000) out = out.slice(0,32000)+" …[truncated, "+out.length+" chars total — see the live table for the full value]";
                   flat[k] = out;
