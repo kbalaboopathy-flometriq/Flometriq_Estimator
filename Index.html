@@ -7651,7 +7651,29 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         doc.setTextColor(...dark);
       }
 
-      // ---- Page 2: reserved for the Index — filled in last, once every
+      // ---- Revision History — right after the Cover, its own page, only
+      // for a revision with logged changes ----
+      let revHistStartPage = null, revHistEndPage = null;
+      if(isRevisionPdf && revChangesForPdf.length){
+        const AREA_LABELS_PDF = {header:"Header",commercial_terms:"Commercial Terms",notes:"Notes",datasheet:"Datasheet",bom:"BOM"};
+        doc.addPage();
+        letterhead("ANNEXURE - IC  REVISION HISTORY");
+        revHistStartPage = doc.internal.getNumberOfPages();
+        doc.autoTable({
+          startY:34,
+          head:[["Area","Field","Old value","New value","By"]],
+          body:revChangesForPdf.map(r=>[AREA_LABELS_PDF[r.area]||r.area,(r.item_sl_no?("Sl "+r.item_sl_no+" — "):"")+(r.field_name||"").split("|").pop(),r.old_value||"—",r.new_value||"—",r.changed_by||"—"]),
+          theme:"plain",
+          styles:{font:"times",fontSize:8,textColor:dark,cellPadding:{top:2.5,bottom:2.5,left:2,right:4}},
+          headStyles:{font:"times",fontStyle:"bold"},
+          columnStyles:{0:{cellWidth:26},1:{cellWidth:40},2:{cellWidth:38},3:{cellWidth:38},4:{cellWidth:"auto"}},
+          margin:{top:32,left:12,right:12,bottom:16},
+          didDrawPage:()=>letterhead("ANNEXURE - IC  REVISION HISTORY")
+        });
+        revHistEndPage = doc.internal.getNumberOfPages();
+      }
+
+      // ---- Page reserved for the Index — filled in last, once every
       // other section's real page number is known ----
       doc.addPage();
       const indexPage = doc.internal.getNumberOfPages();
@@ -7686,15 +7708,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         didDrawPage:()=>letterhead("ANNEXURE - I  COMMERCIAL TERMS")
       });
       const termsEndPage = doc.internal.getNumberOfPages();
+      const afterTermsY = doc.lastAutoTable.finalY;
 
-      // ---- Notes (new) — its own page, only when there's at least one note ----
+      // ---- Notes — fits entirely below Commercial Terms on the same
+      // page, or starts completely fresh on its own page. Never split
+      // partway: measured first on a disposable scratch document using
+      // the exact same table settings, so the decision reflects real
+      // wrapped-text height rather than a guess at line count. ----
       let notesStartPage = null, notesEndPage = null;
       if(quoteNotes.length){
-        doc.addPage();
-        letterhead("ANNEXURE - IB  NOTES");
-        notesStartPage = doc.internal.getNumberOfPages();
-        doc.autoTable({
-          startY:34,
+        const notesTableOpts = (startY)=>({
+          startY,
           head:[["Sl No","Note"]],
           body:quoteNotes.map(n=>[String(n.sl_no??""),n.note_text||""]),
           theme:"plain",
@@ -7702,30 +7726,28 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           headStyles:{font:"times",fontStyle:"bold"},
           columnStyles:{0:{cellWidth:20},1:{cellWidth:"auto"}},
           margin:{top:32,left:12,right:12,bottom:16},
-          didDrawPage:()=>letterhead("ANNEXURE - IB  NOTES")
         });
-        notesEndPage = doc.internal.getNumberOfPages();
-      }
+        const headerY = afterTermsY + 10;
+        const { jsPDF: ScratchPDF } = window.jspdf;
+        const scratch = new ScratchPDF({orientation:"portrait",unit:"mm",format:"a4"});
+        scratch.autoTable(notesTableOpts(headerY+4));
+        const fitsInline = scratch.internal.getNumberOfPages()===1;
 
-      // ---- Revision History (new) — its own page, only for a revision with logged changes ----
-      let revHistStartPage = null, revHistEndPage = null;
-      if(isRevisionPdf && revChangesForPdf.length){
-        const AREA_LABELS_PDF = {header:"Header",commercial_terms:"Commercial Terms",notes:"Notes",datasheet:"Datasheet",bom:"BOM"};
-        doc.addPage();
-        letterhead("ANNEXURE - IC  REVISION HISTORY");
-        revHistStartPage = doc.internal.getNumberOfPages();
-        doc.autoTable({
-          startY:34,
-          head:[["Area","Field","Old value","New value","By"]],
-          body:revChangesForPdf.map(r=>[AREA_LABELS_PDF[r.area]||r.area,(r.item_sl_no?("Sl "+r.item_sl_no+" — "):"")+(r.field_name||"").split("|").pop(),r.old_value||"—",r.new_value||"—",r.changed_by||"—"]),
-          theme:"plain",
-          styles:{font:"times",fontSize:8,textColor:dark,cellPadding:{top:2.5,bottom:2.5,left:2,right:4}},
-          headStyles:{font:"times",fontStyle:"bold"},
-          columnStyles:{0:{cellWidth:26},1:{cellWidth:40},2:{cellWidth:38},3:{cellWidth:38},4:{cellWidth:"auto"}},
-          margin:{top:32,left:12,right:12,bottom:16},
-          didDrawPage:()=>letterhead("ANNEXURE - IC  REVISION HISTORY")
-        });
-        revHistEndPage = doc.internal.getNumberOfPages();
+        if(fitsInline){
+          doc.setFontSize(9.5); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+          doc.text("NOTES", 12, headerY);
+          notesStartPage = doc.internal.getNumberOfPages();
+          doc.autoTable(notesTableOpts(headerY+4));
+        } else {
+          doc.addPage();
+          letterhead("ANNEXURE - IB  NOTES");
+          notesStartPage = doc.internal.getNumberOfPages();
+          doc.autoTable({
+            ...notesTableOpts(34),
+            didDrawPage:()=>{ if(doc.internal.getNumberOfPages() > notesStartPage) letterhead("ANNEXURE - IB  NOTES"); }
+          });
+        }
+        notesEndPage = doc.internal.getNumberOfPages();
       }
 
       // ---- Price Summary — one row per Sl No ----
@@ -7796,18 +7818,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // ---- Go back and fill in the Index now that every page number is known ----
       doc.setPage(indexPage);
       letterhead("INDEX");
+      const indexRows = [["1","","Cover Page","1"]];
+      let seq = 2;
+      if(revHistStartPage) indexRows.push([String(seq++),"Annexure-IC","Revision History", revHistStartPage===revHistEndPage?String(revHistStartPage):revHistStartPage+"-"+revHistEndPage]);
+      indexRows.push([String(seq++),"","Index",String(indexPage)]);
+      indexRows.push([String(seq++),"Annexure-I","Commercial Terms", termsStartPage===termsEndPage?String(termsStartPage):termsStartPage+"-"+termsEndPage]);
+      if(quoteNotes.length) indexRows.push([String(seq++),"Annexure-IB","Notes", notesStartPage===notesEndPage?String(notesStartPage):notesStartPage+"-"+notesEndPage]);
+      indexRows.push([String(seq++),"Annexure-II","Price Summary", summaryStartPage===summaryEndPage?String(summaryStartPage):summaryStartPage+"-"+summaryEndPage]);
+      indexRows.push([String(seq++),"Annexure-III","Technical Data Sheet", dsStartPage===dsEndPage?String(dsStartPage):dsStartPage+"-"+dsEndPage]);
       doc.autoTable({
         startY:36,
         head:[["S.No","Annexures","Description","Page Nos"]],
-        body:[
-          ["1","","Cover Page","1"],
-          ["2","","Index","2"],
-          ["3","Annexure-I","Commercial Terms", termsStartPage===termsEndPage?String(termsStartPage):termsStartPage+"-"+termsEndPage],
-          ...(quoteNotes.length ? [["","Annexure-IB","Notes", notesStartPage===notesEndPage?String(notesStartPage):notesStartPage+"-"+notesEndPage]] : []),
-          ...(revHistStartPage ? [["","Annexure-IC","Revision History", revHistStartPage===revHistEndPage?String(revHistStartPage):revHistStartPage+"-"+revHistEndPage]] : []),
-          ["4","Annexure-II","Price Summary", summaryStartPage===summaryEndPage?String(summaryStartPage):summaryStartPage+"-"+summaryEndPage],
-          ["5","Annexure-III","Technical Data Sheet", dsStartPage===dsEndPage?String(dsStartPage):dsStartPage+"-"+dsEndPage],
-        ],
+        body: indexRows,
         theme:"grid",
         headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:9,font:"times"},
         bodyStyles:{font:"times",fontSize:9,textColor:dark},
@@ -11026,6 +11048,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (28)", summary:"Quote PDF restructured, verified with real generated test files before shipping (not just reasoning about it) — built the exact same page-flow logic in a standalone script, ran it, and checked the actual page-by-page text output for three cases (short/medium/long Notes) before porting into the real generator. (1) Revision History now sits right after the Cover Page — effectively page 2 — instead of after Notes; Index shifts down accordingly and its own listing now reflects the new physical order with dynamic S.No numbering, since Revision History is conditional (only present on a revision with logged changes). (2) Notes placement is now all-or-nothing: it's measured on a disposable scratch PDF first, using the exact same table settings, before anything is drawn for real — if it fits entirely below Commercial Terms, it's drawn right there with just a plain \"NOTES\" heading; if it doesn't fit in full, none of it starts on the Terms page at all, it begins completely fresh on its own page with the full Annexure-IB letterhead. Previous approach just started drawing and let the table library split content across the boundary, which looked broken — this fixed that by deciding once, atomically, rather than reacting after the fact." },
   { date:"25 Jul 2026 (27)", summary:"Data Backup: fixed \"Text length must not exceed 32767 characters\" — Excel's own hard per-cell limit, most likely tripped by a large jsonb column (the parameters array on Description Master/Item MOC Rules, or a big Datasheet field_values blob) getting flattened into one giant JSON string. This only ever surfaces at final file-write time, well outside any single table's own per-table try/catch, so a fix there wouldn't have caught it — capped every cell's length proactively before it's ever written instead, truncating anything over 32,000 characters with a note pointing back to the live table for the full value." },
   { date:"25 Jul 2026 (26)", summary:"Data Backup: found and fixed the real cause of it getting stuck at \"Finishing…\" forever — runBackup had no top-level try/catch, so any failure past the per-table fetch loop (writing the file, the closing audit log entry) left the button stuck showing \"Backing up…\" with no error and no way out short of reloading. Now fully wrapped — any failure pops up a message and resets the button, nothing is downloaded silently-broken. Also: audit_log, login_history, and calc_history grow forever and were being pulled in full every time, which is plausibly what was actually stalling it — these three are now trimmed to a \"days to keep\" number (default 90, persisted as your last choice) in every backup, except DELETE and EXPORT actions in Audit Log specifically, which are always kept in full regardless of the window, since those are the two categories with real accountability value. Added a live percentage next to the progress bar and a wait/hourglass cursor while a backup is running." },
   { date:"25 Jul 2026 (25)", summary:"\"Rules\" is now a proper dropdown menu (same style as Master Data/Reports) instead of two separate flat buttons crowding the toolbar — Datasheet MOC and Description now sit as sub-items inside one \"Rules\" click." },
