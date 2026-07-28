@@ -11026,6 +11026,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (26)", summary:"Data Backup: found and fixed the real cause of it getting stuck at \"Finishing…\" forever — runBackup had no top-level try/catch, so any failure past the per-table fetch loop (writing the file, the closing audit log entry) left the button stuck showing \"Backing up…\" with no error and no way out short of reloading. Now fully wrapped — any failure pops up a message and resets the button, nothing is downloaded silently-broken. Also: audit_log, login_history, and calc_history grow forever and were being pulled in full every time, which is plausibly what was actually stalling it — these three are now trimmed to a \"days to keep\" number (default 90, persisted as your last choice) in every backup, except DELETE and EXPORT actions in Audit Log specifically, which are always kept in full regardless of the window, since those are the two categories with real accountability value. Added a live percentage next to the progress bar and a wait/hourglass cursor while a backup is running." },
   { date:"25 Jul 2026 (25)", summary:"\"Rules\" is now a proper dropdown menu (same style as Master Data/Reports) instead of two separate flat buttons crowding the toolbar — Datasheet MOC and Description now sit as sub-items inside one \"Rules\" click." },
   { date:"25 Jul 2026 (24)", summary:"Commercial Terms and Documents cards moved up to sit in a row next to Generate Quote PDF, right under the status row — previously they lived down in the Export panel grid, separate from Generate Quote PDF's own compact box. All three now share the same row and card styling." },
   { date:"25 Jul 2026 (23)", summary:"Three fixes. (1) BOM Entry Form moved out of Reports into Master Data → Item Master, right after Items — BOM itself (the report/table view) stays in Reports as confirmed correct. (2) Rename Model's cascade now also updates the saved BOM lines on Draft quotes (estimate_lines), not just the Sl No header (estimates) — previously a renamed model would show correctly at the header level while every line underneath silently kept the old name. (3) Closed the real gap that made (2) possible to bypass in the first place: \"Model\" is now read-only in both single-row Edit and bulk \"Edit all lines\" on the Models table, with a note pointing to the dedicated Rename tool — editing it directly used to update only that one model_tbl row with no cascade at all, silently breaking the link to BOM and Draft quotes. Renaming is now only possible through the one tool built to handle its consequences correctly. Adding a brand new model is unaffected — Model stays freely editable there, since nothing references a new model yet." },
@@ -12918,6 +12919,14 @@ function DataBackupScreen({ user }){
   const [tableListSource,setTableListSource] = useState("loading"); // "live" | "fallback" | "loading"
   const [progress,setProgress] = useState({done:0,total:BACKUP_ALL_TABLES.length,current:""});
   const [lastBackup,setLastBackup] = useState(null);
+  const BACKUP_DAYS_KEY = "flometriq_backup_log_days";
+  const [backupDays,setBackupDays] = useState(()=>{
+    try{ const v = Number(localStorage.getItem(BACKUP_DAYS_KEY)); return v>0?v:90; } catch(e){ return 90; }
+  });
+  const setBackupDaysPersisted = (v)=>{
+    setBackupDays(v);
+    try{ localStorage.setItem(BACKUP_DAYS_KEY, String(v)); } catch(e){}
+  };
 
   const [restoreFile,setRestoreFile] = useState(null);
   const [restoreRunning,setRestoreRunning] = useState(false);
@@ -12942,41 +12951,62 @@ function DataBackupScreen({ user }){
     })();
   },[]);
 
+  // Log-style tables grow forever and are never restored-from directly —
+  // only DELETE and EXPORT actions in audit_log carry real accountability
+  // value and are kept in full regardless of the window below; everything
+  // else in these three tables is trimmed to backupDays, since pulling an
+  // ever-growing table's full history into one Excel sheet is exactly what
+  // stalled this screen before.
+  const LOG_TABLE_DATE_COL = { audit_log:"performed_at", login_history:"logged_in_at", calc_history:"performed_at" };
   const runBackup = async()=>{
     setRunning(true);
     setProgress({done:0,total:tableList.length,current:""});
-    const wb = XLSX.utils.book_new();
-    let successCount = 0, failCount = 0;
-    for(let i=0;i<tableList.length;i++){
-      const table = tableList[i];
-      setProgress({done:i,total:tableList.length,current:table});
-      try{
-        const { data, error } = await sb.from(table).select("*");
-        if(error) throw error;
-        const rows = data||[];
-        const ws = rows.length
-          ? XLSX.utils.json_to_sheet(rows.map(r=>{
-              // Flatten anything jsonb/object so it lands in a cell as text, not [object Object]
-              const flat = {};
-              Object.keys(r).forEach(k=>{ const v=r[k]; flat[k] = (v&&typeof v==="object") ? JSON.stringify(v) : v; });
-              return flat;
-            }))
-          : XLSX.utils.aoa_to_sheet([["(no rows)"]]);
-        // Sheet names are capped at 31 characters in Excel
-        XLSX.utils.book_append_sheet(wb, ws, table.slice(0,31));
-        successCount++;
-      } catch(e){
-        console.error("Backup failed for table",table,e);
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Could not export: "+(e.message||e)]]), table.slice(0,31));
-        failCount++;
+    try{
+      const wb = XLSX.utils.book_new();
+      let successCount = 0, failCount = 0;
+      const cutoff = new Date(Date.now() - backupDays*24*60*60*1000).toISOString();
+      for(let i=0;i<tableList.length;i++){
+        const table = tableList[i];
+        setProgress({done:i,total:tableList.length,current:table});
+        try{
+          let query = sb.from(table).select("*");
+          if(table==="audit_log"){
+            query = sb.from(table).select("*").or("action.eq.DELETE,action.eq.EXPORT,performed_at.gte."+cutoff);
+          } else if(LOG_TABLE_DATE_COL[table]){
+            query = sb.from(table).select("*").gte(LOG_TABLE_DATE_COL[table], cutoff);
+          }
+          const { data, error } = await query;
+          if(error) throw error;
+          const rows = data||[];
+          const ws = rows.length
+            ? XLSX.utils.json_to_sheet(rows.map(r=>{
+                // Flatten anything jsonb/object so it lands in a cell as text, not [object Object]
+                const flat = {};
+                Object.keys(r).forEach(k=>{ const v=r[k]; flat[k] = (v&&typeof v==="object") ? JSON.stringify(v) : v; });
+                return flat;
+              }))
+            : XLSX.utils.aoa_to_sheet([[LOG_TABLE_DATE_COL[table]?"(no rows in the last "+backupDays+" day(s) — deletions/exports are kept in full for audit_log)":"(no rows)"]]);
+          // Sheet names are capped at 31 characters in Excel
+          XLSX.utils.book_append_sheet(wb, ws, table.slice(0,31));
+          successCount++;
+        } catch(e){
+          console.error("Backup failed for table",table,e);
+          XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Could not export: "+(e.message||e)]]), table.slice(0,31));
+          failCount++;
+        }
       }
+      setProgress({done:tableList.length,total:tableList.length,current:""});
+      const filename = "Flometriq_Backup_"+new Date().toISOString().slice(0,10)+".xlsx";
+      XLSX.writeFile(wb, filename);
+      await logAudit("EXPORT","__backup__","full-backup","Manual data backup — "+successCount+" table(s) exported"+(failCount?", "+failCount+" failed":"")+" (audit_log/login_history/calc_history trimmed to last "+backupDays+" day(s), except audit_log deletions/exports kept in full)",user?.username||"unknown",null,null);
+      setLastBackup({performed_by:user?.username,performed_at:new Date().toISOString()});
+      if(failCount>0) alert("Backup finished, but "+failCount+" table(s) failed — check the sheet for that table in the downloaded file for the reason.");
+    } catch(e){
+      console.error("Backup failed",e);
+      alert("Backup failed: "+(e.message||e)+"\n\nNothing was downloaded. Try again — if it keeps happening, this is worth reporting.");
+    } finally {
+      setRunning(false);
     }
-    setProgress({done:tableList.length,total:tableList.length,current:""});
-    const filename = "Flometriq_Backup_"+new Date().toISOString().slice(0,10)+".xlsx";
-    XLSX.writeFile(wb, filename);
-    await logAudit("EXPORT","__backup__","full-backup","Manual data backup — "+successCount+" table(s) exported"+(failCount?", "+failCount+" failed":""),user?.username||"unknown",null,null);
-    setLastBackup({performed_by:user?.username,performed_at:new Date().toISOString()});
-    setRunning(false);
   };
 
   // Restore is a MERGE only — never deletes anything. Rows with an "id"
@@ -13040,10 +13070,15 @@ function DataBackupScreen({ user }){
     }
   };
 
-  return h("div",{style:{padding:"20px 24px",maxWidth:640}},
+  return h("div",{style:{padding:"20px 24px",maxWidth:640,cursor:running?"wait":"default"}},
     h("div",{style:{fontWeight:700,fontSize:16,marginBottom:4}},"Data Backup"),
     h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14,lineHeight:1.6}},"Downloads every table's current data as one Excel file, one sheet per table. Nothing scheduled — click whenever you want a snapshot. This is a data-only snapshot, not a restore point — see the note below before relying on it."),
     lastBackup && h("div",{style:{fontSize:11,color:colors.muted,marginBottom:14}},"Last backup: "+new Date(lastBackup.performed_at).toLocaleString()+" by "+lastBackup.performed_by),
+    h("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:14,fontSize:11.5,color:colors.muted}},
+      h("span",null,"Keep this many days of activity/login/calc history in each backup:"),
+      h("input",{type:"number",min:1,value:backupDays,disabled:running,onChange:e=>setBackupDaysPersisted(Math.max(1,Number(e.target.value)||1)),style:{...inputStyle,width:70,padding:"4px 7px",fontSize:12}}),
+      h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"— deletions and downloads in Audit Log are always kept in full")
+    ),
     h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,background:"#fff",padding:"14px 16px",marginBottom:14,maxHeight:180,overflowY:"auto"}},
       h("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:6}},
         h("div",{style:{fontSize:10.5,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em"}},tableList.length+" tables"),
@@ -13053,16 +13088,16 @@ function DataBackupScreen({ user }){
       ),
       tableList.map(t=>h("div",{key:t,style:{fontSize:12,padding:"2px 0",color:progress.current===t?colors.accent:colors.text,fontWeight:progress.current===t?700:400}},t))
     ),
-    h("button",{onClick:runBackup,disabled:running,style:{...btnPrimary,width:"100%",opacity:running?0.7:1}},running?"Backing up…":"Backup Now"),
+    h("button",{onClick:runBackup,disabled:running,style:{...btnPrimary,width:"100%",opacity:running?0.7:1,cursor:running?"wait":"pointer"}},running?("⏳ Backing up… "+Math.round((progress.done/progress.total)*100)+"%"):"Backup Now"),
     running && h("div",{style:{marginTop:12}},
       h("div",{style:{background:"#eceae0",borderRadius:6,height:8,overflow:"hidden"}},
         h("div",{style:{background:colors.dark,height:"100%",width:((progress.done/progress.total)*100)+"%",transition:"width 0.2s"}})
       ),
-      h("div",{style:{fontSize:11,color:colors.muted,marginTop:6}},progress.done<progress.total?("Exporting "+progress.current+"…"):"Finishing…")
+      h("div",{style:{fontSize:11,color:colors.muted,marginTop:6}},progress.done<progress.total?("Exporting "+progress.current+"… ("+Math.round((progress.done/progress.total)*100)+"%)"):"Finishing…")
     ),
     h("div",{style:{marginTop:16,fontSize:11,color:colors.mutedLight,lineHeight:1.6,borderTop:"1px solid "+colors.border,paddingTop:12}},
       h("strong",null,"Restoring from this file isn't a one-click process — "),
-      "it's data only, not the database schema or relationships. If Supabase itself is lost, someone (realistically, whoever built this app) needs to rebuild the tables first, then re-import this data carefully. For real point-in-time recovery, check whether your Supabase plan includes built-in daily backups under Database → Backups in the Supabase dashboard — that restores everything, schema included, in one step."
+      "it's data only, not the database schema or relationships. If Supabase itself is lost, someone (realistically, whoever built this app) needs to rebuild the tables first, then re-import this data carefully. For real point-in-time recovery, check whether your Supabase plan includes built-in daily backups under Database → Backups in the Supabase dashboard — that restores everything, schema included, in one step. Also: audit_log, login_history, and calc_history are trimmed to the day count above in every backup — they grow forever and pulling their full history in one go is what stalled this screen before. Deletions and exports in Audit Log are always kept in full regardless."
     ),
     isSuperAdmin && h("div",{style:{marginTop:24,paddingTop:20,borderTop:"2px solid "+colors.border}},
       h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Restore from Backup"),
