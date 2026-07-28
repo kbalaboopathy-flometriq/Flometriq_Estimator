@@ -11026,6 +11026,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (27)", summary:"Data Backup: fixed \"Text length must not exceed 32767 characters\" — Excel's own hard per-cell limit, most likely tripped by a large jsonb column (the parameters array on Description Master/Item MOC Rules, or a big Datasheet field_values blob) getting flattened into one giant JSON string. This only ever surfaces at final file-write time, well outside any single table's own per-table try/catch, so a fix there wouldn't have caught it — capped every cell's length proactively before it's ever written instead, truncating anything over 32,000 characters with a note pointing back to the live table for the full value." },
   { date:"25 Jul 2026 (26)", summary:"Data Backup: found and fixed the real cause of it getting stuck at \"Finishing…\" forever — runBackup had no top-level try/catch, so any failure past the per-table fetch loop (writing the file, the closing audit log entry) left the button stuck showing \"Backing up…\" with no error and no way out short of reloading. Now fully wrapped — any failure pops up a message and resets the button, nothing is downloaded silently-broken. Also: audit_log, login_history, and calc_history grow forever and were being pulled in full every time, which is plausibly what was actually stalling it — these three are now trimmed to a \"days to keep\" number (default 90, persisted as your last choice) in every backup, except DELETE and EXPORT actions in Audit Log specifically, which are always kept in full regardless of the window, since those are the two categories with real accountability value. Added a live percentage next to the progress bar and a wait/hourglass cursor while a backup is running." },
   { date:"25 Jul 2026 (25)", summary:"\"Rules\" is now a proper dropdown menu (same style as Master Data/Reports) instead of two separate flat buttons crowding the toolbar — Datasheet MOC and Description now sit as sub-items inside one \"Rules\" click." },
   { date:"25 Jul 2026 (24)", summary:"Commercial Terms and Documents cards moved up to sit in a row next to Generate Quote PDF, right under the status row — previously they lived down in the Export panel grid, separate from Generate Quote PDF's own compact box. All three now share the same row and card styling." },
@@ -12980,9 +12981,18 @@ function DataBackupScreen({ user }){
           const rows = data||[];
           const ws = rows.length
             ? XLSX.utils.json_to_sheet(rows.map(r=>{
-                // Flatten anything jsonb/object so it lands in a cell as text, not [object Object]
+                // Flatten anything jsonb/object so it lands in a cell as text, not [object Object].
+                // Excel's own hard limit is 32,767 characters per cell — this only
+                // ever surfaces at final file-write time, well after any single
+                // table's own try/catch has already passed, so it has to be
+                // capped proactively here rather than caught reactively later.
                 const flat = {};
-                Object.keys(r).forEach(k=>{ const v=r[k]; flat[k] = (v&&typeof v==="object") ? JSON.stringify(v) : v; });
+                Object.keys(r).forEach(k=>{
+                  const v=r[k];
+                  let out = (v&&typeof v==="object") ? JSON.stringify(v) : v;
+                  if(typeof out==="string" && out.length>32000) out = out.slice(0,32000)+" …[truncated, "+out.length+" chars total — see the live table for the full value]";
+                  flat[k] = out;
+                });
                 return flat;
               }))
             : XLSX.utils.aoa_to_sheet([[LOG_TABLE_DATE_COL[table]?"(no rows in the last "+backupDays+" day(s) — deletions/exports are kept in full for audit_log)":"(no rows)"]]);
