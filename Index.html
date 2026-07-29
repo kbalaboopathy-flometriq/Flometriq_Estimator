@@ -1047,6 +1047,7 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports_audit",label:"Masters Audit"},
         {key:"reports_overdue_calls",label:"Overdue Calls"},
         {key:"reports_pending_validation",label:"Pending Validation"},
+        {key:"reports_missed_entries",label:"Missed / Late Entries"},
         {key:"bom",label:"BOM"},
       ]}]:[]),
     ]},
@@ -6445,26 +6446,34 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   },[]);
   useEffect(()=>{ if(quoteExportRef) loadQuoteDocuments(quoteExportRef); },[quoteExportRef,loadQuoteDocuments]);
 
-  // Quote-specific follow-up log — distinct from the company-level Activity
-  // Log elsewhere in CRM. If an account has several quotes running at
-  // once, this is what tells you which one a given call was actually about.
+  // Quote-specific follow-up log — same table as the company-level Activity
+  // Log elsewhere in CRM (activity_log_tbl), just filtered to this Quote#'s
+  // reference_number, so My Worklist / the overdue prompt / Overdue Calls
+  // all pick these up automatically with zero changes on their end.
   const [quoteActivities,setQuoteActivities]=useState([]);
   const [showQuoteActivityPanel,setShowQuoteActivityPanel]=useState(false);
-  const [quoteActivityDraft,setQuoteActivityDraft]=useState({activity_type:"Call",notes:""});
+  const [quoteActivityDraft,setQuoteActivityDraft]=useState({activity_type:"Call",notes:"",activity_date:new Date().toISOString().slice(0,10),next_followup_date:""});
   const [savingQuoteActivity,setSavingQuoteActivity]=useState(false);
   const loadQuoteActivities = useCallback(async(ref)=>{
     if(!ref) return;
-    const { data } = await sb.from("quote_activity_log").select("*").eq("reference_number",ref).order("created_at",{ascending:false});
+    const { data } = await sb.from("activity_log_tbl").select("*").eq("reference_number",ref).order("created_at",{ascending:false});
     setQuoteActivities(data||[]);
   },[]);
   useEffect(()=>{ if(quoteExportRef) loadQuoteActivities(quoteExportRef); },[quoteExportRef,loadQuoteActivities]);
   const saveQuoteActivity = async()=>{
     if(!quoteActivityDraft.notes.trim()){ alert("Add a note before saving."); return; }
+    if(!quoteActivityDraft.activity_date){ alert("Enter the date this actually happened."); return; }
     setSavingQuoteActivity(true);
     try{
-      await sb.from("quote_activity_log").insert({reference_number:quoteExportRef,activity_type:quoteActivityDraft.activity_type,notes:quoteActivityDraft.notes.trim(),logged_by:user?.username||"unknown"});
-      await logAudit("INSERT","quote_activity_log",quoteExportRef,"Logged "+quoteActivityDraft.activity_type+" follow-up on Quote# "+quoteExportRef,user?.username||"unknown",null,null);
-      setQuoteActivityDraft({activity_type:"Call",notes:""});
+      await sb.from("activity_log_tbl").insert({
+        reference_number:quoteExportRef,
+        company_name:(quoteHeaderRow&&quoteHeaderRow.customer_name)||null,
+        activity_type:quoteActivityDraft.activity_type, notes:quoteActivityDraft.notes.trim(),
+        activity_date:quoteActivityDraft.activity_date, next_followup_date:quoteActivityDraft.next_followup_date||null,
+        logged_by:user?.username||"unknown"
+      });
+      await logAudit("INSERT","activity_log_tbl",quoteExportRef,"Logged "+quoteActivityDraft.activity_type+" follow-up on Quote# "+quoteExportRef,user?.username||"unknown",null,null);
+      setQuoteActivityDraft({activity_type:"Call",notes:"",activity_date:new Date().toISOString().slice(0,10),next_followup_date:""});
       await loadQuoteActivities(quoteExportRef);
     } finally { setSavingQuoteActivity(false); }
   };
@@ -9133,21 +9142,29 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{fontWeight:700,fontSize:15}},"Follow-up log — "+quoteExportRef),
           h("button",{onClick:()=>setShowQuoteActivityPanel(false),style:{background:"none",border:"none",fontSize:16,cursor:"pointer",color:colors.mutedLight}},"✕")
         ),
-        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:16}},"Scoped to this quote specifically — separate from the account's own Activity Log elsewhere in CRM."),
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:16}},"Feeds the same Activity Log as My Worklist and the overdue-follow-up prompt — just filtered to this Quote# specifically, so a call about one of a customer's several parallel quotes doesn't get lost in their general history."),
         h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"12px 14px",marginBottom:14}},
           h("div",{style:{display:"flex",gap:8,marginBottom:8}},
-            h("select",{value:quoteActivityDraft.activity_type,onChange:e=>setQuoteActivityDraft(d=>({...d,activity_type:e.target.value})),style:{...inputStyle,width:110}},
+            h("select",{value:quoteActivityDraft.activity_type,onChange:e=>setQuoteActivityDraft(d=>({...d,activity_type:e.target.value})),style:{...inputStyle,width:100}},
               h("option",{value:"Call"},"Call"),h("option",{value:"Visit"},"Visit"),h("option",{value:"Email"},"Email")
-            )
+            ),
+            h("input",{type:"date",value:quoteActivityDraft.activity_date,onChange:e=>setQuoteActivityDraft(d=>({...d,activity_date:e.target.value})),style:{...inputStyle,width:120},title:"Date this actually happened"}),
+            h("input",{type:"date",value:quoteActivityDraft.next_followup_date,onChange:e=>setQuoteActivityDraft(d=>({...d,next_followup_date:e.target.value})),style:{...inputStyle,width:120},title:"Next follow-up date"})
           ),
           h("textarea",{value:quoteActivityDraft.notes,onChange:e=>setQuoteActivityDraft(d=>({...d,notes:e.target.value})),placeholder:"What was discussed…",style:{...inputStyle,width:"100%",minHeight:60,marginBottom:8}}),
           h("button",{onClick:saveQuoteActivity,disabled:savingQuoteActivity,style:{...btnPrimary,width:"100%",opacity:savingQuoteActivity?0.6:1}},savingQuoteActivity?"Saving…":"Log follow-up")
         ),
         quoteActivities.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"Nothing logged yet for this quote."),
-        quoteActivities.map(a=>h("div",{key:a.id,style:{borderLeft:"2px solid "+colors.border,paddingLeft:10,marginBottom:10}},
-          h("div",{style:{fontSize:12}},h("span",{style:{fontWeight:600}},a.activity_type)," · "+new Date(a.created_at).toLocaleDateString()+" · "+(a.logged_by||"—")),
-          a.notes && h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},a.notes)
-        ))
+        quoteActivities.map(a=>{
+          const loggedLate = a.activity_date && a.activity_date!==(a.created_at||"").slice(0,10);
+          return h("div",{key:a.id,style:{borderLeft:"2px solid "+colors.border,paddingLeft:10,marginBottom:10}},
+            h("div",{style:{fontSize:12}},
+              h("span",{style:{fontWeight:600}},a.activity_type)," · "+(a.activity_date?new Date(a.activity_date).toLocaleDateString():"—")+" · "+(a.logged_by||"—"),
+              loggedLate && h("span",{style:{fontSize:10,color:"#854f0b",marginLeft:6}},"(logged "+new Date(a.created_at).toLocaleDateString()+")")
+            ),
+            a.notes && h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},a.notes)
+          );
+        })
       )
     ),
     showDocumentsPanel && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
@@ -9757,15 +9774,16 @@ function MyWorklistScreen({ user }){
     .filter(a=>a.next_followup_date && a.next_followup_date<=today)
     .sort((a,b)=>(a.next_followup_date||"").localeCompare(b.next_followup_date||""));
 
-  const openLog = (companyName)=>{ setLogFor(companyName); setLogDraft({activity_type:"Call",outcome:"",notes:"",next_followup_date:""}); };
+  const openLog = (companyName)=>{ setLogFor(companyName); setLogDraft({activity_type:"Call",outcome:"",notes:"",activity_date:new Date().toISOString().slice(0,10),next_followup_date:""}); };
   const saveLog = async()=>{
+    if(!logDraft.activity_date){ alert("Enter the date this actually happened."); return; }
     setSaving(true);
     try{
       const relevant = activities.filter(a=>a.company_name===logFor && a.next_followup_date);
       const lastFollowUp = relevant.length ? relevant[0] : null;
       await sb.from("activity_log_tbl").insert({
         company_name:logFor, activity_type:logDraft.activity_type, outcome:logDraft.outcome||"",
-        notes:logDraft.notes||"", next_followup_date:logDraft.next_followup_date||null,
+        notes:logDraft.notes||"", activity_date:logDraft.activity_date, next_followup_date:logDraft.next_followup_date||null,
         is_followup_of: lastFollowUp?lastFollowUp.id:null, logged_by:user?.username||"unknown"
       });
       setLogFor(null);
@@ -9788,7 +9806,8 @@ function MyWorklistScreen({ user }){
         h("option",{value:""},"Outcome…"),h("option",{value:"Interested"},"Interested"),h("option",{value:"Not interested"},"Not interested"),
         h("option",{value:"Call back later"},"Call back later"),h("option",{value:"No response"},"No response")
       ),
-      h("input",{type:"date",value:logDraft.next_followup_date,onChange:e=>setLogDraft(d=>({...d,next_followup_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:150}})
+      h("input",{type:"date",value:logDraft.activity_date,onChange:e=>setLogDraft(d=>({...d,activity_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:130},title:"Date this actually happened"}),
+      h("input",{type:"date",value:logDraft.next_followup_date,onChange:e=>setLogDraft(d=>({...d,next_followup_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:150},title:"Next follow-up date"})
     ),
     h("textarea",{value:logDraft.notes,onChange:e=>setLogDraft(d=>({...d,notes:e.target.value})),placeholder:"What was discussed…",style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%",minHeight:44,marginBottom:8}}),
     h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
@@ -9935,12 +9954,14 @@ function CustomersScreen({ user }){
   useEffect(()=>{ if(selected) loadActivities(selected.company_name); },[selected,loadActivities]);
   const saveNewActivity = async()=>{
     if(!newActivity.activity_type){ alert("Pick an activity type."); return; }
+    if(!newActivity.activity_date){ alert("Enter the date this actually happened."); return; }
     setSavingActivity(true);
     try{
       const lastFollowUp = activities.find(a=>a.next_followup_date);
       await sb.from("activity_log_tbl").insert({
         company_name:selected.company_name, activity_type:newActivity.activity_type,
         outcome:newActivity.outcome||"", notes:newActivity.notes||"",
+        activity_date:newActivity.activity_date,
         next_followup_date:newActivity.next_followup_date||null,
         is_followup_of: lastFollowUp?lastFollowUp.id:null,
         logged_by:user?.username||"unknown"
@@ -10273,7 +10294,7 @@ function CustomersScreen({ user }){
       ),
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",margin:"18px 0 8px"}},
         h("div",{style:{fontWeight:700,fontSize:13}},"Activity ("+activities.length+")"),
-        h("button",{onClick:()=>setNewActivity({activity_type:"Call",outcome:"",notes:"",next_followup_date:""}),style:btnSmall},"+ Log activity")
+        h("button",{onClick:()=>setNewActivity({activity_type:"Call",outcome:"",notes:"",activity_date:new Date().toISOString().slice(0,10),next_followup_date:""}),style:btnSmall},"+ Log activity")
       ),
       newActivity && h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px",marginBottom:10,background:"#faf9f4"}},
         h("div",{style:{display:"flex",gap:8,marginBottom:8}},
@@ -10285,6 +10306,7 @@ function CustomersScreen({ user }){
             h("option",{value:"Interested"},"Interested"),h("option",{value:"Not interested"},"Not interested"),
             h("option",{value:"Call back later"},"Call back later"),h("option",{value:"No response"},"No response")
           ),
+          h("input",{type:"date",value:newActivity.activity_date,onChange:e=>setNewActivity({...newActivity,activity_date:e.target.value}),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:130},title:"Date this actually happened"}),
           h("input",{type:"date",value:newActivity.next_followup_date,onChange:e=>setNewActivity({...newActivity,next_followup_date:e.target.value}),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:150},title:"Next follow-up date"})
         ),
         h("textarea",{value:newActivity.notes,onChange:e=>setNewActivity({...newActivity,notes:e.target.value}),placeholder:"What was discussed…",style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%",minHeight:50,marginBottom:8}}),
@@ -11248,6 +11270,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (33)", summary:"Run crm_phase12_activity_date_and_missed_report.sql. Added a manual \"date this actually happened\" field to every activity-logging form (Customers screen, My Worklist's quick-log, and the quote Follow-up panel) — deliberately NOT auto-filled from today, since someone might log a call the day after it happened. Retired quote_activity_log from last round entirely and merged it into the existing activity_log_tbl instead (added a nullable reference_number column) — the quote Follow-up panel now writes to the exact same table My Worklist, the overdue-follow-up prompt, and Overdue Calls already read from, so all of that picks up quote-level follow-ups automatically with zero changes on their end, rather than needing to be taught about a second table. New: Reports → Admin only → Missed / Late Entries — flags any activity where the manual date doesn't match when it was actually logged, with days-late, exportable as both Excel and PDF." },
   { date:"25 Jul 2026 (32)", summary:"Big batch — left/right CRM gaps plus a new Dashboards section. Run crm_phase11_left_right_dashboards.sql. Correction made along the way, not a build: the \"Contacts\" gap discussed earlier in this session doesn't actually exist — there's already a complete contacts table with full CRUD on the Customers screen, predating this session; removed the redundant table from the SQL rather than ship a duplicate. Two genuine right-side gaps closed: (1) a quote-specific Follow-up log (new card next to Commercial Terms/Documents/Generate Quote PDF) — distinct from the company-level Activity Log elsewhere in CRM, so a call about one of a customer's several parallel quotes doesn't get lost in their general history; (2) Won/Lost outcome capture — moving a quote's status to Won prompts for the PO number/date/value, moving to Lost prompts for a reason plus competitor name/price if known. Built as one shared component (WonLostOutcomeModal) and wired into all THREE places status can change — the Quote form's own dropdown, the CRM Kanban board, and Quote Status Review — so none of them can bypass it, closing a scope gap flagged honestly in the previous round rather than left quietly incomplete. New: Dashboards, a separate always-visible top-level nav key (not admin-gated — Reports stays the place for filtered/exportable detail, this is glanceable summary only) with five views: Sales pipeline, Owner leaderboard, Quote health, Rules coverage, and Admin/security (that last one alone gated to admin/super_admin internally). Built with the same plain div/CSS bar style already used in Won by Owner — no new charting library added." },
   { date:"25 Jul 2026 (31)", summary:"Rename tool's \"Old model\" field is now the same predictive-text search combo used in 30+ other places across the app (LimitToListCombo) — type to filter, paste a model number in directly, or pick from suggestions, instead of a plain dropdown you had to scroll through. Still validated against real model names on blur, same as everywhere else it's used." },
   { date:"25 Jul 2026 (30)", summary:"Active/Inactive users. Run crm_phase10_user_active_status.sql (adds app_users.is_active, defaults true, nothing else changes). Admin → Users gets a Status column (Super Admin only, same gating as the password column) with a Deactivate/Reactivate button — deactivating blocks that username from logging in entirely, even with the correct password, checked at login time (not a live-session kick — someone already logged in stays logged in until their session ends normally). A blocked login attempt is logged distinctly in Login History (\"blocked (inactive)\") rather than lumped in with a genuinely wrong password, since those mean different things when reviewing history later. Every deactivate/reactivate is logged to the Audit Log same as the password reset. Primary admin (\"Babu\") can't be deactivated, same protection the existing delete-user rule already had." },
@@ -12913,6 +12936,106 @@ function QuoteStatusReview({ user }){
       onCancel:()=>setOutcomeTarget(null)
     })
   );
+}
+
+// Missed/Late Entries — flags any activity where the manual "date this
+// happened" (activity_date) differs from when it was actually logged
+// (created_at). Someone forgetting to log a call until the next day is
+// exactly what a mandatory-but-editable date field makes possible to spot
+// — this report is what turns that possibility into something Admin/
+// Super Admin can actually review, rather than a field nobody checks.
+function MissedEntriesReport({ user }){
+  const [rows,setRows]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [page,setPage]=useState(0);
+  const pageSize = 25;
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("activity_log_tbl").select("*").not("activity_date","is",null).order("created_at",{ascending:false});
+    const late = (data||[]).filter(a=>a.activity_date!==(a.created_at||"").slice(0,10)).map(a=>{
+      const daysLate = Math.round((new Date((a.created_at||"").slice(0,10))-new Date(a.activity_date))/86400000);
+      return {...a, daysLate};
+    });
+    setRows(late);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+  const pageRows = rows.slice(page*pageSize,(page+1)*pageSize);
+
+  const exportExcel = ()=>{
+    const ws = XLSX.utils.json_to_sheet(rows.map(r=>({
+      "Company / Quote#": r.reference_number || r.company_name,
+      "Activity type": r.activity_type,
+      "Actually happened": r.activity_date,
+      "Logged on": (r.created_at||"").slice(0,10),
+      "Days late": r.daysLate,
+      "Logged by": r.logged_by,
+      "Notes": r.notes
+    })));
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"Missed Entries");
+    XLSX.writeFile(wb,"Missed_Late_Entries_"+new Date().toISOString().slice(0,10)+".xlsx");
+  };
+  const exportPdf = ()=>{
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
+    const W = doc.internal.pageSize.getWidth();
+    letterheadForReports(doc, W, "MISSED / LATE ENTRIES");
+    doc.autoTable({
+      startY:34,
+      head:[["Company / Quote#","Type","Actually happened","Logged on","Days late","Logged by"]],
+      body: rows.map(r=>[r.reference_number||r.company_name,r.activity_type,r.activity_date,(r.created_at||"").slice(0,10),String(r.daysLate),r.logged_by||"—"]),
+      theme:"plain", styles:{font:"times",fontSize:8.5,textColor:[28,31,26]}, headStyles:{fontStyle:"bold"},
+      margin:{top:32,left:12,right:12,bottom:16},
+      didDrawPage:()=>letterheadForReports(doc, W, "MISSED / LATE ENTRIES")
+    });
+    doc.save("Missed_Late_Entries_"+new Date().toISOString().slice(0,10)+".pdf");
+  };
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:4}},"Missed / Late Entries"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Any activity where the date it actually happened doesn't match the date it was logged — someone entering a call the day after it happened, for example. Not a violation by itself, just visibility."),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):h(React.Fragment,null,
+      h("div",{style:{display:"flex",gap:8,marginBottom:14}},
+        h("button",{onClick:exportExcel,disabled:rows.length===0,style:btnSmall},"Excel"),
+        h("button",{onClick:exportPdf,disabled:rows.length===0,style:btnSmall},"PDF")
+      ),
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Company / Quote#"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Type"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Actually happened"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Logged on"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Days late"),
+          h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Logged by")
+        )),
+        h("tbody",null,
+          pageRows.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #eceae0"}},
+            h("td",{style:{padding:"7px 9px",fontWeight:600}},r.reference_number||r.company_name),
+            h("td",{style:{padding:"7px 9px"}},r.activity_type),
+            h("td",{style:{padding:"7px 9px",color:colors.muted}},r.activity_date),
+            h("td",{style:{padding:"7px 9px",color:colors.muted}},(r.created_at||"").slice(0,10)),
+            h("td",{style:{padding:"7px 9px",color:r.daysLate>0?"#854f0b":colors.text,fontWeight:700}},r.daysLate),
+            h("td",{style:{padding:"7px 9px",color:colors.muted}},r.logged_by||"—")
+          )),
+          pageRows.length===0 && h("tr",null,h("td",{colSpan:6,style:{padding:14,fontSize:12,color:colors.mutedLight}},"No late entries found."))
+        )
+      ),
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10,fontSize:11.5,color:colors.mutedLight}},
+        h("div",null,"Showing "+(rows.length===0?0:page*pageSize+1)+"–"+Math.min((page+1)*pageSize,rows.length)+" of "+rows.length),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Prev"),
+          h("button",{onClick:()=>setPage(p=>((p+1)*pageSize<rows.length)?p+1:p),disabled:(page+1)*pageSize>=rows.length,style:btnSmall},"Next")
+        )
+      )
+    )
+  );
+}
+function letterheadForReports(doc, W, title){
+  drawPdfLetterhead(doc, W, null, {logoW:36,logoH:18});
+  doc.setFontSize(9); doc.setTextColor(28,31,26); doc.setFont(undefined,"bold");
+  doc.text(title, W-14, 23, {align:"right"});
+  doc.setDrawColor(200,197,185); doc.setLineWidth(0.4);
+  doc.line(10,27,W-10,27);
 }
 
 function OverdueCallsReport(){
@@ -15230,6 +15353,7 @@ function App() {
     tab==="my_worklist"?h(MyWorklistScreen,{user}):
     tab==="reports_won_by_owner"?h(WonByOwnerReport,null):
     tab==="reports_overdue_calls"?h(OverdueCallsReport,null):
+    tab==="reports_missed_entries"?h(MissedEntriesReport,{user}):
     tab==="reports_pending_validation"?h(PendingValidationScreen,{user}):
     tab==="reports_status_history"?h(StatusChangeHistoryReport,null):
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
