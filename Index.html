@@ -15527,11 +15527,29 @@ function PoRegisterScreen({ user }){
   const [showAddVendor,setShowAddVendor] = useState(false);
   const blankNewVendor = {vendor_name:"",phone:"",website:"",billing_street:"",billing_city:"",billing_state:"",billing_country:"",billing_pin:"",gst_tax_id:"",bank_name:"",account_number:"",ifsc_code:"",swift_code:""};
   const [newVendorDraft,setNewVendorDraft] = useState(blankNewVendor);
+  const [filterPoNo,setFilterPoNo] = useState("");
+  const [filterDateFrom,setFilterDateFrom] = useState("");
+  const [filterDateTo,setFilterDateTo] = useState("");
+  const [posItemsMap,setPosItemsMap] = useState({}); // po_no -> [{description,value}]
 
   const loadPos = useCallback(async()=>{
-    const { data, count } = await sb.from("po_register").select("*",{count:"exact"}).order("po_date",{ascending:false}).range(page*PAGE_SIZE,page*PAGE_SIZE+PAGE_SIZE-1);
+    let q = sb.from("po_register").select("*",{count:"exact"}).order("po_date",{ascending:false});
+    if(filterPoNo.trim()) q = q.ilike("po_no","%"+filterPoNo.trim()+"%");
+    if(filterDateFrom) q = q.gte("po_date",filterDateFrom);
+    if(filterDateTo) q = q.lte("po_date",filterDateTo);
+    const { data } = await q.range(page*PAGE_SIZE,page*PAGE_SIZE+PAGE_SIZE-1);
     setPos(data||[]);
-  },[page]);
+    const poNos = (data||[]).map(p=>p.po_no);
+    if(poNos.length>0){
+      const { data: itemRows } = await sb.from("po_register_items").select("po_no,description,qty,rate").in("po_no",poNos);
+      const map = {};
+      (itemRows||[]).forEach(it=>{
+        if(!map[it.po_no]) map[it.po_no]=[];
+        map[it.po_no].push({description:it.description, value:(Number(it.qty)||0)*(Number(it.rate)||0)});
+      });
+      setPosItemsMap(map);
+    } else setPosItemsMap({});
+  },[page,filterPoNo,filterDateFrom,filterDateTo]);
   useEffect(()=>{ loadPos(); },[loadPos]);
   useEffect(()=>{
     sb.from("vendor_tbl").select("vendor_name").order("vendor_name").then(({data})=>setVendorOptions((data||[]).map(r=>r.vendor_name).filter(Boolean)));
@@ -15567,7 +15585,7 @@ function PoRegisterScreen({ user }){
     setItems(data||[]);
   };
 
-  const openPo = async(po)=>{ setSelected(po); setCreatingNew(false); setItemDraft(null); await loadItemsFor(po.po_no); };
+  const openPo = async(po)=>{ setSelected(po); setDraft(po); setCreatingNew(false); setItemDraft(null); await loadItemsFor(po.po_no); };
 
   const savePoHeader = async()=>{
     if(!draft.vendor_name){ alert("Vendor is required."); return; }
@@ -15624,19 +15642,34 @@ function PoRegisterScreen({ user }){
     ),
 
     (!selected && !creatingNew) ? h("div",null,
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:12,background:"#faf9f4",borderRadius:6,padding:10}},
+        h("input",{placeholder:"Filter by P.O. no",value:filterPoNo,onChange:e=>setFilterPoNo(e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+        h("input",{type:"date",value:filterDateFrom,onChange:e=>setFilterDateFrom(e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+        h("input",{type:"date",value:filterDateTo,onChange:e=>setFilterDateTo(e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})
+      ),
       h("table",null,
         h("thead",null,h("tr",null,
           h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"P.O. no"),
           h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"Vendor"),
           h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"P.O. date"),
+          h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"Items"),
+          h("th",{style:{textAlign:"right",padding:"6px 8px",color:colors.muted,fontSize:12}},"Value"),
+          h("th",{style:{textAlign:"right",padding:"6px 8px",color:colors.muted,fontSize:12}},"Total value"),
           h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"Status")
         )),
-        h("tbody",null,pos.map(p=>h("tr",{key:p.id,onClick:()=>openPo(p),style:{cursor:"pointer",borderTop:"1px solid "+colors.border}},
-          h("td",{style:{padding:"7px 8px",color:colors.accent,fontSize:13}},p.po_no),
-          h("td",{style:{padding:"7px 8px",fontSize:13}},p.vendor_name),
-          h("td",{style:{padding:"7px 8px",fontSize:13}},p.po_date),
-          h("td",{style:{padding:"7px 8px",fontSize:13}},p.status)
-        )))
+        h("tbody",null,pos.map(p=>{
+          const poItems = posItemsMap[p.po_no]||[];
+          const poTotal = poItems.reduce((s,it)=>s+it.value,0);
+          return h("tr",{key:p.id,onClick:()=>openPo(p),style:{cursor:"pointer",borderTop:"1px solid "+colors.border}},
+            h("td",{style:{padding:"7px 8px",color:colors.accent,fontSize:13,verticalAlign:"top"}},p.po_no),
+            h("td",{style:{padding:"7px 8px",fontSize:13,verticalAlign:"top"}},p.vendor_name),
+            h("td",{style:{padding:"7px 8px",fontSize:13,verticalAlign:"top"}},p.po_date),
+            h("td",{style:{padding:"7px 8px",fontSize:13}},poItems.map((it,i)=>h("div",{key:i},it.description||"—"))),
+            h("td",{style:{padding:"7px 8px",fontSize:13,textAlign:"right"}},poItems.map((it,i)=>h("div",{key:i},it.value.toFixed(2)))),
+            h("td",{style:{padding:"7px 8px",fontSize:13,textAlign:"right",verticalAlign:"top",fontWeight:600}},poTotal.toFixed(2)),
+            h("td",{style:{padding:"7px 8px",fontSize:13,verticalAlign:"top"}},p.status)
+          );
+        }))
       ),
       h("div",{style:{display:"flex",gap:8,marginTop:10}},
         h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Previous"),
@@ -15806,7 +15839,7 @@ function MaterialInwardScreen({ user }){
     const { data } = await q;
     setLineItems(data||[]);
   };
-  const openGrn = async(g)=>{ setSelected(g); setCreatingNew(false); setItemDraft(null); await loadLineItemsFor(g.grn_no); };
+  const openGrn = async(g)=>{ setSelected(g); setDraft(g); setCreatingNew(false); setItemDraft(null); await loadLineItemsFor(g.grn_no); };
 
   const onPoChange = (po_no)=>{
     if(po_no==="__register_new__"){
@@ -16019,16 +16052,24 @@ function PoRegisterReport(){
     ),
     h("table",null,
       h("thead",null,h("tr",null,
-        ["P.O. number","P.O. date","Description","Value"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},l))
+        h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"P.O. number"),
+        h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"P.O. date"),
+        h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"Description"),
+        h("th",{style:{textAlign:"right",padding:"6px 8px",color:colors.muted,fontSize:12}},"Value"),
+        h("th",{style:{textAlign:"right",padding:"6px 8px",color:colors.muted,fontSize:12}},"Total value")
       )),
-      h("tbody",null,rows.map(r=>h("tr",{key:r.po_no,style:{borderTop:"1px solid "+colors.border}},
-        h("td",{style:{padding:"6px 8px",color:colors.accent,fontSize:13,verticalAlign:"top"}},r.po_no),
-        h("td",{style:{padding:"6px 8px",fontSize:13,verticalAlign:"top"}},r.po_date),
-        h("td",{style:{padding:"6px 8px",fontSize:13}}, r.items.map((it,i)=>h("div",{key:i},it.description||"—"))),
-        h("td",{style:{padding:"6px 8px",fontSize:13}}, r.items.map((it,i)=>h("div",{key:i},it.value.toFixed(2))))
-      )))
+      h("tbody",null,rows.map(r=>{
+        const rowTotal = r.items.reduce((s,it)=>s+it.value,0);
+        return h("tr",{key:r.po_no,style:{borderTop:"1px solid "+colors.border}},
+          h("td",{style:{padding:"6px 8px",color:colors.accent,fontSize:13,verticalAlign:"top"}},r.po_no),
+          h("td",{style:{padding:"6px 8px",fontSize:13,verticalAlign:"top"}},r.po_date),
+          h("td",{style:{padding:"6px 8px",fontSize:13}}, r.items.map((it,i)=>h("div",{key:i},it.description||"—"))),
+          h("td",{style:{padding:"6px 8px",fontSize:13,textAlign:"right"}}, r.items.map((it,i)=>h("div",{key:i},it.value.toFixed(2)))),
+          h("td",{style:{padding:"6px 8px",fontSize:13,textAlign:"right",verticalAlign:"top",fontWeight:600}},rowTotal.toFixed(2))
+        );
+      }))
     ),
-    h("div",{style:{textAlign:"right",fontWeight:700,fontSize:13,marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:8}},"Total: "+grandTotal.toFixed(2))
+    h("div",{style:{textAlign:"right",fontWeight:700,fontSize:13,marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:8}},"Grand total: "+grandTotal.toFixed(2))
   );
 }
 
