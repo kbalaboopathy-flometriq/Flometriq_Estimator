@@ -1046,6 +1046,7 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports_quote_status_review",label:"Quote Status Review"},
         {key:"reports_won_by_owner",label:"Won by Owner"},
         {key:"reports_status_history",label:"Status Change History"},
+        {key:"reports_po_register",label:"PO Register"},
       ]},
       ...(isAdmin?[{ label:"Admin only", tabs:[
         {key:"reports_masters",label:"Material Rates"},
@@ -1064,6 +1065,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Raw Material Master", tabs: byKeys(rawMaterialKeys) },
       { label:"Commercial terms", tabs: byKeys(ctKeys) },
       { label:"Customers", tabs:[{key:"customers",label:"Customers"},{key:"customer_bulk_upload",label:"Customer Bulk Upload"}] },
+      { label:"Vendors", tabs:[{key:"vendors",label:"Vendors"}] },
       { label:"CRM Setup", tabs: byKeys(["state_zone_tbl","country_zone_tbl","territory_rule_state_tbl","territory_rule_country_tbl"]) },
       { label:"Engineering", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"}] },
       { label:"Company", tabs:[{key:"company_master",label:"Company Master"}] },
@@ -15397,6 +15399,7 @@ function App() {
     tab==="reports_missed_entries"?h(MissedEntriesReport,{user}):
     tab==="reports_pending_validation"?h(PendingValidationScreen,{user}):
     tab==="reports_status_history"?h(StatusChangeHistoryReport,null):
+    tab==="reports_po_register"?h(PoRegisterReport,null):
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="authorization_codes"?h(AuthorizationCodesScreen,{user}):
     tab==="delete_activity_report"?h(DeleteActivityReportScreen,{user}):
@@ -15406,6 +15409,7 @@ function App() {
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
     tab==="customers"?h(CustomersScreen,{user}):
+    tab==="vendors"?h(VendorsScreen,{user}):
     tab==="user_manual"?h(UserManualScreen,null):
     tab==="tour"?h(TourScreen,null):
     tab==="faq"?h(FaqScreen,null):
@@ -15440,11 +15444,14 @@ function App() {
    PO accepted/rejected-qty rollups — those are the next phase.
    ================================================================== */
 
-// Shared item-entry block: Item + Shape/Spec/Grade cascading dropdowns,
-// with Description auto-built from Item+Spec+Grade and freely editable
-// (a manual edit sets `description_overridden`; Restore reverts it).
-// Standing pattern — reused wherever an item is entered in this app.
-function ItemShapeSpecGradeFields({ row, onChange, itemOptions }){
+// Shared item-entry block: Shape/Spec/Grade cascading dropdowns (limit
+// to list — no free typing), with Description auto-built from
+// Shape+Spec+Grade and freely editable (a manual edit sets
+// `description_overridden`; Restore reverts it). Standing pattern —
+// reused wherever a raw-material line item is entered in this app.
+// No separate "Item" field: for raw materials, Shape effectively IS
+// the item.
+function ShapeSpecGradeFields({ row, onChange }){
   const [shapeOptions,setShapeOptions] = useState([]);
   const [specOptions,setSpecOptions] = useState([]);
   const [gradeOptions,setGradeOptions] = useState([]);
@@ -15461,20 +15468,16 @@ function ItemShapeSpecGradeFields({ row, onChange, itemOptions }){
   const set = (patch)=>{
     const next = {...row, ...patch};
     if(!next.description_overridden){
-      next.description = [next.item,next.spec,next.grade].filter(Boolean).join(" ");
+      next.description = [next.shape,next.spec,next.grade].filter(Boolean).join(" ");
     }
     onChange(next);
   };
   const restoreDescription = ()=>{
-    onChange({...row, description:[row.item,row.spec,row.grade].filter(Boolean).join(" "), description_overridden:false});
+    onChange({...row, description:[row.shape,row.spec,row.grade].filter(Boolean).join(" "), description_overridden:false});
   };
 
   return h("div",null,
     h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:8}},
-      h("div",null,
-        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Item"),
-        h(LimitToListCombo,{value:row.item||"",onChange:v=>set({item:v}),options:itemOptions||[],limitToList:false,placeholder:"Search item master…",style:{...inputStyle,padding:"6px 8px",fontSize:12.5}})
-      ),
       h("div",null,
         h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Shape"),
         h("select",{value:row.shape||"",onChange:e=>set({shape:e.target.value,spec:"",grade:""}),style:{...inputStyle,padding:"6px 8px",fontSize:12.5}},
@@ -15488,23 +15491,21 @@ function ItemShapeSpecGradeFields({ row, onChange, itemOptions }){
           h("option",{value:""},"—"),
           specOptions.map(s=>h("option",{key:s,value:s},s))
         )
-      )
-    ),
-    h("div",{style:{display:"grid",gridTemplateColumns:"1fr 2fr",gap:10}},
+      ),
       h("div",null,
         h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Grade"),
         h("select",{value:row.grade||"",onChange:e=>set({grade:e.target.value}),disabled:!row.shape,style:{...inputStyle,padding:"6px 8px",fontSize:12.5}},
           h("option",{value:""},"—"),
           gradeOptions.map(s=>h("option",{key:s,value:s},s))
         )
-      ),
-      h("div",null,
-        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}},
-          h("div",{style:{fontSize:11.5,color:colors.muted}},"Description"),
-          row.description_overridden ? h("button",{onClick:restoreDescription,style:{...btnSmall,padding:"2px 8px",fontSize:11}},"Restore") : h("div",{style:{fontSize:10.5,color:colors.mutedLight}},"Auto-built — edit to override")
-        ),
-        h("input",{value:row.description||"",onChange:e=>onChange({...row,description:e.target.value,description_overridden:true}),style:{...inputStyle,padding:"6px 8px",fontSize:12.5}})
       )
+    ),
+    h("div",null,
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}},
+        h("div",{style:{fontSize:11.5,color:colors.muted}},"Description"),
+        row.description_overridden ? h("button",{onClick:restoreDescription,style:{...btnSmall,padding:"2px 8px",fontSize:11}},"Restore") : h("div",{style:{fontSize:10.5,color:colors.mutedLight}},"Auto-built — edit to override")
+      ),
+      h("input",{value:row.description||"",onChange:e=>onChange({...row,description:e.target.value,description_overridden:true}),style:{...inputStyle,padding:"6px 8px",fontSize:12.5}})
     )
   );
 }
@@ -15515,7 +15516,6 @@ function PoRegisterScreen({ user }){
   const [page,setPage] = useState(0);
   const PAGE_SIZE = 25;
   const [vendorOptions,setVendorOptions] = useState([]);
-  const [itemOptions,setItemOptions] = useState([]);
   const [uomOptions,setUomOptions] = useState([]);
   const [selected,setSelected] = useState(null); // po_register row, or null
   const [items,setItems] = useState([]); // po_register_items for selected PO
@@ -15523,6 +15523,7 @@ function PoRegisterScreen({ user }){
   const [draft,setDraft] = useState({po_no:"",vendor_name:"",po_date:new Date().toISOString().slice(0,10),status:"Open"});
   const [itemDraft,setItemDraft] = useState(null); // row being added/edited, or null
   const [editingItemId,setEditingItemId] = useState(null);
+  const [rateLookup,setRateLookup] = useState({loading:false,found:null}); // found: material_rates row, or null if no match
 
   const loadPos = useCallback(async()=>{
     const { data, count } = await sb.from("po_register").select("*",{count:"exact"}).order("po_date",{ascending:false}).range(page*PAGE_SIZE,page*PAGE_SIZE+PAGE_SIZE-1);
@@ -15531,9 +15532,32 @@ function PoRegisterScreen({ user }){
   useEffect(()=>{ loadPos(); },[loadPos]);
   useEffect(()=>{
     sb.from("vendor_tbl").select("vendor_name").order("vendor_name").then(({data})=>setVendorOptions((data||[]).map(r=>r.vendor_name).filter(Boolean)));
-    sb.from("item_tbl").select("item").order("item").then(({data})=>setItemOptions((data||[]).map(r=>r.item).filter(Boolean)));
     sb.from("uom_tbl").select("uom").order("uom").then(({data})=>setUomOptions((data||[]).map(r=>r.uom).filter(Boolean)));
   },[]);
+
+  // Look up Material Rates whenever Shape/Spec/Grade are all picked on the item draft
+  useEffect(()=>{
+    if(!itemDraft || !itemDraft.shape || !itemDraft.spec){ setRateLookup({loading:false,found:null}); return; }
+    let cancelled=false;
+    setRateLookup({loading:true,found:null});
+    let q = sb.from("material_rates").select("rate").eq("material_shape",itemDraft.shape).eq("material_spec",itemDraft.spec);
+    q = itemDraft.grade ? q.eq("material_grade",itemDraft.grade) : q.is("material_grade",null);
+    q.maybeSingle().then(({data})=>{
+      if(cancelled) return;
+      setRateLookup({loading:false,found:data||null});
+      if(data && !itemDraft.rate){ setItemDraft(d=>d?{...d, rate:data.rate, master_rate:data.rate}:d); }
+      else if(data){ setItemDraft(d=>d?{...d, master_rate:data.rate}:d); }
+    });
+    return ()=>{ cancelled=true; };
+  },[itemDraft && itemDraft.shape, itemDraft && itemDraft.spec, itemDraft && itemDraft.grade]);
+
+  const addRateToMaster = async()=>{
+    if(!itemDraft.rate){ alert("Enter a rate first."); return; }
+    const { error } = await sb.from("material_rates").insert({material_shape:itemDraft.shape, material_spec:itemDraft.spec, material_grade:itemDraft.grade||null, rate:Number(itemDraft.rate), uom:itemDraft.uom||null, spec_grade:[itemDraft.spec,itemDraft.grade].filter(Boolean).join(" ")});
+    if(error){ alert("Could not add to Material Rates: "+error.message); return; }
+    setRateLookup({loading:false,found:{rate:Number(itemDraft.rate)}});
+    setItemDraft(d=>({...d, master_rate:Number(itemDraft.rate)}));
+  };
 
   const loadItemsFor = async(po_no)=>{
     const { data } = await sb.from("po_register_items").select("*").eq("po_no",po_no).order("created_at");
@@ -15543,28 +15567,44 @@ function PoRegisterScreen({ user }){
   const openPo = async(po)=>{ setSelected(po); setCreatingNew(false); setItemDraft(null); await loadItemsFor(po.po_no); };
 
   const savePoHeader = async()=>{
-    if(!draft.po_no.trim()){ alert("P.O. no is required."); return; }
     if(!draft.vendor_name){ alert("Vendor is required."); return; }
     if(creatingNew){
-      const { error } = await sb.from("po_register").insert({...draft, created_by:user?.username||"unknown"});
+      const { po_no, ...rest } = draft; // po_no is auto-generated (FFIL-#####) — never sent on create
+      const { data, error } = await sb.from("po_register").insert({...rest, created_by:user?.username||"unknown"}).select().maybeSingle();
       if(error){ alert("Save failed: "+error.message); return; }
+      setCreatingNew(false);
+      await loadPos();
+      if(data) openPo(data);
     } else {
-      const { id, ...rest } = draft;
+      const { id, po_no, ...rest } = draft;
       await sb.from("po_register").update({...rest, updated_at:new Date().toISOString()}).eq("id",id);
+      await loadPos();
     }
-    setCreatingNew(false);
-    await loadPos();
-    const { data } = await sb.from("po_register").select("*").eq("po_no",draft.po_no).limit(1).maybeSingle();
-    if(data) openPo(data);
   };
 
   const poTotal = items.reduce((sum,r)=>sum + (Number(r.qty)||0)*(Number(r.rate)||0), 0);
 
+  const notifySuperAdminsOfOverride = async(logRow)=>{
+    const { data: admins } = await sb.from("app_users").select("username").eq("role","super_admin");
+    const msg = "Rate override on "+logRow.po_no+": "+[logRow.shape,logRow.spec,logRow.grade].filter(Boolean).join(" ")+" — master "+logRow.master_rate+" → used "+logRow.override_rate;
+    for(const a of (admins||[])){
+      await sb.from("notifications_tbl").insert({ employee_name:a.username, message:msg, related_company:null });
+    }
+  };
+
   const saveItemRow = async()=>{
     if(!confirm("Are you sure you want to save changes to this line item?")) return;
-    const payload = {po_no:selected.po_no, item:itemDraft.item||"", shape:itemDraft.shape||"", spec:itemDraft.spec||"", grade:itemDraft.grade||"", description:itemDraft.description||"", qty:Number(itemDraft.qty)||0, uom:itemDraft.uom||"", rate:Number(itemDraft.rate)||0};
+    const masterRate = itemDraft.master_rate!=null ? Number(itemDraft.master_rate) : null;
+    const enteredRate = Number(itemDraft.rate)||0;
+    const overridden = masterRate!=null && enteredRate!==masterRate;
+    const payload = {po_no:selected.po_no, shape:itemDraft.shape||"", spec:itemDraft.spec||"", grade:itemDraft.grade||"", description:itemDraft.description||"", qty:Number(itemDraft.qty)||0, uom:itemDraft.uom||"", rate:enteredRate, master_rate:masterRate, rate_overridden:overridden};
     if(editingItemId){ await sb.from("po_register_items").update(payload).eq("id",editingItemId); }
     else { await sb.from("po_register_items").insert(payload); }
+    if(overridden){
+      const logRow = {po_no:selected.po_no, shape:itemDraft.shape, spec:itemDraft.spec, grade:itemDraft.grade, master_rate:masterRate, override_rate:enteredRate, changed_by:user?.username||"unknown"};
+      await sb.from("rate_override_log").insert(logRow);
+      await notifySuperAdminsOfOverride(logRow);
+    }
     setItemDraft(null); setEditingItemId(null);
     await loadItemsFor(selected.po_no);
   };
@@ -15577,7 +15617,7 @@ function PoRegisterScreen({ user }){
   return h("div",{style:{padding:20}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
       h("div",{style:{fontWeight:700,fontSize:18}},"PO Register"),
-      h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft({po_no:"",vendor_name:"",po_date:new Date().toISOString().slice(0,10),status:"Open"}); setItems([]); },style:btnPrimary},"+ New PO")
+      h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft({po_no:"",vendor_name:"",po_date:new Date().toISOString().slice(0,10),status:"Open"}); setItems([]); },style:btnPrimary},"+ Register PO")
     ),
 
     (!selected && !creatingNew) ? h("div",null,
@@ -15603,7 +15643,7 @@ function PoRegisterScreen({ user }){
       h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14,marginBottom:14}},
         h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8,textTransform:"uppercase",letterSpacing:0.4}},"Main form — PO header"),
         h("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10}},
-          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"P.O. no"),h("input",{value:draft.po_no,disabled:!creatingNew,onChange:e=>setDraft(d=>({...d,po_no:e.target.value})),style:inputStyle})),
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"P.O. no"),h("input",{value:creatingNew?"(auto-generated)":draft.po_no,disabled:true,style:{...inputStyle,background:"#f4f2ea"}})),
           h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Vendor"),
             h("select",{value:draft.vendor_name,onChange:e=>setDraft(d=>({...d,vendor_name:e.target.value})),style:inputStyle},
               h("option",{value:""},"—"),vendorOptions.map(v=>h("option",{key:v,value:v},v))
@@ -15612,7 +15652,7 @@ function PoRegisterScreen({ user }){
           h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"P.O. date"),h("input",{type:"date",value:draft.po_date,onChange:e=>setDraft(d=>({...d,po_date:e.target.value})),style:inputStyle})),
           h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Status"),
             h("select",{value:draft.status,onChange:e=>setDraft(d=>({...d,status:e.target.value})),style:inputStyle},
-              h("option",{value:"Open"},"Open"),h("option",{value:"Closed"},"Closed")
+              h("option",{value:"Open"},"Open"),h("option",{value:"Closed"},"Closed"),h("option",{value:"Cancel"},"Cancel"),h("option",{value:"Hold"},"Hold")
             )
           )
         ),
@@ -15625,16 +15665,15 @@ function PoRegisterScreen({ user }){
         h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8,textTransform:"uppercase",letterSpacing:0.4}},"Sub form — PO items"),
         h("table",null,
           h("thead",null,h("tr",null,
-            ["Item","Shape","Spec","Grade","Qty","UOM","Rate","Value","Actions"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
+            ["Shape","Spec","Grade","Qty","UOM","Rate","Value","Actions"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
           )),
           h("tbody",null,items.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid "+colors.border}},
-            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.item),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.shape),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.spec),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.grade),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.qty),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.uom),
-            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.rate),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.rate+(r.rate_overridden?" *":"")),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},((Number(r.qty)||0)*(Number(r.rate)||0)).toFixed(2)),
             h("td",{style:{padding:"5px 6px"}},
               h("button",{onClick:()=>{setEditingItemId(r.id);setItemDraft({...r});},style:{...btnSmall,marginRight:6}},"Edit"),
@@ -15643,16 +15682,27 @@ function PoRegisterScreen({ user }){
           )))
         ),
         h("div",{style:{textAlign:"right",fontWeight:700,fontSize:13,marginTop:8,borderTop:"1px solid "+colors.border,paddingTop:8}},"PO total: "+poTotal.toFixed(2)),
-        !itemDraft ? h("button",{onClick:()=>{setEditingItemId(null);setItemDraft({item:"",shape:"",spec:"",grade:"",description:"",qty:"",uom:"",rate:""});},style:{...btnSmall,marginTop:10}},"+ Add item")
+        h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:4}},"* rate edited away from Material Rates master — logged and flagged to Super Admin"),
+        !itemDraft ? h("button",{onClick:()=>{setEditingItemId(null);setItemDraft({shape:"",spec:"",grade:"",description:"",qty:"",uom:"",rate:"",master_rate:null});},style:{...btnSmall,marginTop:10}},"+ Add item")
         : h("div",{style:{marginTop:12,borderTop:"1px solid "+colors.border,paddingTop:12}},
-            h(ItemShapeSpecGradeFields,{row:itemDraft,onChange:setItemDraft,itemOptions}),
+            h(ShapeSpecGradeFields,{row:itemDraft,onChange:setItemDraft}),
             h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:8}},
               h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Qty"),h("input",{value:itemDraft.qty,onChange:e=>setItemDraft(d=>({...d,qty:e.target.value})),style:inputStyle})),
               h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"UOM"),
                 h("select",{value:itemDraft.uom,onChange:e=>setItemDraft(d=>({...d,uom:e.target.value})),style:inputStyle},h("option",{value:""},"—"),uomOptions.map(u=>h("option",{key:u,value:u},u)))
               )
             ),
-            h("div",{style:{marginTop:8}},h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Rate"),h("input",{value:itemDraft.rate,onChange:e=>setItemDraft(d=>({...d,rate:e.target.value})),style:inputStyle})),
+            h("div",{style:{marginTop:8}},
+              h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}},
+                h("div",{style:{fontSize:11.5,color:colors.muted}},"Rate"),
+                itemDraft.master_rate!=null ? h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"Master: "+itemDraft.master_rate) : (rateLookup.loading ? h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"Looking up…") : null)
+              ),
+              h("input",{value:itemDraft.rate,onChange:e=>setItemDraft(d=>({...d,rate:e.target.value})),style:inputStyle}),
+              (!rateLookup.loading && !rateLookup.found && itemDraft.shape && itemDraft.spec) ? h("div",{style:{marginTop:6,fontSize:11,color:colors.muted}},
+                "No rate on file for this Shape/Spec/Grade. ",
+                h("button",{onClick:addRateToMaster,style:{...btnSmall,marginLeft:4}},"+ Add to Material Rates")
+              ) : null
+            ),
             h("div",{style:{display:"flex",gap:8,marginTop:10}},
               h("button",{onClick:saveItemRow,style:btnPrimary},"Save item"),
               h("button",{onClick:()=>{setItemDraft(null);setEditingItemId(null);},style:btnSecondary},"Cancel")
@@ -15669,7 +15719,6 @@ function MaterialInwardScreen({ user }){
   const PAGE_SIZE = 25;
   const [filters,setFilters] = useState({shape:"",spec:"",grade:"",vendor_name:"",grn_no:"",po_no:"",date_from:"",date_to:""});
   const [poOptions,setPoOptions] = useState([]); // [{po_no, vendor_name}]
-  const [itemOptions,setItemOptions] = useState([]);
   const [uomOptions,setUomOptions] = useState([]);
   const [shapeOptions,setShapeOptions] = useState([]);
   const [specOptions,setSpecOptions] = useState([]);
@@ -15682,6 +15731,8 @@ function MaterialInwardScreen({ user }){
   const [lineItems,setLineItems] = useState([]);
   const [itemDraft,setItemDraft] = useState(null);
   const [editingItemId,setEditingItemId] = useState(null);
+  const [showAddPo,setShowAddPo] = useState(false);
+  const [newPoDraft,setNewPoDraft] = useState({po_no:"",vendor_name:"",po_date:new Date().toISOString().slice(0,10)});
 
   const loadGrns = useCallback(async()=>{
     let q = sb.from("grn_header").select("*").order("grn_date",{ascending:false});
@@ -15697,7 +15748,6 @@ function MaterialInwardScreen({ user }){
 
   useEffect(()=>{
     sb.from("po_register").select("po_no,vendor_name").eq("status","Open").order("po_no").then(({data})=>setPoOptions(data||[]));
-    sb.from("item_tbl").select("item").order("item").then(({data})=>setItemOptions((data||[]).map(r=>r.item).filter(Boolean)));
     sb.from("uom_tbl").select("uom").order("uom").then(({data})=>setUomOptions((data||[]).map(r=>r.uom).filter(Boolean)));
     sb.from("materials_shape").select("shape").order("shape").then(({data})=>setShapeOptions((data||[]).map(r=>r.shape).filter(Boolean)));
     sb.from("vendor_tbl").select("vendor_name").order("vendor_name").then(({data})=>setVendorOptions((data||[]).map(r=>r.vendor_name).filter(Boolean)));
@@ -15719,8 +15769,24 @@ function MaterialInwardScreen({ user }){
   const openGrn = async(g)=>{ setSelected(g); setCreatingNew(false); setItemDraft(null); await loadLineItemsFor(g.grn_no); };
 
   const onPoChange = (po_no)=>{
+    if(po_no==="__register_new__"){
+      setShowAddPo(true);
+      setNewPoDraft({po_no:"",vendor_name:"",po_date:new Date().toISOString().slice(0,10)});
+      return;
+    }
     const match = poOptions.find(p=>p.po_no===po_no);
     setDraft(d=>({...d, po_no, vendor_name: match ? match.vendor_name : d.vendor_name}));
+  };
+
+  const registerNewPo = async()=>{
+    if(!newPoDraft.po_no.trim()){ alert("P.O. no is required."); return; }
+    if(!newPoDraft.vendor_name){ alert("Vendor is required."); return; }
+    const { error } = await sb.from("po_register").insert({po_no:newPoDraft.po_no.trim(), vendor_name:newPoDraft.vendor_name, po_date:newPoDraft.po_date, status:"Open", created_by:user?.username||"unknown"});
+    if(error){ alert("Could not register PO: "+error.message); return; }
+    const { data } = await sb.from("po_register").select("po_no,vendor_name").eq("status","Open").order("po_no");
+    setPoOptions(data||[]);
+    setDraft(d=>({...d, po_no:newPoDraft.po_no.trim(), vendor_name:newPoDraft.vendor_name}));
+    setShowAddPo(false);
   };
 
   const saveGrnHeader = async()=>{
@@ -15750,7 +15816,7 @@ function MaterialInwardScreen({ user }){
 
   const saveLineItem = async()=>{
     if(!confirm("Are you sure you want to save changes to this line item?")) return;
-    const payload = {grn_no:selected.grn_no, item:itemDraft.item||"", shape:itemDraft.shape||"", spec:itemDraft.spec||"", grade:itemDraft.grade||"", description:itemDraft.description||"", description_overridden:!!itemDraft.description_overridden, qty:Number(itemDraft.qty)||0, uom:itemDraft.uom||""};
+    const payload = {grn_no:selected.grn_no, shape:itemDraft.shape||"", spec:itemDraft.spec||"", grade:itemDraft.grade||"", description:itemDraft.description||"", description_overridden:!!itemDraft.description_overridden, qty:Number(itemDraft.qty)||0, uom:itemDraft.uom||""};
     if(editingItemId){ await sb.from("grn_items").update(payload).eq("id",editingItemId); }
     else { await sb.from("grn_items").insert(payload); }
     setItemDraft(null); setEditingItemId(null);
@@ -15812,7 +15878,17 @@ function MaterialInwardScreen({ user }){
         ),
         h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginTop:10}},
           h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"P.O. no"),
-            h("select",{value:draft.po_no,disabled:isCleared,onChange:e=>onPoChange(e.target.value),style:inputStyle},h("option",{value:""},"—"),poOptions.map(p=>h("option",{key:p.po_no,value:p.po_no},p.po_no)))
+            h("select",{value:draft.po_no,disabled:isCleared,onChange:e=>onPoChange(e.target.value),style:inputStyle},h("option",{value:""},"—"),poOptions.map(p=>h("option",{key:p.po_no,value:p.po_no},p.po_no)),h("option",{value:"__register_new__"},"+ Register a PO…")),
+            showAddPo ? h("div",{style:{marginTop:8,border:"1px solid "+colors.border,borderRadius:6,padding:10,background:"#faf9f4"}},
+              h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:6}},"Register a PO that already exists (created outside this app)"),
+              h("input",{placeholder:"P.O. no",value:newPoDraft.po_no,onChange:e=>setNewPoDraft(d=>({...d,po_no:e.target.value})),style:{...inputStyle,marginBottom:6}}),
+              h("select",{value:newPoDraft.vendor_name,onChange:e=>setNewPoDraft(d=>({...d,vendor_name:e.target.value})),style:{...inputStyle,marginBottom:6}},h("option",{value:""},"Vendor —"),vendorOptions.map(v=>h("option",{key:v,value:v},v))),
+              h("input",{type:"date",value:newPoDraft.po_date,onChange:e=>setNewPoDraft(d=>({...d,po_date:e.target.value})),style:{...inputStyle,marginBottom:6}}),
+              h("div",{style:{display:"flex",gap:6}},
+                h("button",{onClick:registerNewPo,style:{...btnSmall,background:colors.dark,color:"#fff"}},"Register"),
+                h("button",{onClick:()=>setShowAddPo(false),style:btnSmall},"Cancel")
+              )
+            ) : null
           ),
           h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Vendor"),h("input",{value:draft.vendor_name,disabled:true,style:{...inputStyle,background:"#f4f2ea"}})),
           h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Bill no (vendor invoice)"),h("input",{value:draft.bill_no,disabled:isCleared,onChange:e=>setDraft(d=>({...d,bill_no:e.target.value})),style:inputStyle}))
@@ -15834,10 +15910,9 @@ function MaterialInwardScreen({ user }){
         h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8,textTransform:"uppercase",letterSpacing:0.4}},"Sub form — material details ("+draft.grn_no+")"),
         h("table",null,
           h("thead",null,h("tr",null,
-            ["Item","Shape","Spec","Grade","Description","Qty","UOM","Actions"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
+            ["Shape","Spec","Grade","Description","Qty","UOM","Actions"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
           )),
           h("tbody",null,lineItems.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid "+colors.border}},
-            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.item),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.shape),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.spec),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.grade),
@@ -15850,9 +15925,9 @@ function MaterialInwardScreen({ user }){
             ] : h("span",{style:{fontSize:11,color:colors.mutedLight}},"Locked"))
           )))
         ),
-        (!itemDraft && !isCleared) ? h("button",{onClick:()=>{setEditingItemId(null);setItemDraft({item:"",shape:"",spec:"",grade:"",description:"",description_overridden:false,qty:"",uom:""});},style:{...btnSmall,marginTop:10}},"+ Add row")
+        (!itemDraft && !isCleared) ? h("button",{onClick:()=>{setEditingItemId(null);setItemDraft({shape:"",spec:"",grade:"",description:"",description_overridden:false,qty:"",uom:""});},style:{...btnSmall,marginTop:10}},"+ Add row")
         : (itemDraft ? h("div",{style:{marginTop:12,borderTop:"1px solid "+colors.border,paddingTop:12}},
-            h(ItemShapeSpecGradeFields,{row:itemDraft,onChange:setItemDraft,itemOptions}),
+            h(ShapeSpecGradeFields,{row:itemDraft,onChange:setItemDraft}),
             h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:8}},
               h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Qty"),h("input",{value:itemDraft.qty,onChange:e=>setItemDraft(d=>({...d,qty:e.target.value})),style:inputStyle})),
               h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"UOM"),
@@ -15864,6 +15939,188 @@ function MaterialInwardScreen({ user }){
               h("button",{onClick:()=>{setItemDraft(null);setEditingItemId(null);},style:btnSecondary},"Cancel")
             )
           ) : null)
+      ) : null
+    )
+  );
+}
+
+function PoRegisterReport(){
+  const [dateFrom,setDateFrom] = useState("");
+  const [dateTo,setDateTo] = useState("");
+  const [rows,setRows] = useState([]); // [{po_no, po_date, items:[{description,value}]}]
+
+  const runReport = useCallback(async()=>{
+    let q = sb.from("po_register").select("po_no,po_date").order("po_date",{ascending:false});
+    if(dateFrom) q = q.gte("po_date",dateFrom);
+    if(dateTo) q = q.lte("po_date",dateTo);
+    const { data: pos } = await q;
+    const poNos = (pos||[]).map(p=>p.po_no);
+    if(poNos.length===0){ setRows([]); return; }
+    const { data: items } = await sb.from("po_register_items").select("po_no,description,qty,rate").in("po_no",poNos);
+    const byPo = new Map();
+    (items||[]).forEach(it=>{
+      if(!byPo.has(it.po_no)) byPo.set(it.po_no,[]);
+      byPo.get(it.po_no).push({description:it.description, value:(Number(it.qty)||0)*(Number(it.rate)||0)});
+    });
+    setRows((pos||[]).map(p=>({po_no:p.po_no, po_date:p.po_date, items:byPo.get(p.po_no)||[]})));
+  },[dateFrom,dateTo]);
+  useEffect(()=>{ runReport(); },[runReport]);
+
+  const grandTotal = rows.reduce((sum,r)=>sum + r.items.reduce((s,i)=>s+i.value,0), 0);
+
+  return h("div",{style:{padding:20}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
+      h("div",{style:{fontWeight:700,fontSize:18}},"PO Register report"),
+      h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+        h("input",{type:"date",value:dateFrom,onChange:e=>setDateFrom(e.target.value),style:{fontSize:12}}),
+        h("span",{style:{fontSize:12,color:colors.muted}},"to"),
+        h("input",{type:"date",value:dateTo,onChange:e=>setDateTo(e.target.value),style:{fontSize:12}})
+      )
+    ),
+    h("table",null,
+      h("thead",null,h("tr",null,
+        ["P.O. number","P.O. date","Description","Value"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},l))
+      )),
+      h("tbody",null,rows.map(r=>h("tr",{key:r.po_no,style:{borderTop:"1px solid "+colors.border}},
+        h("td",{style:{padding:"6px 8px",color:colors.accent,fontSize:13,verticalAlign:"top"}},r.po_no),
+        h("td",{style:{padding:"6px 8px",fontSize:13,verticalAlign:"top"}},r.po_date),
+        h("td",{style:{padding:"6px 8px",fontSize:13}}, r.items.map((it,i)=>h("div",{key:i},it.description||"—"))),
+        h("td",{style:{padding:"6px 8px",fontSize:13}}, r.items.map((it,i)=>h("div",{key:i},it.value.toFixed(2))))
+      )))
+    ),
+    h("div",{style:{textAlign:"right",fontWeight:700,fontSize:13,marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:8}},"Total: "+grandTotal.toFixed(2))
+  );
+}
+
+function VendorsScreen({ user }){
+  const [vendors,setVendors] = useState([]);
+  const [page,setPage] = useState(0);
+  const PAGE_SIZE = 25;
+  const [selected,setSelected] = useState(null);
+  const [creatingNew,setCreatingNew] = useState(false);
+  const blankVendor = {vendor_name:"",phone:"",website:"",billing_street:"",billing_city:"",billing_state:"",billing_country:"",billing_pin:"",gst_tax_id:"",bank_name:"",account_number:"",ifsc_code:"",swift_code:"",notes:""};
+  const [draft,setDraft] = useState(blankVendor);
+  const [addresses,setAddresses] = useState([]);
+  const [newAddress,setNewAddress] = useState({address_text:"",gst_number:"",is_primary:"No"});
+
+  const loadVendors = useCallback(async()=>{
+    const { data } = await sb.from("vendor_tbl").select("*").eq("is_archived",false).order("vendor_name").range(page*PAGE_SIZE,page*PAGE_SIZE+PAGE_SIZE-1);
+    setVendors(data||[]);
+  },[page]);
+  useEffect(()=>{ loadVendors(); },[loadVendors]);
+
+  const loadAddresses = async(vendor_name)=>{
+    const { data } = await sb.from("vendor_addresses").select("*").eq("vendor_name",vendor_name).order("created_at");
+    setAddresses(data||[]);
+  };
+
+  const openVendor = async(v)=>{ setSelected(v); setDraft(v); setCreatingNew(false); await loadAddresses(v.vendor_name); };
+
+  const saveVendor = async()=>{
+    if(!draft.vendor_name.trim()){ alert("Vendor name is required."); return; }
+    if(creatingNew){
+      const { data, error } = await sb.from("vendor_tbl").insert({...draft, created_by:user?.username||"unknown"}).select().maybeSingle();
+      if(error){ alert("Save failed: "+error.message); return; }
+      setCreatingNew(false);
+      await loadVendors();
+      if(data) openVendor(data);
+    } else {
+      const { id, ...rest } = draft;
+      await sb.from("vendor_tbl").update({...rest, updated_at:new Date().toISOString()}).eq("id",id);
+      await loadVendors();
+    }
+  };
+
+  const saveAddress = async()=>{
+    if(!newAddress.address_text.trim()){ alert("Address is required."); return; }
+    await sb.from("vendor_addresses").insert({vendor_name:selected.vendor_name, address_text:newAddress.address_text.trim(), gst_number:newAddress.gst_number.trim(), is_primary:newAddress.is_primary});
+    setNewAddress({address_text:"",gst_number:"",is_primary:"No"});
+    await loadAddresses(selected.vendor_name);
+  };
+  const deleteAddress = async(row)=>{
+    if(!confirm("Are you sure you want to delete this address?")) return;
+    await sb.from("vendor_addresses").delete().eq("id",row.id);
+    await loadAddresses(selected.vendor_name);
+  };
+
+  const field = (label,key,extraStyle)=>h("div",null,
+    h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},label),
+    h("input",{value:draft[key]||"",onChange:e=>setDraft(d=>({...d,[key]:e.target.value})),style:{...inputStyle,...(extraStyle||{})}})
+  );
+
+  return h("div",{style:{padding:20}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
+      h("div",{style:{fontWeight:700,fontSize:18}},"Vendors"),
+      h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft(blankVendor); setAddresses([]); },style:btnPrimary},"+ New vendor")
+    ),
+
+    (!selected && !creatingNew) ? h("div",null,
+      h("table",null,
+        h("thead",null,h("tr",null,
+          ["Vendor name","City","GSTR number","Phone"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},l))
+        )),
+        h("tbody",null,vendors.map(v=>h("tr",{key:v.id,onClick:()=>openVendor(v),style:{cursor:"pointer",borderTop:"1px solid "+colors.border}},
+          h("td",{style:{padding:"7px 8px",color:colors.accent,fontSize:13}},v.vendor_name),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},v.billing_city),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},v.gst_tax_id),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},v.phone)
+        )))
+      ),
+      h("div",{style:{display:"flex",gap:8,marginTop:10}},
+        h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Previous"),
+        h("button",{onClick:()=>setPage(p=>p+1),disabled:vendors.length<PAGE_SIZE,style:btnSmall},"Next")
+      )
+    ) : h("div",null,
+      h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14,marginBottom:14}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8,textTransform:"uppercase",letterSpacing:0.4}},"Vendor details"),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:10}},
+          field("Vendor name","vendor_name",{disabled:!creatingNew}),
+          field("Phone","phone"),
+          field("Website","website")
+        ),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:10}},
+          field("Billing street","billing_street"),
+          field("Billing city","billing_city"),
+          field("GSTR number","gst_tax_id")
+        ),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:10}},
+          field("Billing state","billing_state"),
+          field("Billing country","billing_country"),
+          field("Billing PIN","billing_pin")
+        ),
+        h("div",{style:{fontSize:11,color:colors.mutedLight,margin:"6px 0",textTransform:"uppercase",letterSpacing:0.4}},"Bank details (vendor-only)"),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:10}},
+          field("Bank name","bank_name"),
+          field("Account no","account_number"),
+          field("IFSC code","ifsc_code"),
+          field("SWIFT code","swift_code")
+        ),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:saveVendor,style:btnPrimary},creatingNew?"Create vendor":"Save vendor"),
+          h("button",{onClick:()=>{setSelected(null);setCreatingNew(false);},style:btnSecondary},"Back to list")
+        )
+      ),
+      (!creatingNew) ? h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8,textTransform:"uppercase",letterSpacing:0.4}},"Addresses (multiple, each with own GST)"),
+        h("table",null,
+          h("thead",null,h("tr",null,
+            ["Address","GST number","Primary","Actions"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
+          )),
+          h("tbody",null,addresses.map(a=>h("tr",{key:a.id,style:{borderTop:"1px solid "+colors.border}},
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},a.address_text),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},a.gst_number),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},a.is_primary),
+            h("td",{style:{padding:"5px 6px"}},h("button",{onClick:()=>deleteAddress(a),style:btnDanger},"Delete"))
+          )))
+        ),
+        h("div",{style:{marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:10}},
+          h("div",{style:{display:"grid",gridTemplateColumns:"2fr 1fr 1fr",gap:8,marginBottom:8}},
+            h("input",{placeholder:"Address",value:newAddress.address_text,onChange:e=>setNewAddress(a=>({...a,address_text:e.target.value})),style:inputStyle}),
+            h("input",{placeholder:"GST number",value:newAddress.gst_number,onChange:e=>setNewAddress(a=>({...a,gst_number:e.target.value})),style:inputStyle}),
+            h("select",{value:newAddress.is_primary,onChange:e=>setNewAddress(a=>({...a,is_primary:e.target.value})),style:inputStyle},h("option",{value:"No"},"No"),h("option",{value:"Yes"},"Yes"))
+          ),
+          h("button",{onClick:saveAddress,style:btnSmall},"+ Add address")
+        )
       ) : null
     )
   );
