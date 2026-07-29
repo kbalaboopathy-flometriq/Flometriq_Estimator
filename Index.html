@@ -1022,6 +1022,12 @@ function MenuTabs({ user, active, onChange }) {
     { label:"Dashboards", tabs:[
       {key:"dashboards",label:"Dashboards"},
     ]},
+    { label:"Inventory", subgroups:[
+      { label:"Inventory", tabs:[
+        {key:"po_register",label:"PO Register"},
+        {key:"material_inward",label:"Material Inward Register"},
+      ]},
+    ]},
     { label:"CRM", subgroups:[
       { label:"Funnel", tabs:[
         {key:"crm_funnel",label:"Funnel"},
@@ -15412,6 +15418,8 @@ function App() {
     tab==="users"?h(UsersEditor,{user}):
     tab==="permissions"?h(PermissionsEditor,null):
     tab==="dashboards"?h(DashboardsScreen,{user}):
+    tab==="po_register"?h(PoRegisterScreen,{user}):
+    tab==="material_inward"?h(MaterialInwardScreen,{user}):
     tab==="login_history"?h(LoginHistoryViewer,null):
     tab==="audit_log"?h(AuditLogViewer,null):
     tab==="change_password"?h(ChangePassword,{user}):
@@ -15422,6 +15430,442 @@ function App() {
       h("div",{style:{fontSize:11,color:colors.mutedLight}},"Pick Quotes from Sales, or Engineering Calc above, to get started.")
     ):
     (tab!=="estimator" && tab!=="home"?h(MasterEditor,{tableKey:tab,key:tab,user}):null)
+  );
+}
+
+/* ==================================================================
+   PO REGISTER + MATERIAL INWARD REGISTER (Phase 14)
+   Scope: PO Register (header + item lines) and GRN header + line
+   items. NOT included yet: Tag Number Register, QC status/NCR,
+   PO accepted/rejected-qty rollups — those are the next phase.
+   ================================================================== */
+
+// Shared item-entry block: Item + Shape/Spec/Grade cascading dropdowns,
+// with Description auto-built from Item+Spec+Grade and freely editable
+// (a manual edit sets `description_overridden`; Restore reverts it).
+// Standing pattern — reused wherever an item is entered in this app.
+function ItemShapeSpecGradeFields({ row, onChange, itemOptions }){
+  const [shapeOptions,setShapeOptions] = useState([]);
+  const [specOptions,setSpecOptions] = useState([]);
+  const [gradeOptions,setGradeOptions] = useState([]);
+
+  useEffect(()=>{
+    sb.from("materials_shape").select("shape").order("shape").then(({data})=>setShapeOptions((data||[]).map(r=>r.shape).filter(Boolean)));
+  },[]);
+  useEffect(()=>{
+    if(!row.shape){ setSpecOptions([]); setGradeOptions([]); return; }
+    sb.from("material_spec").select("material_spec").eq("material_shape",row.shape).then(({data})=>setSpecOptions((data||[]).map(r=>r.material_spec).filter(Boolean)));
+    sb.from("grade_tbl").select("material_grade").eq("material_shape",row.shape).then(({data})=>setGradeOptions((data||[]).map(r=>r.material_grade).filter(Boolean)));
+  },[row.shape]);
+
+  const set = (patch)=>{
+    const next = {...row, ...patch};
+    if(!next.description_overridden){
+      next.description = [next.item,next.spec,next.grade].filter(Boolean).join(" ");
+    }
+    onChange(next);
+  };
+  const restoreDescription = ()=>{
+    onChange({...row, description:[row.item,row.spec,row.grade].filter(Boolean).join(" "), description_overridden:false});
+  };
+
+  return h("div",null,
+    h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:8}},
+      h("div",null,
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Item"),
+        h(LimitToListCombo,{value:row.item||"",onChange:v=>set({item:v}),options:itemOptions||[],limitToList:false,placeholder:"Search item master…",style:{...inputStyle,padding:"6px 8px",fontSize:12.5}})
+      ),
+      h("div",null,
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Shape"),
+        h("select",{value:row.shape||"",onChange:e=>set({shape:e.target.value,spec:"",grade:""}),style:{...inputStyle,padding:"6px 8px",fontSize:12.5}},
+          h("option",{value:""},"—"),
+          shapeOptions.map(s=>h("option",{key:s,value:s},s))
+        )
+      ),
+      h("div",null,
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Spec"),
+        h("select",{value:row.spec||"",onChange:e=>set({spec:e.target.value}),disabled:!row.shape,style:{...inputStyle,padding:"6px 8px",fontSize:12.5}},
+          h("option",{value:""},"—"),
+          specOptions.map(s=>h("option",{key:s,value:s},s))
+        )
+      )
+    ),
+    h("div",{style:{display:"grid",gridTemplateColumns:"1fr 2fr",gap:10}},
+      h("div",null,
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Grade"),
+        h("select",{value:row.grade||"",onChange:e=>set({grade:e.target.value}),disabled:!row.shape,style:{...inputStyle,padding:"6px 8px",fontSize:12.5}},
+          h("option",{value:""},"—"),
+          gradeOptions.map(s=>h("option",{key:s,value:s},s))
+        )
+      ),
+      h("div",null,
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}},
+          h("div",{style:{fontSize:11.5,color:colors.muted}},"Description"),
+          row.description_overridden ? h("button",{onClick:restoreDescription,style:{...btnSmall,padding:"2px 8px",fontSize:11}},"Restore") : h("div",{style:{fontSize:10.5,color:colors.mutedLight}},"Auto-built — edit to override")
+        ),
+        h("input",{value:row.description||"",onChange:e=>onChange({...row,description:e.target.value,description_overridden:true}),style:{...inputStyle,padding:"6px 8px",fontSize:12.5}})
+      )
+    )
+  );
+}
+
+function PoRegisterScreen({ user }){
+  const isAdmin = user.role==="admin" || user.role==="super_admin";
+  const [pos,setPos] = useState([]);
+  const [page,setPage] = useState(0);
+  const PAGE_SIZE = 25;
+  const [vendorOptions,setVendorOptions] = useState([]);
+  const [itemOptions,setItemOptions] = useState([]);
+  const [uomOptions,setUomOptions] = useState([]);
+  const [selected,setSelected] = useState(null); // po_register row, or null
+  const [items,setItems] = useState([]); // po_register_items for selected PO
+  const [creatingNew,setCreatingNew] = useState(false);
+  const [draft,setDraft] = useState({po_no:"",vendor_name:"",po_date:new Date().toISOString().slice(0,10),status:"Open"});
+  const [itemDraft,setItemDraft] = useState(null); // row being added/edited, or null
+  const [editingItemId,setEditingItemId] = useState(null);
+
+  const loadPos = useCallback(async()=>{
+    const { data, count } = await sb.from("po_register").select("*",{count:"exact"}).order("po_date",{ascending:false}).range(page*PAGE_SIZE,page*PAGE_SIZE+PAGE_SIZE-1);
+    setPos(data||[]);
+  },[page]);
+  useEffect(()=>{ loadPos(); },[loadPos]);
+  useEffect(()=>{
+    sb.from("vendor_tbl").select("vendor_name").order("vendor_name").then(({data})=>setVendorOptions((data||[]).map(r=>r.vendor_name).filter(Boolean)));
+    sb.from("item_tbl").select("item").order("item").then(({data})=>setItemOptions((data||[]).map(r=>r.item).filter(Boolean)));
+    sb.from("uom_tbl").select("uom").order("uom").then(({data})=>setUomOptions((data||[]).map(r=>r.uom).filter(Boolean)));
+  },[]);
+
+  const loadItemsFor = async(po_no)=>{
+    const { data } = await sb.from("po_register_items").select("*").eq("po_no",po_no).order("created_at");
+    setItems(data||[]);
+  };
+
+  const openPo = async(po)=>{ setSelected(po); setCreatingNew(false); setItemDraft(null); await loadItemsFor(po.po_no); };
+
+  const savePoHeader = async()=>{
+    if(!draft.po_no.trim()){ alert("P.O. no is required."); return; }
+    if(!draft.vendor_name){ alert("Vendor is required."); return; }
+    if(creatingNew){
+      const { error } = await sb.from("po_register").insert({...draft, created_by:user?.username||"unknown"});
+      if(error){ alert("Save failed: "+error.message); return; }
+    } else {
+      const { id, ...rest } = draft;
+      await sb.from("po_register").update({...rest, updated_at:new Date().toISOString()}).eq("id",id);
+    }
+    setCreatingNew(false);
+    await loadPos();
+    const { data } = await sb.from("po_register").select("*").eq("po_no",draft.po_no).limit(1).maybeSingle();
+    if(data) openPo(data);
+  };
+
+  const poTotal = items.reduce((sum,r)=>sum + (Number(r.qty)||0)*(Number(r.rate)||0), 0);
+
+  const saveItemRow = async()=>{
+    if(!confirm("Are you sure you want to save changes to this line item?")) return;
+    const payload = {po_no:selected.po_no, item:itemDraft.item||"", shape:itemDraft.shape||"", spec:itemDraft.spec||"", grade:itemDraft.grade||"", description:itemDraft.description||"", qty:Number(itemDraft.qty)||0, uom:itemDraft.uom||"", rate:Number(itemDraft.rate)||0};
+    if(editingItemId){ await sb.from("po_register_items").update(payload).eq("id",editingItemId); }
+    else { await sb.from("po_register_items").insert(payload); }
+    setItemDraft(null); setEditingItemId(null);
+    await loadItemsFor(selected.po_no);
+  };
+  const deleteItemRow = async(row)=>{
+    if(!confirm("Are you sure you want to delete this line item?")) return;
+    await sb.from("po_register_items").delete().eq("id",row.id);
+    await loadItemsFor(selected.po_no);
+  };
+
+  return h("div",{style:{padding:20}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
+      h("div",{style:{fontWeight:700,fontSize:18}},"PO Register"),
+      h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft({po_no:"",vendor_name:"",po_date:new Date().toISOString().slice(0,10),status:"Open"}); setItems([]); },style:btnPrimary},"+ New PO")
+    ),
+
+    (!selected && !creatingNew) ? h("div",null,
+      h("table",null,
+        h("thead",null,h("tr",null,
+          h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"P.O. no"),
+          h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"Vendor"),
+          h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"P.O. date"),
+          h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"Status")
+        )),
+        h("tbody",null,pos.map(p=>h("tr",{key:p.id,onClick:()=>openPo(p),style:{cursor:"pointer",borderTop:"1px solid "+colors.border}},
+          h("td",{style:{padding:"7px 8px",color:colors.accent,fontSize:13}},p.po_no),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},p.vendor_name),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},p.po_date),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},p.status)
+        )))
+      ),
+      h("div",{style:{display:"flex",gap:8,marginTop:10}},
+        h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Previous"),
+        h("button",{onClick:()=>setPage(p=>p+1),disabled:pos.length<PAGE_SIZE,style:btnSmall},"Next")
+      )
+    ) : h("div",null,
+      h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14,marginBottom:14}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8,textTransform:"uppercase",letterSpacing:0.4}},"Main form — PO header"),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10}},
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"P.O. no"),h("input",{value:draft.po_no,disabled:!creatingNew,onChange:e=>setDraft(d=>({...d,po_no:e.target.value})),style:inputStyle})),
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Vendor"),
+            h("select",{value:draft.vendor_name,onChange:e=>setDraft(d=>({...d,vendor_name:e.target.value})),style:inputStyle},
+              h("option",{value:""},"—"),vendorOptions.map(v=>h("option",{key:v,value:v},v))
+            )
+          ),
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"P.O. date"),h("input",{type:"date",value:draft.po_date,onChange:e=>setDraft(d=>({...d,po_date:e.target.value})),style:inputStyle})),
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Status"),
+            h("select",{value:draft.status,onChange:e=>setDraft(d=>({...d,status:e.target.value})),style:inputStyle},
+              h("option",{value:"Open"},"Open"),h("option",{value:"Closed"},"Closed")
+            )
+          )
+        ),
+        h("div",{style:{display:"flex",gap:8,marginTop:10}},
+          h("button",{onClick:savePoHeader,style:btnPrimary},creatingNew?"Create PO":"Save header"),
+          h("button",{onClick:()=>{setSelected(null);setCreatingNew(false);},style:btnSecondary},"Back to list")
+        )
+      ),
+      (!creatingNew) ? h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8,textTransform:"uppercase",letterSpacing:0.4}},"Sub form — PO items"),
+        h("table",null,
+          h("thead",null,h("tr",null,
+            ["Item","Shape","Spec","Grade","Qty","UOM","Rate","Value","Actions"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
+          )),
+          h("tbody",null,items.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid "+colors.border}},
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.item),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.shape),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.spec),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.grade),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.qty),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.uom),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.rate),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},((Number(r.qty)||0)*(Number(r.rate)||0)).toFixed(2)),
+            h("td",{style:{padding:"5px 6px"}},
+              h("button",{onClick:()=>{setEditingItemId(r.id);setItemDraft({...r});},style:{...btnSmall,marginRight:6}},"Edit"),
+              h("button",{onClick:()=>deleteItemRow(r),style:btnDanger},"Delete")
+            )
+          )))
+        ),
+        h("div",{style:{textAlign:"right",fontWeight:700,fontSize:13,marginTop:8,borderTop:"1px solid "+colors.border,paddingTop:8}},"PO total: "+poTotal.toFixed(2)),
+        !itemDraft ? h("button",{onClick:()=>{setEditingItemId(null);setItemDraft({item:"",shape:"",spec:"",grade:"",description:"",qty:"",uom:"",rate:""});},style:{...btnSmall,marginTop:10}},"+ Add item")
+        : h("div",{style:{marginTop:12,borderTop:"1px solid "+colors.border,paddingTop:12}},
+            h(ItemShapeSpecGradeFields,{row:itemDraft,onChange:setItemDraft,itemOptions}),
+            h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:8}},
+              h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Qty"),h("input",{value:itemDraft.qty,onChange:e=>setItemDraft(d=>({...d,qty:e.target.value})),style:inputStyle})),
+              h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"UOM"),
+                h("select",{value:itemDraft.uom,onChange:e=>setItemDraft(d=>({...d,uom:e.target.value})),style:inputStyle},h("option",{value:""},"—"),uomOptions.map(u=>h("option",{key:u,value:u},u)))
+              )
+            ),
+            h("div",{style:{marginTop:8}},h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Rate"),h("input",{value:itemDraft.rate,onChange:e=>setItemDraft(d=>({...d,rate:e.target.value})),style:inputStyle})),
+            h("div",{style:{display:"flex",gap:8,marginTop:10}},
+              h("button",{onClick:saveItemRow,style:btnPrimary},"Save item"),
+              h("button",{onClick:()=>{setItemDraft(null);setEditingItemId(null);},style:btnSecondary},"Cancel")
+            )
+          )
+      ) : null
+    )
+  );
+}
+
+function MaterialInwardScreen({ user }){
+  const [grns,setGrns] = useState([]);
+  const [page,setPage] = useState(0);
+  const PAGE_SIZE = 25;
+  const [filters,setFilters] = useState({shape:"",spec:"",grade:"",vendor_name:"",grn_no:"",po_no:"",date_from:"",date_to:""});
+  const [poOptions,setPoOptions] = useState([]); // [{po_no, vendor_name}]
+  const [itemOptions,setItemOptions] = useState([]);
+  const [uomOptions,setUomOptions] = useState([]);
+  const [shapeOptions,setShapeOptions] = useState([]);
+  const [specOptions,setSpecOptions] = useState([]);
+  const [gradeOptions,setGradeOptions] = useState([]);
+  const [vendorOptions,setVendorOptions] = useState([]);
+
+  const [selected,setSelected] = useState(null); // grn_header row, or null
+  const [creatingNew,setCreatingNew] = useState(false);
+  const [draft,setDraft] = useState({grn_date:new Date().toISOString().slice(0,10),vehicle_no:"",dc_no:"",receiver_name:"",po_no:"",vendor_name:"",bill_no:"",status:"Open",stores_incharge_signature:""});
+  const [lineItems,setLineItems] = useState([]);
+  const [itemDraft,setItemDraft] = useState(null);
+  const [editingItemId,setEditingItemId] = useState(null);
+
+  const loadGrns = useCallback(async()=>{
+    let q = sb.from("grn_header").select("*").order("grn_date",{ascending:false});
+    if(filters.vendor_name) q = q.eq("vendor_name",filters.vendor_name);
+    if(filters.grn_no) q = q.eq("grn_no",filters.grn_no);
+    if(filters.po_no) q = q.eq("po_no",filters.po_no);
+    if(filters.date_from) q = q.gte("grn_date",filters.date_from);
+    if(filters.date_to) q = q.lte("grn_date",filters.date_to);
+    const { data } = await q.range(page*PAGE_SIZE,page*PAGE_SIZE+PAGE_SIZE-1);
+    setGrns(data||[]);
+  },[page,filters.vendor_name,filters.grn_no,filters.po_no,filters.date_from,filters.date_to]);
+  useEffect(()=>{ loadGrns(); },[loadGrns]);
+
+  useEffect(()=>{
+    sb.from("po_register").select("po_no,vendor_name").eq("status","Open").order("po_no").then(({data})=>setPoOptions(data||[]));
+    sb.from("item_tbl").select("item").order("item").then(({data})=>setItemOptions((data||[]).map(r=>r.item).filter(Boolean)));
+    sb.from("uom_tbl").select("uom").order("uom").then(({data})=>setUomOptions((data||[]).map(r=>r.uom).filter(Boolean)));
+    sb.from("materials_shape").select("shape").order("shape").then(({data})=>setShapeOptions((data||[]).map(r=>r.shape).filter(Boolean)));
+    sb.from("vendor_tbl").select("vendor_name").order("vendor_name").then(({data})=>setVendorOptions((data||[]).map(r=>r.vendor_name).filter(Boolean)));
+  },[]);
+  useEffect(()=>{
+    if(!filters.shape){ setSpecOptions([]); setGradeOptions([]); return; }
+    sb.from("material_spec").select("material_spec").eq("material_shape",filters.shape).then(({data})=>setSpecOptions((data||[]).map(r=>r.material_spec).filter(Boolean)));
+    sb.from("grade_tbl").select("material_grade").eq("material_shape",filters.shape).then(({data})=>setGradeOptions((data||[]).map(r=>r.material_grade).filter(Boolean)));
+  },[filters.shape]);
+
+  const loadLineItemsFor = async(grn_no)=>{
+    let q = sb.from("grn_items").select("*").eq("grn_no",grn_no).order("created_at");
+    if(filters.shape) q = q.eq("shape",filters.shape);
+    if(filters.spec) q = q.eq("spec",filters.spec);
+    if(filters.grade) q = q.eq("grade",filters.grade);
+    const { data } = await q;
+    setLineItems(data||[]);
+  };
+  const openGrn = async(g)=>{ setSelected(g); setCreatingNew(false); setItemDraft(null); await loadLineItemsFor(g.grn_no); };
+
+  const onPoChange = (po_no)=>{
+    const match = poOptions.find(p=>p.po_no===po_no);
+    setDraft(d=>({...d, po_no, vendor_name: match ? match.vendor_name : d.vendor_name}));
+  };
+
+  const saveGrnHeader = async()=>{
+    if(!draft.vehicle_no.trim()){ alert("Vehicle number is required."); return; }
+    if(!draft.po_no){ alert("P.O. no is required."); return; }
+    if(creatingNew){
+      const { data, error } = await sb.from("grn_header").insert({...draft, created_by:user?.username||"unknown"}).select().maybeSingle();
+      if(error){ alert("Save failed: "+error.message); return; }
+      setCreatingNew(false);
+      await loadGrns();
+      if(data) openGrn(data);
+    } else {
+      const { id, ...rest } = draft;
+      await sb.from("grn_header").update({...rest, updated_at:new Date().toISOString()}).eq("id",id);
+      await loadGrns();
+    }
+  };
+
+  const clearGrn = async()=>{
+    if(!draft.stores_incharge_signature.trim()){ alert("Type your name to sign off and clear this GRN."); return; }
+    if(!confirm("Clearing this GRN will lock all its line items from further edits. Continue?")) return;
+    const payload = {status:"Cleared", stores_incharge_signature:draft.stores_incharge_signature.trim(), cleared_at:new Date().toISOString(), updated_at:new Date().toISOString()};
+    await sb.from("grn_header").update(payload).eq("id",draft.id);
+    setDraft(d=>({...d,...payload}));
+    await loadGrns();
+  };
+
+  const saveLineItem = async()=>{
+    if(!confirm("Are you sure you want to save changes to this line item?")) return;
+    const payload = {grn_no:selected.grn_no, item:itemDraft.item||"", shape:itemDraft.shape||"", spec:itemDraft.spec||"", grade:itemDraft.grade||"", description:itemDraft.description||"", description_overridden:!!itemDraft.description_overridden, qty:Number(itemDraft.qty)||0, uom:itemDraft.uom||""};
+    if(editingItemId){ await sb.from("grn_items").update(payload).eq("id",editingItemId); }
+    else { await sb.from("grn_items").insert(payload); }
+    setItemDraft(null); setEditingItemId(null);
+    await loadLineItemsFor(selected.grn_no);
+  };
+  const deleteLineItem = async(row)=>{
+    if(!confirm("Are you sure you want to delete this line item?")) return;
+    await sb.from("grn_items").delete().eq("id",row.id);
+    await loadLineItemsFor(selected.grn_no);
+  };
+
+  const isCleared = draft.status==="Cleared";
+
+  return h("div",{style:{padding:20}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
+      h("div",{style:{fontWeight:700,fontSize:18}},"Material Inward Register"),
+      h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft({grn_date:new Date().toISOString().slice(0,10),vehicle_no:"",dc_no:"",receiver_name:"",po_no:"",vendor_name:"",bill_no:"",status:"Open",stores_incharge_signature:""}); setLineItems([]); },style:btnPrimary},"+ New entry")
+    ),
+
+    (!selected && !creatingNew) ? h("div",null,
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:12,background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:10}},
+        h("select",{value:filters.shape,onChange:e=>setFilters(f=>({...f,shape:e.target.value,spec:"",grade:""})),style:{...inputStyle,padding:"6px 8px",fontSize:12}},h("option",{value:""},"Shape: all"),shapeOptions.map(s=>h("option",{key:s,value:s},s))),
+        h("select",{value:filters.spec,onChange:e=>setFilters(f=>({...f,spec:e.target.value})),disabled:!filters.shape,style:{...inputStyle,padding:"6px 8px",fontSize:12}},h("option",{value:""},"Spec: all"),specOptions.map(s=>h("option",{key:s,value:s},s))),
+        h("select",{value:filters.grade,onChange:e=>setFilters(f=>({...f,grade:e.target.value})),disabled:!filters.shape,style:{...inputStyle,padding:"6px 8px",fontSize:12}},h("option",{value:""},"Grade: all"),gradeOptions.map(s=>h("option",{key:s,value:s},s))),
+        h("select",{value:filters.vendor_name,onChange:e=>setFilters(f=>({...f,vendor_name:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}},h("option",{value:""},"Vendor: all"),vendorOptions.map(v=>h("option",{key:v,value:v},v))),
+        h("select",{value:filters.po_no,onChange:e=>setFilters(f=>({...f,po_no:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}},h("option",{value:""},"P.O. no: all"),poOptions.map(p=>h("option",{key:p.po_no,value:p.po_no},p.po_no))),
+        h("input",{type:"date",placeholder:"GRN date from",value:filters.date_from,onChange:e=>setFilters(f=>({...f,date_from:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+        h("input",{type:"date",placeholder:"GRN date to",value:filters.date_to,onChange:e=>setFilters(f=>({...f,date_to:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+        h("input",{placeholder:"GRN no",value:filters.grn_no,onChange:e=>setFilters(f=>({...f,grn_no:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})
+      ),
+      h("table",null,
+        h("thead",null,h("tr",null,
+          ["GRN no","Date","Vehicle no","Vendor","P.O. no","Status"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},l))
+        )),
+        h("tbody",null,grns.map(g=>h("tr",{key:g.id,onClick:()=>openGrn(g),style:{cursor:"pointer",borderTop:"1px solid "+colors.border}},
+          h("td",{style:{padding:"7px 8px",color:colors.accent,fontSize:13}},g.grn_no),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},g.grn_date),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},g.vehicle_no),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},g.vendor_name),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},g.po_no),
+          h("td",{style:{padding:"7px 8px",fontSize:13}},g.status)
+        )))
+      ),
+      h("div",{style:{display:"flex",gap:8,marginTop:10}},
+        h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Previous"),
+        h("button",{onClick:()=>setPage(p=>p+1),disabled:grns.length<PAGE_SIZE,style:btnSmall},"Next")
+      )
+    ) : h("div",null,
+      h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14,marginBottom:14}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}},
+          h("div",{style:{fontSize:11,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:0.4}},"Main form — GRN header"+(draft.grn_no?" ("+draft.grn_no+")":"")),
+          h("span",{style:{fontSize:11,padding:"3px 10px",borderRadius:4,background:isCleared?"#e2f0e2":"#faeeda",color:isCleared?"#2b6b2b":"#854f0b",fontWeight:600}},draft.status)
+        ),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10}},
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Date"),h("input",{type:"date",value:draft.grn_date,disabled:isCleared,onChange:e=>setDraft(d=>({...d,grn_date:e.target.value})),style:inputStyle})),
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Vehicle no"),h("input",{value:draft.vehicle_no,disabled:isCleared,onChange:e=>setDraft(d=>({...d,vehicle_no:e.target.value})),style:inputStyle})),
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Delivery note / DC no"),h("input",{value:draft.dc_no,disabled:isCleared,onChange:e=>setDraft(d=>({...d,dc_no:e.target.value})),style:inputStyle})),
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Receiver's name"),h("input",{value:draft.receiver_name,disabled:isCleared,onChange:e=>setDraft(d=>({...d,receiver_name:e.target.value})),style:inputStyle}))
+        ),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginTop:10}},
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"P.O. no"),
+            h("select",{value:draft.po_no,disabled:isCleared,onChange:e=>onPoChange(e.target.value),style:inputStyle},h("option",{value:""},"—"),poOptions.map(p=>h("option",{key:p.po_no,value:p.po_no},p.po_no)))
+          ),
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Vendor"),h("input",{value:draft.vendor_name,disabled:true,style:{...inputStyle,background:"#f4f2ea"}})),
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Bill no (vendor invoice)"),h("input",{value:draft.bill_no,disabled:isCleared,onChange:e=>setDraft(d=>({...d,bill_no:e.target.value})),style:inputStyle}))
+        ),
+        h("div",{style:{display:"flex",gap:8,marginTop:10}},
+          h("button",{onClick:saveGrnHeader,disabled:isCleared,style:btnPrimary},creatingNew?"Create GRN":"Save header"),
+          h("button",{onClick:()=>{setSelected(null);setCreatingNew(false);},style:btnSecondary},"Back to list")
+        ),
+        !creatingNew ? h("div",{style:{display:"flex",alignItems:"flex-end",justifyContent:"space-between",gap:16,marginTop:12,borderTop:"1px solid "+colors.border,paddingTop:12}},
+          h("div",{style:{flex:1}},
+            h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Stores in-charge signature (typed sign-off)"),
+            h("input",{value:draft.stores_incharge_signature,disabled:isCleared,onChange:e=>setDraft(d=>({...d,stores_incharge_signature:e.target.value})),placeholder:"Type full name to sign off",style:inputStyle})
+          ),
+          !isCleared ? h("button",{onClick:clearGrn,style:{...btnPrimary,background:"#3b6d11",whiteSpace:"nowrap"}},"Clear GRN") : null
+        ) : null
+      ),
+
+      (!creatingNew) ? h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8,textTransform:"uppercase",letterSpacing:0.4}},"Sub form — material details ("+draft.grn_no+")"),
+        h("table",null,
+          h("thead",null,h("tr",null,
+            ["Item","Shape","Spec","Grade","Description","Qty","UOM","Actions"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
+          )),
+          h("tbody",null,lineItems.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid "+colors.border}},
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.item),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.shape),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.spec),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.grade),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.description),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.qty),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.uom),
+            h("td",{style:{padding:"5px 6px"}},!isCleared ? [
+              h("button",{key:"e",onClick:()=>{setEditingItemId(r.id);setItemDraft({...r});},style:{...btnSmall,marginRight:6}},"Edit"),
+              h("button",{key:"d",onClick:()=>deleteLineItem(r),style:btnDanger},"Delete")
+            ] : h("span",{style:{fontSize:11,color:colors.mutedLight}},"Locked"))
+          )))
+        ),
+        (!itemDraft && !isCleared) ? h("button",{onClick:()=>{setEditingItemId(null);setItemDraft({item:"",shape:"",spec:"",grade:"",description:"",description_overridden:false,qty:"",uom:""});},style:{...btnSmall,marginTop:10}},"+ Add row")
+        : (itemDraft ? h("div",{style:{marginTop:12,borderTop:"1px solid "+colors.border,paddingTop:12}},
+            h(ItemShapeSpecGradeFields,{row:itemDraft,onChange:setItemDraft,itemOptions}),
+            h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:8}},
+              h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Qty"),h("input",{value:itemDraft.qty,onChange:e=>setItemDraft(d=>({...d,qty:e.target.value})),style:inputStyle})),
+              h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"UOM"),
+                h("select",{value:itemDraft.uom,onChange:e=>setItemDraft(d=>({...d,uom:e.target.value})),style:inputStyle},h("option",{value:""},"—"),uomOptions.map(u=>h("option",{key:u,value:u},u)))
+              )
+            ),
+            h("div",{style:{display:"flex",gap:8,marginTop:10}},
+              h("button",{onClick:saveLineItem,style:btnPrimary},"Save item"),
+              h("button",{onClick:()=>{setItemDraft(null);setEditingItemId(null);},style:btnSecondary},"Cancel")
+            )
+          ) : null)
+      ) : null
+    )
   );
 }
 
