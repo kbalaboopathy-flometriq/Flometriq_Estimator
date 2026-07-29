@@ -6661,7 +6661,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // a datasheet on file.
   const checkQuoteReadiness = useCallback(async(refNumber)=>{
     const missing = [];
-    let termsDone = true, datasheetsDone = true, descriptionsDone = true, validationDone = true;
+    let termsDone = true, validationDone = true;
+    let dsDoneCount=0, descDoneCount=0, slCount=0;
     const {data:terms} = await sb.from("quote_commercial_terms").select("*").eq("reference_number",refNumber).maybeSingle();
     if(!terms){ missing.push({section:"Commercial Terms", items:["Not created yet"]}); termsDone=false; }
     else {
@@ -6671,9 +6672,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const {estimatesRows, datasheetsRows} = await fetchQuoteBundle(refNumber);
     const dsBySl = new Set(datasheetsRows.map(d=>d.item_sl_no));
     estimatesRows.forEach(est=>{
-      if(!dsBySl.has(est.item_sl_no)){ missing.push({section:"Sl No "+est.item_sl_no, items:["Datasheet not created"]}); datasheetsDone=false; }
-      if(!String(est.description||"").trim()){ missing.push({section:"Sl No "+est.item_sl_no, items:["Description not entered"]}); descriptionsDone=false; }
+      slCount++;
+      if(dsBySl.has(est.item_sl_no)) dsDoneCount++;
+      else missing.push({section:"Sl No "+est.item_sl_no, items:["Datasheet not created"]});
+      if(String(est.description||"").trim()) descDoneCount++;
+      else missing.push({section:"Sl No "+est.item_sl_no, items:["Description not entered"]});
     });
+    // Three states, not just done/not-done — a quote with 5 Sl Nos where
+    // only 2 have datasheets looks very different from one where none do,
+    // and lumping them together hid that difference before.
+    const datasheetsState = slCount===0 ? "none" : dsDoneCount===0 ? "none" : dsDoneCount===slCount ? "all" : "some";
+    const descriptionsState = slCount===0 ? "none" : descDoneCount===0 ? "none" : descDoneCount===slCount ? "all" : "some";
     const { data: pendingLines } = await sb.from("estimate_lines").select("item_sl_no,component").eq("reference_number",refNumber).eq("validation_status","Pending");
     if(pendingLines && pendingLines.length){
       const bySl = new Map();
@@ -6681,21 +6690,21 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       bySl.forEach((items,sl)=>missing.push({section:"Sl No "+sl, items:["Pending validation: "+items.join(", ")]}));
       validationDone = false;
     }
-    return { ready: missing.length===0, missing, categories:{ terms:termsDone, datasheets:datasheetsDone, descriptions:descriptionsDone, validation:validationDone } };
+    return { ready: missing.length===0, missing, categories:{ terms:termsDone, datasheets:datasheetsState, descriptions:descriptionsState, validation:validationDone } };
   },[]);
-  const [readiness,setReadiness]=useState({ready:false,missing:[],loading:true,categories:{terms:false,datasheets:false,descriptions:false,validation:false}});
+  const [readiness,setReadiness]=useState({ready:false,missing:[],loading:true,categories:{terms:false,datasheets:"none",descriptions:"none",validation:false}});
   const refreshReadiness=useCallback(async(refNumber)=>{
-    if(!refNumber){ setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:false,descriptions:false,validation:false}}); return; }
+    if(!refNumber){ setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:"none",descriptions:"none",validation:false}}); return; }
     setReadiness(r=>({...r,loading:true}));
     try {
       const result = await checkQuoteReadiness(refNumber);
       setReadiness({...result,loading:false});
     } catch(e){
       console.error("Readiness check failed",e);
-      setReadiness({ready:false,missing:[{section:"Readiness check",items:["Couldn't check — "+(e.message||"unknown error")]}],loading:false,error:true,categories:{terms:false,datasheets:false,descriptions:false,validation:false}});
+      setReadiness({ready:false,missing:[{section:"Readiness check",items:["Couldn't check — "+(e.message||"unknown error")]}],loading:false,error:true,categories:{terms:false,datasheets:"none",descriptions:"none",validation:false}});
     }
   },[checkQuoteReadiness]);
-  useEffect(()=>{ if(refFilter) refreshReadiness(refFilter); else setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:false,descriptions:false,validation:false}}); },[refFilter]);
+  useEffect(()=>{ if(refFilter) refreshReadiness(refFilter); else setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:"none",descriptions:"none",validation:false}}); },[refFilter]);
   // Export panel always follows whichever quote is selected in the header — no separate picker.
   useEffect(()=>{ setQuoteExportRef(refFilter||""); },[refFilter]);
   // Default the header selector to the most recently created quote once refs load, if nothing is picked yet.
@@ -6750,7 +6759,20 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const cost=Number((qty*(orderQty||1)*rate).toFixed(4));
       const sales_price=Number((cost*sf).toFixed(4));
       const payload={...edits,cost,sales_price};
+      // A Validated Direct Price line whose price actually changes on a
+      // revision needs re-validation — the whole point of Validated is
+      // "an Admin/Super Admin signed off on this exact number." Only
+      // reverts on a genuine price change, not on unrelated field edits
+      // (e.g. fixing a typo in the component name shouldn't re-trigger it).
+      if(line.is_direct_price===true && line.validation_status==="Validated" && Number(line.sales_price)!==sales_price){
+        payload.validation_status="Pending";
+        payload.validated_by=null;
+        payload.validated_at=null;
+      }
       await sb.from("estimate_lines").update(payload).eq("reference_number",line.reference_number).eq("item_sl_no",line.item_sl_no).eq("sl_no",line.sl_no);
+      if(payload.validation_status==="Pending"){
+        await logAudit("UPDATE","estimate_lines",line.reference_number+"-"+line.item_sl_no,"Direct Price line \""+(line.component||"")+"\" reverted from Validated to Pending — price changed from "+line.sales_price+" to "+sales_price+" on a revision, needs re-validation",user?.username||"unknown",{validation_status:"Validated",sales_price:line.sales_price},{validation_status:"Pending",sales_price});
+      }
       if(line.reference_number.includes("-Rev-")){
         const logs=[];
         Object.keys(edits).forEach(f=>{
@@ -7983,7 +8005,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       });
       const dsEndPage = doc.internal.getNumberOfPages();
 
-      // ---- Go back and fill in the Index now that every page number is known ----
+      // ---- Fill in the Index now that every page number is known —
+      // includes Cover Page and Revision History, matching physical order ----
       doc.setPage(indexPage);
       letterhead("INDEX");
       const indexRows = [["1","","Cover Page","1"]];
@@ -8271,10 +8294,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   };
 
   const READINESS_SEGMENTS = [["terms","Commercial Terms"],["datasheets","Datasheets"],["descriptions","Descriptions"],["validation","Validation"]];
+  const THREE_STATE_SEGMENTS = new Set(["datasheets","descriptions"]);
+  const segmentIsDone = (key,val)=> THREE_STATE_SEGMENTS.has(key) ? val==="all" : !!val;
   const renderReadinessBar = (categories, opts={})=>{
     const safeCategories = categories || {};
     const { height=44, labels=true, onClick } = opts;
-    const allDone = READINESS_SEGMENTS.every(([k])=>safeCategories[k]);
+    const allDone = READINESS_SEGMENTS.every(([k])=>segmentIsDone(k,safeCategories[k]));
     if(allDone){
       return h("div",{onClick,style:{height,borderRadius:8,background:"#1c8c56",display:"flex",alignItems:"center",justifyContent:"center",cursor:onClick?"pointer":"default"}},
         h("span",{style:{color:"#fff",fontSize:13,fontWeight:700}},opts.doneLabel||"✓ Ready")
@@ -8282,10 +8307,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     }
     return h("div",{onClick,style:{height,borderRadius:8,overflow:"hidden",display:"flex",cursor:onClick?"pointer":"default"}},
       READINESS_SEGMENTS.map(([key,label],i)=>{
-        const done = !!safeCategories[key];
-        return h("div",{key,style:{flex:1,background:done?"#e0b325":"#c0392b",display:"flex",alignItems:"center",justifyContent:"center",
+        const val = safeCategories[key];
+        const done = segmentIsDone(key,val);
+        // Three-state segments (partial-across-Sl-No categories only —
+        // Commercial Terms and Validation don't have a meaningful "some"
+        // state, so they stay the simple done/not-done they always were.
+        const isPartial = THREE_STATE_SEGMENTS.has(key) && val==="some";
+        const bg = done ? "#1c8c56" : isPartial ? "#e0b325" : "#c0392b";
+        const textColor = done ? "#fff" : isPartial ? "#4a3a00" : "#fff";
+        const prefix = done ? "✓ " : isPartial ? "◐ " : "";
+        return h("div",{key,style:{flex:1,background:bg,display:"flex",alignItems:"center",justifyContent:"center",
           borderRight:i<READINESS_SEGMENTS.length-1?"1px solid rgba(255,255,255,0.4)":"none"}},
-          labels && h("span",{style:{fontSize:9.5,fontWeight:700,color:done?"#4a3a00":"#fff",padding:"0 4px",textAlign:"center"}},(done?"✓ ":"")+label)
+          labels && h("span",{style:{fontSize:9.5,fontWeight:700,color:textColor,padding:"0 4px",textAlign:"center"}},prefix+label)
         );
       })
     );
@@ -11270,6 +11303,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"25 Jul 2026 (35)", summary:"Reverted last round's removal of Cover Page and Revision History from the Quote PDF's Index listing — on reflection they should stay listed after all. Back to how it was before: Cover Page as row 1, Revision History as Annexure-IC when present, both correctly reflecting the physical page order (Revision History still sits right after the Cover as page 2)." },
+  { date:"25 Jul 2026 (34)", summary:"Closed out three items that had been sitting open since earlier in this project. (1) Three-state readiness coloring, finally built: Datasheets and Descriptions now show green when every Sl No has one, amber (with a ◐ marker) when some do and some don't, red when none do — previously any partial completion looked identical to zero progress. Commercial Terms and Validation stay simple green/red, since a \"some\" state doesn't really apply to either of those the same way. (2) Cover Page and Revision History no longer appear as rows in the Quote PDF's own Index — same logic as a book not listing its own cover or itself in its table of contents; both pages are completely unaffected, still exactly where they've always been, just not listed. (3) A Validated Direct Price line now correctly reverts to Pending if its price actually changes on a revision — the whole point of \"Validated\" is that an Admin/Super Admin signed off on that exact number, so a changed number needs to go through that again. Logged when it happens, and only triggers on a genuine price change, not on unrelated edits to the same line." },
   { date:"25 Jul 2026 (33)", summary:"Run crm_phase12_activity_date_and_missed_report.sql. Added a manual \"date this actually happened\" field to every activity-logging form (Customers screen, My Worklist's quick-log, and the quote Follow-up panel) — deliberately NOT auto-filled from today, since someone might log a call the day after it happened. Retired quote_activity_log from last round entirely and merged it into the existing activity_log_tbl instead (added a nullable reference_number column) — the quote Follow-up panel now writes to the exact same table My Worklist, the overdue-follow-up prompt, and Overdue Calls already read from, so all of that picks up quote-level follow-ups automatically with zero changes on their end, rather than needing to be taught about a second table. New: Reports → Admin only → Missed / Late Entries — flags any activity where the manual date doesn't match when it was actually logged, with days-late, exportable as both Excel and PDF." },
   { date:"25 Jul 2026 (32)", summary:"Big batch — left/right CRM gaps plus a new Dashboards section. Run crm_phase11_left_right_dashboards.sql. Correction made along the way, not a build: the \"Contacts\" gap discussed earlier in this session doesn't actually exist — there's already a complete contacts table with full CRUD on the Customers screen, predating this session; removed the redundant table from the SQL rather than ship a duplicate. Two genuine right-side gaps closed: (1) a quote-specific Follow-up log (new card next to Commercial Terms/Documents/Generate Quote PDF) — distinct from the company-level Activity Log elsewhere in CRM, so a call about one of a customer's several parallel quotes doesn't get lost in their general history; (2) Won/Lost outcome capture — moving a quote's status to Won prompts for the PO number/date/value, moving to Lost prompts for a reason plus competitor name/price if known. Built as one shared component (WonLostOutcomeModal) and wired into all THREE places status can change — the Quote form's own dropdown, the CRM Kanban board, and Quote Status Review — so none of them can bypass it, closing a scope gap flagged honestly in the previous round rather than left quietly incomplete. New: Dashboards, a separate always-visible top-level nav key (not admin-gated — Reports stays the place for filtered/exportable detail, this is glanceable summary only) with five views: Sales pipeline, Owner leaderboard, Quote health, Rules coverage, and Admin/security (that last one alone gated to admin/super_admin internally). Built with the same plain div/CSS bar style already used in Won by Owner — no new charting library added." },
   { date:"25 Jul 2026 (31)", summary:"Rename tool's \"Old model\" field is now the same predictive-text search combo used in 30+ other places across the app (LimitToListCombo) — type to filter, paste a model number in directly, or pick from suggestions, instead of a plain dropdown you had to scroll through. Still validated against real model names on blur, same as everywhere else it's used." },
