@@ -108,7 +108,8 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
       const { data: existing } = await sb.from("quote_outcomes").select("id").eq("reference_number",referenceNumber).maybeSingle();
       if(existing) await sb.from("quote_outcomes").update(payload).eq("id",existing.id);
       else await sb.from("quote_outcomes").insert(payload);
-      await updateQuoteStatusForQuote(referenceNumber,newStatus,user?.username||"unknown","status change");
+      const result = await updateQuoteStatusForQuote(referenceNumber,newStatus,user?.username||"unknown","status change");
+      if(result && result.blocked){ return; }
       await logAudit("UPDATE","quote_outcomes",referenceNumber,"Captured "+newStatus+" outcome details for Quote# "+referenceNumber,user?.username||"unknown",null,payload);
       onDone(newStatus);
     } finally { setSaving(false); }
@@ -6270,12 +6271,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const base = baseRefOf(refFilter);
       const newRef = base+"-Rev-"+nextRevNum;
 
-      const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows}] = await Promise.all([
+      const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows}] = await Promise.all([
         sb.from("estimates").select("*").eq("reference_number",latestRef),
         sb.from("estimate_lines").select("*").eq("reference_number",latestRef),
         sb.from("quote_commercial_terms").select("*").eq("reference_number",latestRef),
         sb.from("quote_notes").select("*").eq("reference_number",latestRef),
         sb.from("datasheets").select("*").eq("reference_number",latestRef),
+        sb.from("quote_extra_price_tbl").select("*").eq("reference_number",latestRef),
       ]);
 
       const stripId = (r)=>{ const c={...r}; delete c.id; return c; };
@@ -6284,6 +6286,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       if(termsRows?.length) await sb.from("quote_commercial_terms").insert(termsRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(noteRows?.length) await sb.from("quote_notes").insert(noteRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(dsRows?.length) await sb.from("datasheets").insert(dsRows.map(r=>({...stripId(r), reference_number:newRef})));
+      // Extra Price lines clone forward like everything else, but the
+      // "declined" flag deliberately does NOT — a new revision gets its own
+      // fresh Yes/No prompt cycle even if the previous revision declined.
+      if(epRows?.length) await sb.from("quote_extra_price_tbl").insert(epRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(amendAreas.documents){
         const { data: docRows } = await sb.from("quote_documents").select("*").eq("reference_number",latestRef).eq("is_archived",false);
         if(docRows?.length) await sb.from("quote_documents").insert(docRows.map(r=>({...stripId(r), reference_number:newRef, file_path:null, lives_in_supabase:false})));
@@ -6589,6 +6595,79 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const downloadDocument = async(docRow)=>{
     const { data } = await sb.storage.from("quote-documents").createSignedUrl(docRow.file_path,60);
     if(data?.signedUrl) window.open(data.signedUrl,"_blank");
+  };
+
+  // ---- Extra Price Addition: multi-line, one set per Quote# (reference_number),
+  // same scope as Commercial Terms. On amendment, lines are already cloned
+  // forward under the new reference_number by startAmendment — so "ghosting"
+  // here just means: show each existing line blank with its real value as a
+  // placeholder, and only overwrite a field if something is actually typed.
+  const [showExtraPrice,setShowExtraPrice]=useState(false);
+  const [extraPriceLoading,setExtraPriceLoading]=useState(false);
+  const [extraPriceLines,setExtraPriceLines]=useState([]); // rows from quote_extra_price_tbl for this ref
+  const [extraPriceGhostDraft,setExtraPriceGhostDraft]=useState({}); // {[lineId]: {label,price}} — only used in amendment mode
+  const [extraPriceNewLines,setExtraPriceNewLines]=useState([]); // brand-new lines added this session, not yet saved
+  const [extraPriceLabelOptions,setExtraPriceLabelOptions]=useState([]);
+  const loadExtraPriceLabels=useCallback(async()=>{
+    const{data}=await sb.from("extra_price_labels_tbl").select("value").order("value");
+    setExtraPriceLabelOptions((data||[]).map(r=>r.value));
+  },[]);
+  useEffect(()=>{ loadExtraPriceLabels(); },[loadExtraPriceLabels]);
+  const isAmendmentRef = (ref)=> !!ref && ref.includes("-Rev-");
+  const openExtraPrice=async()=>{
+    if(!quoteExportRef) return;
+    setExtraPriceLoading(true); setShowExtraPrice(true); setExtraPriceGhostDraft({}); setExtraPriceNewLines([]);
+    try{
+      const{data}=await sb.from("quote_extra_price_tbl").select("*").eq("reference_number",quoteExportRef).order("created_at");
+      setExtraPriceLines(data||[]);
+    } catch(e){ console.error("Load extra price failed",e); setExtraPriceLines([]); }
+    finally{ setExtraPriceLoading(false); }
+  };
+  const saveExtraPrice=async()=>{
+    try{
+      const amend = isAmendmentRef(quoteExportRef);
+      // Existing (possibly ghosted) lines
+      for(const line of extraPriceLines){
+        const draft = extraPriceGhostDraft[line.id];
+        if(amend){
+          const newLabel = draft && draft.label && draft.label.trim() ? draft.label.trim() : line.label;
+          const newPrice = draft && draft.price!==undefined && draft.price!=="" ? Number(draft.price) : Number(line.price);
+          if(newLabel!==line.label || newPrice!==Number(line.price)){
+            await sb.from("quote_extra_price_tbl").update({label:newLabel,price:newPrice}).eq("id",line.id);
+            await logRevisionChange(quoteExportRef,"extra_price",line.label,line.price,newPrice);
+          }
+        } else {
+          const newLabel = draft && draft.label!==undefined ? draft.label : line.label;
+          const newPrice = draft && draft.price!==undefined ? Number(draft.price) : Number(line.price);
+          await sb.from("quote_extra_price_tbl").update({label:newLabel,price:newPrice}).eq("id",line.id);
+        }
+      }
+      // Brand-new lines
+      const toInsert = extraPriceNewLines.filter(l=>l.label && l.label.trim()).map(l=>({reference_number:quoteExportRef,label:l.label.trim(),price:Number(l.price)||0,created_by:user?.username||"unknown"}));
+      if(toInsert.length) await sb.from("quote_extra_price_tbl").insert(toInsert);
+      // A save with at least one real line clears any prior "declined" flag for this ref
+      const totalLines = extraPriceLines.length + toInsert.length;
+      if(totalLines>0) await sb.from("quote_extra_price_declined_tbl").delete().eq("reference_number",quoteExportRef);
+      setShowExtraPrice(false);
+    } catch(e){ alert("Save failed: "+(e.message||e)); }
+  };
+  const deleteExtraPriceLine=async(line)=>{
+    if(!confirm("Remove this Extra Price line?")) return;
+    await sb.from("quote_extra_price_tbl").delete().eq("id",line.id);
+    setExtraPriceLines(ls=>ls.filter(l=>l.id!==line.id));
+  };
+  // Checks whether the quote has any Extra Price lines and hasn't been
+  // explicitly declined yet for this ref. Used as the gate before Generate
+  // PDF and before Quote Status leaves Draft.
+  const checkExtraPriceGate=async(ref)=>{
+    const [{count},{data:declined}] = await Promise.all([
+      sb.from("quote_extra_price_tbl").select("id",{count:"exact",head:true}).eq("reference_number",ref),
+      sb.from("quote_extra_price_declined_tbl").select("reference_number").eq("reference_number",ref).maybeSingle()
+    ]);
+    return { hasLines:(count||0)>0, declined:!!declined };
+  };
+  const declineExtraPrice=async(ref)=>{
+    await sb.from("quote_extra_price_declined_tbl").upsert({reference_number:ref,declined_by:user?.username||"unknown",declined_at:new Date().toISOString()},{onConflict:"reference_number"});
   };
 
   const openCommercialTerms=async()=>{
@@ -7718,8 +7797,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // terms, a per-Sl-No price summary, then every Sl No's datasheet — all in
   // a single file, matching the section layout of the reference template.
   const [showNoDocsGenerateConfirm,setShowNoDocsGenerateConfirm]=useState(false);
-  const attemptGenerateQuotePdf = ()=>{
+  const attemptGenerateQuotePdf = async ()=>{
     if(!quoteExportRef) return;
+    const gate = await checkExtraPriceGate(quoteExportRef);
+    if(!gate.hasLines && !gate.declined){
+      if(confirm("Does this quote have any Extra Price Additions?\n\nOK = add some now\nCancel = none needed")){
+        await openExtraPrice();
+        return; // user adds lines, then clicks Generate PDF again
+      } else {
+        await declineExtraPrice(quoteExportRef);
+      }
+    }
     if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setShowNoDocsGenerateConfirm(true); return; }
     generateQuotePdf();
   };
@@ -7740,6 +7828,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const cancelCharges = terms.order_cancellation_charges || CT_DEFAULTS.order_cancellation_charges;
       const {data:notesRows} = await sb.from("quote_notes").select("*").eq("reference_number",quoteExportRef).order("sl_no",{ascending:true});
       const quoteNotes = (notesRows||[]).filter(n=>n.note_text&&n.note_text.trim());
+      const {data:extraPriceRows} = await sb.from("quote_extra_price_tbl").select("*").eq("reference_number",quoteExportRef).order("created_at");
+      const extraPriceForPdf = extraPriceRows||[];
       const isRevisionPdf = quoteExportRef.includes("-Rev-");
       const {data:revChangesRows} = isRevisionPdf ? await sb.from("revision_changes").select("*").eq("revision_ref",quoteExportRef).order("changed_at",{ascending:true}) : {data:[]};
       const revChangesForPdf = revChangesRows||[];
@@ -7964,11 +8054,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         if(!quoteIsInr) row.push(fmtR(totalInr/quoteFx));
         return row;
       });
+      const extraPriceTotal = extraPriceForPdf.reduce((s,l)=>s+(Number(l.price)||0),0);
       const grandTotalInr = estimatesRows.reduce((s,est)=>{
         const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
         const unitPriceInr = slLines.reduce((ss,l)=>ss+(Number(l.sales_price)||0),0);
         return s+unitPriceInr*(est.order_qty||1);
-      },0);
+      },0) + extraPriceTotal;
       const summaryHead = quoteIsInr
         ? ["S.No","Item","Description","Unit price","Qty","Total"]
         : ["S.No","Item","Description","Unit price (INR)","Unit price ("+quoteCurrency+")","Qty","Total (INR)","Total ("+quoteCurrency+")"];
@@ -7979,7 +8070,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         startY:34,
         head:[summaryHead],
         body: summaryRows,
-        foot: summaryFoot,
+        foot: extraPriceForPdf.length ? undefined : summaryFoot,
         theme:"grid",
         headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8,font:"times"},
         footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.5,font:"times"},
@@ -7987,6 +8078,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         margin:{top:32,left:12,right:12,bottom:16},
         didDrawPage:()=>letterhead("ANNEXURE II - PRICE SUMMARY")
       });
+      if(extraPriceForPdf.length){
+        doc.setFontSize(8.5); doc.setFont(undefined,"bold"); doc.setTextColor(...dark);
+        const afterMainTableY = doc.lastAutoTable.finalY + 6;
+        doc.text("Extra Price Addition", 12, afterMainTableY);
+        doc.autoTable({
+          startY: afterMainTableY+3,
+          head: [["Label","Price"]],
+          body: extraPriceForPdf.map(l=>[l.label, fmtR(Number(l.price)||0)]),
+          foot: quoteIsInr ? [["Total Price:", fmtR(grandTotalInr)]] : [["Total Price:", fmtR(grandTotalInr)]],
+          theme:"grid",
+          headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8,font:"times"},
+          footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.5,font:"times"},
+          bodyStyles:{font:"times",fontSize:8,textColor:dark},
+          margin:{top:32,left:12,right:12,bottom:16},
+          didDrawPage:()=>letterhead("ANNEXURE II - PRICE SUMMARY")
+        });
+      }
       const summaryEndPage = doc.internal.getNumberOfPages();
 
       // ---- Datasheets, one per Sl No ----
@@ -8362,7 +8470,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                       const newStatus=e.target.value;
                       const doChange=async()=>{
                         if(newStatus==="Won"||newStatus==="Lost"){ setOutcomeTarget({referenceNumber:refFilter,newStatus}); return; }
-                        await updateQuoteStatusForQuote(refFilter,newStatus,user.username,"Quote form");
+                        const result = await updateQuoteStatusForQuote(refFilter,newStatus,user.username,"Quote form");
+                        if(result && result.blocked) return;
                         setOpenRef(r=>({...r,quote_status:newStatus}));
                         setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,quote_status:newStatus}:r));
                       };
@@ -8428,6 +8537,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           ),
           h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}},
             h("button",{onClick:openCommercialTerms,style:{...btnSmall,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Commercial Terms"),
+            h("button",{onClick:openExtraPrice,style:{...btnSmall,background:"#0f766e",color:"#fff",border:"none",fontWeight:600}},"Extra Price Addition"),
             h("div",{style:{display:"flex",gap:4,alignItems:"center"}},
               h("input",{type:"number",step:"0.1",value:globalSfInput,onChange:e=>setGlobalSfInput(e.target.value),placeholder:"New Sf",style:{...inputStyle,width:110}}),
               h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf"),
@@ -9406,6 +9516,54 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
+    showExtraPrice && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Extra Price Addition — "+quoteExportRef),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"One set per quote, applied on top of every Sl No's price in the summary total."),
+        extraPriceLoading ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"Loading…") : h(React.Fragment,null,
+          isAmendmentRef(quoteExportRef) && extraPriceLines.length>0 ? h("div",{style:{background:"#eaf2fb",border:"1px solid #85b7eb",borderRadius:6,padding:"8px 12px",marginBottom:14,fontSize:11.5,color:"#0c447c"}},
+            "Amending "+quoteExportRef+" — leave a line blank to keep it as-is. Type into a field to replace just that line."
+          ) : null,
+          extraPriceLines.map(line=>{
+            const amend = isAmendmentRef(quoteExportRef);
+            const draft = extraPriceGhostDraft[line.id]||{};
+            return h("div",{key:line.id,style:{display:"flex",gap:8,alignItems:"center",marginBottom:8}},
+              h(MasterSelect,{
+                value: amend ? (draft.label||"") : (draft.label!==undefined?draft.label:line.label),
+                onChange:v=>setExtraPriceGhostDraft(d=>({...d,[line.id]:{...d[line.id],label:v}})),
+                options:extraPriceLabelOptions, table:"extra_price_labels_tbl", fieldLabel:"Extra Price Labels",
+                refreshOptions:loadExtraPriceLabels,
+                placeholder: amend ? (line.label+" (blank = keep)") : "Select…",
+                style:{fontSize:12,padding:"7px 9px"}
+              }),
+              h("input",{
+                value: amend ? (draft.price!==undefined?draft.price:"") : (draft.price!==undefined?draft.price:String(line.price)),
+                onChange:e=>setExtraPriceGhostDraft(d=>({...d,[line.id]:{...d[line.id],price:e.target.value}})),
+                placeholder: amend ? String(line.price) : "Price",
+                style:{...inputStyle,width:110,padding:"7px 9px",fontSize:12,textAlign:"right"}
+              }),
+              h("button",{onClick:()=>deleteExtraPriceLine(line),style:{...btnSmall,color:colors.danger}},"Delete")
+            );
+          }),
+          extraPriceNewLines.map((line,idx)=>
+            h("div",{key:"new-"+idx,style:{display:"flex",gap:8,alignItems:"center",marginBottom:8}},
+              h(MasterSelect,{
+                value:line.label, onChange:v=>setExtraPriceNewLines(ls=>ls.map((l,i)=>i===idx?{...l,label:v}:l)),
+                options:extraPriceLabelOptions, table:"extra_price_labels_tbl", fieldLabel:"Extra Price Labels",
+                refreshOptions:loadExtraPriceLabels, placeholder:"Select…", style:{fontSize:12,padding:"7px 9px"}
+              }),
+              h("input",{value:line.price, onChange:e=>setExtraPriceNewLines(ls=>ls.map((l,i)=>i===idx?{...l,price:e.target.value}:l)), placeholder:"Price", style:{...inputStyle,width:110,padding:"7px 9px",fontSize:12,textAlign:"right"}}),
+              h("button",{onClick:()=>setExtraPriceNewLines(ls=>ls.filter((_,i)=>i!==idx)),style:{...btnSmall,color:colors.danger}},"Remove")
+            )
+          ),
+          h("button",{onClick:()=>setExtraPriceNewLines(ls=>[...ls,{label:"",price:""}]),style:{...btnSmall,marginTop:4}},"+ Add line"),
+          h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16,borderTop:"1px solid "+colors.border,paddingTop:14}},
+            h("button",{onClick:()=>setShowExtraPrice(false),style:btnSecondary},"Cancel"),
+            h("button",{onClick:saveExtraPrice,style:btnPrimary},"Save")
+          )
+        )
+      )
+    ),
     showCtMissingModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1100,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:400,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},ctMissingFields.length+" field"+(ctMissingFields.length!==1?"s":"")+" still need"+(ctMissingFields.length===1?"s":"")+" an entry"),
@@ -9439,6 +9597,19 @@ async function logAudit(action, tableName, recordId, recordSummary, performedBy,
 // No under this Quote# is out of Draft (Documents living in Supabase are
 // meant to be temporary — see purgeQuoteDocumentsIfLeavingDraft).
 async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source){
+  if(newStatus!=="Draft"){
+    const [{count},{data:declined}] = await Promise.all([
+      sb.from("quote_extra_price_tbl").select("id",{count:"exact",head:true}).eq("reference_number",referenceNumber),
+      sb.from("quote_extra_price_declined_tbl").select("reference_number").eq("reference_number",referenceNumber).maybeSingle()
+    ]);
+    if(!(count||0) && !declined){
+      if(confirm("Does "+referenceNumber+" have any Extra Price Additions?\n\nOK = add some now (status change will be cancelled — open Extra Price from the quote and try again after)\nCancel = none needed")){
+        return { blocked:true, reason:"extra_price_needed" };
+      } else {
+        await sb.from("quote_extra_price_declined_tbl").upsert({reference_number:referenceNumber,declined_by:changedBy,declined_at:new Date().toISOString()},{onConflict:"reference_number"});
+      }
+    }
+  }
   const now = new Date().toISOString();
   const { data: allRows } = await sb.from("estimates").select("id,item_sl_no,quote_status").eq("reference_number",referenceNumber);
   const oldStatus = allRows && allRows[0] ? allRows[0].quote_status : null;
@@ -10609,6 +10780,33 @@ const MANUAL_SECTIONS = [
           {
             "type": "tip",
             "text": "Any strict dropdown missing an option you need has a \"+ Add\" button right next to it, opening a small panel to add the option without losing what you were filling in."
+          }
+        ]
+      },
+      {
+        "key": "quotes_extra_price",
+        "title": "Quotes \u2014 Extra Price Addition",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Extra Price Addition is a multi-line list of one-off charges (freight surcharges, inspection fees, and the like) set once per Quote# \u2014 same scope as Commercial Terms, shared across every Sl No. It adds into the Quote PDF's Price Summary total. Open it from the \"Extra Price Addition\" card next to Commercial Terms."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "Click \"+ Add line\", pick a Label from the dropdown (or \"+ Add\" to add a new label to the Extra Price Labels list on the spot), and type the Price.",
+              "Add as many lines as needed, then Save.",
+              "Delete removes a line immediately \u2014 no separate save step needed for that."
+            ]
+          },
+          {
+            "type": "p",
+            "text": "Most quotes have none, so there's no empty form waiting to be filled in every time. Instead, a Yes/No prompt only appears at two moments \u2014 clicking \"Generate Quote PDF\", and moving Quote Status out of Draft \u2014 and only if the quote still has zero Extra Price lines. Answering \"No\" is remembered, so it won't ask again for that quote."
+          },
+          {
+            "type": "tip",
+            "text": "On an amendment, existing Extra Price lines carry over automatically. Each shows up blank with its old label/price as a placeholder \u2014 leave it blank to keep that line as-is, or type into it to replace just that line. A brand-new revision also gets its own fresh Yes/No prompt cycle, even if the previous revision answered \"No\"."
           }
         ]
       },
@@ -12465,8 +12663,8 @@ function DraftOfferReminder({ user, onDone }){
   const changeStatus = async(row,newStatus)=>{
     setSaving(s=>({...s,[row.id]:true}));
     const by = user?.username||"unknown";
-    await updateQuoteStatusForQuote(row.reference_number,newStatus,by,"login reminder");
-    setRows(rs=>rs.filter(r=>r.id!==row.id));
+    const result = await updateQuoteStatusForQuote(row.reference_number,newStatus,by,"login reminder");
+    if(!(result && result.blocked)) setRows(rs=>rs.filter(r=>r.id!==row.id));
     setSaving(s=>({...s,[row.id]:false}));
   };
 
@@ -12765,7 +12963,8 @@ function CrmFunnelKanban({ user }){
 
   const doMoveCard = async(card, newStatus)=>{
     const by = user?.username||"unknown";
-    await updateQuoteStatusForQuote(card.reference_number,newStatus,by,"CRM funnel board");
+    const result = await updateQuoteStatusForQuote(card.reference_number,newStatus,by,"CRM funnel board");
+    if(result && result.blocked) return;
     setCards(cs=>cs.map(c=>c.reference_number===card.reference_number?{...c,quote_status:newStatus,status_changed_by:by,status_changed_at:new Date().toISOString()}:c));
   };
   const [outcomeTarget,setOutcomeTarget]=useState(null); // {card, newStatus} | null
