@@ -1048,6 +1048,7 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports_won_by_owner",label:"Won by Owner"},
         {key:"reports_status_history",label:"Status Change History"},
         {key:"reports_po_register",label:"PO Register"},
+        {key:"reports_grn_status",label:"GRN Status Report"},
       ]},
       ...(isAdmin?[{ label:"Admin only", tabs:[
         {key:"reports_masters",label:"Material Rates"},
@@ -15401,6 +15402,7 @@ function App() {
     tab==="reports_pending_validation"?h(PendingValidationScreen,{user}):
     tab==="reports_status_history"?h(StatusChangeHistoryReport,null):
     tab==="reports_po_register"?h(PoRegisterReport,null):
+    tab==="reports_grn_status"?h(GrnStatusReport,null):
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="authorization_codes"?h(AuthorizationCodesScreen,{user}):
     tab==="delete_activity_report"?h(DeleteActivityReportScreen,{user}):
@@ -15424,7 +15426,7 @@ function App() {
     tab==="permissions"?h(PermissionsEditor,null):
     tab==="dashboards"?h(DashboardsScreen,{user}):
     tab==="po_register"?h(PoRegisterScreen,{user}):
-    tab==="material_inward"?h(MaterialInwardScreen,{user}):
+    tab==="material_inward"?h(MaterialInwardScreen,{user,sessionCompany}):
     tab==="tag_register"?h(TagRegisterScreen,{user}):
     tab==="login_history"?h(LoginHistoryViewer,null):
     tab==="audit_log"?h(AuditLogViewer,null):
@@ -15455,6 +15457,22 @@ function App() {
 // the item.
 // Shared export helpers for Inventory screens (PO Register, Material
 // Inward, Tag Register). Reuses the app's existing XLSX/jsPDF setup.
+// Computes the GRN's *display* status from completeness — Draft/Open are
+// derived, not stored separately in the DB (only Cleared is a real
+// persisted state, set explicitly by the Clear GRN sign-off). A GRN stays
+// Draft if Bill No is missing OR any line is missing Rack/Bin (unless
+// Super Admin has relaxed that requirement), and only counts as Open
+// (eligible to be cleared) once both conditions are satisfied.
+function computeGrnDisplayStatus(header, lineItems, relaxRackBin){
+  if(header.status==="Cleared") return { status:"Cleared", reason:"" };
+  if(!header.bill_no || !header.bill_no.trim()) return { status:"Draft", reason:"Missing Bill No" };
+  if(!relaxRackBin){
+    const missing = (lineItems||[]).filter(li=>!li.rack_no || !li.bin_no);
+    if(missing.length>0) return { status:"Draft", reason:missing.length+" of "+lineItems.length+" lines missing Rack/Bin" };
+  }
+  return { status:"Open", reason:"Ready to clear" };
+}
+
 function exportRowsToExcel(columns, rows, sheetName, filename){
   const header = columns.map(c=>c.label);
   const body = rows.map(r=>columns.map(c=>c.get(r)));
@@ -15836,7 +15854,12 @@ function PoRegisterScreen({ user }){
   );
 }
 
-function MaterialInwardScreen({ user }){
+function MaterialInwardScreen({ user, sessionCompany }){
+  const [locationOptions,setLocationOptions] = useState([]);
+  const [employeeOptions,setEmployeeOptions] = useState([]); // Production dept employee names
+  const [relaxRackBin,setRelaxRackBin] = useState(false);
+  const [grnsItemsMap,setGrnsItemsMap] = useState({}); // grn_no -> grn_items[] (for status computation + kanban reasons)
+  const [grnNoOptions,setGrnNoOptions] = useState([]); // for the limit-to-list GRN search combo
   const [grns,setGrns] = useState([]);
   const [page,setPage] = useState(0);
   const PAGE_SIZE = 25;
@@ -15850,7 +15873,7 @@ function MaterialInwardScreen({ user }){
 
   const [selected,setSelected] = useState(null); // grn_header row, or null
   const [creatingNew,setCreatingNew] = useState(false);
-  const [draft,setDraft] = useState({grn_date:new Date().toISOString().slice(0,10),vehicle_no:"",dc_no:"",receiver_name:"",po_no:"",vendor_name:"",bill_no:"",status:"Open",stores_incharge_signature:""});
+  const [draft,setDraft] = useState({grn_date:new Date().toISOString().slice(0,10),vehicle_no:"",dc_no:"",receiver_name:"",po_no:"",vendor_name:"",bill_no:"",location:"Meppur Factory",status:"Open",stores_incharge_signature:""});
   const [lineItems,setLineItems] = useState([]);
   const [itemDraft,setItemDraft] = useState(null);
   const [editingItemId,setEditingItemId] = useState(null);
@@ -15873,6 +15896,13 @@ function MaterialInwardScreen({ user }){
     if(filters.date_to) q = q.lte("grn_date",filters.date_to);
     const { data } = await q.range(page*PAGE_SIZE,page*PAGE_SIZE+PAGE_SIZE-1);
     setGrns(data||[]);
+    const grnNos = (data||[]).map(g=>g.grn_no);
+    if(grnNos.length>0){
+      const { data: itemRows } = await sb.from("grn_items").select("grn_no,rack_no,bin_no").in("grn_no",grnNos);
+      const map = {};
+      (itemRows||[]).forEach(it=>{ if(!map[it.grn_no]) map[it.grn_no]=[]; map[it.grn_no].push(it); });
+      setGrnsItemsMap(map);
+    } else setGrnsItemsMap({});
   },[page,filters.vendor_name,filters.grn_no,filters.po_no,filters.date_from,filters.date_to]);
   useEffect(()=>{ loadGrns(); },[loadGrns]);
 
@@ -15881,6 +15911,10 @@ function MaterialInwardScreen({ user }){
     sb.from("uom_tbl").select("uom").order("uom").then(({data})=>setUomOptions((data||[]).map(r=>r.uom).filter(Boolean)));
     sb.from("materials_shape").select("shape").order("shape").then(({data})=>setShapeOptions((data||[]).map(r=>r.shape).filter(Boolean)));
     sb.from("vendor_tbl").select("vendor_name").order("vendor_name").then(({data})=>setVendorOptions((data||[]).map(r=>r.vendor_name).filter(Boolean)));
+    sb.from("grn_locations").select("location").order("location").then(({data})=>setLocationOptions((data||[]).map(r=>r.location).filter(Boolean)));
+    sb.from("employee_tbl").select("employee_name,department").eq("department","Production").order("employee_name").then(({data})=>setEmployeeOptions((data||[]).map(r=>r.employee_name).filter(Boolean)));
+    sb.from("inventory_settings").select("relax_rack_bin").eq("id",1).maybeSingle().then(({data})=>setRelaxRackBin(data?!!data.relax_rack_bin:false));
+    sb.from("grn_header").select("grn_no").order("grn_date",{ascending:false}).limit(500).then(({data})=>setGrnNoOptions((data||[]).map(r=>r.grn_no).filter(Boolean)));
   },[]);
   useEffect(()=>{
     if(!filters.shape){ setSpecOptions([]); setGradeOptions([]); return; }
@@ -15961,6 +15995,7 @@ function MaterialInwardScreen({ user }){
   const saveGrnHeader = async()=>{
     if(!draft.vehicle_no.trim()){ alert("Vehicle number is required."); return; }
     if(!draft.po_no){ alert("P.O. no is required."); return; }
+    if(!draft.receiver_name || !draft.receiver_name.trim()){ alert("Receiver's name is required."); return; }
     if(creatingNew){
       const { data, error } = await sb.from("grn_header").insert({...draft, created_by:user?.username||"unknown"}).select().maybeSingle();
       if(error){ alert("Save failed: "+error.message); return; }
@@ -15971,10 +16006,16 @@ function MaterialInwardScreen({ user }){
       const { id, ...rest } = draft;
       await sb.from("grn_header").update({...rest, updated_at:new Date().toISOString()}).eq("id",id);
       await loadGrns();
+      const computed = computeGrnDisplayStatus({...draft}, lineItems, relaxRackBin);
+      if(computed.status==="Open" && confirm("Bill number added — this GRN is ready to be cleared. Clear it now?")){
+        await clearGrn();
+      }
     }
   };
 
   const clearGrn = async()=>{
+    const computed = computeGrnDisplayStatus(draft, lineItems, relaxRackBin);
+    if(computed.status!=="Open"){ alert("This GRN isn't ready to clear yet: "+computed.reason); return; }
     if(!draft.stores_incharge_signature.trim()){ alert("Type your name to sign off and clear this GRN."); return; }
     if(!confirm("Clearing this GRN will lock all its line items from further edits. Continue?")) return;
     const payload = {status:"Cleared", stores_incharge_signature:draft.stores_incharge_signature.trim(), cleared_at:new Date().toISOString(), updated_at:new Date().toISOString()};
@@ -15989,7 +16030,7 @@ function MaterialInwardScreen({ user }){
       if(tagBasis && tagNumbers.some(t=>!t.trim())){ alert("Every tag number must be filled in before saving."); return; }
     }
     if(!confirm("Are you sure you want to save changes to this line item?")) return;
-    const payload = {grn_no:selected.grn_no, shape:itemDraft.shape||"", spec:itemDraft.spec||"", grade:itemDraft.grade||"", description:itemDraft.description||"", description_overridden:!!itemDraft.description_overridden, qty:Number(itemDraft.qty)||0, uom:itemDraft.uom||""};
+    const payload = {grn_no:selected.grn_no, shape:itemDraft.shape||"", spec:itemDraft.spec||"", grade:itemDraft.grade||"", description:itemDraft.description||"", description_overridden:!!itemDraft.description_overridden, qty:Number(itemDraft.qty)||0, uom:itemDraft.uom||"", rack_no:itemDraft.rack_no||"", bin_no:itemDraft.bin_no||""};
     let itemId = editingItemId;
     if(editingItemId){
       await sb.from("grn_items").update(payload).eq("id",editingItemId);
@@ -16015,6 +16056,32 @@ function MaterialInwardScreen({ user }){
   };
 
   const isCleared = draft.status==="Cleared";
+  const currentComputed = computeGrnDisplayStatus(draft, lineItems, relaxRackBin);
+
+  const generateGrnPdf = ()=>{
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
+    const W = doc.internal.pageSize.getWidth();
+    drawPdfLetterhead(doc, W, sessionCompany, {});
+    doc.setFontSize(14); doc.text("Goods Receipt Note", 10, 30);
+    doc.setFontSize(10);
+    const lines = [
+      "GRN no: "+draft.grn_no, "Date: "+draft.grn_date, "Location: "+(draft.location||"—"),
+      "Vehicle no: "+draft.vehicle_no, "Receiver's name: "+draft.receiver_name, "Bill no: "+(draft.bill_no||"—"),
+      "Vendor: "+draft.vendor_name, "P.O. no: "+draft.po_no, "Status: "+currentComputed.status
+    ];
+    let y = 40;
+    lines.forEach(l=>{ doc.text(l, 10, y); y+=6; });
+    y += 4;
+    doc.autoTable({
+      startY: y,
+      head: [["Shape","Spec","Grade","Description","Qty","UOM","Rack","Bin"]],
+      body: lineItems.map(li=>[li.shape,li.spec,li.grade,li.description,li.qty,li.uom,li.rack_no||"—",li.bin_no||"—"]),
+      styles: { fontSize: 8 },
+      headStyles: { fillColor: [26,43,74] }
+    });
+    doc.save((draft.grn_no||"grn")+".pdf");
+  };
 
   return h("div",{style:{padding:20}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
@@ -16022,10 +16089,12 @@ function MaterialInwardScreen({ user }){
       h("div",{style:{display:"flex",gap:8}},
         h(ExportButtons,{title:"Material Inward Register",columns:[
           {label:"GRN no",get:g=>g.grn_no},{label:"Date",get:g=>g.grn_date},{label:"Vehicle no",get:g=>g.vehicle_no},
-          {label:"Vendor",get:g=>g.vendor_name},{label:"P.O. no",get:g=>g.po_no},{label:"Status",get:g=>g.status}
+          {label:"Location",get:g=>g.location},{label:"Receiver",get:g=>g.receiver_name},
+          {label:"Vendor",get:g=>g.vendor_name},{label:"P.O. no",get:g=>g.po_no},
+          {label:"Status",get:g=>computeGrnDisplayStatus(g,grnsItemsMap[g.grn_no]||[],relaxRackBin).status}
         ],rows:grns,filenameBase:"material_inward_register"}),
         h("button",{onClick:()=>setViewMode(v=>v==="list"?"kanban":"list"),style:btnSmall},viewMode==="list"?"Kanban view":"List view"),
-        h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft({grn_date:new Date().toISOString().slice(0,10),vehicle_no:"",dc_no:"",receiver_name:"",po_no:"",vendor_name:"",bill_no:"",status:"Open",stores_incharge_signature:""}); setLineItems([]); },style:btnPrimary},"+ New entry")
+        h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft({grn_date:new Date().toISOString().slice(0,10),vehicle_no:"",dc_no:"",receiver_name:"",po_no:"",vendor_name:"",bill_no:"",location:"Meppur Factory",status:"Open",stores_incharge_signature:""}); setLineItems([]); },style:btnPrimary},"+ New entry")
       )
     ),
 
@@ -16038,32 +16107,40 @@ function MaterialInwardScreen({ user }){
         h("select",{value:filters.po_no,onChange:e=>setFilters(f=>({...f,po_no:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}},h("option",{value:""},"P.O. no: all"),poOptions.map(p=>h("option",{key:p.po_no,value:p.po_no},p.po_no))),
         h("input",{type:"date",placeholder:"GRN date from",value:filters.date_from,onChange:e=>setFilters(f=>({...f,date_from:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
         h("input",{type:"date",placeholder:"GRN date to",value:filters.date_to,onChange:e=>setFilters(f=>({...f,date_to:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
-        h("input",{placeholder:"GRN no",value:filters.grn_no,onChange:e=>setFilters(f=>({...f,grn_no:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})
+        h(LimitToListCombo,{value:filters.grn_no,onChange:v=>setFilters(f=>({...f,grn_no:v})),options:grnNoOptions,limitToList:true,placeholder:"GRN no",style:{...inputStyle,padding:"6px 8px",fontSize:12}})
       ),
       viewMode==="kanban" ? h(StatusKanban,{
-        statuses:["Open","Cleared"],
+        statuses:["Draft","Open","Cleared"],
         items:grns,
-        getStatus:g=>g.status,
+        getStatus:g=>computeGrnDisplayStatus(g,grnsItemsMap[g.grn_no]||[],relaxRackBin).status,
         getTitle:g=>g.grn_no,
-        getSubtitle:g=>g.vendor_name+" · "+g.grn_date,
+        getSubtitle:g=>{ const c=computeGrnDisplayStatus(g,grnsItemsMap[g.grn_no]||[],relaxRackBin); return g.vendor_name+" · "+g.grn_date+(c.reason?" · "+c.reason:""); },
         onMove: async(g,newStatus)=>{
+          const c = computeGrnDisplayStatus(g,grnsItemsMap[g.grn_no]||[],relaxRackBin);
+          if(newStatus!==c.status){ alert("Can't move this GRN to "+newStatus+" yet — "+(c.reason||"conditions not met")+"."); return; }
           if(newStatus==="Cleared" && !confirm("Clearing this GRN will lock all its line items from further edits. Continue?")) return;
-          await sb.from("grn_header").update({status:newStatus,updated_at:new Date().toISOString()}).eq("id",g.id);
-          await loadGrns();
+          if(newStatus==="Cleared"){
+            await sb.from("grn_header").update({status:"Cleared",cleared_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",g.id);
+            await loadGrns();
+          }
         }
       }) : h("div",null,
       h("table",null,
         h("thead",null,h("tr",null,
-          ["GRN no","Date","Vehicle no","Vendor","P.O. no","Status"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},l))
+          ["GRN no","Date","Location","Vehicle no","Vendor","P.O. no","Status"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},l))
         )),
-        h("tbody",null,grns.map(g=>h("tr",{key:g.id,onClick:()=>openGrn(g),style:{cursor:"pointer",borderTop:"1px solid "+colors.border}},
-          h("td",{style:{padding:"7px 8px",color:colors.accent,fontSize:13}},g.grn_no),
-          h("td",{style:{padding:"7px 8px",fontSize:13}},g.grn_date),
-          h("td",{style:{padding:"7px 8px",fontSize:13}},g.vehicle_no),
-          h("td",{style:{padding:"7px 8px",fontSize:13}},g.vendor_name),
-          h("td",{style:{padding:"7px 8px",fontSize:13}},g.po_no),
-          h("td",{style:{padding:"7px 8px",fontSize:13}},g.status)
-        )))
+        h("tbody",null,grns.map(g=>{
+          const c = computeGrnDisplayStatus(g,grnsItemsMap[g.grn_no]||[],relaxRackBin);
+          return h("tr",{key:g.id,onClick:()=>openGrn(g),style:{cursor:"pointer",borderTop:"1px solid "+colors.border}},
+            h("td",{style:{padding:"7px 8px",color:colors.accent,fontSize:13}},g.grn_no),
+            h("td",{style:{padding:"7px 8px",fontSize:13}},g.grn_date),
+            h("td",{style:{padding:"7px 8px",fontSize:13}},g.location),
+            h("td",{style:{padding:"7px 8px",fontSize:13}},g.vehicle_no),
+            h("td",{style:{padding:"7px 8px",fontSize:13}},g.vendor_name),
+            h("td",{style:{padding:"7px 8px",fontSize:13}},g.po_no),
+            h("td",{style:{padding:"7px 8px",fontSize:13}},c.status)
+          );
+        }))
       ),
       h("div",{style:{display:"flex",gap:8,marginTop:10}},
         h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Previous"),
@@ -16074,15 +16151,23 @@ function MaterialInwardScreen({ user }){
       h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14,marginBottom:14}},
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}},
           h("div",{style:{fontSize:11,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:0.4}},"Main form — GRN header"+(draft.grn_no?" ("+draft.grn_no+")":"")),
-          h("span",{style:{fontSize:11,padding:"3px 10px",borderRadius:4,background:isCleared?"#e2f0e2":"#faeeda",color:isCleared?"#2b6b2b":"#854f0b",fontWeight:600}},draft.status)
+          h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+            !creatingNew ? h("button",{onClick:generateGrnPdf,style:btnSmall},"Generate GRN PDF") : null,
+            h("span",{style:{fontSize:11,padding:"3px 10px",borderRadius:4,background:currentComputed.status==="Cleared"?"#e2f0e2":(currentComputed.status==="Open"?"#e3edfb":"#faeeda"),color:currentComputed.status==="Cleared"?"#2b6b2b":(currentComputed.status==="Open"?"#1c4a8a":"#854f0b"),fontWeight:600}},currentComputed.status)
+          )
         ),
         h("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10}},
           h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Date"),h("input",{type:"date",value:draft.grn_date,disabled:isCleared,onChange:e=>setDraft(d=>({...d,grn_date:e.target.value})),style:inputStyle})),
           h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Vehicle no"),h("input",{value:draft.vehicle_no,disabled:isCleared,onChange:e=>setDraft(d=>({...d,vehicle_no:e.target.value})),style:inputStyle})),
           h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Delivery note / DC no"),h("input",{value:draft.dc_no,disabled:isCleared,onChange:e=>setDraft(d=>({...d,dc_no:e.target.value})),style:inputStyle})),
-          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Receiver's name"),h("input",{value:draft.receiver_name,disabled:isCleared,onChange:e=>setDraft(d=>({...d,receiver_name:e.target.value})),style:inputStyle}))
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Location"),
+            h("select",{value:draft.location,disabled:isCleared,onChange:e=>setDraft(d=>({...d,location:e.target.value})),style:inputStyle},locationOptions.map(l=>h("option",{key:l,value:l},l)))
+          )
         ),
         h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginTop:10}},
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Receiver's name *"),
+            h(LimitToListCombo,{value:draft.receiver_name,onChange:v=>setDraft(d=>({...d,receiver_name:v})),options:employeeOptions,limitToList:false,disabled:isCleared,placeholder:"Type or pick a Production employee",style:inputStyle})
+          ),
           h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"P.O. no"),
             h("select",{value:draft.po_no,disabled:isCleared,onChange:e=>onPoChange(e.target.value),style:inputStyle},h("option",{value:""},"—"),poOptions.map(p=>h("option",{key:p.po_no,value:p.po_no},p.po_no)),h("option",{value:"__register_new__"},"+ Register a PO…")),
             showAddPo ? h("div",{style:{marginTop:8,border:"1px solid "+colors.border,borderRadius:6,padding:10,background:"#faf9f4"}},
@@ -16096,8 +16181,11 @@ function MaterialInwardScreen({ user }){
               )
             ) : null
           ),
-          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Vendor"),h("input",{value:draft.vendor_name,disabled:true,style:{...inputStyle,background:"#f4f2ea"}})),
-          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Bill no (vendor invoice)"),h("input",{value:draft.bill_no,disabled:isCleared,onChange:e=>setDraft(d=>({...d,bill_no:e.target.value})),style:inputStyle}))
+          h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Vendor"),h("input",{value:draft.vendor_name,disabled:true,style:{...inputStyle,background:"#f4f2ea"}}))
+        ),
+        h("div",{style:{marginTop:10,maxWidth:280}},
+          h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Bill no (vendor invoice)"),
+          h("input",{value:draft.bill_no,disabled:isCleared,onChange:e=>setDraft(d=>({...d,bill_no:e.target.value})),style:inputStyle})
         ),
         h("div",{style:{display:"flex",gap:8,marginTop:10}},
           h("button",{onClick:saveGrnHeader,disabled:isCleared,style:btnPrimary},creatingNew?"Create GRN":"Save header"),
@@ -16108,15 +16196,16 @@ function MaterialInwardScreen({ user }){
             h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Stores in-charge signature (typed sign-off)"),
             h("input",{value:draft.stores_incharge_signature,disabled:isCleared,onChange:e=>setDraft(d=>({...d,stores_incharge_signature:e.target.value})),placeholder:"Type full name to sign off",style:inputStyle})
           ),
-          !isCleared ? h("button",{onClick:clearGrn,style:{...btnPrimary,background:"#3b6d11",whiteSpace:"nowrap"}},"Clear GRN") : null
-        ) : null
+          !isCleared ? h("button",{onClick:clearGrn,disabled:currentComputed.status!=="Open",title:currentComputed.status!=="Open"?currentComputed.reason:"",style:{...btnPrimary,background:currentComputed.status==="Open"?"#3b6d11":colors.border,whiteSpace:"nowrap"}},"Clear GRN") : null
+        ) : null,
+        (!creatingNew && currentComputed.status==="Draft") ? h("p",{style:{fontSize:11,color:"#8a4b1f",marginTop:8}},currentComputed.reason) : null
       ),
 
       (!creatingNew) ? h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14}},
         h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8,textTransform:"uppercase",letterSpacing:0.4}},"Sub form — material details ("+draft.grn_no+")"),
         h("table",null,
           h("thead",null,h("tr",null,
-            ["Shape","Spec","Grade","Description","Qty","UOM","Actions"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
+            ["Shape","Spec","Grade","Description","Qty","UOM","Rack","Bin","Actions"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
           )),
           h("tbody",null,lineItems.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid "+colors.border}},
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.shape),
@@ -16125,13 +16214,15 @@ function MaterialInwardScreen({ user }){
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.description),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.qty),
             h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.uom),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5,color:r.rack_no?colors.text:colors.mutedLight}},r.rack_no||"—"),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5,color:r.bin_no?colors.text:colors.mutedLight}},r.bin_no||"—"),
             h("td",{style:{padding:"5px 6px"}},!isCleared ? [
               h("button",{key:"e",onClick:()=>{setEditingItemId(r.id);setItemDraft({...r});},style:{...btnSmall,marginRight:6}},"Edit"),
               h("button",{key:"d",onClick:()=>deleteLineItem(r),style:btnDanger},"Delete")
             ] : h("span",{style:{fontSize:11,color:colors.mutedLight}},"Locked"))
           )))
         ),
-        (!itemDraft && !isCleared) ? h("button",{onClick:()=>{setEditingItemId(null);setItemDraft({shape:"",spec:"",grade:"",description:"",description_overridden:false,qty:"",uom:""});},style:{...btnSmall,marginTop:10}},"+ Add row")
+        (!itemDraft && !isCleared) ? h("button",{onClick:()=>{setEditingItemId(null);setItemDraft({shape:"",spec:"",grade:"",description:"",description_overridden:false,qty:"",uom:"",rack_no:"",bin_no:""});},style:{...btnSmall,marginTop:10}},"+ Add row")
         : (itemDraft ? h("div",{style:{marginTop:12,borderTop:"1px solid "+colors.border,paddingTop:12}},
             h(ShapeSpecGradeFields,{row:itemDraft,onChange:setItemDraft}),
             h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:8}},
@@ -16139,6 +16230,10 @@ function MaterialInwardScreen({ user }){
               h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"UOM"),
                 h("select",{value:itemDraft.uom,onChange:e=>setItemDraft(d=>({...d,uom:e.target.value})),style:inputStyle},h("option",{value:""},"—"),uomOptions.map(u=>h("option",{key:u,value:u},u)))
               )
+            ),
+            h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:8}},
+              h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Rack no"+(relaxRackBin?"":" (needed before this GRN can clear)")),h("input",{value:itemDraft.rack_no||"",onChange:e=>setItemDraft(d=>({...d,rack_no:e.target.value})),style:inputStyle})),
+              h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:3}},"Bin no"+(relaxRackBin?"":" (needed before this GRN can clear)")),h("input",{value:itemDraft.bin_no||"",onChange:e=>setItemDraft(d=>({...d,bin_no:e.target.value})),style:inputStyle}))
             ),
             (itemDraft.shape && tagBasis==="") ? h("div",{style:{marginTop:10,border:"1px solid "+colors.border,borderRadius:6,padding:10,background:"#fff4e5"}},
               h("div",{style:{fontSize:12,marginBottom:8}},"\"" +itemDraft.shape+ "\" has no Tagging Basis set on the Shape master yet."),
@@ -16450,6 +16545,68 @@ function StatusKanban({ statuses, items, getStatus, getTitle, getSubtitle, onMov
         ))
       );
     })
+  );
+}
+
+function GrnStatusReport(){
+  const [grns,setGrns] = useState([]);
+  const [itemsMap,setItemsMap] = useState({});
+  const [relaxRackBin,setRelaxRackBin] = useState(false);
+
+  const load = useCallback(async()=>{
+    const { data } = await sb.from("grn_header").select("*").order("grn_date",{ascending:false}).limit(500);
+    setGrns(data||[]);
+    const grnNos = (data||[]).map(g=>g.grn_no);
+    if(grnNos.length>0){
+      const { data: items } = await sb.from("grn_items").select("grn_no,rack_no,bin_no").in("grn_no",grnNos);
+      const map = {};
+      (items||[]).forEach(it=>{ if(!map[it.grn_no]) map[it.grn_no]=[]; map[it.grn_no].push(it); });
+      setItemsMap(map);
+    }
+    const { data: settings } = await sb.from("inventory_settings").select("relax_rack_bin").eq("id",1).maybeSingle();
+    setRelaxRackBin(settings?!!settings.relax_rack_bin:false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const grouped = { Draft:[], Open:[], Cleared:[] };
+  grns.forEach(g=>{
+    const c = computeGrnDisplayStatus(g, itemsMap[g.grn_no]||[], relaxRackBin);
+    grouped[c.status].push({...g, reason:c.reason});
+  });
+
+  const section = (title, rows, color)=> h("div",{style:{marginBottom:20}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}},
+      h("div",{style:{fontWeight:600,fontSize:14}},title+" ("+rows.length+")"),
+      h(ExportButtons,{title:title+" GRNs",columns:[
+        {label:"GRN no",get:r=>r.grn_no},{label:"Date",get:r=>r.grn_date},{label:"Vendor",get:r=>r.vendor_name},
+        {label:"P.O. no",get:r=>r.po_no},{label:"Reason",get:r=>r.reason}
+      ],rows,filenameBase:title.toLowerCase()+"_grns"})
+    ),
+    rows.length===0 ? h("p",{style:{fontSize:12,color:colors.mutedLight}},"None") : h("table",null,
+      h("thead",null,h("tr",null,
+        ["GRN no","Date","Vendor","P.O. no","Reason"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
+      )),
+      h("tbody",null,rows.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid "+colors.border}},
+        h("td",{style:{padding:"5px 6px",fontSize:12.5,color:colors.accent}},r.grn_no),
+        h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.grn_date),
+        h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.vendor_name),
+        h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.po_no),
+        h("td",{style:{padding:"5px 6px",fontSize:12.5,color}},r.reason||"—")
+      )))
+    )
+  );
+
+  return h("div",{style:{padding:20}},
+    h("div",{style:{fontWeight:700,fontSize:18,marginBottom:14}},"GRN Status Report"),
+    h("div",{style:{display:"flex",gap:16,marginBottom:20}},
+      ["Draft","Open","Cleared"].map(s=>h("div",{key:s,style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:"10px 16px",textAlign:"center"}},
+        h("div",{style:{fontSize:20,fontWeight:700}},grouped[s].length),
+        h("div",{style:{fontSize:11.5,color:colors.muted}},s)
+      ))
+    ),
+    section("Draft", grouped.Draft, "#8a4b1f"),
+    section("Open", grouped.Open, "#1c4a8a"),
+    section("Cleared", grouped.Cleared, "#2b6b2b")
   );
 }
 
