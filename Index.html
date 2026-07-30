@@ -1069,6 +1069,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Commercial terms", tabs: byKeys(ctKeys) },
       { label:"Customers", tabs:[{key:"customers",label:"Customers"},{key:"customer_bulk_upload",label:"Customer Bulk Upload"}] },
       { label:"Vendors", tabs:[{key:"vendors",label:"Vendors"}] },
+      { label:"Test Types", tabs:[{key:"test_types",label:"Test Types Master"}] },
       { label:"CRM Setup", tabs: byKeys(["state_zone_tbl","country_zone_tbl","territory_rule_state_tbl","territory_rule_country_tbl"]) },
       { label:"Engineering", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"}] },
       { label:"Company", tabs:[{key:"company_master",label:"Company Master"}] },
@@ -6271,13 +6272,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const base = baseRefOf(refFilter);
       const newRef = base+"-Rev-"+nextRevNum;
 
-      const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows}] = await Promise.all([
+      const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows},{data:slEpRows},{data:slTestRows}] = await Promise.all([
         sb.from("estimates").select("*").eq("reference_number",latestRef),
         sb.from("estimate_lines").select("*").eq("reference_number",latestRef),
         sb.from("quote_commercial_terms").select("*").eq("reference_number",latestRef),
         sb.from("quote_notes").select("*").eq("reference_number",latestRef),
         sb.from("datasheets").select("*").eq("reference_number",latestRef),
         sb.from("quote_extra_price_tbl").select("*").eq("reference_number",latestRef),
+        sb.from("quote_sl_extra_price_tbl").select("*").eq("reference_number",latestRef),
+        sb.from("quote_sl_testing_tbl").select("*").eq("reference_number",latestRef),
       ]);
 
       const stripId = (r)=>{ const c={...r}; delete c.id; return c; };
@@ -6290,6 +6293,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // "declined" flag deliberately does NOT — a new revision gets its own
       // fresh Yes/No prompt cycle even if the previous revision declined.
       if(epRows?.length) await sb.from("quote_extra_price_tbl").insert(epRows.map(r=>({...stripId(r), reference_number:newRef})));
+      // Sl No-level Extra Price and Testing clone forward too, same idea.
+      if(slEpRows?.length) await sb.from("quote_sl_extra_price_tbl").insert(slEpRows.map(r=>({...stripId(r), reference_number:newRef})));
+      if(slTestRows?.length) await sb.from("quote_sl_testing_tbl").insert(slTestRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(amendAreas.documents){
         const { data: docRows } = await sb.from("quote_documents").select("*").eq("reference_number",latestRef).eq("is_archived",false);
         if(docRows?.length) await sb.from("quote_documents").insert(docRows.map(r=>({...stripId(r), reference_number:newRef, file_path:null, lives_in_supabase:false})));
@@ -6668,6 +6674,61 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   };
   const declineExtraPrice=async(ref)=>{
     await sb.from("quote_extra_price_declined_tbl").upsert({reference_number:ref,declined_by:user?.username||"unknown",declined_at:new Date().toISOString()},{onConflict:"reference_number"});
+  };
+
+  // ---- Sl No-level Options (Extra Price) & Testing (NDE/DT) — distinct
+  // from the Quote-level Extra Price Addition above. Attaches to one
+  // specific Sl No; always folds into that Sl No's own unit price.
+  const [showOptionsTesting,setShowOptionsTesting]=useState(false);
+  const [optionsTestingTab,setOptionsTestingTab]=useState("options"); // 'options' | 'testing'
+  const [slExtraPriceLines,setSlExtraPriceLines]=useState([]);
+  const [slTestingLines,setSlTestingLines]=useState([]);
+  const [testTypeOptions,setTestTypeOptions]=useState([]); // rows from test_types_tbl
+  const loadTestTypes=useCallback(async()=>{
+    const{data}=await sb.from("test_types_tbl").select("*").order("test_name");
+    setTestTypeOptions(data||[]);
+  },[]);
+  useEffect(()=>{ loadTestTypes(); },[loadTestTypes]);
+
+  const currentSlNoUnitPrice = openLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+
+  const openOptionsTesting=async()=>{
+    if(!openRef || !openRef.item_sl_no) return;
+    setShowOptionsTesting(true);
+    const [{data:opRows},{data:testRows}] = await Promise.all([
+      sb.from("quote_sl_extra_price_tbl").select("*").eq("reference_number",quoteExportRef).eq("item_sl_no",openRef.item_sl_no).order("created_at"),
+      sb.from("quote_sl_testing_tbl").select("*").eq("reference_number",quoteExportRef).eq("item_sl_no",openRef.item_sl_no).order("created_at")
+    ]);
+    setSlExtraPriceLines(opRows||[]);
+    setSlTestingLines(testRows||[]);
+  };
+  const addSlExtraPriceLine=async(label,price)=>{
+    if(!label||!label.trim()) return;
+    await sb.from("quote_sl_extra_price_tbl").insert({reference_number:quoteExportRef,item_sl_no:openRef.item_sl_no,label:label.trim(),price:Number(price)||0,created_by:user?.username||"unknown"});
+    openOptionsTesting();
+  };
+  const deleteSlExtraPriceLine=async(row)=>{
+    if(!confirm("Remove this line?")) return;
+    await sb.from("quote_sl_extra_price_tbl").delete().eq("id",row.id);
+    setSlExtraPriceLines(ls=>ls.filter(l=>l.id!==row.id));
+  };
+  const suggestTestPrice=(testName)=>{
+    const t = testTypeOptions.find(tt=>tt.test_name===testName);
+    if(!t) return "";
+    let p = t.basis==="Percentage" ? (currentSlNoUnitPrice*(Number(t.value)||0)/100) : Number(t.value)||0;
+    if(t.min_charge!=null && p<Number(t.min_charge)) p = Number(t.min_charge);
+    if(t.max_charge!=null && p>Number(t.max_charge)) p = Number(t.max_charge);
+    return p.toFixed(2);
+  };
+  const addSlTestingLine=async(testName,price)=>{
+    if(!testName) return;
+    await sb.from("quote_sl_testing_tbl").insert({reference_number:quoteExportRef,item_sl_no:openRef.item_sl_no,test_name:testName,price:Number(price)||0,created_by:user?.username||"unknown"});
+    openOptionsTesting();
+  };
+  const deleteSlTestingLine=async(row)=>{
+    if(!confirm("Remove this test?")) return;
+    await sb.from("quote_sl_testing_tbl").delete().eq("id",row.id);
+    setSlTestingLines(ls=>ls.filter(l=>l.id!==row.id));
   };
 
   const openCommercialTerms=async()=>{
@@ -7797,6 +7858,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // terms, a per-Sl-No price summary, then every Sl No's datasheet — all in
   // a single file, matching the section layout of the reference template.
   const [showNoDocsGenerateConfirm,setShowNoDocsGenerateConfirm]=useState(false);
+  const [pendingTestingMode,setPendingTestingMode]=useState("separate");
   const attemptGenerateQuotePdf = async ()=>{
     if(!quoteExportRef) return;
     const gate = await checkExtraPriceGate(quoteExportRef);
@@ -7808,10 +7870,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         await declineExtraPrice(quoteExportRef);
       }
     }
-    if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setShowNoDocsGenerateConfirm(true); return; }
-    generateQuotePdf();
+    let testingMode = "separate";
+    const { count: testingCount } = await sb.from("quote_sl_testing_tbl").select("id",{count:"exact",head:true}).eq("reference_number",quoteExportRef);
+    if((testingCount||0)>0){
+      testingMode = confirm("This quote has NDE/Testing costs attached.\n\nOK = Pro-rata (fold into item prices, no separate line)\nCancel = Show separately (in Price Summary)") ? "prorata" : "separate";
+    }
+    if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setPendingTestingMode(testingMode); setShowNoDocsGenerateConfirm(true); return; }
+    generateQuotePdf(testingMode);
   };
-  const generateQuotePdf = async()=>{
+  const generateQuotePdf = async(testingMode="separate")=>{
     if(!quoteExportRef) return;
     setGeneratingQuotePdf(true);
     try {
@@ -7830,6 +7897,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const quoteNotes = (notesRows||[]).filter(n=>n.note_text&&n.note_text.trim());
       const {data:extraPriceRows} = await sb.from("quote_extra_price_tbl").select("*").eq("reference_number",quoteExportRef).order("created_at");
       const extraPriceForPdf = extraPriceRows||[];
+      const {data:slExtraPriceAll} = await sb.from("quote_sl_extra_price_tbl").select("*").eq("reference_number",quoteExportRef);
+      const {data:slTestingAll} = await sb.from("quote_sl_testing_tbl").select("*").eq("reference_number",quoteExportRef);
+      const slExtraByItem = new Map(); (slExtraPriceAll||[]).forEach(r=>{ if(!slExtraByItem.has(r.item_sl_no)) slExtraByItem.set(r.item_sl_no,[]); slExtraByItem.get(r.item_sl_no).push(r); });
+      const slTestingByItem = new Map(); (slTestingAll||[]).forEach(r=>{ if(!slTestingByItem.has(r.item_sl_no)) slTestingByItem.set(r.item_sl_no,[]); slTestingByItem.get(r.item_sl_no).push(r); });
       const isRevisionPdf = quoteExportRef.includes("-Rev-");
       const {data:revChangesRows} = isRevisionPdf ? await sb.from("revision_changes").select("*").eq("revision_ref",quoteExportRef).order("changed_at",{ascending:true}) : {data:[]};
       const revChangesForPdf = revChangesRows||[];
@@ -8045,8 +8116,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const summaryStartPage = doc.internal.getNumberOfPages();
       const summaryRows = estimatesRows.map(est=>{
         const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
-        const unitPriceInr = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+        const baseUnitPriceInr = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
         const qty = est.order_qty||1;
+        const slExtraTotal = (slExtraByItem.get(est.item_sl_no)||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
+        const slTestingTotal = (slTestingByItem.get(est.item_sl_no)||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
+        const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) : 0);
+        const unitPriceInr = baseUnitPriceInr + foldedPerUnit;
         const totalInr = unitPriceInr*qty;
         const row = [est.item_sl_no, modelItemMap.get(est.model)||est.model||"—", est.description||"—", fmtR(unitPriceInr)];
         if(!quoteIsInr) row.push(fmtR(unitPriceInr/quoteFx));
@@ -8055,11 +8130,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         return row;
       });
       const extraPriceTotal = extraPriceForPdf.reduce((s,l)=>s+(Number(l.price)||0),0);
+      const testingSeparateTotal = testingMode==="separate" ? (slTestingAll||[]).reduce((s,l)=>s+(Number(l.price)||0),0) : 0;
       const grandTotalInr = estimatesRows.reduce((s,est)=>{
         const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
-        const unitPriceInr = slLines.reduce((ss,l)=>ss+(Number(l.sales_price)||0),0);
-        return s+unitPriceInr*(est.order_qty||1);
-      },0) + extraPriceTotal;
+        const baseUnitPriceInr = slLines.reduce((ss,l)=>ss+(Number(l.sales_price)||0),0);
+        const qty = est.order_qty||1;
+        const slExtraTotal = (slExtraByItem.get(est.item_sl_no)||[]).reduce((ss,l)=>ss+(Number(l.price)||0),0);
+        const slTestingTotal = (slTestingByItem.get(est.item_sl_no)||[]).reduce((ss,l)=>ss+(Number(l.price)||0),0);
+        const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) : 0);
+        return s+(baseUnitPriceInr+foldedPerUnit)*qty;
+      },0) + extraPriceTotal + testingSeparateTotal;
       const summaryHead = quoteIsInr
         ? ["S.No","Item","Description","Unit price","Qty","Total"]
         : ["S.No","Item","Description","Unit price (INR)","Unit price ("+quoteCurrency+")","Qty","Total (INR)","Total ("+quoteCurrency+")"];
@@ -8095,6 +8175,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           didDrawPage:()=>letterhead("ANNEXURE II - PRICE SUMMARY")
         });
       }
+      if(testingMode==="separate" && (slTestingAll||[]).length){
+        doc.setFontSize(8.5); doc.setFont(undefined,"bold"); doc.setTextColor(...dark);
+        const afterY = doc.lastAutoTable.finalY + 6;
+        doc.text("NDE / Testing", 12, afterY);
+        doc.autoTable({
+          startY: afterY+3,
+          head: [["S.No","Test","Price"]],
+          body: (slTestingAll||[]).map(l=>[l.item_sl_no, l.test_name, fmtR(Number(l.price)||0)]),
+          foot: [["","Total Price:", fmtR(grandTotalInr)]],
+          theme:"grid",
+          headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8,font:"times"},
+          footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.5,font:"times"},
+          bodyStyles:{font:"times",fontSize:8,textColor:dark},
+          margin:{top:32,left:12,right:12,bottom:16},
+          didDrawPage:()=>letterhead("ANNEXURE II - PRICE SUMMARY")
+        });
+      }
       const summaryEndPage = doc.internal.getNumberOfPages();
 
       // ---- Datasheets, one per Sl No ----
@@ -8113,6 +8210,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           body.push([{content:sec.title,colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
           sec.rows.forEach(r=>body.push([r.label, r.value]));
         });
+        const slOptions = slExtraByItem.get(inst.slNo)||[];
+        if(slOptions.length){
+          body.push([{content:"Options",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
+          slOptions.forEach(o=>body.push([o.label, ""]));
+        }
+        const slTests = slTestingByItem.get(inst.slNo)||[];
+        if(slTests.length){
+          body.push([{content:"Testing",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
+          slTests.forEach(t=>body.push([t.test_name+" — Included in scope", ""]));
+        }
         doc.autoTable({
           startY:yy+6, body, theme:"plain",
           styles:{font:"helvetica",fontSize:8.5,textColor:dark,cellPadding:{top:1,right:5,bottom:1,left:5}},
@@ -8818,6 +8925,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   h("span",{style:{fontSize:10,color:"#0f6e56"}},`→ Qty by Order/Quote updates live`)
                 ),
                 h("button",{onClick:()=>setShowDatasheet(true),style:{...btnSecondary,background:"#b8590a",color:"#fff",border:"none",fontWeight:600}},"Datasheet"),
+                h("button",{onClick:readiness.ready?openOptionsTesting:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Complete Datasheets/Descriptions/pricing first",style:{...btnSecondary,background:readiness.ready?"#0f766e":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},"Options & Testing"),
                 h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line"),
                 isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No")
               )
@@ -9276,7 +9384,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{fontSize:12.5,color:colors.mutedLight,marginBottom:16}},"Do you want to attach documents before generating this quote?"),
         h("div",{style:{display:"flex",gap:8}},
           h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); openDocumentsPanel(); },style:{...btnPrimary,flex:1}},"Yes"),
-          h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); generateQuotePdf(); },style:{...btnSecondary,flex:1}},"No, generate anyway")
+          h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); generateQuotePdf(pendingTestingMode); },style:{...btnSecondary,flex:1}},"No, generate anyway")
         )
       )
     ),
@@ -9561,6 +9669,55 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("button",{onClick:()=>setShowExtraPrice(false),style:btnSecondary},"Cancel"),
             h("button",{onClick:saveExtraPrice,style:btnPrimary},"Save")
           )
+        )
+      )
+    ),
+    showOptionsTesting && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Options & Testing — Sl No "+(openRef&&openRef.item_sl_no)),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Both fold into this Sl No's own unit price (total ÷ qty). Shown as labels only on the Datasheet — no cost breakdown there."),
+        h("div",{style:{display:"flex",gap:6,marginBottom:14,borderBottom:"1px solid "+colors.border}},
+          h("button",{onClick:()=>setOptionsTestingTab("options"),style:{fontSize:12,padding:"7px 14px",border:"none",borderBottom:optionsTestingTab==="options"?"2px solid "+colors.accent:"2px solid transparent",background:"none",fontWeight:optionsTestingTab==="options"?700:400,color:optionsTestingTab==="options"?colors.accent:colors.muted,cursor:"pointer"}},"Options (Extra Price)"),
+          h("button",{onClick:()=>setOptionsTestingTab("testing"),style:{fontSize:12,padding:"7px 14px",border:"none",borderBottom:optionsTestingTab==="testing"?"2px solid "+colors.accent:"2px solid transparent",background:"none",fontWeight:optionsTestingTab==="testing"?700:400,color:optionsTestingTab==="testing"?colors.accent:colors.muted,cursor:"pointer"}},"Testing (NDE)")
+        ),
+
+        optionsTestingTab==="options" ? h("div",null,
+          h("table",null,
+            h("thead",null,h("tr",null,
+              h("th",{style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},"Label"),
+              h("th",{style:{textAlign:"right",padding:"5px 6px",color:colors.muted,fontSize:11.5,width:90}},"Price"),
+              h("th",{style:{width:36}})
+            )),
+            h("tbody",null,slExtraPriceLines.map(l=>h("tr",{key:l.id},
+              h("td",{style:{padding:"5px 6px",fontSize:12.5}},l.label),
+              h("td",{style:{padding:"5px 6px",fontSize:12.5,textAlign:"right"}},Number(l.price).toFixed(2)),
+              h("td",{style:{padding:"5px 6px",textAlign:"center"}},h("button",{onClick:()=>deleteSlExtraPriceLine(l),style:{...btnSmall,color:colors.danger}},"Delete"))
+            )))
+          ),
+          h(NewOptionsLineForm,{labelOptions:extraPriceLabelOptions,refreshLabels:loadExtraPriceLabels,onAdd:addSlExtraPriceLine}),
+          slExtraPriceLines.length>0 && h("p",{style:{fontSize:11,color:colors.muted,marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:8}},
+            "Total ₹"+slExtraPriceLines.reduce((s,l)=>s+Number(l.price),0).toFixed(2)+" ÷ qty "+(openRef&&openRef.order_qty||1)+" = ₹"+(slExtraPriceLines.reduce((s,l)=>s+Number(l.price),0)/((openRef&&openRef.order_qty)||1)).toFixed(2)+" added to unit price"
+          )
+        ) : h("div",null,
+          h("table",null,
+            h("thead",null,h("tr",null,
+              h("th",{style:{textAlign:"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},"Test"),
+              h("th",{style:{textAlign:"right",padding:"5px 6px",color:colors.muted,fontSize:11.5,width:90}},"Price"),
+              h("th",{style:{width:36}})
+            )),
+            h("tbody",null,slTestingLines.map(l=>h("tr",{key:l.id},
+              h("td",{style:{padding:"5px 6px",fontSize:12.5}},l.test_name),
+              h("td",{style:{padding:"5px 6px",fontSize:12.5,textAlign:"right"}},Number(l.price).toFixed(2)),
+              h("td",{style:{padding:"5px 6px",textAlign:"center"}},h("button",{onClick:()=>deleteSlTestingLine(l),style:{...btnSmall,color:colors.danger}},"Delete"))
+            )))
+          ),
+          h(NewTestingLineForm,{testTypeOptions,suggestPrice:suggestTestPrice,unitPrice:currentSlNoUnitPrice,onAdd:addSlTestingLine}),
+          slTestingLines.length>0 && h("p",{style:{fontSize:11,color:colors.muted,marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:8}},
+            "Datasheet will show each as \"<test> — Included in scope\". How the cost enters the price (folded vs. shown separately) is chosen when you generate the PDF."
+          )
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:16,borderTop:"1px solid "+colors.border,paddingTop:14}},
+          h("button",{onClick:()=>setShowOptionsTesting(false),style:btnPrimary},"Close")
         )
       )
     ),
@@ -15735,6 +15892,7 @@ function App() {
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
     tab==="customers"?h(CustomersScreen,{user}):
     tab==="vendors"?h(VendorsScreen,{user}):
+    tab==="test_types"?h(TestTypesScreen,null):
     tab==="user_manual"?h(UserManualScreen,null):
     tab==="tour"?h(TourScreen,null):
     tab==="faq"?h(FaqScreen,null):
@@ -15817,6 +15975,39 @@ function exportRowsToPdf(title, columns, rows, filename){
   });
   doc.save(filename+".pdf");
 }
+function NewOptionsLineForm({ labelOptions, refreshLabels, onAdd }){
+  const [label,setLabel]=useState("");
+  const [price,setPrice]=useState("");
+  return h("div",{style:{display:"flex",gap:8,alignItems:"flex-end",marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:10}},
+    h("div",{style:{flex:1}},
+      h(MasterSelect,{value:label,onChange:setLabel,options:labelOptions,table:"extra_price_labels_tbl",fieldLabel:"Extra Price Labels",refreshOptions:refreshLabels,placeholder:"Select label…",style:{fontSize:12.5,padding:"7px 9px"}})
+    ),
+    h("input",{value:price,onChange:e=>setPrice(e.target.value),placeholder:"Price",style:{...inputStyle,width:100,padding:"7px 9px",fontSize:12.5,textAlign:"right"}}),
+    h("button",{onClick:()=>{ onAdd(label,price); setLabel(""); setPrice(""); },style:btnPrimary},"+ Add")
+  );
+}
+
+function NewTestingLineForm({ testTypeOptions, suggestPrice, unitPrice, onAdd }){
+  const [testName,setTestName]=useState("");
+  const [price,setPrice]=useState("");
+  const suggested = testName ? suggestPrice(testName) : "";
+  const exceeds = price!=="" && Number(price) > unitPrice;
+  return h("div",{style:{marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:10}},
+    h("div",{style:{display:"flex",gap:8,alignItems:"flex-end"}},
+      h("div",{style:{flex:1}},
+        h("select",{value:testName,onChange:e=>{ const v=e.target.value; setTestName(v); setPrice(suggestPrice(v)); },style:{...inputStyle,padding:"7px 9px",fontSize:12.5}},
+          h("option",{value:""},"Select test type…"),
+          testTypeOptions.map(t=>h("option",{key:t.test_name,value:t.test_name},t.test_name))
+        )
+      ),
+      h("input",{value:price,onChange:e=>setPrice(e.target.value),placeholder:"Price",style:{...inputStyle,width:100,padding:"7px 9px",fontSize:12.5,textAlign:"right"}}),
+      h("button",{onClick:()=>{ onAdd(testName,price); setTestName(""); setPrice(""); },style:btnPrimary},"+ Add")
+    ),
+    testName && suggested!=="" ? h("p",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:4}},"Suggested from Test Types Master: "+suggested+" — edit freely above") : null,
+    exceeds ? h("p",{style:{fontSize:11,color:"#8a4b1f",marginTop:4}},"⚠ Exceeds this Sl No's item price ("+unitPrice.toFixed(2)+")") : null
+  );
+}
+
 function ExportButtons({ title, columns, rows, filenameBase }){
   return h("div",{style:{display:"flex",gap:8}},
     h("button",{onClick:()=>exportRowsToExcel(columns,rows,title,filenameBase),style:btnSmall},"Export Excel"),
@@ -16929,6 +17120,74 @@ function GrnStatusReport(){
     section("Draft", grouped.Draft, "#8a4b1f"),
     section("Open", grouped.Open, "#1c4a8a"),
     section("Cleared", grouped.Cleared, "#2b6b2b")
+  );
+}
+
+function TestTypesScreen(){
+  const blank = {test_name:"",basis:"Flat",value:"",min_charge:"",max_charge:""};
+  const [rows,setRows]=useState([]);
+  const [draft,setDraft]=useState(blank);
+  const [editingId,setEditingId]=useState(null);
+  const load=useCallback(async()=>{
+    const{data}=await sb.from("test_types_tbl").select("*").order("test_name");
+    setRows(data||[]);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const save=async()=>{
+    if(!draft.test_name.trim()){ alert("Test name is required."); return; }
+    const payload = {
+      test_name:draft.test_name.trim(), basis:draft.basis,
+      value:Number(draft.value)||0,
+      min_charge:draft.min_charge===""?null:Number(draft.min_charge),
+      max_charge:draft.max_charge===""?null:Number(draft.max_charge)
+    };
+    if(editingId){ await sb.from("test_types_tbl").update(payload).eq("id",editingId); }
+    else { const{error}=await sb.from("test_types_tbl").insert(payload); if(error){ alert("Save failed: "+error.message); return; } }
+    setDraft(blank); setEditingId(null);
+    await load();
+  };
+  const remove=async(row)=>{
+    if(!confirm("Delete test type \""+row.test_name+"\"?")) return;
+    await sb.from("test_types_tbl").delete().eq("id",row.id);
+    await load();
+  };
+
+  return h("div",{style:{padding:20}},
+    h("div",{style:{fontWeight:700,fontSize:18,marginBottom:14}},"Test Types Master"),
+    h("p",{style:{fontSize:12,color:colors.muted,marginBottom:14}},"Each test's pricing rule — used to suggest a starting price when attached to a Sl No (price stays editable there)."),
+    h("table",null,
+      h("thead",null,h("tr",null,
+        ["Test name","Basis","Value","Min","Max","Actions"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},l))
+      )),
+      h("tbody",null,rows.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid "+colors.border}},
+        h("td",{style:{padding:"6px 8px",fontSize:13}},r.test_name),
+        h("td",{style:{padding:"6px 8px",fontSize:13}},r.basis),
+        h("td",{style:{padding:"6px 8px",fontSize:13}},r.basis==="Percentage"?r.value+"%":r.value),
+        h("td",{style:{padding:"6px 8px",fontSize:13}},r.min_charge!=null?r.min_charge:"—"),
+        h("td",{style:{padding:"6px 8px",fontSize:13}},r.max_charge!=null?r.max_charge:"—"),
+        h("td",{style:{padding:"6px 8px"}},
+          h("button",{onClick:()=>{setEditingId(r.id);setDraft({test_name:r.test_name,basis:r.basis,value:String(r.value),min_charge:r.min_charge!=null?String(r.min_charge):"",max_charge:r.max_charge!=null?String(r.max_charge):""});},style:{...btnSmall,marginRight:6}},"Edit"),
+          h("button",{onClick:()=>remove(r),style:btnDanger},"Delete")
+        )
+      )))
+    ),
+    h("div",{style:{marginTop:16,background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14,maxWidth:520}},
+      h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8,textTransform:"uppercase",letterSpacing:0.4}},editingId?"Edit test type":"Add test type"),
+      h("div",{style:{display:"grid",gridTemplateColumns:"2fr 1fr",gap:10,marginBottom:10}},
+        h("input",{placeholder:"Test name (e.g. Radiography Testing (RT))",value:draft.test_name,onChange:e=>setDraft(d=>({...d,test_name:e.target.value})),style:inputStyle}),
+        h("select",{value:draft.basis,onChange:e=>setDraft(d=>({...d,basis:e.target.value})),style:inputStyle},h("option",{value:"Flat"},"Flat"),h("option",{value:"Percentage"},"Percentage"))
+      ),
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:10}},
+        h("div",null,h("div",{style:{fontSize:11,color:colors.muted,marginBottom:3}},draft.basis==="Percentage"?"Percentage (%)":"Flat amount"),h("input",{value:draft.value,onChange:e=>setDraft(d=>({...d,value:e.target.value})),style:inputStyle})),
+        h("div",null,h("div",{style:{fontSize:11,color:colors.muted,marginBottom:3}},"Min charge"),h("input",{value:draft.min_charge,onChange:e=>setDraft(d=>({...d,min_charge:e.target.value})),style:inputStyle})),
+        h("div",null,h("div",{style:{fontSize:11,color:colors.muted,marginBottom:3}},"Max charge (blank = no cap)"),h("input",{value:draft.max_charge,onChange:e=>setDraft(d=>({...d,max_charge:e.target.value})),style:inputStyle}))
+      ),
+      h("div",{style:{display:"flex",gap:8}},
+        h("button",{onClick:save,style:btnPrimary},editingId?"Save changes":"Add test type"),
+        editingId ? h("button",{onClick:()=>{setEditingId(null);setDraft(blank);},style:btnSecondary},"Cancel") : null
+      )
+    )
   );
 }
 
