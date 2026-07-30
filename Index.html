@@ -6731,6 +6731,27 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     setSlTestingLines(ls=>ls.filter(l=>l.id!==row.id));
   };
 
+  const [showTestingModeModal,setShowTestingModeModal]=useState(false);
+  const [currentTestingMode,setCurrentTestingMode]=useState(null); // 'prorata' | 'separate' | null (not yet chosen)
+  const openTestingModeModal=async()=>{
+    const{data}=await sb.from("quote_testing_mode_tbl").select("mode").eq("reference_number",quoteExportRef).maybeSingle();
+    setCurrentTestingMode(data?data.mode:null);
+    setShowTestingModeModal(true);
+  };
+  const chooseTestingMode=async(mode)=>{
+    await sb.from("quote_testing_mode_tbl").upsert({reference_number:quoteExportRef, mode, chosen_by:user?.username||"unknown", chosen_at:new Date().toISOString()},{onConflict:"reference_number"});
+    setCurrentTestingMode(mode);
+    setShowTestingModeModal(false);
+  };
+  const [ndeRollupSummary,setNdeRollupSummary]=useState(null); // {count, total} | null
+  const loadNdeRollupSummary=useCallback(async()=>{
+    if(!quoteExportRef){ setNdeRollupSummary(null); return; }
+    const{data}=await sb.from("quote_sl_testing_tbl").select("price").eq("reference_number",quoteExportRef);
+    if(!data||!data.length){ setNdeRollupSummary(null); return; }
+    setNdeRollupSummary({count:data.length,total:data.reduce((s,r)=>s+(Number(r.price)||0),0)});
+  },[quoteExportRef]);
+  useEffect(()=>{ loadNdeRollupSummary(); },[loadNdeRollupSummary]);
+
   const openCommercialTerms=async()=>{
     if(!quoteExportRef) return;
     setCtLoading(true); setShowCommercialTerms(true); setCtAllowMismatch(false); setCtMismatchBlocked(false); setCtGhostDraft({});
@@ -8641,6 +8662,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}},
             h("button",{onClick:openCommercialTerms,style:{...btnSmall,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Commercial Terms"),
             h("button",{onClick:openExtraPrice,style:{...btnSmall,background:"#0f766e",color:"#fff",border:"none",fontWeight:600}},"Extra Price Addition"),
+            h("button",{onClick:readiness.ready?openTestingModeModal:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Enabled once the quote is marked Ready",style:{...btnSmall,background:readiness.ready?"#8a4b1f":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},ndeRollupSummary?("NDE Testing ("+ndeRollupSummary.count+" item"+(ndeRollupSummary.count!==1?"s":"")+", ₹"+ndeRollupSummary.total.toFixed(0)+")"):"NDE Testing"),
             h("div",{style:{display:"flex",gap:4,alignItems:"center"}},
               h("input",{type:"number",step:"0.1",value:globalSfInput,onChange:e=>setGlobalSfInput(e.target.value),placeholder:"New Sf",style:{...inputStyle,width:110}}),
               h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf"),
@@ -9715,6 +9737,28 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:16,borderTop:"1px solid "+colors.border,paddingTop:14}},
           h("button",{onClick:()=>setShowOptionsTesting(false),style:btnPrimary},"Close")
         )
+      )
+    ),
+    showTestingModeModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"24px",width:380,maxWidth:"100%",textAlign:"center"}},
+        h("div",{style:{width:44,height:44,borderRadius:"50%",background:"#eef3fb",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 12px"}},
+          h("i",{className:"ti ti-flask",style:{fontSize:20,color:"#1c4a8a"}})
+        ),
+        h("div",{style:{fontWeight:700,fontSize:15,marginBottom:6}},"How should testing costs appear?"),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16,lineHeight:1.5}},
+          ndeRollupSummary ? ("This quote has ₹"+ndeRollupSummary.total.toFixed(0)+" in testing costs across "+ndeRollupSummary.count+" item"+(ndeRollupSummary.count!==1?"s":"")+". Choose how to show this in the PDF.") : "No testing costs on this quote yet — you can still set the default for when there are."
+        ),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+          h("button",{onClick:()=>chooseTestingMode("prorata"),style:{fontSize:13,padding:"10px 14px",textAlign:"left",borderRadius:6,border:"none",background:currentTestingMode==="prorata"?"#0f3d75":"#1c4a8a",color:"#fff",fontWeight:700}},
+            "Pro-rata into item prices",currentTestingMode==="prorata"?" ✓":"",
+            h("div",{style:{fontSize:11,fontWeight:400,opacity:0.9,marginTop:2}},"Spread proportionally by item price — no separate testing line shown")
+          ),
+          h("button",{onClick:()=>chooseTestingMode("separate"),style:{fontSize:13,padding:"10px 14px",textAlign:"left",borderRadius:6,border:"1px solid "+colors.border,background:currentTestingMode==="separate"?"#f4f2ea":"#fff",fontWeight:700}},
+            "Show separately",currentTestingMode==="separate"?" ✓":"",
+            h("div",{style:{fontSize:11,fontWeight:400,color:colors.muted,marginTop:2}},"Listed in the Price Summary, alongside the item totals")
+          )
+        ),
+        h("button",{onClick:()=>setShowTestingModeModal(false),style:{...btnSecondary,marginTop:14,width:"100%"}},"Close")
       )
     ),
     showCtMissingModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1100,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
