@@ -1026,6 +1026,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Inventory", tabs:[
         {key:"po_register",label:"PO Register"},
         {key:"material_inward",label:"Material Inward Register"},
+        {key:"tag_register",label:"Tag Register"},
       ]},
     ]},
     { label:"CRM", subgroups:[
@@ -15424,6 +15425,7 @@ function App() {
     tab==="dashboards"?h(DashboardsScreen,{user}):
     tab==="po_register"?h(PoRegisterScreen,{user}):
     tab==="material_inward"?h(MaterialInwardScreen,{user}):
+    tab==="tag_register"?h(TagRegisterScreen,{user}):
     tab==="login_history"?h(LoginHistoryViewer,null):
     tab==="audit_log"?h(AuditLogViewer,null):
     tab==="change_password"?h(ChangePassword,{user}):
@@ -15451,6 +15453,37 @@ function App() {
 // reused wherever a raw-material line item is entered in this app.
 // No separate "Item" field: for raw materials, Shape effectively IS
 // the item.
+// Shared export helpers for Inventory screens (PO Register, Material
+// Inward, Tag Register). Reuses the app's existing XLSX/jsPDF setup.
+function exportRowsToExcel(columns, rows, sheetName, filename){
+  const header = columns.map(c=>c.label);
+  const body = rows.map(r=>columns.map(c=>c.get(r)));
+  const ws = XLSX.utils.aoa_to_sheet([header, ...body]);
+  ws["!cols"] = columns.map(()=>({wch:18}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, sheetName.slice(0,31));
+  XLSX.writeFile(wb, filename+".xlsx");
+}
+function exportRowsToPdf(title, columns, rows, filename){
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation:"landscape", unit:"mm", format:"a4" });
+  doc.setFontSize(14); doc.text(title, 10, 12);
+  doc.autoTable({
+    startY: 18,
+    head: [columns.map(c=>c.label)],
+    body: rows.map(r=>columns.map(c=>c.get(r))),
+    styles: { fontSize: 8 },
+    headStyles: { fillColor: [26,43,74] }
+  });
+  doc.save(filename+".pdf");
+}
+function ExportButtons({ title, columns, rows, filenameBase }){
+  return h("div",{style:{display:"flex",gap:8}},
+    h("button",{onClick:()=>exportRowsToExcel(columns,rows,title,filenameBase),style:btnSmall},"Export Excel"),
+    h("button",{onClick:()=>exportRowsToPdf(title,columns,rows,filenameBase),style:btnSmall},"Export PDF")
+  );
+}
+
 function ShapeSpecGradeFields({ row, onChange }){
   const [shapeOptions,setShapeOptions] = useState([]);
   const [specOptions,setSpecOptions] = useState([]);
@@ -15528,6 +15561,7 @@ function PoRegisterScreen({ user }){
   const blankNewVendor = {vendor_name:"",phone:"",website:"",billing_street:"",billing_city:"",billing_state:"",billing_country:"",billing_pin:"",gst_tax_id:"",bank_name:"",account_number:"",ifsc_code:"",swift_code:""};
   const [newVendorDraft,setNewVendorDraft] = useState(blankNewVendor);
   const [filterPoNo,setFilterPoNo] = useState("");
+  const [viewMode,setViewMode] = useState("list"); // 'list' | 'kanban'
   const [filterDateFrom,setFilterDateFrom] = useState("");
   const [filterDateTo,setFilterDateTo] = useState("");
   const [posItemsMap,setPosItemsMap] = useState({}); // po_no -> [{description,value}]
@@ -15638,7 +15672,14 @@ function PoRegisterScreen({ user }){
   return h("div",{style:{padding:20}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
       h("div",{style:{fontWeight:700,fontSize:18}},"PO Register"),
-      h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft({po_no:"",vendor_name:"",po_date:new Date().toISOString().slice(0,10),status:"Open"}); setItems([]); },style:btnPrimary},"+ Register PO")
+      h("div",{style:{display:"flex",gap:8}},
+        h(ExportButtons,{title:"PO Register",columns:[
+          {label:"P.O. no",get:p=>p.po_no},{label:"Vendor",get:p=>p.vendor_name},{label:"P.O. date",get:p=>p.po_date},
+          {label:"Status",get:p=>p.status},{label:"Total value",get:p=>(posItemsMap[p.po_no]||[]).reduce((s,it)=>s+it.value,0).toFixed(2)}
+        ],rows:pos,filenameBase:"po_register"}),
+        h("button",{onClick:()=>setViewMode(v=>v==="list"?"kanban":"list"),style:btnSmall},viewMode==="list"?"Kanban view":"List view"),
+        h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft({po_no:"",vendor_name:"",po_date:new Date().toISOString().slice(0,10),status:"Open"}); setItems([]); },style:btnPrimary},"+ Register PO")
+      )
     ),
 
     (!selected && !creatingNew) ? h("div",null,
@@ -15647,6 +15688,14 @@ function PoRegisterScreen({ user }){
         h("input",{type:"date",value:filterDateFrom,onChange:e=>setFilterDateFrom(e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
         h("input",{type:"date",value:filterDateTo,onChange:e=>setFilterDateTo(e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})
       ),
+      viewMode==="kanban" ? h(StatusKanban,{
+        statuses:["Open","Closed","Cancel","Hold"],
+        items:pos,
+        getStatus:p=>p.status,
+        getTitle:p=>p.po_no,
+        getSubtitle:p=>p.vendor_name+" · "+p.po_date,
+        onMove: async(p,newStatus)=>{ await sb.from("po_register").update({status:newStatus,updated_at:new Date().toISOString()}).eq("id",p.id); await loadPos(); }
+      }) : h("div",null,
       h("table",null,
         h("thead",null,h("tr",null,
           h("th",{style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},"P.O. no"),
@@ -15674,6 +15723,7 @@ function PoRegisterScreen({ user }){
       h("div",{style:{display:"flex",gap:8,marginTop:10}},
         h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Previous"),
         h("button",{onClick:()=>setPage(p=>p+1),disabled:pos.length<PAGE_SIZE,style:btnSmall},"Next")
+      )
       )
     ) : h("div",null,
       h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14,marginBottom:14}},
@@ -15805,7 +15855,14 @@ function MaterialInwardScreen({ user }){
   const [itemDraft,setItemDraft] = useState(null);
   const [editingItemId,setEditingItemId] = useState(null);
   const [showAddPo,setShowAddPo] = useState(false);
+  const [viewMode,setViewMode] = useState("list"); // 'list' | 'kanban'
   const [newPoDraft,setNewPoDraft] = useState({po_no:"",vendor_name:"",po_date:new Date().toISOString().slice(0,10)});
+  const [tagBasis,setTagBasis] = useState(null); // 'Per Lot' | 'Per No' | '' (blank, needs setting) | null (not looked up yet)
+  const [tagNumbers,setTagNumbers] = useState([]); // array of editable tag strings
+  const [showSetTagBasis,setShowSetTagBasis] = useState(false);
+  const [newTagBasisValue,setNewTagBasisValue] = useState("Per Lot");
+  const [tagBasisAuthCode,setTagBasisAuthCode] = useState("");
+  const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
 
   const loadGrns = useCallback(async()=>{
     let q = sb.from("grn_header").select("*").order("grn_date",{ascending:false});
@@ -15830,6 +15887,45 @@ function MaterialInwardScreen({ user }){
     sb.from("material_spec").select("material_spec").eq("material_shape",filters.shape).then(({data})=>setSpecOptions((data||[]).map(r=>r.material_spec).filter(Boolean)));
     sb.from("grade_tbl").select("material_grade").eq("material_shape",filters.shape).then(({data})=>setGradeOptions((data||[]).map(r=>r.material_grade).filter(Boolean)));
   },[filters.shape]);
+
+  // Look up the shape's Tagging Basis whenever the item draft's shape changes,
+  // and (re)build the tag number list once basis + qty are both known.
+  useEffect(()=>{
+    if(!itemDraft || !itemDraft.shape){ setTagBasis(null); setTagNumbers([]); return; }
+    let cancelled=false;
+    sb.from("materials_shape").select("tagging_basis").eq("shape",itemDraft.shape).maybeSingle().then(({data})=>{
+      if(cancelled) return;
+      setTagBasis(data ? (data.tagging_basis||"") : "");
+    });
+    return ()=>{ cancelled=true; };
+  },[itemDraft && itemDraft.shape]);
+
+  useEffect(()=>{
+    if(!itemDraft || !tagBasis) { setTagNumbers([]); return; }
+    const qty = Math.max(1, Math.floor(Number(itemDraft.qty)||1));
+    if(tagBasis==="Per Lot"){
+      setTagNumbers(prev=>prev.length===1?prev:[""]);
+    } else if(tagBasis==="Per No"){
+      const seed = (selected && selected.grn_no ? selected.grn_no.replace(/[^0-9]/g,"") : "NEW");
+      setTagNumbers(prev=>{
+        const next=[];
+        for(let i=0;i<qty;i++){ next.push(prev[i] || ("TAG-"+seed+"-"+String(i+1).padStart(3,"0"))); }
+        return next;
+      });
+    }
+  },[itemDraft && itemDraft.qty, tagBasis]);
+
+  const saveTagBasis = async()=>{
+    if(!isAdminOrAbove){
+      const result = await verifyAndConsumeAuthCode(tagBasisAuthCode, user.username, "edit");
+      if(!result.ok){ alert(result.reason); return; }
+    }
+    const { error } = await sb.from("materials_shape").update({tagging_basis:newTagBasisValue}).eq("shape",itemDraft.shape);
+    if(error){ alert("Could not set Tagging Basis: "+error.message); return; }
+    setTagBasis(newTagBasisValue);
+    setShowSetTagBasis(false);
+    setTagBasisAuthCode("");
+  };
 
   const loadLineItemsFor = async(grn_no)=>{
     let q = sb.from("grn_items").select("*").eq("grn_no",grn_no).order("created_at");
@@ -15888,15 +15984,32 @@ function MaterialInwardScreen({ user }){
   };
 
   const saveLineItem = async()=>{
+    if(itemDraft.shape){
+      if(tagBasis===""){ alert("This shape has no Tagging Basis set yet. Set it below before saving."); setShowSetTagBasis(true); return; }
+      if(tagBasis && tagNumbers.some(t=>!t.trim())){ alert("Every tag number must be filled in before saving."); return; }
+    }
     if(!confirm("Are you sure you want to save changes to this line item?")) return;
     const payload = {grn_no:selected.grn_no, shape:itemDraft.shape||"", spec:itemDraft.spec||"", grade:itemDraft.grade||"", description:itemDraft.description||"", description_overridden:!!itemDraft.description_overridden, qty:Number(itemDraft.qty)||0, uom:itemDraft.uom||""};
-    if(editingItemId){ await sb.from("grn_items").update(payload).eq("id",editingItemId); }
-    else { await sb.from("grn_items").insert(payload); }
-    setItemDraft(null); setEditingItemId(null);
+    let itemId = editingItemId;
+    if(editingItemId){
+      await sb.from("grn_items").update(payload).eq("id",editingItemId);
+      await sb.from("tag_register").delete().eq("grn_item_id",editingItemId); // replace tags on re-save
+    } else {
+      const { data, error } = await sb.from("grn_items").insert(payload).select().maybeSingle();
+      if(error){ alert("Save failed: "+error.message); return; }
+      itemId = data ? data.id : null;
+    }
+    if(tagBasis && tagNumbers.length>0 && itemId){
+      const tagRows = tagNumbers.map(t=>({tag_number:t.trim(), grn_no:selected.grn_no, grn_item_id:itemId, shape:itemDraft.shape, spec:itemDraft.spec, grade:itemDraft.grade, description:itemDraft.description, tagging_basis:tagBasis, created_by:user?.username||"unknown"}));
+      const { error: tagErr } = await sb.from("tag_register").insert(tagRows);
+      if(tagErr){ alert("Line item saved, but tag numbers could not be recorded: "+tagErr.message); }
+    }
+    setItemDraft(null); setEditingItemId(null); setTagBasis(null); setTagNumbers([]);
     await loadLineItemsFor(selected.grn_no);
   };
   const deleteLineItem = async(row)=>{
-    if(!confirm("Are you sure you want to delete this line item?")) return;
+    if(!confirm("Are you sure you want to delete this line item? Its tag numbers will also be removed.")) return;
+    await sb.from("tag_register").delete().eq("grn_item_id",row.id);
     await sb.from("grn_items").delete().eq("id",row.id);
     await loadLineItemsFor(selected.grn_no);
   };
@@ -15906,7 +16019,14 @@ function MaterialInwardScreen({ user }){
   return h("div",{style:{padding:20}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
       h("div",{style:{fontWeight:700,fontSize:18}},"Material Inward Register"),
-      h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft({grn_date:new Date().toISOString().slice(0,10),vehicle_no:"",dc_no:"",receiver_name:"",po_no:"",vendor_name:"",bill_no:"",status:"Open",stores_incharge_signature:""}); setLineItems([]); },style:btnPrimary},"+ New entry")
+      h("div",{style:{display:"flex",gap:8}},
+        h(ExportButtons,{title:"Material Inward Register",columns:[
+          {label:"GRN no",get:g=>g.grn_no},{label:"Date",get:g=>g.grn_date},{label:"Vehicle no",get:g=>g.vehicle_no},
+          {label:"Vendor",get:g=>g.vendor_name},{label:"P.O. no",get:g=>g.po_no},{label:"Status",get:g=>g.status}
+        ],rows:grns,filenameBase:"material_inward_register"}),
+        h("button",{onClick:()=>setViewMode(v=>v==="list"?"kanban":"list"),style:btnSmall},viewMode==="list"?"Kanban view":"List view"),
+        h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft({grn_date:new Date().toISOString().slice(0,10),vehicle_no:"",dc_no:"",receiver_name:"",po_no:"",vendor_name:"",bill_no:"",status:"Open",stores_incharge_signature:""}); setLineItems([]); },style:btnPrimary},"+ New entry")
+      )
     ),
 
     (!selected && !creatingNew) ? h("div",null,
@@ -15920,6 +16040,18 @@ function MaterialInwardScreen({ user }){
         h("input",{type:"date",placeholder:"GRN date to",value:filters.date_to,onChange:e=>setFilters(f=>({...f,date_to:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
         h("input",{placeholder:"GRN no",value:filters.grn_no,onChange:e=>setFilters(f=>({...f,grn_no:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})
       ),
+      viewMode==="kanban" ? h(StatusKanban,{
+        statuses:["Open","Cleared"],
+        items:grns,
+        getStatus:g=>g.status,
+        getTitle:g=>g.grn_no,
+        getSubtitle:g=>g.vendor_name+" · "+g.grn_date,
+        onMove: async(g,newStatus)=>{
+          if(newStatus==="Cleared" && !confirm("Clearing this GRN will lock all its line items from further edits. Continue?")) return;
+          await sb.from("grn_header").update({status:newStatus,updated_at:new Date().toISOString()}).eq("id",g.id);
+          await loadGrns();
+        }
+      }) : h("div",null,
       h("table",null,
         h("thead",null,h("tr",null,
           ["GRN no","Date","Vehicle no","Vendor","P.O. no","Status"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},l))
@@ -15936,6 +16068,7 @@ function MaterialInwardScreen({ user }){
       h("div",{style:{display:"flex",gap:8,marginTop:10}},
         h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Previous"),
         h("button",{onClick:()=>setPage(p=>p+1),disabled:grns.length<PAGE_SIZE,style:btnSmall},"Next")
+      )
       )
     ) : h("div",null,
       h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14,marginBottom:14}},
@@ -16007,9 +16140,24 @@ function MaterialInwardScreen({ user }){
                 h("select",{value:itemDraft.uom,onChange:e=>setItemDraft(d=>({...d,uom:e.target.value})),style:inputStyle},h("option",{value:""},"—"),uomOptions.map(u=>h("option",{key:u,value:u},u)))
               )
             ),
+            (itemDraft.shape && tagBasis==="") ? h("div",{style:{marginTop:10,border:"1px solid "+colors.border,borderRadius:6,padding:10,background:"#fff4e5"}},
+              h("div",{style:{fontSize:12,marginBottom:8}},"\"" +itemDraft.shape+ "\" has no Tagging Basis set on the Shape master yet."),
+              h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:8}},
+                h("select",{value:newTagBasisValue,onChange:e=>setNewTagBasisValue(e.target.value),style:{...inputStyle,width:140}},h("option",{value:"Per Lot"},"Per Lot"),h("option",{value:"Per No"},"Per No")),
+                !isAdminOrAbove ? h("input",{placeholder:"Authorization code",value:tagBasisAuthCode,onChange:e=>setTagBasisAuthCode(e.target.value),style:{...inputStyle,width:180}}) : null
+              ),
+              h("button",{onClick:saveTagBasis,style:btnSmall},"Set Tagging Basis")
+            ) : null,
+            (itemDraft.shape && tagBasis && tagBasis!=="") ? h("div",{style:{marginTop:10,border:"1px solid "+colors.border,borderRadius:6,padding:10}},
+              h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:6}},"Tag numbers ("+tagBasis+")"+(tagBasis==="Per No"?" — auto-suggested, edit any if needed":"")),
+              tagBasis==="Per Lot" ? h("input",{placeholder:"Tag number for this whole line",value:tagNumbers[0]||"",onChange:e=>setTagNumbers([e.target.value]),style:inputStyle})
+              : h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6}},
+                  tagNumbers.map((t,i)=>h("input",{key:i,value:t,onChange:e=>setTagNumbers(prev=>prev.map((x,ix)=>ix===i?e.target.value:x)),style:{...inputStyle,fontSize:12}}))
+                )
+            ) : null,
             h("div",{style:{display:"flex",gap:8,marginTop:10}},
               h("button",{onClick:saveLineItem,style:btnPrimary},"Save item"),
-              h("button",{onClick:()=>{setItemDraft(null);setEditingItemId(null);},style:btnSecondary},"Cancel")
+              h("button",{onClick:()=>{setItemDraft(null);setEditingItemId(null);setTagBasis(null);setTagNumbers([]);},style:btnSecondary},"Cancel")
             )
           ) : null)
       ) : null
@@ -16204,6 +16352,104 @@ function VendorsScreen({ user }){
         )
       ) : null
     )
+  );
+}
+
+function TagRegisterScreen({ user }){
+  const [search,setSearch] = useState("");
+  const [rows,setRows] = useState([]);
+  const [page,setPage] = useState(0);
+  const PAGE_SIZE = 25;
+  const [detail,setDetail] = useState(null); // {tag row, grn header}
+
+  const loadRows = useCallback(async()=>{
+    let q = sb.from("tag_register").select("*").order("created_at",{ascending:false});
+    if(search.trim()) q = q.ilike("tag_number","%"+search.trim()+"%");
+    const { data } = await q.range(page*PAGE_SIZE,page*PAGE_SIZE+PAGE_SIZE-1);
+    setRows(data||[]);
+  },[page,search]);
+  useEffect(()=>{ loadRows(); },[loadRows]);
+
+  const openTag = async(row)=>{
+    const { data: grn } = await sb.from("grn_header").select("*").eq("grn_no",row.grn_no).maybeSingle();
+    setDetail({ tag: row, grn: grn||null });
+  };
+
+  const columns = [
+    {label:"Tag number", get:r=>r.tag_number},
+    {label:"GRN", get:r=>r.grn_no},
+    {label:"Shape", get:r=>r.shape},
+    {label:"Spec", get:r=>r.spec},
+    {label:"Grade", get:r=>r.grade},
+    {label:"Basis", get:r=>r.tagging_basis},
+    {label:"Date", get:r=>new Date(r.created_at).toLocaleDateString()},
+  ];
+
+  return h("div",{style:{padding:20}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
+      h("div",{style:{fontWeight:700,fontSize:18}},"Tag Register"),
+      h(ExportButtons,{title:"Tag Register",columns,rows,filenameBase:"tag_register"})
+    ),
+    h("input",{placeholder:"Search tag number…",value:search,onChange:e=>{setSearch(e.target.value);setPage(0);},style:{...inputStyle,marginBottom:14}}),
+
+    detail ? h("div",{style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:14,marginBottom:14}},
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:0.4}},"Traceability"),
+        h("button",{onClick:()=>setDetail(null),style:btnSmall},"Close")
+      ),
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:6,fontSize:12.5}},
+        h("p",{style:{margin:0}},h("span",{style:{color:colors.muted}},"Tag number: "),detail.tag.tag_number),
+        h("p",{style:{margin:0}},h("span",{style:{color:colors.muted}},"Basis: "),detail.tag.tagging_basis),
+        h("p",{style:{margin:0}},h("span",{style:{color:colors.muted}},"GRN: "),detail.tag.grn_no),
+        h("p",{style:{margin:0}},h("span",{style:{color:colors.muted}},"GRN date: "),detail.grn?detail.grn.grn_date:"—"),
+        h("p",{style:{margin:0}},h("span",{style:{color:colors.muted}},"Vendor: "),detail.grn?detail.grn.vendor_name:"—"),
+        h("p",{style:{margin:0}},h("span",{style:{color:colors.muted}},"P.O. no: "),detail.grn?detail.grn.po_no:"—"),
+        h("p",{style:{margin:0}},h("span",{style:{color:colors.muted}},"Item: "),detail.tag.description),
+        h("p",{style:{margin:0}},h("span",{style:{color:colors.muted}},"Shape / Spec / Grade: "),[detail.tag.shape,detail.tag.spec,detail.tag.grade].filter(Boolean).join(" / "))
+      )
+    ) : null,
+
+    h("table",null,
+      h("thead",null,h("tr",null,
+        ["Tag number","GRN","Shape","Spec","Grade","Basis","Date"].map(l=>h("th",{key:l,style:{textAlign:"left",padding:"6px 8px",color:colors.muted,fontSize:12}},l))
+      )),
+      h("tbody",null,rows.map(r=>h("tr",{key:r.id,onClick:()=>openTag(r),style:{cursor:"pointer",borderTop:"1px solid "+colors.border}},
+        h("td",{style:{padding:"7px 8px",color:colors.accent,fontSize:13}},r.tag_number),
+        h("td",{style:{padding:"7px 8px",fontSize:13}},r.grn_no),
+        h("td",{style:{padding:"7px 8px",fontSize:13}},r.shape),
+        h("td",{style:{padding:"7px 8px",fontSize:13}},r.spec),
+        h("td",{style:{padding:"7px 8px",fontSize:13}},r.grade),
+        h("td",{style:{padding:"7px 8px",fontSize:13}},r.tagging_basis),
+        h("td",{style:{padding:"7px 8px",fontSize:13}},new Date(r.created_at).toLocaleDateString())
+      )))
+    ),
+    h("div",{style:{display:"flex",gap:8,marginTop:10}},
+      h("button",{onClick:()=>setPage(p=>Math.max(0,p-1)),disabled:page===0,style:btnSmall},"Previous"),
+      h("button",{onClick:()=>setPage(p=>p+1),disabled:rows.length<PAGE_SIZE,style:btnSmall},"Next")
+    )
+  );
+}
+
+// Generic Kanban board: one column per status, cards can be moved by
+// picking a new status directly on the card (no drag-and-drop — kept
+// simple and reliable). Reusable wherever a status needs a board view.
+function StatusKanban({ statuses, items, getStatus, getTitle, getSubtitle, onMove }){
+  return h("div",{style:{display:"grid",gridTemplateColumns:"repeat("+statuses.length+",1fr)",gap:10}},
+    statuses.map(st=>{
+      const colItems = items.filter(it=>getStatus(it)===st);
+      return h("div",{key:st,style:{background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,padding:10,minHeight:120}},
+        h("div",{style:{fontSize:12,fontWeight:600,marginBottom:8,display:"flex",justifyContent:"space-between"}},
+          h("span",null,st), h("span",{style:{color:colors.mutedLight}},colItems.length)
+        ),
+        colItems.map((it,i)=>h("div",{key:i,style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:8,marginBottom:8,fontSize:12}},
+          h("div",{style:{fontWeight:600,marginBottom:2}},getTitle(it)),
+          h("div",{style:{color:colors.muted,marginBottom:6,fontSize:11}},getSubtitle(it)),
+          h("select",{value:getStatus(it),onChange:e=>onMove(it,e.target.value),style:{...inputStyle,padding:"3px 6px",fontSize:11}},
+            statuses.map(s2=>h("option",{key:s2,value:s2},s2))
+          )
+        ))
+      );
+    })
   );
 }
 
