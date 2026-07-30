@@ -7870,11 +7870,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         await declineExtraPrice(quoteExportRef);
       }
     }
-    let testingMode = "separate";
-    const { count: testingCount } = await sb.from("quote_sl_testing_tbl").select("id",{count:"exact",head:true}).eq("reference_number",quoteExportRef);
-    if((testingCount||0)>0){
-      testingMode = confirm("This quote has NDE/Testing costs attached.\n\nOK = Pro-rata (fold into item prices, no separate line)\nCancel = Show separately (in Price Summary)") ? "prorata" : "separate";
-    }
+    const testingMode = await resolveTestingMode(quoteExportRef, user?.username);
     if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setPendingTestingMode(testingMode); setShowNoDocsGenerateConfirm(true); return; }
     generateQuotePdf(testingMode);
   };
@@ -9753,6 +9749,21 @@ async function logAudit(action, tableName, recordId, recordSummary, performedBy,
 // out of sync with the rest. Also fires the Documents purge once every Sl
 // No under this Quote# is out of Draft (Documents living in Supabase are
 // meant to be temporary — see purgeQuoteDocumentsIfLeavingDraft).
+// Resolves (and remembers) the Pro-rata vs Show Separately choice for a
+// quote's NDE testing costs. Fires the prompt only if the quote actually
+// has testing lines and no choice has been made yet; once chosen, it's
+// stored in quote_testing_mode_tbl so neither Generate PDF nor a status
+// change out of Draft asks twice for the same quote/revision.
+async function resolveTestingMode(referenceNumber, changedBy){
+  const { data: existing } = await sb.from("quote_testing_mode_tbl").select("mode").eq("reference_number",referenceNumber).maybeSingle();
+  if(existing) return existing.mode;
+  const { count } = await sb.from("quote_sl_testing_tbl").select("id",{count:"exact",head:true}).eq("reference_number",referenceNumber);
+  if(!(count||0)) return "separate";
+  const mode = confirm("This quote has NDE/Testing costs attached.\n\nOK = Pro-rata (fold into item prices, no separate line)\nCancel = Show separately (in Price Summary)") ? "prorata" : "separate";
+  await sb.from("quote_testing_mode_tbl").upsert({reference_number:referenceNumber, mode, chosen_by:changedBy||"unknown", chosen_at:new Date().toISOString()},{onConflict:"reference_number"});
+  return mode;
+}
+
 async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source){
   if(newStatus!=="Draft"){
     const [{count},{data:declined}] = await Promise.all([
@@ -9766,6 +9777,9 @@ async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, 
         await sb.from("quote_extra_price_declined_tbl").upsert({reference_number:referenceNumber,declined_by:changedBy,declined_at:new Date().toISOString()},{onConflict:"reference_number"});
       }
     }
+    // Same idea for NDE testing costs — resolveTestingMode fires its own
+    // prompt only if needed, and remembers the choice either way.
+    await resolveTestingMode(referenceNumber, changedBy);
   }
   const now = new Date().toISOString();
   const { data: allRows } = await sb.from("estimates").select("id,item_sl_no,quote_status").eq("reference_number",referenceNumber);
