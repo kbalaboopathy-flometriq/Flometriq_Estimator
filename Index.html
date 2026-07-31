@@ -6272,7 +6272,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const base = baseRefOf(refFilter);
       const newRef = base+"-Rev-"+nextRevNum;
 
-      const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows},{data:slEpRows},{data:slTestRows}] = await Promise.all([
+      const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows},{data:slEpRows},{data:slTestRows},{data:globalTestRows}] = await Promise.all([
         sb.from("estimates").select("*").eq("reference_number",latestRef),
         sb.from("estimate_lines").select("*").eq("reference_number",latestRef),
         sb.from("quote_commercial_terms").select("*").eq("reference_number",latestRef),
@@ -6281,6 +6281,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         sb.from("quote_extra_price_tbl").select("*").eq("reference_number",latestRef),
         sb.from("quote_sl_extra_price_tbl").select("*").eq("reference_number",latestRef),
         sb.from("quote_sl_testing_tbl").select("*").eq("reference_number",latestRef),
+        sb.from("quote_global_testing_tbl").select("*").eq("reference_number",latestRef),
       ]);
 
       const stripId = (r)=>{ const c={...r}; delete c.id; return c; };
@@ -6296,6 +6297,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // Sl No-level Extra Price and Testing clone forward too, same idea.
       if(slEpRows?.length) await sb.from("quote_sl_extra_price_tbl").insert(slEpRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(slTestRows?.length) await sb.from("quote_sl_testing_tbl").insert(slTestRows.map(r=>({...stripId(r), reference_number:newRef})));
+      // Global testing clones forward too — but quote_testing_mode_tbl
+      // (the remembered Pro-rata/Separate choice) deliberately does NOT,
+      // same reasoning as the Extra Price declined flag above.
+      if(globalTestRows?.length) await sb.from("quote_global_testing_tbl").insert(globalTestRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(amendAreas.documents){
         const { data: docRows } = await sb.from("quote_documents").select("*").eq("reference_number",latestRef).eq("is_archived",false);
         if(docRows?.length) await sb.from("quote_documents").insert(docRows.map(r=>({...stripId(r), reference_number:newRef, file_path:null, lives_in_supabase:false})));
@@ -6743,12 +6748,80 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     setCurrentTestingMode(mode);
     setShowTestingModeModal(false);
   };
+
+  // ---- Global NDE Testing: pick tests → applies to every Sl No on the
+  // quote automatically → rate review (editable) → Pro-rata/Show
+  // Separately choice (reuses the modal above). Distinct from the
+  // per-Sl-No "Options & Testing" mechanism, which is untouched.
+  const [showGlobalTestPicker,setShowGlobalTestPicker]=useState(false);
+  const [globalTestPickerRows,setGlobalTestPickerRows]=useState([""]); // array of test_name strings
+  const [showGlobalAddTestType,setShowGlobalAddTestType]=useState(false);
+  const [newGlobalTestType,setNewGlobalTestType]=useState({test_name:"",basis:"Flat",value:"",min_charge:"",max_charge:""});
+  const [showGlobalRateReview,setShowGlobalRateReview]=useState(false);
+  const [globalRateReviewRows,setGlobalRateReviewRows]=useState([]); // [{test_name,item_sl_no,itemName,rate}]
+
+  const openGlobalTestPicker=()=>{ setGlobalTestPickerRows([""]); setShowGlobalTestPicker(true); };
+
+  const addGlobalTestTypeToMaster=async()=>{
+    if(!newGlobalTestType.test_name.trim()){ alert("Test name is required."); return; }
+    const payload = {
+      test_name:newGlobalTestType.test_name.trim(), basis:newGlobalTestType.basis,
+      value:Number(newGlobalTestType.value)||0,
+      min_charge:newGlobalTestType.min_charge===""?null:Number(newGlobalTestType.min_charge),
+      max_charge:newGlobalTestType.max_charge===""?null:Number(newGlobalTestType.max_charge)
+    };
+    const{error}=await sb.from("test_types_tbl").insert(payload);
+    if(error){ alert("Could not add test type: "+error.message); return; }
+    await loadTestTypes();
+    setGlobalTestPickerRows(rows=>{ const next=[...rows]; next[next.length-1]=payload.test_name; return next; });
+    setShowGlobalAddTestType(false);
+    setNewGlobalTestType({test_name:"",basis:"Flat",value:"",min_charge:"",max_charge:""});
+  };
+
+  const applyGlobalTests=async()=>{
+    const tests = globalTestPickerRows.filter(t=>t&&t.trim());
+    if(!tests.length){ alert("Pick at least one test."); return; }
+    const { data: estRows } = await sb.from("estimates").select("item_sl_no,model,description,order_qty").eq("reference_number",quoteExportRef);
+    const { data: lineRows } = await sb.from("estimate_lines").select("item_sl_no,sales_price").eq("reference_number",quoteExportRef);
+    const rows = [];
+    (estRows||[]).forEach(est=>{
+      const price = (lineRows||[]).filter(l=>l.item_sl_no===est.item_sl_no).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+      const itemName = modelItemMap.get(est.model)||est.model||est.description||"—";
+      tests.forEach(testName=>{
+        const t = testTypeOptions.find(tt=>tt.test_name===testName);
+        let rate = 0;
+        if(t){
+          rate = t.basis==="Percentage" ? (price*(Number(t.value)||0)/100) : Number(t.value)||0;
+          if(t.min_charge!=null && rate<Number(t.min_charge)) rate = Number(t.min_charge);
+          if(t.max_charge!=null && rate>Number(t.max_charge)) rate = Number(t.max_charge);
+        }
+        rows.push({test_name:testName, item_sl_no:est.item_sl_no, itemName, rate:rate.toFixed(2)});
+      });
+    });
+    setGlobalRateReviewRows(rows);
+    setShowGlobalTestPicker(false);
+    setShowGlobalRateReview(true);
+  };
+
+  const saveGlobalTestRates=async()=>{
+    const payload = globalRateReviewRows.map(r=>({reference_number:quoteExportRef, item_sl_no:r.item_sl_no, test_name:r.test_name, rate:Number(r.rate)||0, created_by:user?.username||"unknown"}));
+    const{error}=await sb.from("quote_global_testing_tbl").insert(payload);
+    if(error){ alert("Save failed: "+error.message); return; }
+    setShowGlobalRateReview(false);
+    await loadNdeRollupSummary();
+    await openTestingModeModal();
+  };
+
   const [ndeRollupSummary,setNdeRollupSummary]=useState(null); // {count, total} | null
   const loadNdeRollupSummary=useCallback(async()=>{
     if(!quoteExportRef){ setNdeRollupSummary(null); return; }
-    const{data}=await sb.from("quote_sl_testing_tbl").select("price").eq("reference_number",quoteExportRef);
-    if(!data||!data.length){ setNdeRollupSummary(null); return; }
-    setNdeRollupSummary({count:data.length,total:data.reduce((s,r)=>s+(Number(r.price)||0),0)});
+    const [{data:slData},{data:globalData}] = await Promise.all([
+      sb.from("quote_sl_testing_tbl").select("price").eq("reference_number",quoteExportRef),
+      sb.from("quote_global_testing_tbl").select("rate").eq("reference_number",quoteExportRef)
+    ]);
+    const combined = [...(slData||[]).map(r=>Number(r.price)||0), ...(globalData||[]).map(r=>Number(r.rate)||0)];
+    if(!combined.length){ setNdeRollupSummary(null); return; }
+    setNdeRollupSummary({count:combined.length,total:combined.reduce((s,v)=>s+v,0)});
   },[quoteExportRef]);
   useEffect(()=>{ loadNdeRollupSummary(); },[loadNdeRollupSummary]);
 
@@ -7918,6 +7991,29 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const {data:slTestingAll} = await sb.from("quote_sl_testing_tbl").select("*").eq("reference_number",quoteExportRef);
       const slExtraByItem = new Map(); (slExtraPriceAll||[]).forEach(r=>{ if(!slExtraByItem.has(r.item_sl_no)) slExtraByItem.set(r.item_sl_no,[]); slExtraByItem.get(r.item_sl_no).push(r); });
       const slTestingByItem = new Map(); (slTestingAll||[]).forEach(r=>{ if(!slTestingByItem.has(r.item_sl_no)) slTestingByItem.set(r.item_sl_no,[]); slTestingByItem.get(r.item_sl_no).push(r); });
+      const {data:globalTestingAll} = await sb.from("quote_global_testing_tbl").select("*").eq("reference_number",quoteExportRef);
+      const globalTestingByItem = new Map(); (globalTestingAll||[]).forEach(r=>{ if(!globalTestingByItem.has(r.item_sl_no)) globalTestingByItem.set(r.item_sl_no,[]); globalTestingByItem.get(r.item_sl_no).push(r); });
+      // Global testing redistribution: each test's combined total (across
+      // all items it was applied to — always "all items" per the confirmed
+      // design) is reallocated proportional to each item's own (price×qty)
+      // value share of the whole quote — NOT kept as each item's original
+      // individually-computed rate.
+      const valueByItem = new Map();
+      estimatesRows.forEach(est=>{
+        const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+        const baseUnitPriceInr = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+        valueByItem.set(est.item_sl_no, baseUnitPriceInr*(est.order_qty||1));
+      });
+      const totalQuoteValue = Array.from(valueByItem.values()).reduce((s,v)=>s+v,0) || 1;
+      const globalTestNames = Array.from(new Set((globalTestingAll||[]).map(r=>r.test_name)));
+      const globalFoldTotalByItem = new Map(); // item_sl_no -> redistributed INR total (not per-unit yet)
+      globalTestNames.forEach(testName=>{
+        const combinedTotal = (globalTestingAll||[]).filter(r=>r.test_name===testName).reduce((s,r)=>s+(Number(r.rate)||0),0);
+        estimatesRows.forEach(est=>{
+          const share = (valueByItem.get(est.item_sl_no)||0) / totalQuoteValue;
+          globalFoldTotalByItem.set(est.item_sl_no, (globalFoldTotalByItem.get(est.item_sl_no)||0) + combinedTotal*share);
+        });
+      });
       const isRevisionPdf = quoteExportRef.includes("-Rev-");
       const {data:revChangesRows} = isRevisionPdf ? await sb.from("revision_changes").select("*").eq("revision_ref",quoteExportRef).order("changed_at",{ascending:true}) : {data:[]};
       const revChangesForPdf = revChangesRows||[];
@@ -8137,7 +8233,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const qty = est.order_qty||1;
         const slExtraTotal = (slExtraByItem.get(est.item_sl_no)||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
         const slTestingTotal = (slTestingByItem.get(est.item_sl_no)||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
-        const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) : 0);
+        const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) + ((globalFoldTotalByItem.get(est.item_sl_no)||0)/qty) : 0);
         const unitPriceInr = baseUnitPriceInr + foldedPerUnit;
         const totalInr = unitPriceInr*qty;
         const row = [est.item_sl_no, modelItemMap.get(est.model)||est.model||"—", est.description||"—", fmtR(unitPriceInr)];
@@ -8147,14 +8243,14 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         return row;
       });
       const extraPriceTotal = extraPriceForPdf.reduce((s,l)=>s+(Number(l.price)||0),0);
-      const testingSeparateTotal = testingMode==="separate" ? (slTestingAll||[]).reduce((s,l)=>s+(Number(l.price)||0),0) : 0;
+      const testingSeparateTotal = testingMode==="separate" ? ((slTestingAll||[]).reduce((s,l)=>s+(Number(l.price)||0),0) + (globalTestingAll||[]).reduce((s,l)=>s+(Number(l.rate)||0),0)) : 0;
       const grandTotalInr = estimatesRows.reduce((s,est)=>{
         const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
         const baseUnitPriceInr = slLines.reduce((ss,l)=>ss+(Number(l.sales_price)||0),0);
         const qty = est.order_qty||1;
         const slExtraTotal = (slExtraByItem.get(est.item_sl_no)||[]).reduce((ss,l)=>ss+(Number(l.price)||0),0);
         const slTestingTotal = (slTestingByItem.get(est.item_sl_no)||[]).reduce((ss,l)=>ss+(Number(l.price)||0),0);
-        const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) : 0);
+        const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) + ((globalFoldTotalByItem.get(est.item_sl_no)||0)/qty) : 0);
         return s+(baseUnitPriceInr+foldedPerUnit)*qty;
       },0) + extraPriceTotal + testingSeparateTotal;
       const summaryHead = quoteIsInr
@@ -8192,14 +8288,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           didDrawPage:()=>letterhead("ANNEXURE II - PRICE SUMMARY")
         });
       }
-      if(testingMode==="separate" && (slTestingAll||[]).length){
+      const allTestingRowsForPdf = [
+        ...(slTestingAll||[]).map(l=>[l.item_sl_no, l.test_name, fmtR(Number(l.price)||0)]),
+        ...(globalTestingAll||[]).map(l=>[l.item_sl_no, l.test_name, fmtR(Number(l.rate)||0)])
+      ];
+      if(testingMode==="separate" && allTestingRowsForPdf.length){
         doc.setFontSize(8.5); doc.setFont(undefined,"bold"); doc.setTextColor(...dark);
         const afterY = doc.lastAutoTable.finalY + 6;
         doc.text("NDE / Testing", 12, afterY);
         doc.autoTable({
           startY: afterY+3,
           head: [["S.No","Test","Price"]],
-          body: (slTestingAll||[]).map(l=>[l.item_sl_no, l.test_name, fmtR(Number(l.price)||0)]),
+          body: allTestingRowsForPdf,
           foot: [["","Total Price:", fmtR(grandTotalInr)]],
           theme:"grid",
           headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8,font:"times"},
@@ -8232,7 +8332,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           body.push([{content:"Options",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
           slOptions.forEach(o=>body.push([o.label, ""]));
         }
-        const slTests = slTestingByItem.get(inst.slNo)||[];
+        const slTests = [...(slTestingByItem.get(inst.slNo)||[]), ...(globalTestingByItem.get(inst.slNo)||[]).map(g=>({test_name:g.test_name}))];
         if(slTests.length){
           body.push([{content:"Testing",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
           slTests.forEach(t=>body.push([t.test_name+" — Included in scope", ""]));
@@ -8662,7 +8762,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}},
             h("button",{onClick:openCommercialTerms,style:{...btnSmall,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Commercial Terms"),
             h("button",{onClick:openExtraPrice,style:{...btnSmall,background:"#0f766e",color:"#fff",border:"none",fontWeight:600}},"Extra Price Addition"),
-            h("button",{onClick:readiness.ready?openTestingModeModal:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Enabled once the quote is marked Ready",style:{...btnSmall,background:readiness.ready?"#8a4b1f":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},ndeRollupSummary?("NDE Testing ("+ndeRollupSummary.count+" item"+(ndeRollupSummary.count!==1?"s":"")+", ₹"+ndeRollupSummary.total.toFixed(0)+")"):"NDE Testing"),
+            h("button",{onClick:readiness.ready?openGlobalTestPicker:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Enabled once the quote is marked Ready",style:{...btnSmall,background:readiness.ready?"#8a4b1f":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},ndeRollupSummary?("NDE Testing ("+ndeRollupSummary.count+" item"+(ndeRollupSummary.count!==1?"s":"")+", ₹"+ndeRollupSummary.total.toFixed(0)+")"):"NDE Testing"),
             h("div",{style:{display:"flex",gap:4,alignItems:"center"}},
               h("input",{type:"number",step:"0.1",value:globalSfInput,onChange:e=>setGlobalSfInput(e.target.value),placeholder:"New Sf",style:{...inputStyle,width:110}}),
               h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf"),
@@ -9739,6 +9839,69 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
+    showGlobalTestPicker && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:480,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Which tests are required?"),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Applies automatically to every Sl No on the quote — rates computed from Test Types Master, reviewable next."),
+        globalTestPickerRows.map((val,idx)=>h("div",{key:idx,style:{display:"flex",gap:8,alignItems:"center",marginBottom:8}},
+          h("select",{value:val,onChange:e=>{
+            const v=e.target.value;
+            if(v==="__add_new__"){ setShowGlobalAddTestType(true); return; }
+            setGlobalTestPickerRows(rows=>rows.map((r,i)=>i===idx?v:r));
+          },style:{...inputStyle,flex:1,fontSize:12.5,padding:"7px 9px"}},
+            h("option",{value:""},"Select test type…"),
+            testTypeOptions.map(t=>h("option",{key:t.test_name,value:t.test_name},t.test_name)),
+            h("option",{value:"__add_new__"},"+ Add new test type…")
+          ),
+          h("button",{onClick:()=>setGlobalTestPickerRows(rows=>rows.filter((_,i)=>i!==idx)),style:{...btnSmall,color:colors.danger}},"Remove")
+        )),
+        h("button",{onClick:()=>setGlobalTestPickerRows(rows=>[...rows,""]),style:{...btnSmall,marginBottom:14}},"+ Add test"),
+        showGlobalAddTestType ? h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:12,background:"#faf9f4",marginBottom:14}},
+          h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8}},"New test type"),
+          h("div",{style:{display:"grid",gridTemplateColumns:"2fr 1fr",gap:8,marginBottom:8}},
+            h("input",{placeholder:"Test name",value:newGlobalTestType.test_name,onChange:e=>setNewGlobalTestType(d=>({...d,test_name:e.target.value})),style:{...inputStyle,fontSize:12.5}}),
+            h("select",{value:newGlobalTestType.basis,onChange:e=>setNewGlobalTestType(d=>({...d,basis:e.target.value})),style:{...inputStyle,fontSize:12.5}},h("option",{value:"Flat"},"Flat"),h("option",{value:"Percentage"},"Percentage"))
+          ),
+          h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:10}},
+            h("input",{placeholder:"Value",value:newGlobalTestType.value,onChange:e=>setNewGlobalTestType(d=>({...d,value:e.target.value})),style:{...inputStyle,fontSize:12.5}}),
+            h("input",{placeholder:"Min charge",value:newGlobalTestType.min_charge,onChange:e=>setNewGlobalTestType(d=>({...d,min_charge:e.target.value})),style:{...inputStyle,fontSize:12.5}}),
+            h("input",{placeholder:"Max charge (optional)",value:newGlobalTestType.max_charge,onChange:e=>setNewGlobalTestType(d=>({...d,max_charge:e.target.value})),style:{...inputStyle,fontSize:12.5}})
+          ),
+          h("div",{style:{display:"flex",gap:8}},
+            h("button",{onClick:addGlobalTestTypeToMaster,style:btnPrimary},"Add to master & select"),
+            h("button",{onClick:()=>setShowGlobalAddTestType(false),style:btnSecondary},"Cancel")
+          )
+        ) : null,
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,borderTop:"1px solid "+colors.border,paddingTop:14}},
+          h("button",{onClick:()=>setShowGlobalTestPicker(false),style:btnSecondary},"Cancel"),
+          h("button",{onClick:applyGlobalTests,style:btnPrimary},"Apply to quote")
+        )
+      )
+    ),
+    showGlobalRateReview && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Review rates"),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Computed from Test Types Master for each item's own price. Edit anything before continuing."),
+        h("table",null,
+          h("thead",null,h("tr",null,
+            ["Test","Sl No","Item","Rate"].map((l,i)=>h("th",{key:l,style:{textAlign:i===3?"right":"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
+          )),
+          h("tbody",null,globalRateReviewRows.map((r,idx)=>h("tr",{key:idx,style:{borderTop:"1px solid "+colors.border}},
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.test_name),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.item_sl_no),
+            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.itemName),
+            h("td",{style:{padding:"5px 6px",textAlign:"right"}},h("input",{value:r.rate,onChange:e=>setGlobalRateReviewRows(rows=>rows.map((row,i)=>i===idx?{...row,rate:e.target.value}:row)),style:{width:90,fontSize:12,padding:"4px 6px",textAlign:"right"}}))
+          )))
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:8}},
+          h("p",{style:{fontSize:12.5,fontWeight:600,margin:0}},"Combined total: ₹"+globalRateReviewRows.reduce((s,r)=>s+(Number(r.rate)||0),0).toFixed(2))
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
+          h("button",{onClick:()=>{setShowGlobalRateReview(false);setShowGlobalTestPicker(true);},style:btnSecondary},"Back"),
+          h("button",{onClick:saveGlobalTestRates,style:btnPrimary},"Continue →")
+        )
+      )
+    ),
     showTestingModeModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:10,padding:"24px",width:380,maxWidth:"100%",textAlign:"center"}},
         h("div",{style:{width:44,height:44,borderRadius:"50%",background:"#eef3fb",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 12px"}},
@@ -9801,8 +9964,11 @@ async function logAudit(action, tableName, recordId, recordSummary, performedBy,
 async function resolveTestingMode(referenceNumber, changedBy){
   const { data: existing } = await sb.from("quote_testing_mode_tbl").select("mode").eq("reference_number",referenceNumber).maybeSingle();
   if(existing) return existing.mode;
-  const { count } = await sb.from("quote_sl_testing_tbl").select("id",{count:"exact",head:true}).eq("reference_number",referenceNumber);
-  if(!(count||0)) return "separate";
+  const [{count:slCount},{count:globalCount}] = await Promise.all([
+    sb.from("quote_sl_testing_tbl").select("id",{count:"exact",head:true}).eq("reference_number",referenceNumber),
+    sb.from("quote_global_testing_tbl").select("id",{count:"exact",head:true}).eq("reference_number",referenceNumber)
+  ]);
+  if(!((slCount||0)+(globalCount||0))) return "separate";
   const mode = confirm("This quote has NDE/Testing costs attached.\n\nOK = Pro-rata (fold into item prices, no separate line)\nCancel = Show separately (in Price Summary)") ? "prorata" : "separate";
   await sb.from("quote_testing_mode_tbl").upsert({reference_number:referenceNumber, mode, chosen_by:changedBy||"unknown", chosen_at:new Date().toISOString()},{onConflict:"reference_number"});
   return mode;
