@@ -3054,14 +3054,20 @@ function EmployeeLoginModal({ employee, user, onClose, onLinked }){
 function UsersEditor({ user }) {
   const isSuperAdmin = user?.role==="super_admin";
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
-  const [adding,setAdding]=useState(false); const [draft,setDraft]=useState({username:"",password:"",role:"user"});
+  const [adding,setAdding]=useState(false); const [draft,setDraft]=useState({username:"",password:"",role:"user",employee_name:""});
   const [companies,setCompanies]=useState([]);
+  const [employeeOptions,setEmployeeOptions]=useState([]);
   const [revealed,setRevealed]=useState(new Set()); // ids currently showing their real password
   const [resetTarget,setResetTarget]=useState(null); // row being reset
   const [resetVal,setResetVal]=useState("");
   const load = useCallback(async()=>{ setLoading(true); const {data}=await sb.from("app_users").select("*").order("id"); setRows(data||[]); setLoading(false); },[]);
   useEffect(()=>{load();},[load]);
   useEffect(()=>{ (async()=>{ const {data}=await sb.from("company_master").select("id,company_name").order("company_name"); setCompanies(data||[]); })(); },[]);
+  useEffect(()=>{ sb.from("employee_tbl").select("employee_name").order("employee_name").then(({data})=>setEmployeeOptions((data||[]).map(r=>r.employee_name).filter(Boolean))); },[]);
+  const setUserEmployee=async(id,employeeName)=>{
+    await sb.from("app_users").update({employee_name:employeeName||null}).eq("id",id);
+    setRows(rs=>rs.map(r=>r.id===id?{...r,employee_name:employeeName||null}:r));
+  };
   const toggleReveal = async(row)=>{
     const willReveal = !revealed.has(row.id);
     setRevealed(s=>{ const n=new Set(s); if(willReveal) n.add(row.id); else n.delete(row.id); return n; });
@@ -3085,7 +3091,7 @@ function UsersEditor({ user }) {
     await logAudit("UPDATE","app_users",resetTarget.username,"Password reset for \""+resetTarget.username+"\" by "+(user?.username||"unknown"),user?.username||"unknown",null,null);
     setResetTarget(null); setResetVal(""); load();
   };
-  const addUser=async()=>{ if(!draft.username.trim()||!draft.password.trim()){alert("Username and password required.");return;} const{error:err}=await sb.from("app_users").insert({username:draft.username.trim(),password:draft.password,role:draft.role}); if(err){alert("Failed: "+err.message);return;} await logAudit("CREATE","app_users",draft.username.trim(),"New user \""+draft.username.trim()+"\" created with role "+draft.role+" and an initial password set",user?.username||"unknown",null,{username:draft.username.trim(),role:draft.role}); setAdding(false);setDraft({username:"",password:"",role:"user"});load(); };
+  const addUser=async()=>{ if(!draft.username.trim()||!draft.password.trim()){alert("Username and password required.");return;} const{error:err}=await sb.from("app_users").insert({username:draft.username.trim(),password:draft.password,role:draft.role,employee_name:draft.employee_name||null}); if(err){alert("Failed: "+err.message);return;} await logAudit("CREATE","app_users",draft.username.trim(),"New user \""+draft.username.trim()+"\" created with role "+draft.role+(draft.employee_name?" for employee \""+draft.employee_name+"\"":"")+" and an initial password set",user?.username||"unknown",null,{username:draft.username.trim(),role:draft.role,employee_name:draft.employee_name}); setAdding(false);setDraft({username:"",password:"",role:"user",employee_name:""});load(); };
   const deleteUser=async(id,username)=>{ if(username==="Babu"){alert("Cannot delete primary admin.");return;} if(!confirm("Delete user "+username+"?"))return; await sb.from("app_users").delete().eq("id",id); await logAudit("DELETE","app_users",String(id),"Deleted user \""+username+"\"",user?.username||"unknown",{username},null); load(); };
   const setUserCompany=async(id,companyId)=>{
     await sb.from("app_users").update({company_id:companyId?Number(companyId):null}).eq("id",id);
@@ -3100,13 +3106,25 @@ function UsersEditor({ user }) {
       h("input",{placeholder:"Username",value:draft.username,onChange:e=>setDraft(d=>({...d,username:e.target.value})),style:{...inputStyle,width:160}}),
       h("input",{placeholder:"Password",value:draft.password,onChange:e=>setDraft(d=>({...d,password:e.target.value})),style:{...inputStyle,width:160}}),
       h("select",{value:draft.role,onChange:e=>setDraft(d=>({...d,role:e.target.value})),style:{...inputStyle,width:120}},h("option",{value:"user"},"user"),h("option",{value:"admin"},"admin")),
+      h("select",{value:draft.employee_name,onChange:e=>setDraft(d=>({...d,employee_name:e.target.value})),style:{...inputStyle,width:180}},
+        h("option",{value:""},"— Employee —"),
+        employeeOptions.map(e=>h("option",{key:e,value:e},e))
+      ),
       h("button",{onClick:addUser,style:btnSecondary},"Save"),h("button",{onClick:()=>setAdding(false),style:btnSecondary},"Cancel")
     ),
     loading?h("div",{style:{color:colors.mutedLight}},"Loading…"):
-    h("table",{style:{fontSize:13,maxWidth:750}},
-      h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left"}},h("th",{style:{padding:"8px 10px"}},"Username"),h("th",{style:{padding:"8px 10px"}},"Role"),isSuperAdmin&&h("th",{style:{padding:"8px 10px"}},"Password"),isSuperAdmin&&h("th",{style:{padding:"8px 10px"}},"Status"),h("th",{style:{padding:"8px 10px"}},"Company (used on their PDFs)"),h("th",{style:{padding:"8px 10px"}},""  ))),
+    h("table",{style:{fontSize:13,maxWidth:900}},
+      h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.dark,textAlign:"left"}},h("th",{style:{padding:"8px 10px"}},"Username"),h("th",{style:{padding:"8px 10px"}},"Employee"),h("th",{style:{padding:"8px 10px"}},"Role"),isSuperAdmin&&h("th",{style:{padding:"8px 10px"}},"Password"),isSuperAdmin&&h("th",{style:{padding:"8px 10px"}},"Status"),h("th",{style:{padding:"8px 10px"}},"Company (used on their PDFs)"),h("th",{style:{padding:"8px 10px"}},""  ))),
       h("tbody",null,rows.map(r=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
         h("td",{style:{padding:"8px 10px"}},r.username),
+        h("td",{style:{padding:"8px 10px"}},
+          isSuperAdmin
+            ? h("select",{value:r.employee_name||"",onChange:e=>setUserEmployee(r.id,e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12}},
+                h("option",{value:""},"— none —"),
+                employeeOptions.map(e=>h("option",{key:e,value:e},e))
+              )
+            : h("span",{style:{fontSize:12,color:colors.muted}},r.employee_name||"— none —")
+        ),
         h("td",{style:{padding:"8px 10px"}},r.role),
         isSuperAdmin && h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
           h("span",{style:{fontFamily:"monospace",fontSize:12,marginRight:8}},revealed.has(r.id)?r.password:"••••••••"),
