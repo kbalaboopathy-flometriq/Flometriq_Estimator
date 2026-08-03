@@ -8149,26 +8149,116 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         doc.setTextColor(...dark);
       }
 
-      // ---- Revision History — right after the Cover, its own page, only
-      // for a revision with logged changes ----
+      // ---- Revision History — QMS doc-control style page, right after
+      // the Cover. Shows every revision from the original (R00) through
+      // the one being generated, grouped by revision — not just the
+      // current revision's own changes (that was the old behaviour).
+      // Per-revision date/actor comes from audit_log's CREATE entry for
+      // that reference_number (accurate — never cloned on amendment),
+      // falling back to the revision's own earliest logged field change,
+      // then to the estimates row itself for R00 (its created_at/by are
+      // authentic since R00 is never a clone of anything).
       let revHistStartPage = null, revHistEndPage = null;
-      if(isRevisionPdf && revChangesForPdf.length){
+      if(isRevisionPdf){
         const AREA_LABELS_PDF = {header:"Header",commercial_terms:"Commercial Terms",notes:"Notes",datasheet:"Datasheet",bom:"BOM"};
-        doc.addPage();
-        letterhead("ANNEXURE - IC  REVISION HISTORY");
-        revHistStartPage = doc.internal.getNumberOfPages();
-        doc.autoTable({
-          startY:34,
-          head:[["Area","Field","Old value","New value","By"]],
-          body:revChangesForPdf.map(r=>[AREA_LABELS_PDF[r.area]||r.area,(r.item_sl_no?("Sl "+r.item_sl_no+" — "):"")+(r.field_name||"").split("|").pop(),r.old_value||"—",r.new_value||"—",r.changed_by||"—"]),
-          theme:"plain",
-          styles:{font:"times",fontSize:8,textColor:dark,cellPadding:{top:2.5,bottom:2.5,left:2,right:4}},
-          headStyles:{font:"times",fontStyle:"bold"},
-          columnStyles:{0:{cellWidth:26},1:{cellWidth:40},2:{cellWidth:38},3:{cellWidth:38},4:{cellWidth:"auto"}},
-          margin:{top:32,left:12,right:12,bottom:16},
-          didDrawPage:()=>letterhead("ANNEXURE - IC  REVISION HISTORY")
-        });
-        revHistEndPage = doc.internal.getNumberOfPages();
+        const baseRefForHist = quoteExportRef.replace(/-Rev-\d+$/,"");
+        const currentRevNum = revMatch ? Number(revMatch[1]) : 0;
+        const { data: histSiblingRows } = await sb.from("estimates").select("reference_number").ilike("reference_number", baseRefForHist+"%");
+        const histRefs = Array.from(new Set((histSiblingRows||[]).map(r=>r.reference_number)
+          .filter(rn=>rn===baseRefForHist||rn.startsWith(baseRefForHist+"-Rev-"))))
+          .map(rn=>{ const m=rn.match(/-Rev-(\d+)$/); return { ref:rn, revNum:m?Number(m[1]):0 }; })
+          .filter(r=>r.revNum<=currentRevNum)
+          .sort((a,b)=>a.revNum-b.revNum);
+
+        if(histRefs.length){
+          const revGroups = [];
+          for(const sib of histRefs){
+            if(sib.revNum===0){
+              const { data:r0 } = await sb.from("estimates").select("created_by,created_at").eq("reference_number",sib.ref).limit(1);
+              const row0 = (r0&&r0[0])||{};
+              revGroups.push({
+                label:"R00",
+                date: row0.created_at ? new Date(row0.created_at).toLocaleDateString("en-GB") : "—",
+                rows:[{field:null, original:"—", revised:"Initial issue — Quotation prepared and issued", by:row0.created_by||"—"}]
+              });
+            } else {
+              const [{data:changes},{data:auditRows}] = await Promise.all([
+                sb.from("revision_changes").select("*").eq("revision_ref",sib.ref).order("changed_at",{ascending:true}),
+                sb.from("audit_log").select("*").eq("table_name","estimates").eq("record_id",sib.ref).eq("action","CREATE").order("performed_at",{ascending:true}).limit(1)
+              ]);
+              const auditRow = (auditRows&&auditRows[0])||null;
+              const dateStr = auditRow ? new Date(auditRow.performed_at).toLocaleDateString("en-GB")
+                : ((changes&&changes[0]) ? new Date(changes[0].changed_at).toLocaleDateString("en-GB") : "—");
+              revGroups.push({
+                label:"R"+String(sib.revNum).padStart(2,"0"),
+                date: dateStr,
+                rows: (changes&&changes.length) ? changes.map(r=>({
+                  field:(AREA_LABELS_PDF[r.area]||r.area)+(r.item_sl_no?(" — Sl "+r.item_sl_no):"")+" — "+((r.field_name||"").split("|").pop()),
+                  original:r.old_value||"—", revised:r.new_value||"—", by:r.changed_by||"—"
+                })) : [{field:null, original:"—", revised:"No logged field changes for this revision", by:(auditRow&&auditRow.performed_by)||"—"}]
+              });
+            }
+          }
+
+          const docControlBanner = ()=>{
+            const bx=12, by=10, bw=W-24, bh=20, logoW=46;
+            doc.setDrawColor(20,20,20); doc.setLineWidth(0.5);
+            doc.rect(bx,by,bw,bh);
+            doc.line(bx+logoW,by,bx+logoW,by+bh);
+            if(issuingCompany && issuingCompany.logo_data){
+              try{ doc.addImage(issuingCompany.logo_data,"PNG",bx+3,by+3,logoW-6,bh-6); }catch(e){}
+            } else {
+              doc.setFont("helvetica","normal"); doc.setFontSize(7); doc.setTextColor(150,150,150);
+              doc.text("Authored by K.Bala Boopathy", bx+3, by+bh/2, {maxWidth:logoW-6});
+            }
+            doc.setFont("helvetica","bold"); doc.setFontSize(11); doc.setTextColor(...dark);
+            doc.text((issuingCompany&&issuingCompany.company_name)||COMPANY_NAME, bx+logoW+6, by+bh/2+2, {maxWidth:bw-logoW-10});
+          };
+
+          doc.addPage();
+          docControlBanner();
+          doc.setFont("helvetica","bold"); doc.setFontSize(11); doc.setTextColor(...dark);
+          doc.text("Doc No:", W/2, 46, {align:"center"});
+          doc.setFont("helvetica","normal"); doc.setFontSize(9.5);
+          doc.text(quoteExportRef, W/2, 52, {align:"center"});
+          doc.setFont("helvetica","bold"); doc.setFontSize(11);
+          doc.text("Document Title", W/2, 66, {align:"center"});
+          doc.setFont("helvetica","normal"); doc.setFontSize(9.5);
+          doc.text("Quotation", W/2, 72, {align:"center"});
+          revHistStartPage = doc.internal.getNumberOfPages();
+
+          const body = [];
+          revGroups.forEach(g=>{
+            g.rows.forEach((r,i)=>{
+              const rowArr = [];
+              if(i===0){
+                rowArr.push({content:g.label, rowSpan:g.rows.length, styles:{valign:"middle",halign:"center"}});
+                rowArr.push({content:g.date, rowSpan:g.rows.length, styles:{valign:"middle",halign:"center"}});
+              }
+              rowArr.push(r.field||"—");
+              rowArr.push(r.original);
+              rowArr.push(r.revised);
+              rowArr.push({content:r.by, styles:{halign:"center"}});
+              body.push(rowArr);
+            });
+          });
+          doc.autoTable({
+            startY:82,
+            head:[["Revision","Date","Field","Original content","Revised content","By"]],
+            body,
+            theme:"grid",
+            styles:{font:"helvetica",fontSize:8,textColor:dark,cellPadding:3,lineColor:[26,26,26],lineWidth:0.2},
+            headStyles:{font:"helvetica",fontStyle:"bold",fillColor:[217,217,217],textColor:dark,halign:"center"},
+            columnStyles:{0:{cellWidth:14},1:{cellWidth:22},2:{cellWidth:32},3:{cellWidth:44},4:{cellWidth:44},5:{cellWidth:"auto"}},
+            margin:{top:14,left:12,right:12,bottom:16},
+            didDrawPage:()=>{
+              docControlBanner();
+              doc.setFont("helvetica","normal"); doc.setFontSize(7); doc.setTextColor(120,120,120);
+              doc.text("Doc No.: "+quoteExportRef, 12, H-5);
+            }
+          });
+          revHistEndPage = doc.internal.getNumberOfPages();
+        }
       }
 
       // ---- Page reserved for the Index — filled in last, once every
