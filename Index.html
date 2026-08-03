@@ -3238,6 +3238,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const [descMasterBuilderItem,setDescMasterBuilderItem]=useState(null); // item name while the inline builder modal is open
   const [descMasterDismissedItems,setDescMasterDismissedItems]=useState(new Set()); // don't re-prompt for the same item twice in one session
   const [customerName,setCustomerName]=useState(""); const [customerAddress,setCustomerAddress]=useState("");
+  const [customerCountry,setCustomerCountry]=useState(""); // drives the currency default and the missing-country PDF-generation gate
   const [contactName,setContactName]=useState(""); const [contactDesignation,setContactDesignation]=useState("");
   const [signatoryName,setSignatoryName]=useState(""); const [signatoryDesignation,setSignatoryDesignation]=useState("");
   const [itemSlNo,setItemSlNo]=useState(""); 
@@ -4078,6 +4079,8 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     if(!String(itemSlNo).trim()){setSaveMsg("Enter a Sl No.");return;}
     if(!enquiryNumber.trim()){setSaveMsg("Enter an Enquiry number.");return;}
     if(!refDesc.trim()){setSaveMsg("Description is required for every Sl No.");return;}
+    if(customerName.trim() && !customerCountry.trim()){setSaveMsg("This customer has no country on file. Add one in Master Data → Customers before continuing — currency and conversion rate depend on it.");return;}
+    if(currency!=="INR" && !(Number(conversionRate)>0)){setSaveMsg("Enter a conversion rate (1 "+currency+" = ? INR) before saving — required for any non-INR quote.");return;}
     if(cart.length===0){setSaveMsg("Add at least one model's lines to the estimate first.");return;}
     const ref=refNumber.trim();
     const slNo=Number(itemSlNo);
@@ -4712,7 +4715,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           ),
           h("div",{style:{flex:1,minWidth:220}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Customer"),
-            h(CustomerSelect,{value:customerName,disabled:!!existingQuoteHeader,onSelect:(p)=>{ setCustomerName(p.company_name); setCustomerAddress(p.address); if(p.contact_name) setContactName(p.contact_name); if(p.contact_designation) setContactDesignation(p.contact_designation); }})
+            h(CustomerSelect,{value:customerName,disabled:!!existingQuoteHeader,onSelect:(p)=>{ setCustomerName(p.company_name); setCustomerAddress(p.address); if(p.contact_name) setContactName(p.contact_name); if(p.contact_designation) setContactDesignation(p.contact_designation); setCustomerCountry(p.billing_country||""); const isIndia=(p.billing_country||"").trim().toLowerCase()==="india"; setCurrency(isIndia?"INR":"USD"); if(isIndia) setConversionRate("1"); }})
           ),
           h("div",{style:{flex:1,minWidth:180}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Address"),
@@ -5950,7 +5953,7 @@ function AddCustomerPanel({ onClose, onAdded }){
       if(error) throw error;
       if(payload.owner_employee_name) await logOwnershipChange(payload.company_name, "", payload.owner_employee_name, "Auto", "quick_add");
       const address=[f.billing_street,f.billing_city,f.billing_state,f.billing_pin,f.billing_country].filter(Boolean).join("\n");
-      onAdded({company_name:f.company_name.trim(), address, contact_name:"", contact_designation:""});
+      onAdded({company_name:f.company_name.trim(), address, contact_name:"", contact_designation:"", billing_country:f.billing_country.trim()});
       onClose();
     } catch(e){ setErr(e.message||"Could not save."); }
     finally{ setSaving(false); }
@@ -6002,13 +6005,14 @@ function CustomerSelect({ value, onSelect, disabled }){
   useEffect(()=>{ loadOptions(); },[loadOptions]);
   const pick = (name)=>{
     const match = options.find(c=>c.company_name===name);
-    if(!match){ onSelect({company_name:name,address:"",contact_name:"",contact_designation:""}); return; }
+    if(!match){ onSelect({company_name:name,address:"",contact_name:"",contact_designation:"",billing_country:""}); return; }
     const primary = match.contacts.find(ct=>ct.is_primary==="Yes") || match.contacts[0];
     onSelect({
       company_name: match.company_name,
       address: [match.billing_street,match.billing_city,match.billing_state,match.billing_pin,match.billing_country].filter(Boolean).join("\n"),
       contact_name: primary?primary.contact_name||"":"",
-      contact_designation: primary?primary.designation||"":""
+      contact_designation: primary?primary.designation||"":"",
+      billing_country: match.billing_country||""
     });
   };
   return h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
@@ -6207,13 +6211,36 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [lineEdits,setLineEdits]=useState({}); // {refNum-slNo: {field:value}} — pending unsaved edits
   const [savingLine,setSavingLine]=useState({}); // {refNum-slNo: true} — saving in progress
   const [quoteExportRef,setQuoteExportRef]=useState(""); const [exportingQuote,setExportingQuote]=useState("");
+  // PDF generation counter — reads the existing audit_log EXPORT entries
+  // attemptGenerateQuotePdf already writes on every successful generation
+  // (no new tracking table). Scoped per Quote# family (base + every -Rev-N),
+  // matching how Revision History now reads across the whole family too.
+  const [pdfGenCounts,setPdfGenCounts]=useState({total:0,byUser:[]});
+  useEffect(()=>{
+    if(!refFilter){ setPdfGenCounts({total:0,byUser:[]}); return; }
+    const base = refFilter.replace(/-Rev-\d+$/,"");
+    sb.from("audit_log").select("performed_by").eq("action","EXPORT").eq("table_name","estimates").ilike("record_id",base+"%")
+      .then(({data})=>{
+        const rows=(data||[]).filter(r=>r.record_id===base || (r.record_id||"").startsWith(base+"-Rev-"));
+        const byUserMap={};
+        rows.forEach(r=>{ const u=r.performed_by||"unknown"; byUserMap[u]=(byUserMap[u]||0)+1; });
+        const byUser = Object.entries(byUserMap).sort((a,b)=>b[1]-a[1]).map(([user,count])=>({user,count}));
+        setPdfGenCounts({total:rows.length,byUser});
+      });
+  },[refFilter,generatingQuotePdf]);
   const [headerEditOpen,setHeaderEditOpen]=useState(false);
   const [historyOpen,setHistoryOpen]=useState(false);
   const [headerDraft,setHeaderDraft]=useState({});
+  const [headerCustomerCountry,setHeaderCustomerCountry]=useState(""); // drives prominent currency badge + missing-country gate
   const [savingHeader,setSavingHeader]=useState(false);
   // The row currently backing the shared quote-level fields — any Sl No under
   // this Quote# works, they're kept identical across all of them.
   const quoteHeaderRow = useMemo(()=> refs.find(r=>r.reference_number===refFilter) || null, [refs,refFilter]);
+  useEffect(()=>{
+    if(!quoteHeaderRow?.customer_name){ setHeaderCustomerCountry(""); return; }
+    sb.from("companies").select("billing_country").eq("company_name",quoteHeaderRow.customer_name).maybeSingle()
+      .then(({data})=>setHeaderCustomerCountry((data&&data.billing_country)||""));
+  },[quoteHeaderRow?.customer_name]);
   useEffect(()=>{
     if(!refFilter){ return; }
     const hit = refOptionsList.find(o=>o.rn===refFilter);
@@ -6413,6 +6440,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const quoteAnyNonDraft = ()=> refs.some(r=>r.reference_number===refFilter && r.quote_status && r.quote_status!=="Draft");
   const doSaveQuoteHeader = async()=>{
     if(!refFilter) return;
+    const effCurrency = (headerDraft.currency||"").trim()!=="" ? headerDraft.currency : (quoteHeaderRow?quoteHeaderRow.currency:"INR");
+    const effConvRate = (headerDraft.conversion_rate||"").trim()!=="" ? Number(headerDraft.conversion_rate) : (quoteHeaderRow?quoteHeaderRow.conversion_rate:1);
+    if(effCurrency!=="INR" && !(Number(effConvRate)>0)){ alert("Enter a conversion rate (1 "+effCurrency+" = ? INR) before saving — required for any non-INR quote."); return; }
+    if(!headerCustomerCountry.trim() && (isRevisionRef?quoteHeaderRow?.customer_name:(headerDraft.customer_name||"").trim())){ alert("This customer has no country on file. Add one in Master Data → Customers before continuing — currency and conversion rate depend on it."); return; }
     setSavingHeader(true);
     try{
       let payload;
@@ -7977,6 +8008,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [pendingTestingMode,setPendingTestingMode]=useState("separate");
   const attemptGenerateQuotePdf = async ()=>{
     if(!quoteExportRef) return;
+    const currCurrency = quoteHeaderRow?.currency||"INR";
+    const currConvRate = quoteHeaderRow?.conversion_rate;
+    if(currCurrency!=="INR" && !(Number(currConvRate)>0)){
+      alert("Can't generate the PDF — this quote's currency is "+currCurrency+" but no conversion rate is set. Open the Quote Header panel and enter 1 "+currCurrency+" = ? INR first.");
+      return;
+    }
+    if(!headerCustomerCountry.trim()){
+      alert("Can't generate the PDF — this customer has no country on file. Add one in Master Data → Customers before continuing.");
+      return;
+    }
     const gate = await checkExtraPriceGate(quoteExportRef);
     if(!gate.hasLines && !gate.declined){
       if(confirm("Does this quote have any Extra Price Additions?\n\nOK = add some now\nCancel = none needed")){
@@ -8120,9 +8161,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const coverLetterBody = [
         ["Delivery", effDelivery],
         ["Validity", effValidity],
-        ["Total Basic Price - INR", "INR "+fmtR(totalSalesAll)]
+        ["Total Basic Price", quoteCurrency+" "+fmtR(quoteIsInr?totalSalesAll:(totalSalesAll/quoteFx))]
       ];
-      if(!quoteIsInr) coverLetterBody.push(["Total Basic Price - "+quoteCurrency, quoteCurrency+" "+fmtR(totalSalesAll/quoteFx)]);
       doc.autoTable({
         startY:y,
         body: coverLetterBody,
@@ -8350,11 +8390,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) + ((globalFoldTotalByItem.get(est.item_sl_no)||0)/qty) : 0);
         const unitPriceInr = baseUnitPriceInr + foldedPerUnit;
         const totalInr = unitPriceInr*qty;
-        const row = [est.item_sl_no, modelItemMap.get(est.model)||est.model||"—", est.description||"—", fmtR(unitPriceInr)];
-        if(!quoteIsInr) row.push(fmtR(unitPriceInr/quoteFx));
-        row.push(qty, fmtR(totalInr));
-        if(!quoteIsInr) row.push(fmtR(totalInr/quoteFx));
-        return row;
+        return [est.item_sl_no, modelItemMap.get(est.model)||est.model||"—", est.description||"—",
+          fmtR(quoteIsInr?unitPriceInr:(unitPriceInr/quoteFx)), qty, fmtR(quoteIsInr?totalInr:(totalInr/quoteFx))];
       });
       const extraPriceTotal = extraPriceForPdf.reduce((s,l)=>s+(Number(l.price)||0),0);
       const testingSeparateTotal = testingMode==="separate" ? ((slTestingAll||[]).reduce((s,l)=>s+(Number(l.price)||0),0) + (globalTestingAll||[]).reduce((s,l)=>s+(Number(l.rate)||0),0)) : 0;
@@ -8367,33 +8404,36 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) + ((globalFoldTotalByItem.get(est.item_sl_no)||0)/qty) : 0);
         return s+(baseUnitPriceInr+foldedPerUnit)*qty;
       },0) + extraPriceTotal + testingSeparateTotal;
-      const summaryHead = quoteIsInr
-        ? ["S.No","Item","Description","Unit price","Qty","Total"]
-        : ["S.No","Item","Description","Unit price (INR)","Unit price ("+quoteCurrency+")","Qty","Total (INR)","Total ("+quoteCurrency+")"];
-      const summaryFoot = quoteIsInr
-        ? [["","","","","Total Price:", fmtR(grandTotalInr)]]
-        : [["","","","","","Total Price:", fmtR(grandTotalInr), fmtR(grandTotalInr/quoteFx)]];
-      const summaryAmountCols = quoteIsInr ? [3,4,5] : [3,4,5,6,7];
+      const grandTotalDisplay = quoteIsInr ? grandTotalInr : (grandTotalInr/quoteFx);
+      const summaryHead = ["S.No","Item","Description","Unit price ("+quoteCurrency+")","Qty","Total ("+quoteCurrency+")"];
+      const summaryAmountCols = [3,4,5];
       const summaryColumnStyles = {};
       summaryAmountCols.forEach(i=>{ summaryColumnStyles[i] = {halign:"right"}; });
       const allTestingRowsForPdf = [
-        ...(slTestingAll||[]).map(l=>[l.item_sl_no, l.test_name, fmtR(Number(l.price)||0)]),
-        ...(globalTestingAll||[]).map(l=>[l.item_sl_no, l.test_name, fmtR(Number(l.rate)||0)])
+        ...(slTestingAll||[]).map(l=>[l.item_sl_no, l.test_name, fmtR(quoteIsInr?(Number(l.price)||0):((Number(l.price)||0)/quoteFx))]),
+        ...(globalTestingAll||[]).map(l=>[l.item_sl_no, l.test_name, fmtR(quoteIsInr?(Number(l.rate)||0):((Number(l.rate)||0)/quoteFx))])
       ];
       const testingSectionPresent = testingMode==="separate" && allTestingRowsForPdf.length;
+      // Grand total lives ONLY in the page footer for this annexure — no
+      // in-table "Total"/"Grand Total" row anywhere (main table, NDE/Testing,
+      // or Other options) — confirmed 3 Aug.
+      const priceSummaryPageFooter = ()=>{
+        letterhead("ANNEXURE II - PRICE SUMMARY");
+        doc.setFont("helvetica","normal"); doc.setFontSize(9.5); doc.setTextColor(...dark);
+        doc.text("Grand total: "+quoteCurrency+" "+fmtR(grandTotalDisplay), W-12, H-14, {align:"right"});
+        doc.setDrawColor(200,197,185); doc.setLineWidth(0.3);
+        doc.line(12,H-18,W-12,H-18);
+      };
       doc.autoTable({
         startY:38,
         head:[summaryHead],
         body: summaryRows,
-        foot: (extraPriceForPdf.length || testingSectionPresent) ? undefined : summaryFoot,
         theme:"grid",
         headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.4,font:"times"},
-        footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.4,font:"times"},
         bodyStyles:{font:"helvetica",fontSize:8,textColor:dark},
         columnStyles:summaryColumnStyles,
-        footColumnStyles:summaryColumnStyles,
-        margin:{top:38,left:12,right:12,bottom:16},
-        didDrawPage:()=>letterhead("ANNEXURE II - PRICE SUMMARY")
+        margin:{top:38,left:12,right:12,bottom:22},
+        didDrawPage:priceSummaryPageFooter
       });
       // NDE/Testing now sits above Other options (order swapped 3 Aug).
       if(testingSectionPresent){
@@ -8404,15 +8444,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           startY: afterY+3,
           head: [["S.No","Test",""]],
           body: allTestingRowsForPdf,
-          foot: extraPriceForPdf.length ? undefined : [["","Total Price:", fmtR(grandTotalInr)]],
           theme:"grid",
           headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.4,font:"times"},
-          footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.4,font:"times"},
           bodyStyles:{font:"helvetica",fontSize:8,textColor:dark},
           columnStyles:{2:{halign:"right"}},
-          footColumnStyles:{2:{halign:"right"}},
-          margin:{top:38,left:12,right:12,bottom:16},
-          didDrawPage:()=>letterhead("ANNEXURE II - PRICE SUMMARY")
+          margin:{top:38,left:12,right:12,bottom:22},
+          didDrawPage:priceSummaryPageFooter
         });
       }
       // "Other options" — renamed from "Extra Price Addition" (3 Aug). Still
@@ -8429,16 +8466,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         doc.autoTable({
           startY: afterExtraY+3,
           head: [["S.No","Description",""]],
-          body: extraPriceForPdf.map(l=>["—", l.label, fmtR(Number(l.price)||0)]),
-          foot: [["","Total Price:", fmtR(grandTotalInr)]],
+          body: extraPriceForPdf.map(l=>["—", l.label, fmtR(quoteIsInr?(Number(l.price)||0):((Number(l.price)||0)/quoteFx))]),
           theme:"grid",
           headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.4,font:"times"},
-          footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8.4,font:"times"},
           bodyStyles:{font:"helvetica",fontSize:8,textColor:dark},
           columnStyles:{2:{halign:"right"}},
-          footColumnStyles:{2:{halign:"right"}},
-          margin:{top:38,left:12,right:12,bottom:16},
-          didDrawPage:()=>letterhead("ANNEXURE II - PRICE SUMMARY")
+          margin:{top:38,left:12,right:12,bottom:22},
+          didDrawPage:priceSummaryPageFooter
         });
       }
       const summaryEndPage = doc.internal.getNumberOfPages();
@@ -8846,117 +8880,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("button",{onClick:()=>attemptCloseOrNewQuotes("close"),style:{padding:"6px 14px",fontSize:12,fontWeight:600,borderRadius:5,border:"none",background:colors.danger,color:"#fff",cursor:"pointer"}},"Close")
           )
         ),
-        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,minmax(0,1fr))",gap:10,marginBottom:12}},
-          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
-            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
-              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Follow-up log"),
-              h("span",{style:{fontSize:9,fontWeight:700,color:colors.muted,border:"1px solid "+colors.border,padding:"1px 6px",borderRadius:9}},quoteActivities.length)
-            ),
-            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Calls/notes on this quote specifically"),
-            h("button",{onClick:()=>setShowQuoteActivityPanel(true),disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Log / view")
-          ),
-          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
-            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
-              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Commercial Terms"),
-              h("span",{style:{fontSize:9,fontWeight:700,color:quoteHasTerms?"#0f6e3f":"#8a5a10",border:"1px solid "+(quoteHasTerms?"#0f6e3f":"#d4901f"),padding:"1px 6px",borderRadius:9}},quoteHasTerms?"Set":"Not set")
-            ),
-            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"One set per quote — required before sending"),
-            h("button",{onClick:openCommercialTerms,disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Edit terms")
-          ),
-          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
-            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
-              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Documents"),
-              h("span",{style:{fontSize:9,fontWeight:700,color:quoteDocuments.filter(d=>!d.is_archived).length?"#0f6e3f":colors.muted,border:"1px solid "+(quoteDocuments.filter(d=>!d.is_archived).length?"#0f6e3f":colors.border),padding:"1px 6px",borderRadius:9}},quoteDocuments.filter(d=>!d.is_archived).length+" attached")
-            ),
-            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Drawings, procedures, ITP — optional"),
-            h("button",{onClick:openDocumentsPanel,disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Manage documents")
-          ),
-          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
-            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
-              h("div",{style:{fontSize:10,fontWeight:700,color:colors.dark,textTransform:"uppercase"}},"Generate Quote PDF"),
-              quoteExportRef && quoteExportRef===refFilter && !readiness.loading && !readiness.ready && h("span",{style:{fontSize:9.5,fontWeight:700,color:"#854f0b"}},readiness.missing.reduce((s,m)=>s+m.items.length,0)+" items missing")
-            ),
-            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Cover + index + summary + terms + datasheets"),
-            renderReadinessBar(readiness.categories, {height:38, doneLabel: generatingQuotePdf?"Generating…":"✓ Generate Quote PDF", onClick: (quoteExportRef&&!generatingQuotePdf)?attemptGenerateQuotePdf:undefined})
-          )
-        ),
-        h("div",{style:{borderTop:"1px solid #eceae0",paddingTop:10,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}},
-          h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}},
-            h("select",{value:slNoFilter,onChange:e=>{
-              const val=e.target.value; setSlNoFilter(val);
-              if(refFilter && val){ const match=refs.find(r=>r.reference_number===refFilter&&String(r.item_sl_no)===String(val)); if(match) openEstimate(match); }
-            },style:{...inputStyle,width:110}},
-              h("option",{value:""},"Sl No"),
-              slNoOptions.map(sn=>h("option",{key:sn,value:sn},sn))
-            ),
-            h("input",{value:descSearch,onChange:e=>setDescSearch(e.target.value),placeholder:"Search description…",style:{...inputStyle,width:200}})
-          ),
-          h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}},
-            h("button",{onClick:openCommercialTerms,style:{...btnSmall,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Commercial Terms"),
-            h("button",{onClick:openExtraPrice,style:{...btnSmall,background:"#0f766e",color:"#fff",border:"none",fontWeight:600}},"Extra Price Addition"),
-            h("button",{onClick:readiness.ready?openGlobalTestPicker:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Enabled once the quote is marked Ready",style:{...btnSmall,background:readiness.ready?"#8a4b1f":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},ndeRollupSummary?("NDE Testing ("+ndeRollupSummary.count+" item"+(ndeRollupSummary.count!==1?"s":"")+", ₹"+ndeRollupSummary.total.toFixed(0)+")"):"NDE Testing"),
-            h("div",{style:{display:"flex",gap:4,alignItems:"center"}},
-              h("input",{type:"number",step:"0.1",value:globalSfInput,onChange:e=>setGlobalSfInput(e.target.value),placeholder:"New Sf",style:{...inputStyle,width:110}}),
-              h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf"),
-              lastGlobalSfSnapshot && lastGlobalSfSnapshot.refFilter===refFilter && h("button",{onClick:restorePreviousGlobalSf,disabled:restoringGlobalSf,title:"Undo the last global Sf change — restores each line's Sf and sales price to what they were before it was set to "+lastGlobalSfSnapshot.appliedValue,style:{...btnSmall,fontSize:10.5,color:colors.danger,border:"1px solid #f0997b",opacity:restoringGlobalSf?0.6:1}},restoringGlobalSf?"Restoring…":"↺ Restore previous Sf")
-            ),
-            h("button",{onClick:()=>setHistoryOpen(true),style:btnSmall},"History"),
-            isAdmin && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete quote")
-          )
-        )
-      ),
-      h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
-        h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},"Export full quote"),
-        quoteExportRef && quoteDocuments.filter(d=>!d.is_archived).length===0 && h("div",{style:{border:"1px solid #d4901f",background:"#fffaf0",borderRadius:6,padding:"8px 12px",marginBottom:10,fontSize:11.5,color:"#8a5a10"}},
-          "⚠ No documents attached to this quote. If drawings, ITP, or procedures are relevant, add them before sending."
-        ),
-        h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}},
-          h("div",{style:{fontSize:11.5,color:colors.muted}},
-            "Exporting: ",
-            h("strong",{style:{color:colors.text}},quoteExportRef||"—"),
-            h("span",{style:{fontSize:10,color:colors.mutedLight,marginLeft:6}},"(follows the Quote# selector above)")
-          )
-        ),
-        h("div",{style:{display:"flex",gap:16,flexWrap:"wrap"}},
-          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"BOM ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(per Sl No)")),
-            h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:colors.muted,marginBottom:6,cursor:"pointer"}},
-              h("input",{type:"checkbox",checked:includeSalesPrice,onChange:e=>setIncludeSalesPrice(e.target.checked)}),
-              "Include Sf + Sales price"
-            ),
-            h("div",{style:{display:"flex",gap:6}},
-              h("button",{onClick:()=>exportQuoteBOMExcel(includeSalesPrice),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-xlsx"?"Working…":"Excel"),
-              h("button",{onClick:()=>exportQuoteBOMPDF(includeSalesPrice),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-pdf"?"Working…":"PDF")
-            )
-          ),
-          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Datasheets ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(grouped by item)")),
-            h("div",{style:{display:"flex",gap:6}},
-              h("button",{onClick:exportQuoteDatasheetsExcel,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="ds-xlsx"?"Working…":"Excel"),
-              h("button",{onClick:exportQuoteDatasheetsPDF,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="ds-pdf"?"Working…":"PDF")
-            )
-          ),
-          h("div",{style:{border:"1px solid #8fd0bf",borderRadius:6,padding:"8px 10px",background:"#eaf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:"#085041",textTransform:"uppercase",marginBottom:6}},"Summary ",h("span",{style:{fontWeight:400,color:"#4a8d78"}},"(whole quote, by spec + grade)")),
-            h("div",{style:{display:"flex",gap:6}},
-              h("button",{onClick:exportQuoteSummaryExcel,disabled:!quoteExportRef||!!exportingQuote,style:{...btnSmall,border:"1px solid #1c8c75",color:"#085041"}},exportingQuote==="sum-xlsx"?"Working…":"Excel"),
-              h("button",{onClick:exportQuoteSummaryPDF,disabled:!quoteExportRef||!!exportingQuote,style:{...btnSmall,border:"1px solid #1c8c75",color:"#085041"}},exportingQuote==="sum-pdf"?"Working…":"PDF")
-            )
-          ),
-          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
-            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Cutting Plan ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(whole quote)")),
-            h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden",marginBottom:6,width:"fit-content"}},
-              h("button",{onClick:()=>setQuoteCuttingPlanIncludeCost(true),style:{padding:"3px 10px",fontSize:10.5,border:"none",cursor:"pointer",background:quoteCuttingPlanIncludeCost?colors.dark:"#fff",color:quoteCuttingPlanIncludeCost?"#fff":colors.text,fontFamily:"inherit"}},"With cost"),
-              h("button",{onClick:()=>setQuoteCuttingPlanIncludeCost(false),style:{padding:"3px 10px",fontSize:10.5,border:"none",cursor:"pointer",background:!quoteCuttingPlanIncludeCost?colors.dark:"#fff",color:!quoteCuttingPlanIncludeCost?"#fff":colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Without cost")
-            ),
-            h("div",{style:{display:"flex",gap:6}},
-              h("button",{onClick:()=>exportQuoteCuttingPlanExcel(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-xlsx"?"Working…":"Excel"),
-              h("button",{onClick:()=>exportQuoteCuttingPlanPDF(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-pdf"?"Working…":"PDF")
-            )
-          )
-        )
-      ),
-      refFilter && quoteHeaderRow && h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
+        h("div",{style:{marginTop:14,paddingTop:14,borderTop:"1px solid "+colors.border}},
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
           h("div",{style:{fontSize:12.5,fontWeight:700}},"Quote Header — "+refFilter),
           h("div",{style:{display:"flex",gap:8}},
@@ -8964,9 +8888,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             !headerEditOpen && h("button",{onClick:openHeaderEdit,style:btnSmall},"Edit")
           )
         ),
+        quoteHeaderRow.customer_name && !headerCustomerCountry.trim() && h("div",{style:{background:"#fdeee9",border:"1px solid #f0b8b8",borderRadius:6,padding:"8px 12px",marginBottom:10,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}},
+          h("span",{style:{fontSize:11.5,color:colors.danger}},"This customer has no country on file. Add one before continuing — currency and conversion rate depend on it."),
+          h("button",{onClick:openHeaderEdit,style:{...btnSmall,fontSize:11,padding:"4px 9px",border:"1px solid "+colors.danger,color:colors.danger}},"Add country")
+        ),
         h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:10}},"Shared across all Sl Nos in this quote — saving here updates every one at once."),
         revisionSiblings.length>1 && h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}},
           revisionSiblings.map(rv=>h("span",{key:rv.ref,onClick:()=>jumpToRevision(rv.ref),style:{cursor:"pointer",fontSize:11,fontWeight:600,padding:"4px 10px",borderRadius:5,background:rv.ref===refFilter?colors.dark:"#f4f2ea",color:rv.ref===refFilter?"#fff":colors.muted}},rv.label))
+        ),
+        !headerEditOpen && headerCustomerCountry.trim() && headerCustomerCountry.trim().toLowerCase()!=="india" && h("div",{style:{display:"flex",gap:10,marginBottom:10}},
+          h("div",{style:{background:"#e6f1fb",border:"2px solid #85b7eb",borderRadius:6,padding:"6px 14px"}},
+            h("div",{style:{fontSize:9.5,color:"#0c447c",fontWeight:700}},"CURRENCY"),
+            h("div",{style:{fontSize:16,fontWeight:800,color:"#0c447c"}},quoteHeaderRow.currency||"USD")
+          ),
+          h("div",{style:{background:"#e6f1fb",border:"2px solid #85b7eb",borderRadius:6,padding:"6px 14px"}},
+            h("div",{style:{fontSize:9.5,color:"#0c447c",fontWeight:700}},"1 "+(quoteHeaderRow.currency||"USD")+" = ? INR"),
+            h("div",{style:{fontSize:16,fontWeight:800,color:"#0c447c"}},quoteHeaderRow.conversion_rate||"— not set")
+          )
         ),
         !headerEditOpen
           ? h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"4px 20px",fontSize:12}},
@@ -9051,7 +8989,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               ),
               h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}},
                 h("div",{style:{width:220}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Customer"),
-                  h(CustomerSelect,{value:headerDraft.customer_name,onSelect:(p)=>setHeaderDraft(d=>({...d,customer_name:p.company_name,customer_address:p.address,contact_name:p.contact_name||d.contact_name,contact_designation:p.contact_designation||d.contact_designation}))})
+                  h(CustomerSelect,{value:headerDraft.customer_name,onSelect:(p)=>{ const isIndia=(p.billing_country||"").trim().toLowerCase()==="india"; setHeaderCustomerCountry(p.billing_country||""); setHeaderDraft(d=>({...d,customer_name:p.company_name,customer_address:p.address,contact_name:p.contact_name||d.contact_name,contact_designation:p.contact_designation||d.contact_designation,currency:isIndia?"INR":"USD",conversion_rate:isIndia?"1":d.conversion_rate})); }})
                 ),
                 h("div",{style:{width:190}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Address"),h("textarea",{rows:5,value:headerDraft.customer_address,onChange:e=>setHeaderDraft(d=>({...d,customer_address:e.target.value})),placeholder:"Street\nCity\nState\nPIN\nCountry",style:{...inputStyle,padding:"6px 8px",fontSize:12,resize:"vertical",fontFamily:"inherit"}})),
                 h("div",{style:{width:140}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Attention — Contact"),h("input",{value:headerDraft.contact_name,onChange:e=>setHeaderDraft(d=>({...d,contact_name:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
@@ -9067,7 +9005,121 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               )
             )
       ),
-      refFilter && h(QuoteNotesPanel,{referenceNumber:refFilter,user}),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,minmax(0,1fr))",gap:10,marginBottom:12}},
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Follow-up log"),
+              h("span",{style:{fontSize:9,fontWeight:700,color:colors.muted,border:"1px solid "+colors.border,padding:"1px 6px",borderRadius:9}},quoteActivities.length)
+            ),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Calls/notes on this quote specifically"),
+            h("button",{onClick:()=>setShowQuoteActivityPanel(true),disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Log / view")
+          ),
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Commercial Terms"),
+              h("span",{style:{fontSize:9,fontWeight:700,color:quoteHasTerms?"#0f6e3f":"#8a5a10",border:"1px solid "+(quoteHasTerms?"#0f6e3f":"#d4901f"),padding:"1px 6px",borderRadius:9}},quoteHasTerms?"Set":"Not set")
+            ),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"One set per quote — required before sending"),
+            h("button",{onClick:openCommercialTerms,disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Edit terms")
+          ),
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:10,fontWeight:700,textTransform:"uppercase"}},"Documents"),
+              h("span",{style:{fontSize:9,fontWeight:700,color:quoteDocuments.filter(d=>!d.is_archived).length?"#0f6e3f":colors.muted,border:"1px solid "+(quoteDocuments.filter(d=>!d.is_archived).length?"#0f6e3f":colors.border),padding:"1px 6px",borderRadius:9}},quoteDocuments.filter(d=>!d.is_archived).length+" attached")
+            ),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Drawings, procedures, ITP — optional"),
+            h("button",{onClick:openDocumentsPanel,disabled:!quoteExportRef,style:{width:"100%",padding:"8px",fontSize:12,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:5,cursor:"pointer"}},"Manage documents")
+          ),
+          h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
+              h("div",{style:{fontSize:10,fontWeight:700,color:colors.dark,textTransform:"uppercase"}},"Generate Quote PDF"),
+              quoteExportRef && quoteExportRef===refFilter && !readiness.loading && !readiness.ready && h("span",{style:{fontSize:9.5,fontWeight:700,color:"#854f0b"}},readiness.missing.reduce((s,m)=>s+m.items.length,0)+" items missing")
+            ),
+            h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Cover + index + summary + terms + datasheets"),
+            renderReadinessBar(readiness.categories, {height:38, doneLabel: generatingQuotePdf?"Generating…":"✓ Generate Quote PDF", onClick: (quoteExportRef&&!generatingQuotePdf)?attemptGenerateQuotePdf:undefined}),
+            pdfGenCounts.total>0 && h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginTop:8,paddingTop:8,borderTop:"1px solid #eceae0"}},
+              h("div",{style:{fontSize:11,color:colors.text}},h("strong",null,pdfGenCounts.total),h("span",{style:{color:colors.mutedLight}}," generated")),
+              pdfGenCounts.byUser.map(u=>h("span",{key:u.user,style:{fontSize:10.5,background:"#f4f2ea",borderRadius:5,padding:"3px 8px"}},u.user+" "+u.count))
+            )
+          )
+        ),
+        h("div",{style:{borderTop:"1px solid #eceae0",paddingTop:10,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}},
+          h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}},
+            h("select",{value:slNoFilter,onChange:e=>{
+              const val=e.target.value; setSlNoFilter(val);
+              if(refFilter && val){ const match=refs.find(r=>r.reference_number===refFilter&&String(r.item_sl_no)===String(val)); if(match) openEstimate(match); }
+            },style:{...inputStyle,width:110}},
+              h("option",{value:""},"Sl No"),
+              slNoOptions.map(sn=>h("option",{key:sn,value:sn},sn))
+            ),
+            h("input",{value:descSearch,onChange:e=>setDescSearch(e.target.value),placeholder:"Search description…",style:{...inputStyle,width:200}})
+          ),
+          h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}},
+            h("button",{onClick:openCommercialTerms,style:{...btnSmall,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Commercial Terms"),
+            h("button",{onClick:openExtraPrice,style:{...btnSmall,background:"#0f766e",color:"#fff",border:"none",fontWeight:600}},"Extra Price Addition"),
+            h("button",{onClick:readiness.ready?openGlobalTestPicker:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Enabled once the quote is marked Ready",style:{...btnSmall,background:readiness.ready?"#8a4b1f":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},ndeRollupSummary?("NDE Testing ("+ndeRollupSummary.count+" item"+(ndeRollupSummary.count!==1?"s":"")+", ₹"+ndeRollupSummary.total.toFixed(0)+")"):"NDE Testing"),
+            h("div",{style:{display:"flex",gap:4,alignItems:"center"}},
+              h("input",{type:"number",step:"0.1",value:globalSfInput,onChange:e=>setGlobalSfInput(e.target.value),placeholder:"New Sf",style:{...inputStyle,width:110}}),
+              h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf"),
+              lastGlobalSfSnapshot && lastGlobalSfSnapshot.refFilter===refFilter && h("button",{onClick:restorePreviousGlobalSf,disabled:restoringGlobalSf,title:"Undo the last global Sf change — restores each line's Sf and sales price to what they were before it was set to "+lastGlobalSfSnapshot.appliedValue,style:{...btnSmall,fontSize:10.5,color:colors.danger,border:"1px solid #f0997b",opacity:restoringGlobalSf?0.6:1}},restoringGlobalSf?"Restoring…":"↺ Restore previous Sf")
+            ),
+            h("button",{onClick:()=>setHistoryOpen(true),style:btnSmall},"History"),
+            isAdmin && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete quote")
+          )
+        )
+      ),
+      h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
+        h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},"Export full quote"),
+        quoteExportRef && quoteDocuments.filter(d=>!d.is_archived).length===0 && h("div",{style:{border:"1px solid #d4901f",background:"#fffaf0",borderRadius:6,padding:"8px 12px",marginBottom:10,fontSize:11.5,color:"#8a5a10"}},
+          "⚠ No documents attached to this quote. If drawings, ITP, or procedures are relevant, add them before sending."
+        ),
+        h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}},
+          h("div",{style:{fontSize:11.5,color:colors.muted}},
+            "Exporting: ",
+            h("strong",{style:{color:colors.text}},quoteExportRef||"—"),
+            h("span",{style:{fontSize:10,color:colors.mutedLight,marginLeft:6}},"(follows the Quote# selector above)")
+          )
+        ),
+        h("div",{style:{display:"flex",gap:16,flexWrap:"wrap"}},
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"BOM ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(per Sl No)")),
+            h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:colors.muted,marginBottom:6,cursor:"pointer"}},
+              h("input",{type:"checkbox",checked:includeSalesPrice,onChange:e=>setIncludeSalesPrice(e.target.checked)}),
+              "Include Sf + Sales price"
+            ),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:()=>exportQuoteBOMExcel(includeSalesPrice),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:()=>exportQuoteBOMPDF(includeSalesPrice),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="bom-pdf"?"Working…":"PDF")
+            )
+          ),
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Datasheets ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(grouped by item)")),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:exportQuoteDatasheetsExcel,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="ds-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:exportQuoteDatasheetsPDF,disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="ds-pdf"?"Working…":"PDF")
+            )
+          ),
+          h("div",{style:{border:"1px solid #8fd0bf",borderRadius:6,padding:"8px 10px",background:"#eaf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:"#085041",textTransform:"uppercase",marginBottom:6}},"Summary ",h("span",{style:{fontWeight:400,color:"#4a8d78"}},"(whole quote, by spec + grade)")),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:exportQuoteSummaryExcel,disabled:!quoteExportRef||!!exportingQuote,style:{...btnSmall,border:"1px solid #1c8c75",color:"#085041"}},exportingQuote==="sum-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:exportQuoteSummaryPDF,disabled:!quoteExportRef||!!exportingQuote,style:{...btnSmall,border:"1px solid #1c8c75",color:"#085041"}},exportingQuote==="sum-pdf"?"Working…":"PDF")
+            )
+          ),
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"Cutting Plan ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(whole quote)")),
+            h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden",marginBottom:6,width:"fit-content"}},
+              h("button",{onClick:()=>setQuoteCuttingPlanIncludeCost(true),style:{padding:"3px 10px",fontSize:10.5,border:"none",cursor:"pointer",background:quoteCuttingPlanIncludeCost?colors.dark:"#fff",color:quoteCuttingPlanIncludeCost?"#fff":colors.text,fontFamily:"inherit"}},"With cost"),
+              h("button",{onClick:()=>setQuoteCuttingPlanIncludeCost(false),style:{padding:"3px 10px",fontSize:10.5,border:"none",cursor:"pointer",background:!quoteCuttingPlanIncludeCost?colors.dark:"#fff",color:!quoteCuttingPlanIncludeCost?"#fff":colors.text,borderLeft:"1px solid "+colors.border,fontFamily:"inherit"}},"Without cost")
+            ),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:()=>exportQuoteCuttingPlanExcel(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-xlsx"?"Working…":"Excel"),
+              h("button",{onClick:()=>exportQuoteCuttingPlanPDF(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-pdf"?"Working…":"PDF")
+            )
+          )
+        )
+      ),
+            refFilter && h(QuoteNotesPanel,{referenceNumber:refFilter,user}),
       showAmendGate && h(AuthCodeGate,{requiredType:"edit",user,onClose:()=>setShowAmendGate(false),onAuthorized:async()=>{ setShowAmendGate(false); setShowAmendPicker(true); }}),
       showAmendPicker && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:250}},
         h("div",{style:{background:"#fff",borderRadius:8,width:420,padding:"20px 22px"}},
