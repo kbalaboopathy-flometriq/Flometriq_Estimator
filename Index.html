@@ -7189,6 +7189,55 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     } catch(e){ alert("Save failed: "+e.message); }
     finally { setSavingBomFix(false); }
   };
+
+  // Refresh BOM — syncs one Sl No's own lines against the (now-fixed)
+  // master template. Only ever offered while that Sl No is flagged
+  // incomplete. Matches on Component+Sub-assembly (same key the MOC rule
+  // itself uses). Existing matched lines' grades are NEVER touched, even
+  // if the master's default differs — new lines get a blank grade for
+  // the user to fill in. No admin code needed — this only re-syncs the
+  // user's own quote, it doesn't touch master data.
+  const [bomRefreshPreview,setBomRefreshPreview]=useState(null); // {estRow, itemName, willAdd:[...], willRemove:[...], untouchedCount}
+  const [bomRefreshBusy,setBomRefreshBusy]=useState(false);
+  const lineKey = (l)=> (l.component||"")+"‖"+(l.sub_assembly||"");
+  const openBomRefreshPreview = async(estRow)=>{
+    if(quoteAnyNonDraft()){ alert("This quote has already left Draft — refreshing the BOM here isn't available. Start an amendment instead if this still needs fixing."); return; }
+    const itemName = modelItemMap.get(estRow.model)||estRow.model;
+    const [{data:masterRows},{data:currentLines}] = await Promise.all([
+      sb.from("bom").select("*").eq("item",itemName).eq("model",estRow.model),
+      sb.from("estimate_lines").select("*").eq("reference_number",estRow.reference_number).eq("item_sl_no",estRow.item_sl_no)
+    ]);
+    const currentByKey = new Map((currentLines||[]).map(l=>[lineKey(l),l]));
+    const masterByKey = new Map((masterRows||[]).map(m=>[lineKey(m),m]));
+    const willAdd = (masterRows||[]).filter(m=>!currentByKey.has(lineKey(m)));
+    const willRemove = (currentLines||[]).filter(l=>!masterByKey.has(lineKey(l)));
+    const untouchedCount = (currentLines||[]).length - willRemove.length;
+    setBomRefreshPreview({estRow, itemName, willAdd, willRemove, untouchedCount});
+  };
+  const applyBomRefresh = async()=>{
+    if(!bomRefreshPreview) return;
+    setBomRefreshBusy(true);
+    try{
+      const { estRow, willAdd, willRemove } = bomRefreshPreview;
+      if(willRemove.length) await sb.from("estimate_lines").delete().in("id",willRemove.map(l=>l.id));
+      if(willAdd.length){
+        const newRows = willAdd.map(m=>({
+          reference_number:estRow.reference_number, item_sl_no:estRow.item_sl_no, estimate_id:estRow.id, model:estRow.model,
+          item:m.item, size:m.size||null, sub_assembly:m.sub_assembly||null, component:m.component||null,
+          material_shape:m.material_shape||"", material_spec:m.material_spec||null, grade:"", // blank — never auto-filled
+          qty_required:m.qty_required||null, uom:m.uom||null, rate:m.rate||0, cost:m.cost||0, sf:m.sf||0, sales_price:m.sales_price||0,
+          cutting_plan_layout_size:m.cutting_plan_layout_size||"", cutting_plan_qty:Number(m.cutting_plan_qty)||0, cutting_plan_uom:m.cutting_plan_uom||""
+        }));
+        await sb.from("estimate_lines").insert(newRows);
+      }
+      await logAudit("UPDATE","estimate_lines",estRow.reference_number+"-"+estRow.item_sl_no,"Refresh BOM: added "+willAdd.length+", removed "+willRemove.length+" line(s) to match the master template",user?.username||"unknown",null,{added:willAdd.length,removed:willRemove.length});
+      setBomRefreshPreview(null);
+      await refreshAll();
+      await refreshReadiness(refFilter);
+    } catch(e){ alert("Refresh failed: "+e.message); }
+    finally { setBomRefreshBusy(false); }
+  };
+
   // Export panel always follows whichever quote is selected in the header — no separate picker.
   useEffect(()=>{ setQuoteExportRef(refFilter||""); },[refFilter]);
   // Default the header selector to the most recently created quote once refs load, if nothing is picked yet.
@@ -9462,6 +9511,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 h("button",{onClick:()=>setShowDatasheet(true),style:{...btnSecondary,background:"#b8590a",color:"#fff",border:"none",fontWeight:600}},"Datasheet"),
                 h("button",{onClick:readiness.ready?openOptionsTesting:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Complete Datasheets/Descriptions/pricing first",style:{...btnSecondary,background:readiness.ready?"#0f766e":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},"Options & Testing"),
                 h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line"),
+                (readiness.incompleteBomDetails||[]).some(d=>d.slNo===openRef.item_sl_no) && h("button",{onClick:()=>openBomRefreshPreview(openRef),style:{...btnSmall,border:"1px solid #a3312a",color:"#a3312a"}},"Refresh BOM from master"),
                 isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No")
               )
             ),
@@ -9987,6 +10037,26 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
           h("button",{onClick:()=>setBomFixUnlocked(null),style:btnSecondary},"Cancel"),
           h("button",{onClick:submitBomFixLine,disabled:savingBomFix,style:{...btnPrimary,opacity:savingBomFix?0.6:1}},savingBomFix?"Saving…":"Save to BOM Master")
+        )
+      )
+    ),
+    bomRefreshPreview && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:460,maxWidth:"100%",maxHeight:"80vh",overflow:"auto"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:12}},"Review changes — Sl No "+bomRefreshPreview.estRow.item_sl_no),
+        bomRefreshPreview.willAdd.length>0 && h("div",{style:{marginBottom:12}},
+          h("div",{style:{fontSize:10.5,fontWeight:700,color:"#0f6e3f",textTransform:"uppercase",marginBottom:5}},"Will add ("+bomRefreshPreview.willAdd.length+")"),
+          bomRefreshPreview.willAdd.map((m,i)=>h("div",{key:i,style:{fontSize:12,padding:"6px 8px",background:"#f0faf6",borderRadius:5,marginBottom:4}},(m.component||m.sub_assembly||"line")+" — no grade set yet, fill in below"))
+        ),
+        bomRefreshPreview.willRemove.length>0 && h("div",{style:{marginBottom:12}},
+          h("div",{style:{fontSize:10.5,fontWeight:700,color:"#a3312a",textTransform:"uppercase",marginBottom:5}},"Will remove ("+bomRefreshPreview.willRemove.length+")"),
+          bomRefreshPreview.willRemove.map((l,i)=>h("div",{key:i,style:{fontSize:12,padding:"6px 8px",background:"#fdecea",borderRadius:5,marginBottom:4}},(l.component||l.sub_assembly||"line")+" — no longer in the master template"))
+        ),
+        bomRefreshPreview.willAdd.length===0 && bomRefreshPreview.willRemove.length===0 && h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:12}},"No changes needed — this Sl No's lines already match the master template."),
+        h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:5}},"Untouched ("+bomRefreshPreview.untouchedCount+")"),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14}},"Existing grades on these lines are kept exactly as set."),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setBomRefreshPreview(null),style:btnSecondary},"Cancel"),
+          h("button",{onClick:applyBomRefresh,disabled:bomRefreshBusy||(bomRefreshPreview.willAdd.length===0&&bomRefreshPreview.willRemove.length===0),style:{...btnPrimary,opacity:(bomRefreshBusy||(bomRefreshPreview.willAdd.length===0&&bomRefreshPreview.willRemove.length===0))?0.5:1}},bomRefreshBusy?"Applying…":"Apply changes")
         )
       )
     ),
