@@ -6353,8 +6353,25 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // same reasoning as the Extra Price declined flag above.
       if(globalTestRows?.length) await sb.from("quote_global_testing_tbl").insert(globalTestRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(amendAreas.documents){
-        const { data: docRows } = await sb.from("quote_documents").select("*").eq("reference_number",latestRef).eq("is_archived",false);
-        if(docRows?.length) await sb.from("quote_documents").insert(docRows.map(r=>({...stripId(r), reference_number:newRef, file_path:null, lives_in_supabase:false})));
+        const { data: docParents } = await sb.from("universal_documents_tbl").select("*").eq("entity_type","quote").eq("entity_id",latestRef).eq("is_archived",false);
+        if(docParents?.length){
+          const oldIds = docParents.map(p=>p.id);
+          const { data: oldHistory } = await sb.from("universal_document_history_tbl").select("*").in("document_id",oldIds).order("rev_number",{ascending:false});
+          const latestByOldDoc = new Map();
+          (oldHistory||[]).forEach(h=>{ if(!latestByOldDoc.has(h.document_id)) latestByOldDoc.set(h.document_id,h); });
+          for(const p of docParents){
+            const { data:newParent } = await sb.from("universal_documents_tbl").insert({
+              doc_number:p.doc_number, doc_name:p.doc_name, category:p.category, entity_type:"quote", entity_id:newRef,
+              is_mandatory:p.is_mandatory, is_archived:false, created_by:user?.username||"unknown"
+            }).select().single();
+            const latestOld = latestByOldDoc.get(p.id);
+            if(newParent) await sb.from("universal_document_history_tbl").insert({
+              document_id:newParent.id, doc_number:p.doc_number, rev_number:0, direction:"Out", status:null,
+              link:(latestOld&&latestOld.link)||"", file_path:null, lives_in_supabase:false,
+              reason:"Carried forward from previous revision", changed_by:user?.username||"unknown"
+            });
+          }
+        }
       }
 
       await logAudit("CREATE","estimates",newRef,"Amendment: created "+newRef+" as a clone of "+latestRef+" ("+Object.entries(amendAreas).filter(([k,v])=>v).map(([k])=>k).join(", ")+")",user?.username||"unknown",null,{cloned_from:latestRef,areas:amendAreas});
@@ -6558,8 +6575,21 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [quoteDocuments,setQuoteDocuments]=useState([]);
   const loadQuoteDocuments = useCallback(async(ref)=>{
     if(!ref) return;
-    const { data } = await sb.from("quote_documents").select("*").eq("reference_number",ref).order("uploaded_at",{ascending:false});
-    setQuoteDocuments(data||[]);
+    const { data: parents } = await sb.from("universal_documents_tbl").select("*").eq("entity_type","quote").eq("entity_id",ref);
+    if(!parents?.length){ setQuoteDocuments([]); return; }
+    const ids = parents.map(p=>p.id);
+    const { data: history } = await sb.from("universal_document_history_tbl").select("*").in("document_id",ids).order("rev_number",{ascending:false});
+    const latestByDoc = new Map();
+    (history||[]).forEach(h=>{ if(!latestByDoc.has(h.document_id)) latestByDoc.set(h.document_id,h); });
+    const merged = parents.map(p=>{
+      const latest = latestByDoc.get(p.id)||{};
+      return {
+        id:p.id, category:p.category, doc_number:p.doc_number, title:p.doc_name, is_archived:p.is_archived,
+        link:latest.link||"", file_path:latest.file_path||null, file_name:latest.file_path, lives_in_supabase:!!latest.lives_in_supabase,
+        uploaded_at:latest.changed_at||p.created_at, uploaded_by:latest.changed_by||p.created_by, rev_number:latest.rev_number??0
+      };
+    }).sort((a,b)=> new Date(b.uploaded_at)-new Date(a.uploaded_at));
+    setQuoteDocuments(merged);
   },[]);
   useEffect(()=>{ if(quoteExportRef) loadQuoteDocuments(quoteExportRef); },[quoteExportRef,loadQuoteDocuments]);
 
@@ -6645,18 +6675,24 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     }
     setDocUploading(true);
     try{
-      const groupId = docUploadMode==="combined" ? (quoteExportRef+"_"+Date.now()) : null;
+      // Note: is_combined/group_id grouping metadata from the old schema
+      // has no equivalent yet in universal_documents_tbl — dropped here,
+      // flagged as a known gap if that grouping is needed later.
       for(const d of docDrafts){
         const path = "quote_"+quoteExportRef+"_"+Date.now()+"_"+d.file.name.replace(/[^a-zA-Z0-9._-]/g,"_");
         const { error:err } = await sb.storage.from("quote-documents").upload(path,d.file);
         if(err) throw err;
-        const { data:inserted, error:insErr } = await sb.from("quote_documents").insert({
-          reference_number:quoteExportRef, category:d.category, doc_number:d.docNumber.trim(), title:d.title.trim(), link:d.link.trim(),
-          file_name:d.file.name, file_path:path, lives_in_supabase:true, is_combined:docUploadMode==="combined", group_id:groupId,
-          uploaded_by:user?.username||"unknown"
+        const { data:parentRow, error:parentErr } = await sb.from("universal_documents_tbl").insert({
+          doc_number:d.docNumber.trim(), doc_name:d.title.trim(), category:d.category, entity_type:"quote", entity_id:quoteExportRef,
+          is_mandatory:false, is_archived:false, created_by:user?.username||"unknown"
         }).select().single();
-        if(insErr) throw insErr;
-        await logAudit("INSERT","quote_documents",quoteExportRef,"Uploaded document "+d.docNumber+" ("+d.category+") to Quote# "+quoteExportRef,user?.username||"unknown",null,{doc_number:d.docNumber,category:d.category});
+        if(parentErr) throw parentErr;
+        const { error:histErr } = await sb.from("universal_document_history_tbl").insert({
+          document_id:parentRow.id, doc_number:d.docNumber.trim(), rev_number:0, direction:"Out", status:null,
+          link:d.link.trim(), file_path:path, lives_in_supabase:true, reason:"Initial upload", changed_by:user?.username||"unknown"
+        });
+        if(histErr) throw histErr;
+        await logAudit("INSERT","universal_documents_tbl",quoteExportRef,"Uploaded document "+d.docNumber+" ("+d.category+") to Quote# "+quoteExportRef,user?.username||"unknown",null,{doc_number:d.docNumber,category:d.category});
       }
       await loadQuoteDocuments(quoteExportRef);
       setDocUploadStep("list");
@@ -6671,7 +6707,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [docNewVersionLink,setDocNewVersionLink]=useState("");
   const openDocHistory = async(docRow)=>{
     setDocHistoryFor(docRow); setDocNewVersionFile(null); setDocNewVersionNote(""); setDocNewVersionLink(docRow.link||"");
-    const { data } = await sb.from("quote_document_history").select("*").eq("document_id",docRow.id).order("changed_at",{ascending:false});
+    const { data } = await sb.from("universal_document_history_tbl").select("*").eq("document_id",docRow.id).order("rev_number",{ascending:false});
     setDocHistoryRows(data||[]);
   };
   const uploadNewDocVersion = async()=>{
@@ -6685,9 +6721,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const path = "quote_"+quoteExportRef+"_"+Date.now()+"_"+docNewVersionFile.name.replace(/[^a-zA-Z0-9._-]/g,"_");
       const { error:err } = await sb.storage.from("quote-documents").upload(path,docNewVersionFile);
       if(err) throw err;
-      await sb.from("quote_documents").update({file_path:path,file_name:docNewVersionFile.name,link:docNewVersionLink.trim(),lives_in_supabase:true,uploaded_at:new Date().toISOString(),uploaded_by:user?.username||"unknown"}).eq("id",docHistoryFor.id);
-      await sb.from("quote_document_history").insert({document_id:docHistoryFor.id,reference_number:quoteExportRef,doc_number:docHistoryFor.doc_number,what_changed:docNewVersionNote.trim(),changed_by:user?.username||"unknown",old_file_path:oldPath,new_file_path:path});
-      await logAudit("UPDATE","quote_documents",quoteExportRef,"New version of "+docHistoryFor.doc_number+": "+docNewVersionNote.trim(),user?.username||"unknown",{file_path:oldPath},{file_path:path});
+      const nextRev = (docHistoryFor.rev_number??0)+1;
+      const { error:histErr } = await sb.from("universal_document_history_tbl").insert({
+        document_id:docHistoryFor.id, doc_number:docHistoryFor.doc_number, rev_number:nextRev, direction:"Out", status:null,
+        link:docNewVersionLink.trim(), file_path:path, lives_in_supabase:true, reason:docNewVersionNote.trim(), changed_by:user?.username||"unknown"
+      });
+      if(histErr) throw histErr;
+      await logAudit("UPDATE","universal_documents_tbl",quoteExportRef,"New version of "+docHistoryFor.doc_number+": "+docNewVersionNote.trim(),user?.username||"unknown",{file_path:oldPath},{file_path:path});
       await loadQuoteDocuments(quoteExportRef);
       setDocHistoryFor(null);
     } catch(e){ alert("Failed: "+(e.message||e)); }
@@ -10296,14 +10336,18 @@ async function resolveTestingMode(referenceNumber, changedBy){
 // audit entry is written LAST, after the purge, and is never itself
 // removed by anything — the permanent record of who deleted what.
 async function deleteQuoteReferenceEverywhere(referenceNumber, performedBy){
-  const [{data:slRows},{data:linesData}] = await Promise.all([
+  const [{data:slRows},{data:linesData},{data:docParentsToDelete}] = await Promise.all([
     sb.from("estimates").select("*").eq("reference_number",referenceNumber),
-    sb.from("estimate_lines").select("*").eq("reference_number",referenceNumber)
+    sb.from("estimate_lines").select("*").eq("reference_number",referenceNumber),
+    sb.from("universal_documents_tbl").select("id").eq("entity_type","quote").eq("entity_id",referenceNumber)
   ]);
+  const docIdsToDelete = (docParentsToDelete||[]).map(p=>p.id);
   await Promise.all([
     sb.from("quote_commercial_terms").delete().eq("reference_number",referenceNumber),
     sb.from("quote_documents").delete().eq("reference_number",referenceNumber),
     sb.from("quote_document_history").delete().eq("reference_number",referenceNumber),
+    docIdsToDelete.length ? sb.from("universal_document_history_tbl").delete().in("document_id",docIdsToDelete) : Promise.resolve(),
+    sb.from("universal_documents_tbl").delete().eq("entity_type","quote").eq("entity_id",referenceNumber),
     sb.from("quote_extra_price_tbl").delete().eq("reference_number",referenceNumber),
     sb.from("quote_extra_price_declined_tbl").delete().eq("reference_number",referenceNumber),
     sb.from("quote_sl_extra_price_tbl").delete().eq("reference_number",referenceNumber),
@@ -10317,7 +10361,7 @@ async function deleteQuoteReferenceEverywhere(referenceNumber, performedBy){
     sb.from("estimate_lines").delete().eq("reference_number",referenceNumber)
   ]);
   await sb.from("activity_log_tbl").delete().eq("reference_number",referenceNumber);
-  const auditTables = ["estimates","estimate_lines","datasheets","quote_documents","quote_commercial_terms"];
+  const auditTables = ["estimates","estimate_lines","datasheets","quote_documents","universal_documents_tbl","quote_commercial_terms"];
   await sb.from("audit_log").delete().eq("record_id",referenceNumber).in("table_name",auditTables);
   await sb.from("audit_log").delete().like("record_id",referenceNumber+"-%").in("table_name",auditTables);
   await sb.from("estimates").delete().eq("reference_number",referenceNumber);
@@ -10396,13 +10440,19 @@ async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, 
 // the row (doc number, category, link, history) stays, only the stored
 // file itself goes. Safe to call even if nothing needs purging.
 async function purgeQuoteDocumentsIfLeavingDraft(referenceNumber, performedBy){
-  const { data: docs } = await sb.from("quote_documents").select("*").eq("reference_number",referenceNumber).eq("lives_in_supabase",true).eq("is_archived",false);
-  if(!docs || docs.length===0) return;
-  for(const d of docs){
-    try{ await sb.storage.from("quote-documents").remove([d.file_path]); } catch(e){ console.error("Storage delete failed for",d.doc_number,e); }
-    await sb.from("quote_documents").update({lives_in_supabase:false}).eq("id",d.id);
+  const { data: parents } = await sb.from("universal_documents_tbl").select("id,doc_number").eq("entity_type","quote").eq("entity_id",referenceNumber).eq("is_archived",false);
+  if(!parents?.length) return;
+  const ids = parents.map(p=>p.id);
+  const { data: history } = await sb.from("universal_document_history_tbl").select("*").in("document_id",ids).order("rev_number",{ascending:false});
+  const latestByDoc = new Map();
+  (history||[]).forEach(h=>{ if(!latestByDoc.has(h.document_id)) latestByDoc.set(h.document_id,h); });
+  const toPurge = Array.from(latestByDoc.values()).filter(h=>h.lives_in_supabase && h.file_path);
+  if(toPurge.length===0) return;
+  for(const h of toPurge){
+    try{ await sb.storage.from("quote-documents").remove([h.file_path]); } catch(e){ console.error("Storage delete failed for",h.doc_number,e); }
+    await sb.from("universal_document_history_tbl").update({lives_in_supabase:false}).eq("id",h.id);
   }
-  await logAudit("DELETE","quote_documents",referenceNumber,"Purged "+docs.length+" document file(s) from storage — quote left Draft; links and history remain",performedBy||"system",null,{purged_count:docs.length});
+  await logAudit("DELETE","universal_documents_tbl",referenceNumber,"Purged "+toPurge.length+" document file(s) from storage — quote left Draft; links and history remain",performedBy||"system",null,{purged_count:toPurge.length});
 }
 
 // Checks a deletion-approval code: must exist, be unused, and not expired.
@@ -15028,8 +15078,8 @@ function QuoteHealthDashboard({ user }){
     const refs = Array.from(byQuote.keys());
     const { data: terms } = refs.length ? await sb.from("quote_commercial_terms").select("reference_number").in("reference_number",refs) : {data:[]};
     const termsSet = new Set((terms||[]).map(t=>t.reference_number));
-    const { data: docs } = refs.length ? await sb.from("quote_documents").select("reference_number").eq("is_archived",false).in("reference_number",refs) : {data:[]};
-    const docsSet = new Set((docs||[]).map(d=>d.reference_number));
+    const { data: docs } = refs.length ? await sb.from("universal_documents_tbl").select("entity_id").eq("entity_type","quote").eq("is_archived",false).in("entity_id",refs) : {data:[]};
+    const docsSet = new Set((docs||[]).map(d=>d.entity_id));
     setMissing({terms: refs.filter(r=>!termsSet.has(r)).length, docs: refs.filter(r=>!docsSet.has(r)).length});
     setLoading(false);
   })(); },[]);
