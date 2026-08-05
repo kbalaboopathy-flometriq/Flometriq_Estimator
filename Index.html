@@ -7081,11 +7081,37 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       bySl.forEach((items,sl)=>missing.push({section:"Sl No "+sl, items:["Pending validation: "+items.join(", ")]}));
       validationDone = false;
     }
-    return { ready: missing.length===0, missing, categories:{ terms:termsDone, datasheets:datasheetsState, descriptions:descriptionsState, validation:validationDone } };
-  },[]);
-  const [readiness,setReadiness]=useState({ready:false,missing:[],loading:true,categories:{terms:false,datasheets:"none",descriptions:"none",validation:false}});
+    // BOM completeness — an item's MOC Rule (if one exists) is a MINIMUM
+    // required set: if a rule parameter has zero matching lines anywhere
+    // in that Sl No's BOM, the master BOM for that item is genuinely
+    // missing a component (not just this one quote) — flag it. Items with
+    // no MOC rule defined at all aren't checked (nothing to verify against).
+    const { data: allLinesForBom } = await sb.from("estimate_lines").select("item_sl_no,component,sub_assembly").eq("reference_number",refNumber);
+    const itemsInPlay = Array.from(new Set(estimatesRows.map(est=>modelItemMap.get(est.model)||est.model).filter(Boolean)));
+    const { data: mocRulesForBom } = itemsInPlay.length ? await sb.from("item_moc_rules").select("*").in("item",itemsInPlay) : {data:[]};
+    const rulesByItem = new Map((mocRulesForBom||[]).map(r=>[r.item,r]));
+    let bomDoneCount=0, bomCheckedCount=0;
+    const incompleteBomDetails = [];
+    estimatesRows.forEach(est=>{
+      const itemName = modelItemMap.get(est.model)||est.model;
+      const rule = rulesByItem.get(itemName);
+      if(!rule || !rule.parameters || rule.parameters.length===0) return; // no rule defined — nothing to check
+      bomCheckedCount++;
+      const slLines = (allLinesForBom||[]).filter(l=>l.item_sl_no===est.item_sl_no);
+      const missingParams = rule.parameters.filter(p=> !slLines.some(l=> (p.match_field==="sub_assembly"?l.sub_assembly:l.component)===p.match_value));
+      if(missingParams.length){
+        missing.push({section:"Sl No "+est.item_sl_no, items:["Incomplete BOM (\""+itemName+"\") — missing: "+missingParams.map(p=>p.label||p.match_value).join(", ")]});
+        incompleteBomDetails.push({slNo:est.item_sl_no, itemName, missingParams});
+      } else {
+        bomDoneCount++;
+      }
+    });
+    const bomCompleteState = bomCheckedCount===0 ? "all" : bomDoneCount===bomCheckedCount ? "all" : bomDoneCount===0 ? "none" : "some";
+    return { ready: missing.length===0, missing, incompleteBomDetails, categories:{ terms:termsDone, datasheets:datasheetsState, descriptions:descriptionsState, bomComplete:bomCompleteState, validation:validationDone } };
+  },[modelItemMap]);
+  const [readiness,setReadiness]=useState({ready:false,missing:[],loading:true,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false}});
   const refreshReadiness=useCallback(async(refNumber)=>{
-    if(!refNumber){ setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:"none",descriptions:"none",validation:false}}); return; }
+    if(!refNumber){ setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false}}); return; }
     setReadiness(r=>({...r,loading:true}));
     try {
       const result = await checkQuoteReadiness(refNumber);
@@ -7099,10 +7125,70 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       }
     } catch(e){
       console.error("Readiness check failed",e);
-      setReadiness({ready:false,missing:[{section:"Readiness check",items:["Couldn't check — "+(e.message||"unknown error")]}],loading:false,error:true,categories:{terms:false,datasheets:"none",descriptions:"none",validation:false}});
+      setReadiness({ready:false,missing:[{section:"Readiness check",items:["Couldn't check — "+(e.message||"unknown error")]}],loading:false,error:true,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false}});
     }
   },[checkQuoteReadiness]);
-  useEffect(()=>{ if(refFilter) refreshReadiness(refFilter); else setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:"none",descriptions:"none",validation:false}}); },[refFilter]);
+  useEffect(()=>{ if(refFilter) refreshReadiness(refFilter); else setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false}}); },[refFilter]);
+
+  // Incomplete-BOM fix flow. The Draft-only gate is enforced here, not
+  // just implied — correcting a master BOM template mid-flight only makes
+  // sense while this quote itself is still being drafted; once it's left
+  // Draft, the right move is a fresh amendment, not editing a locked
+  // revision's context. Admin+ gets a direct Yes/No → straight to the BOM
+  // Master. A regular user needs a one-time code (existing gated-PIN
+  // system) to get the same access, since Master Data is otherwise
+  // Admin-only — the fix has to land in the actual master template, not
+  // just this one quote's lines, or every future quote hits the same gap.
+  const [showBomFixPrompt,setShowBomFixPrompt]=useState(false);
+  const [showBomFixCodeEntry,setShowBomFixCodeEntry]=useState(false);
+  const [bomFixCode,setBomFixCode]=useState("");
+  const [bomFixCodeError,setBomFixCodeError]=useState("");
+  const [bomFixUnlocked,setBomFixUnlocked]=useState(null); // {slNo,itemName,missingParams} once a code is validated
+  const [bomFixDraft,setBomFixDraft]=useState({component:"",sub_assembly:"",material_spec:"",spec_grade:""});
+  const [savingBomFix,setSavingBomFix]=useState(false);
+  const openBomFix = ()=>{
+    if(quoteAnyNonDraft()){ alert("This quote has already left Draft — correcting the master BOM here isn't available. Start an amendment instead if this still needs fixing."); return; }
+    if(isAdmin) setShowBomFixPrompt(true);
+    else { setBomFixCode(""); setBomFixCodeError(""); setShowBomFixCodeEntry(true); }
+  };
+  const goFixBomNow = ()=>{
+    setShowBomFixPrompt(false);
+    const detail = (readiness.incompleteBomDetails||[])[0];
+    if(detail) alert("Missing on \""+detail.itemName+"\": "+detail.missingParams.map(p=>p.label||p.match_value).join(", ")+".\n\nAdd it to the BOM Master below. Note: this fixes future quotes using this item — you may also need to add the line to THIS quote's own BOM separately.");
+    if(onGoToTab) onGoToTab("bom");
+  };
+  const submitBomFixCode = async()=>{
+    const detail = (readiness.incompleteBomDetails||[])[0];
+    const res = await verifyAndConsumeGatedPin("correct_incomplete_bom", bomFixCode, user?.username||"unknown", "quote", refFilter, detail?("Sl No "+detail.slNo+" — "+detail.itemName):null);
+    if(!res.ok){ setBomFixCodeError(res.message); return; }
+    setShowBomFixCodeEntry(false);
+    if(detail){
+      setBomFixUnlocked(detail);
+      setBomFixDraft({
+        component: detail.missingParams[0].match_field==="component" ? detail.missingParams[0].match_value : "",
+        sub_assembly: detail.missingParams[0].match_field==="sub_assembly" ? detail.missingParams[0].match_value : "",
+        material_spec:"", spec_grade:""
+      });
+    }
+  };
+  const submitBomFixLine = async()=>{
+    if(!bomFixUnlocked) return;
+    if(!bomFixDraft.material_spec.trim() && !bomFixDraft.spec_grade.trim()){ alert("Fill in a material spec or grade for this component before saving."); return; }
+    setSavingBomFix(true);
+    try{
+      const est = refs.find(r=>r.item_sl_no===bomFixUnlocked.slNo && r.reference_number===refFilter);
+      const { error } = await sb.from("bom").insert({
+        item:bomFixUnlocked.itemName, model:est?.model||null, component:bomFixDraft.component||null, sub_assembly:bomFixDraft.sub_assembly||null,
+        material_spec:bomFixDraft.material_spec.trim()||null, spec_grade:bomFixDraft.spec_grade.trim()||null
+      });
+      if(error) throw error;
+      await logAudit("INSERT","bom",bomFixUnlocked.itemName,"Added missing MOC-rule component via one-time-code BOM fix: "+(bomFixDraft.component||bomFixDraft.sub_assembly),user?.username||"unknown",null,bomFixDraft);
+      alert("Added to the BOM Master. Remember to also add this line to this quote's own BOM if it needs to appear here specifically.");
+      setBomFixUnlocked(null);
+      await refreshReadiness(refFilter);
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally { setSavingBomFix(false); }
+  };
   // Export panel always follows whichever quote is selected in the header — no separate picker.
   useEffect(()=>{ setQuoteExportRef(refFilter||""); },[refFilter]);
   // Default the header selector to the most recently created quote once refs load, if nothing is picked yet.
@@ -8929,8 +9015,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     } finally { setExportingQuote(""); }
   };
 
-  const READINESS_SEGMENTS = [["terms","Commercial Terms"],["datasheets","Datasheets"],["descriptions","Descriptions"],["validation","Validation"]];
-  const THREE_STATE_SEGMENTS = new Set(["datasheets","descriptions"]);
+  const READINESS_SEGMENTS = [["terms","Commercial Terms"],["datasheets","Datasheets"],["descriptions","Descriptions"],["bomComplete","BOM Complete"],["validation","Validation"]];
+  const THREE_STATE_SEGMENTS = new Set(["datasheets","descriptions","bomComplete"]);
   const segmentIsDone = (key,val)=> THREE_STATE_SEGMENTS.has(key) ? val==="all" : !!val;
   const renderReadinessBar = (categories, opts={})=>{
     const safeCategories = categories || {};
@@ -9002,6 +9088,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("div",{style:{width:220}},
               renderReadinessBar(readiness.categories, {height:32, onClick: readiness.ready?undefined:()=>alert(readiness.missing.map(m=>m.section+": "+m.items.join(", ")).join("\n"))})
             )
+          ),
+          readiness.categories.bomComplete!=="all" && readiness.incompleteBomDetails && readiness.incompleteBomDetails.length>0 && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"8px 12px",marginTop:8,marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}},
+            h("div",{style:{fontSize:12,color:"#a3312a"}},
+              h("strong",null,"Incomplete BOM"),": this item's master template is missing a required component — "+readiness.incompleteBomDetails.map(d=>"Sl No "+d.slNo+" (\""+d.itemName+"\"): "+d.missingParams.map(p=>p.label||p.match_value).join(", ")).join("; ")
+            ),
+            h("button",{onClick:openBomFix,style:{...btnSmall,fontSize:11,padding:"4px 9px",border:"1px solid #a3312a",color:"#a3312a"}},isAdmin?"Fix now":"Enter code to fix")
           ),
           h("div",{style:{display:"flex",gap:8}},
             isAdmin && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete this Revision"),
@@ -9856,6 +9948,48 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
+    showBomFixPrompt && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:420,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"This item's BOM master is incomplete"),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},
+          (readiness.incompleteBomDetails||[]).map(d=>"\""+d.itemName+"\" is missing: "+d.missingParams.map(p=>p.label||p.match_value).join(", ")).join(" ")+" — no quote built from this item can satisfy this rule until the master BOM is fixed. Fix it now?"
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setShowBomFixPrompt(false),style:btnSecondary},"No"),
+          h("button",{onClick:goFixBomNow,style:btnPrimary},"Yes, go to BOM Master")
+        )
+      )
+    ),
+    showBomFixCodeEntry && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Correct the BOM Master"),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:12}},"BOM editing is normally Admin-only. Get a one-time code from an Admin to add the missing component yourself."),
+        h("input",{value:bomFixCode,onChange:e=>{ setBomFixCode(e.target.value); setBomFixCodeError(""); },placeholder:"Enter code",style:{...inputStyle,marginBottom:bomFixCodeError?4:14}}),
+        bomFixCodeError && h("div",{style:{fontSize:11,color:colors.danger,marginBottom:10}},bomFixCodeError),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setShowBomFixCodeEntry(false),style:btnSecondary},"Cancel"),
+          h("button",{onClick:submitBomFixCode,style:btnPrimary},"Unlock")
+        )
+      )
+    ),
+    bomFixUnlocked && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:420,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Add missing component — "+bomFixUnlocked.itemName),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:12}},"This adds it to the master BOM template, so future quotes using this item include it too. You may also need to add this line to this quote's own BOM separately."),
+        h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Component"),
+        h("input",{value:bomFixDraft.component,onChange:e=>setBomFixDraft(d=>({...d,component:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:8}}),
+        h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Sub-assembly"),
+        h("input",{value:bomFixDraft.sub_assembly,onChange:e=>setBomFixDraft(d=>({...d,sub_assembly:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:8}}),
+        h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Material spec"),
+        h("input",{value:bomFixDraft.material_spec,onChange:e=>setBomFixDraft(d=>({...d,material_spec:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:8}}),
+        h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Grade"),
+        h("input",{value:bomFixDraft.spec_grade,onChange:e=>setBomFixDraft(d=>({...d,spec_grade:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:14}}),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setBomFixUnlocked(null),style:btnSecondary},"Cancel"),
+          h("button",{onClick:submitBomFixLine,disabled:savingBomFix,style:{...btnPrimary,opacity:savingBomFix?0.6:1}},savingBomFix?"Saving…":"Save to BOM Master")
+        )
+      )
+    ),
     showDeleteEntireQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Delete ENTIRE quote — "+refFilter.replace(/-Rev-\d+$/,"")+"?"),
@@ -10419,6 +10553,23 @@ async function deleteEntireQuoteFamily(anyRefInFamily, performedBy){
   return {refCount:refs.length, totalSl, totalLines};
 }
 
+// First real implementation of the per-action-type gated PIN system
+// (crm_phase25) — one row per action type in gated_action_pin_tbl, each
+// single-use. Returns {ok:true} on success (consumes the PIN, logs who
+// used it — not who issued it, per the confirmed design) or
+// {ok:false, message} on failure. Reusable by any future gated action,
+// not just this one.
+async function verifyAndConsumeGatedPin(actionType, enteredPin, username, entityType, entityId, context){
+  const trimmed = (enteredPin||"").trim();
+  if(!trimmed) return {ok:false, message:"Enter the code."};
+  const { data: row } = await sb.from("gated_action_pin_tbl").select("*").eq("action_type",actionType).maybeSingle();
+  if(!row || !row.pin) return {ok:false, message:"No code has been set for this action yet — ask an Admin to generate one."};
+  if(row.is_used) return {ok:false, message:"That code has already been used. Ask an Admin to generate a new one."};
+  if(row.pin!==trimmed) return {ok:false, message:"That code doesn't match."};
+  await sb.from("gated_action_pin_tbl").update({is_used:true}).eq("id",row.id);
+  await sb.from("gated_action_pin_log_tbl").insert({action_type:actionType, used_by:username||"unknown", entity_type:entityType||null, entity_id:entityId||null, context:context||null});
+  return {ok:true};
+}
 async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source){
   if(newStatus!=="Draft"){
     const [{count},{data:declined}] = await Promise.all([
