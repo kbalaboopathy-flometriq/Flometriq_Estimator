@@ -7521,9 +7521,25 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // Delete an entire quote (every Sl No under a Quote# and all their BOM lines).
   // Gated behind Admin+ and a typed confirmation of the Quote# since it's the
   // most destructive action on this screen.
+  const revisionLabelOf = (ref)=>{ const m=(ref||"").match(/-Rev-(\d+)$/); return m ? "Rev "+m[1] : "Rev 0"; };
+  const higherRevisionExists = (ref)=>{
+    const base = (ref||"").replace(/-Rev-\d+$/,"");
+    const thisNum = (ref.match(/-Rev-(\d+)$/)||[])[1] ? Number(ref.match(/-Rev-(\d+)$/)[1]) : 0;
+    const familyNums = new Set();
+    refs.forEach(r=>{
+      if(r.reference_number===base) familyNums.add(0);
+      else { const m=(r.reference_number||"").match(new RegExp("^"+base.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+"-Rev-(\\d+)$")); if(m) familyNums.add(Number(m[1])); }
+    });
+    return Array.from(familyNums).some(n=>n>thisNum);
+  };
+  const [blockedDeleteMsg,setBlockedDeleteMsg]=useState(null);
   const openDeleteQuote=()=>{
     if(!isAdmin){ alert("Only Admins can delete quotes."); return; }
     if(!refFilter) return;
+    if(higherRevisionExists(refFilter)){
+      setBlockedDeleteMsg("Can't delete "+revisionLabelOf(refFilter)+" — a newer revision of "+refFilter.replace(/-Rev-\d+$/,"")+" still exists. Delete the newer revision(s) first, or use \"Delete Entire Quote\" to remove the whole family at once.");
+      return;
+    }
     setDeleteQuoteConfirmText(""); setShowDeleteQuoteModal(true);
   };
   const doConfirmDeleteQuote=async()=>{
@@ -8930,6 +8946,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             )
           ),
           h("div",{style:{display:"flex",gap:8}},
+            isAdmin && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete this Revision"),
+            isAdmin && h("button",{onClick:openDeleteEntireQuote,style:{...btnSmall,background:colors.danger,color:"#fff",border:"none",fontWeight:600}},"Delete Entire Quote"),
             h("button",{onClick:()=>attemptCloseOrNewQuotes("close"),style:{padding:"6px 14px",fontSize:12,fontWeight:600,borderRadius:5,border:"none",background:colors.danger,color:"#fff",cursor:"pointer"}},"Close")
           )
         ),
@@ -9129,9 +9147,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf"),
               lastGlobalSfSnapshot && lastGlobalSfSnapshot.refFilter===refFilter && h("button",{onClick:restorePreviousGlobalSf,disabled:restoringGlobalSf,title:"Undo the last global Sf change — restores each line's Sf and sales price to what they were before it was set to "+lastGlobalSfSnapshot.appliedValue,style:{...btnSmall,fontSize:10.5,color:colors.danger,border:"1px solid #f0997b",opacity:restoringGlobalSf?0.6:1}},restoringGlobalSf?"Restoring…":"↺ Restore previous Sf")
             ),
-            h("button",{onClick:()=>setHistoryOpen(true),style:btnSmall},"History"),
-            isAdmin && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete this Revision"),
-            isAdmin && h("button",{onClick:openDeleteEntireQuote,style:{...btnSmall,background:colors.danger,color:"#fff",border:"none",fontWeight:600}},"Delete Entire Quote")
+            h("button",{onClick:()=>setHistoryOpen(true),style:btnSmall},"History")
           )
         )
       ),
@@ -9760,14 +9776,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     pdfPreview && h(PdfPreviewModal,{ doc:pdfPreview.doc, filename:pdfPreview.filename, buildDoc:pdfPreview.buildDoc, quickEditDefaults:pdfPreview.quickEditDefaults, onClose:()=>setPdfPreview(null) }),
     showDeleteQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
-        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Delete this revision — "+refFilter+"?"),
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Delete "+revisionLabelOf(refFilter)+" of "+refFilter.replace(/-Rev-\d+$/,"")+"?"),
         h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},
           "This removes all "+refs.filter(r=>r.reference_number===refFilter).length+" Sl No(s) under "+refFilter+" — including Commercial Terms, Documents, Notes, Extra Price, Testing, and Outcomes for this revision — and every BOM line beneath them. Other revisions of this quote are NOT affected. This cannot be undone. Type the reference number to confirm."
         ),
         h("input",{value:deleteQuoteConfirmText,onChange:e=>setDeleteQuoteConfirmText(e.target.value),placeholder:refFilter,style:{...inputStyle,marginBottom:14}}),
         h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
           h("button",{onClick:()=>setShowDeleteQuoteModal(false),style:btnSecondary},"Cancel"),
-          h("button",{onClick:confirmDeleteQuote,disabled:deletingQuote||deleteQuoteConfirmText.trim()!==refFilter,style:{...btnPrimary,background:colors.danger,opacity:(deletingQuote||deleteQuoteConfirmText.trim()!==refFilter)?0.5:1}},deletingQuote?"Deleting…":"Delete this revision")
+          h("button",{onClick:confirmDeleteQuote,disabled:deletingQuote||deleteQuoteConfirmText.trim()!==refFilter,style:{...btnPrimary,background:colors.danger,opacity:(deletingQuote||deleteQuoteConfirmText.trim()!==refFilter)?0.5:1}},deletingQuote?"Deleting…":"Delete "+revisionLabelOf(refFilter))
+        )
+      )
+    ),
+    blockedDeleteMsg && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8,color:colors.danger}},"Can't delete "+revisionLabelOf(refFilter||"")),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},blockedDeleteMsg),
+        h("div",{style:{display:"flex",justifyContent:"flex-end"}},
+          h("button",{onClick:()=>setBlockedDeleteMsg(null),style:btnPrimary},"OK")
         )
       )
     ),
