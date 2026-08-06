@@ -1257,10 +1257,13 @@ function BomEntryForm({ onGoToTab, user }) {
     setLoadingSub(true); setSubRows([]);
     const [{ data }, { data:statusRow }] = await Promise.all([
       sb.from("bom").select("*").eq("model",model).order("id"),
-      sb.from("model_tbl").select("bom_status").eq("model",model).limit(1).maybeSingle(),
+      sb.from("model_tbl").select("bom_status,item").eq("model",model).limit(1).maybeSingle(),
     ]);
     setSubRows(data||[]); setLoadingSub(false);
-    setNewRowDraft({model, sf:3.1});
+    // item is implicit from model (model_tbl.item), never a separate field
+    // on the new-row form — auto-derived here so every new row saves with
+    // the correct item instead of silently defaulting to blank.
+    setNewRowDraft({model, item:statusRow?.item||"", sf:3.1});
     const status = statusRow?.bom_status||"Dirty";
     setBomStatus(status);
     if(status==="Dirty" && confirm("\""+model+"\"'s BOM is marked Dirty — not yet reviewed. Start cleaning it now?")){
@@ -7205,7 +7208,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(quoteAnyNonDraft()){ alert("This quote has already left Draft — refreshing the BOM here isn't available. Start an amendment instead if this still needs fixing."); return; }
     const itemName = modelItemMap.get(estRow.model)||estRow.model;
     const [{data:masterRows},{data:currentLines}] = await Promise.all([
-      sb.from("bom").select("*").eq("item",itemName).eq("model",estRow.model),
+      sb.from("bom").select("*").eq("model",estRow.model),
       sb.from("estimate_lines").select("*").eq("reference_number",estRow.reference_number).eq("item_sl_no",estRow.item_sl_no)
     ]);
     const currentByKey = new Map((currentLines||[]).map(l=>[lineKey(l),l]));
@@ -7219,12 +7222,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(!bomRefreshPreview) return;
     setBomRefreshBusy(true);
     try{
-      const { estRow, willAdd, willRemove } = bomRefreshPreview;
+      const { estRow, itemName, willAdd, willRemove } = bomRefreshPreview;
       if(willRemove.length) await sb.from("estimate_lines").delete().in("id",willRemove.map(l=>l.id));
       if(willAdd.length){
         const newRows = willAdd.map(m=>({
           reference_number:estRow.reference_number, item_sl_no:estRow.item_sl_no, estimate_id:estRow.id, model:estRow.model,
-          item:m.item, size:m.size||null, sub_assembly:m.sub_assembly||null, component:m.component||null,
+          item:m.item||itemName||"", size:m.size||null, sub_assembly:m.sub_assembly||null, component:m.component||null,
           material_shape:m.material_shape||"", material_spec:m.material_spec||null, grade:"", // blank — never auto-filled
           qty_required:m.qty_required||null, uom:m.uom||null, rate:m.rate||0, cost:m.cost||0, sf:m.sf||0, sales_price:m.sales_price||0,
           cutting_plan_layout_size:m.cutting_plan_layout_size||"", cutting_plan_qty:Number(m.cutting_plan_qty)||0, cutting_plan_uom:m.cutting_plan_uom||""
