@@ -7222,23 +7222,29 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const willAdd = (masterRows||[]).filter(m=>!currentByKey.has(lineKey(m)));
     const willRemove = (currentLines||[]).filter(l=>!masterByKey.has(lineKey(l)));
     const untouchedCount = (currentLines||[]).length - willRemove.length;
-    setBomRefreshPreview({estRow, itemName, willAdd, willRemove, untouchedCount});
+    const maxSlNo = (currentLines||[]).reduce((max,l)=>Math.max(max, Number(l.sl_no)||0), 0);
+    setBomRefreshPreview({estRow, itemName, willAdd, willRemove, untouchedCount, maxSlNo});
   };
   const applyBomRefresh = async()=>{
     if(!bomRefreshPreview) return;
     setBomRefreshBusy(true);
     try{
-      const { estRow, itemName, willAdd, willRemove } = bomRefreshPreview;
-      if(willRemove.length) await sb.from("estimate_lines").delete().in("id",willRemove.map(l=>l.id));
+      const { estRow, itemName, willAdd, willRemove, maxSlNo } = bomRefreshPreview;
+      if(willRemove.length){
+        const { error:delErr } = await sb.from("estimate_lines").delete().in("id",willRemove.map(l=>l.id));
+        if(delErr) throw delErr;
+      }
       if(willAdd.length){
-        const newRows = willAdd.map(m=>({
-          reference_number:estRow.reference_number, item_sl_no:estRow.item_sl_no, estimate_id:estRow.id, model:estRow.model,
+        const newRows = willAdd.map((m,idx)=>({
+          reference_number:estRow.reference_number, item_sl_no:estRow.item_sl_no, sl_no:maxSlNo+idx+1, estimate_id:estRow.id, model:estRow.model,
           item:m.item||itemName||"", size:m.size||null, sub_assembly:m.sub_assembly||null, component:m.component||null,
           material_shape:m.material_shape||"", material_spec:m.material_spec||null, grade:"", // blank — never auto-filled
           qty_required:m.qty_required||null, uom:m.uom||null, rate:m.rate||0, cost:m.cost||0, sf:m.sf||0, sales_price:m.sales_price||0,
-          cutting_plan_layout_size:m.cutting_plan_layout_size||"", cutting_plan_qty:Number(m.cutting_plan_qty)||0, cutting_plan_uom:m.cutting_plan_uom||""
+          cutting_plan_layout_size:m.cutting_plan_layout_size||"", cutting_plan_qty:Number(m.cutting_plan_qty)||0, cutting_plan_uom:m.cutting_plan_uom||"",
+          is_direct_price:false, validation_status:null
         }));
-        await sb.from("estimate_lines").insert(newRows);
+        const { error:insErr } = await sb.from("estimate_lines").insert(newRows);
+        if(insErr) throw insErr;
       }
       await logAudit("UPDATE","estimate_lines",estRow.reference_number+"-"+estRow.item_sl_no,"Refresh BOM: added "+willAdd.length+", removed "+willRemove.length+" line(s) to match the master template",user?.username||"unknown",null,{added:willAdd.length,removed:willRemove.length});
       setBomRefreshPreview(null);
