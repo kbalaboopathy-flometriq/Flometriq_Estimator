@@ -365,19 +365,12 @@ function buildPriceDataSection(currency, orderQty, totalSalesValue, conversionRa
   const fx = Number(conversionRate)||1;
   const qty = r2(orderQty)||0;
   const rateInr = qty>0 ? r2(totalSalesValue/qty) : r2(totalSalesValue);
+  const rateDisplay = isInr ? rateInr : (fx>0 ? r2(rateInr/fx) : 0);
   const rows = [
-    { key:"price-rate-inr", label:"Rate - INR", value: fmt2(roundTo5(rateInr)) }
+    { key:"price-rate", label:"Rate - "+cur, value: fmt2(roundTo5(rateDisplay)) },
+    { key:"price-qty", label:"Qty", value: fmt2(qty)+" Nos" },
+    { key:"price-total", label:"Total Price - "+cur, value: fmt2(roundTo5(rateDisplay*qty)) }
   ];
-  if(!isInr){
-    const rateFx = fx>0 ? r2(rateInr/fx) : 0;
-    rows.push({ key:"price-rate-fx", label:"Rate - "+cur, value: fmt2(roundTo5(rateFx)) });
-  }
-  rows.push({ key:"price-qty", label:"Qty", value: fmt2(qty)+" Nos" });
-  rows.push({ key:"price-total-inr", label:"Total Price - INR", value: fmt2(roundTo5(rateInr*qty)) });
-  if(!isInr){
-    const rateFx = fx>0 ? r2(rateInr/fx) : 0;
-    rows.push({ key:"price-total-fx", label:"Total Price - "+cur, value: fmt2(roundTo5(rateFx*qty)) });
-  }
   return { title: "Price Data", rows };
 }
 // Inserts a blank spacer row between every row in an array (not around the
@@ -6303,6 +6296,33 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     setHeaderEditOpen(true);
     setUnsavedGuard(true,"You have unsaved Quote Header changes. Leave anyway?",doSaveQuoteHeader);
   };
+  const [quickCurrencyEditOpen,setQuickCurrencyEditOpen]=useState(false);
+  const openQuickCurrencyEdit = ()=>{
+    if(!quoteHeaderRow) return;
+    // Same safe full-payload population openHeaderEdit uses (not calling it
+    // directly — that also flips on the full Edit form's own open state,
+    // which we don't want here) — for a non-revision quote this must be the
+    // complete current row, or doSaveQuoteHeader would blank other fields;
+    // for a revision, ghost ("" = keep") is fine except currency/rate, which
+    // we want visibly pre-filled with the real current value.
+    if(isRevisionRef){
+      setHeaderDraft({ enquiry_number:"", enquiry_date:"", quote_date:"", currency:quoteHeaderRow.currency||"INR", conversion_rate:String(quoteHeaderRow.conversion_rate||1), customer_address:"", contact_name:"", contact_designation:"", signatory_name:"", signatory_designation:"" });
+    } else {
+      setHeaderDraft({
+        enquiry_number: quoteHeaderRow.enquiry_number||"", enquiry_date: quoteHeaderRow.enquiry_date||"",
+        quote_date: quoteHeaderRow.quote_date||"", currency: quoteHeaderRow.currency||"INR",
+        conversion_rate: String(quoteHeaderRow.conversion_rate||1),
+        customer_name: quoteHeaderRow.customer_name||"", customer_address: quoteHeaderRow.customer_address||"",
+        contact_name: quoteHeaderRow.contact_name||"", contact_designation: quoteHeaderRow.contact_designation||"",
+        signatory_name: quoteHeaderRow.signatory_name||"", signatory_designation: quoteHeaderRow.signatory_designation||""
+      });
+    }
+    setQuickCurrencyEditOpen(true);
+  };
+  const saveQuickCurrencyEdit = async()=>{
+    const ok = await doSaveQuoteHeader();
+    if(ok) setQuickCurrencyEditOpen(false);
+  };
   const isRevisionRef = (refFilter||"").includes("-Rev-");
   const [revisionAddressOptions,setRevisionAddressOptions]=useState([]);
   useEffect(()=>{
@@ -6560,6 +6580,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       await logAudit("UPDATE","estimates",refFilter,"Quote header fields updated for "+refFilter+" (applied to all Sl Nos)",user?.username||"unknown",null,payload);
       setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,...payload}:r));
       if(openRef && openRef.reference_number===refFilter) setOpenRef(r=>({...r,...payload}));
+      return true;
       setHeaderEditOpen(false);
       setUnsavedGuard(false);
     } catch(e){ alert("Save failed: "+(e.message||e)); }
@@ -9181,14 +9202,25 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         revisionSiblings.length>1 && h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}},
           revisionSiblings.map(rv=>h("span",{key:rv.ref,onClick:()=>jumpToRevision(rv.ref),style:{cursor:"pointer",fontSize:11,fontWeight:600,padding:"4px 10px",borderRadius:5,background:rv.ref===refFilter?colors.dark:"#f4f2ea",color:rv.ref===refFilter?"#fff":colors.muted}},rv.label))
         ),
-        !headerEditOpen && headerCustomerCountry.trim() && headerCustomerCountry.trim().toLowerCase()!=="india" && h("div",{style:{display:"flex",gap:10,marginBottom:10}},
-          h("div",{style:{background:"#e6f1fb",border:"2px solid #85b7eb",borderRadius:6,padding:"6px 14px"}},
-            h("div",{style:{fontSize:9.5,color:"#0c447c",fontWeight:700}},"CURRENCY"),
-            h("div",{style:{fontSize:16,fontWeight:800,color:"#0c447c"}},quoteHeaderRow.currency||"USD")
+        !headerEditOpen && headerCustomerCountry.trim() && headerCustomerCountry.trim().toLowerCase()!=="india" && h("div",{style:{marginBottom:10}},
+          h("div",{style:{display:"flex",gap:10}},
+            h("div",{style:{position:"relative",background:"#e6f1fb",border:"2px solid #85b7eb",borderRadius:6,padding:"6px 14px"}},
+              h("div",{style:{fontSize:9.5,color:"#0c447c",fontWeight:700}},"CURRENCY"),
+              h("div",{style:{fontSize:16,fontWeight:800,color:"#0c447c"}},quoteHeaderRow.currency||"USD"),
+              h("button",{onClick:openQuickCurrencyEdit,title:"Change currency",style:{position:"absolute",top:4,right:4,width:16,height:16,padding:0,fontSize:10,lineHeight:1,border:"1px solid #85b7eb",background:"#fff",borderRadius:3,cursor:"pointer"}},"✎")
+            ),
+            h("div",{style:{background:"#e6f1fb",border:"2px solid #85b7eb",borderRadius:6,padding:"6px 14px"}},
+              h("div",{style:{fontSize:9.5,color:"#0c447c",fontWeight:700}},"1 "+(quoteHeaderRow.currency||"USD")+" = ? INR"),
+              h("div",{style:{fontSize:16,fontWeight:800,color:"#0c447c"}},quoteHeaderRow.conversion_rate||"— not set")
+            )
           ),
-          h("div",{style:{background:"#e6f1fb",border:"2px solid #85b7eb",borderRadius:6,padding:"6px 14px"}},
-            h("div",{style:{fontSize:9.5,color:"#0c447c",fontWeight:700}},"1 "+(quoteHeaderRow.currency||"USD")+" = ? INR"),
-            h("div",{style:{fontSize:16,fontWeight:800,color:"#0c447c"}},quoteHeaderRow.conversion_rate||"— not set")
+          quickCurrencyEditOpen && h("div",{style:{marginTop:8,paddingTop:8,borderTop:"1px solid #cfe3f7",display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
+            h("select",{value:headerDraft.currency,onChange:e=>{ const v=e.target.value; setHeaderDraft(d=>({...d,currency:v,conversion_rate:v==="INR"?"1":d.conversion_rate})); },style:{fontSize:12,padding:"4px 7px"}},
+              h("option",{value:"INR"},"INR"),h("option",{value:"USD"},"USD"),h("option",{value:"EUR"},"EUR"),h("option",{value:"AED"},"AED")
+            ),
+            headerDraft.currency!=="INR" && h("input",{type:"number",step:"0.0001",value:headerDraft.conversion_rate,onChange:e=>setHeaderDraft(d=>({...d,conversion_rate:e.target.value})),placeholder:"Conversion rate",style:{width:120,fontSize:12,padding:"4px 7px"}}),
+            h("button",{onClick:saveQuickCurrencyEdit,disabled:savingHeader,style:{fontSize:11,padding:"4px 9px",background:colors.dark,color:"#fff",border:"none",borderRadius:4,cursor:savingHeader?"default":"pointer",opacity:savingHeader?0.6:1}},savingHeader?"Saving…":"Save"),
+            h("button",{onClick:()=>setQuickCurrencyEditOpen(false),style:{fontSize:11,padding:"4px 9px",border:"1px solid "+colors.border,background:"#fff",borderRadius:4,cursor:"pointer"}},"Cancel")
           )
         ),
         !headerEditOpen
@@ -9434,11 +9466,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           )
         )
       ),
-      h("div",{style:{display:"flex",gap:20,flexWrap:"wrap"}},
-        h("div",{style:{width:300,flexShrink:0}},
+      h("div",{style:{display:"flex",flexDirection:"column",gap:16}},
+        h("div",{style:{width:"100%"}},
           loading?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
           h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,maxHeight:520,overflowY:"auto"}},
-            filtered.map(r=>{ const active=openRef&&openRef.id===r.id; return h("div",{key:r.id,onClick:()=>openEstimate(r),style:{padding:"10px 12px",cursor:"pointer",borderBottom:"1px solid #eceae0",background:active?colors.dark:"#fff",color:active?"#fff":colors.text,display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:6}},
+            filtered.map(r=>{ const active=openRef&&openRef.id===r.id; return h("div",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
+              h("div",{onClick:()=>openEstimate(r),style:{padding:"10px 12px",cursor:"pointer",background:active?colors.dark:"#fff",color:active?"#fff":colors.text,display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:6}},
               h("div",{style:{minWidth:0}},
                 h("div",{style:{fontWeight:600,fontSize:13}},r.reference_number+"  ·  Sl "+r.item_sl_no),
                 r.description&&h("div",{style:{fontSize:11,opacity:0.8}},r.description),
@@ -9457,18 +9490,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   style:{border:"none",background:"transparent",color:active?"#f0997b":colors.danger,cursor:"pointer",fontSize:15,padding:2,flexShrink:0,opacity:deletingSlNo===r.id?0.5:1}
                 },deletingSlNo===r.id?"…":"\u2715")
               )
-            );}),
-            filtered.length===0&&h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No quotes yet.")
-          ),
-          refFilter && h("div",{style:{marginTop:8,textAlign:"center"}},
-            h("button",{onClick:()=>{ setNewSlNoInput(""); setNewSlNoError(""); setNewSlNoStep("input"); setShowNewSlNoModal(true); },style:{width:"100%",padding:"12px",fontSize:13.5,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:6,cursor:"pointer"}},"+ Add new Sl No")
-          )
-        ),
-        h("div",{style:{flex:"1 1 400px",minWidth:0}},
-          !openRef?h("div",{style:{color:colors.mutedLight,fontSize:14,marginTop:30}},"Enter a Quote# and Sl No (or pick from the list) to view its line items."):
-          loadingLines?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
-          h(React.Fragment,null,
-            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
+              ),
+              active && !loadingLines && h("div",{style:{padding:"16px 18px",background:"#fff",color:colors.text}},
+                h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
               h("div",null,
                 h("h3",{style:{margin:0}},openRef.reference_number+"  ·  Sl No "+openRef.item_sl_no),
                 h("div",{style:{fontSize:10.5,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginTop:6,marginBottom:2}},"Description"),
@@ -9524,8 +9548,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   h("span",{style:{fontSize:10,color:"#0f6e56"}},`→ Qty by Order/Quote updates live`)
                 ),
                 h("button",{onClick:()=>setShowDatasheet(true),style:{...btnSecondary,background:"#b8590a",color:"#fff",border:"none",fontWeight:600}},"Datasheet"),
-                h("button",{onClick:readiness.ready?openOptionsTesting:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Complete Datasheets/Descriptions/pricing first",style:{...btnSecondary,background:readiness.ready?"#0f766e":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},"Options & Testing"),
-                h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line")
+                h("button",{onClick:readiness.ready?openOptionsTesting:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Complete Datasheets/Descriptions/pricing first",style:{...btnSecondary,background:readiness.ready?"#0f766e":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},"Options & Testing")
               )
             ),
             // Detail / Summary / Cutting Plan — each header card doubles as the
@@ -9565,6 +9588,21 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 )
               )
             ),
+            h("div",{style:{marginBottom:10}},
+              h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line")
+            )
+              )
+            );}),
+            filtered.length===0&&h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No quotes yet.")
+          ),
+          refFilter && h("div",{style:{marginTop:8,textAlign:"center"}},
+            h("button",{onClick:()=>{ setNewSlNoInput(""); setNewSlNoError(""); setNewSlNoStep("input"); setShowNewSlNoModal(true); },style:{width:"100%",padding:"12px",fontSize:13.5,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:6,cursor:"pointer"}},"+ Add new Sl No")
+          )
+        ),
+        h("div",{style:{width:"100%"}},
+          !openRef?h("div",{style:{color:colors.mutedLight,fontSize:14,marginTop:14}},"Select a Sl No above to view its line items."):
+          loadingLines?h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…"):
+          h(React.Fragment,null,
             !showSummarySaved&&!showCuttingPlan&&h("div",{style:fullScreenBOM?{position:"fixed",inset:0,zIndex:1000,background:"#f4f2ea",padding:20,overflowY:"auto"}:{}},
               h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
                 h("div",{style:{fontSize:13,fontWeight:700}}, fullScreenBOM?("BOM — "+(openRef?openRef.reference_number+" · Sl No "+openRef.item_sl_no:"")):""),
