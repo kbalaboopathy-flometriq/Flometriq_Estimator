@@ -1298,8 +1298,8 @@ function BomEntryForm({ onGoToTab, user }) {
   // only being able to add new lines or delete existing ones.
   const [editingRowId,setEditingRowId]=useState(null);
   const [editRowDraft,setEditRowDraft]=useState({});
-  const startEditRow = (row)=>{ setEditingRowId(row.id); setEditRowDraft({...row}); };
-  const cancelEditRow = ()=>{ setEditingRowId(null); setEditRowDraft({}); };
+  const startEditRow = (row)=>{ setEditingRowId(row.id); setEditRowDraft({...row}); setUnsavedGuard(true,"You have an unsaved BOM line edit. Leave anyway?"); };
+  const cancelEditRow = ()=>{ setEditingRowId(null); setEditRowDraft({}); setUnsavedGuard(false); };
   const setEditField = (field,value)=>{
     setEditRowDraft(d=>{ const next={...d,[field]:value}; if(field==="material_spec") delete next.grade; if(field==="component") delete next.sub_assembly; return next; });
   };
@@ -1339,8 +1339,9 @@ function BomEntryForm({ onGoToTab, user }) {
     setEditAllDrafts(drafts);
     setEditAllMode(true);
     setEditingRowId(null); setEditRowDraft({});
+    setUnsavedGuard(true,"You have unsaved BOM line edits. Leave anyway?");
   };
-  const cancelEditAll = ()=>{ setEditAllMode(false); setEditAllDrafts({}); };
+  const cancelEditAll = ()=>{ setEditAllMode(false); setEditAllDrafts({}); setUnsavedGuard(false); };
   const setEditAllField = (id,field,value)=>{
     setEditAllDrafts(d=>{
       const row={...(d[id]||{}),[field]:value};
@@ -1371,6 +1372,7 @@ function BomEntryForm({ onGoToTab, user }) {
       await logAudit("UPDATE","bom",m,"Bulk edit via \"Edit all lines\": "+updates.length+" line(s) updated for model \""+m+"\"",user?.username||"unknown",null,{lineCount:updates.length});
       setSubRows(rs=>rs.map(r=>{ const u=updates.find(x=>x.id===r.id); return u?{...r,...u}:r; }));
       setEditAllMode(false); setEditAllDrafts({});
+      setUnsavedGuard(false);
     } finally { setSavingAll(false); }
   };
   const saveEditRow = async()=>{
@@ -1387,6 +1389,7 @@ function BomEntryForm({ onGoToTab, user }) {
     await logAudit("UPDATE","bom",editingRowId,(modelInput.trim())+" — "+(payload.component),user?.username||"unknown",null,payload);
     setSubRows(rs=>rs.map(r=>r.id===editingRowId?{...r,...payload}:r));
     setEditingRowId(null); setEditRowDraft({});
+    setUnsavedGuard(false);
   };
 
   // Cluster the currently loaded model's lines by Component for easier review.
@@ -1439,6 +1442,7 @@ function BomEntryForm({ onGoToTab, user }) {
       if(field==="material_spec") { delete next.grade; }
       return next;
     });
+    setUnsavedGuard(true,"You have an unsaved new BOM line. Leave anyway?");
   };
 
   const specOptions = useMemo(()=>{
@@ -1477,9 +1481,10 @@ function BomEntryForm({ onGoToTab, user }) {
       const { data, error:err } = await sb.from("bom").insert(payload).select().single();
       if(err) throw err;
       setSubRows(r=>[...r,data]);
-      setNewRowDraft({model:newRowDraft.model});
+      setNewRowDraft({model:newRowDraft.model, item:newRowDraft.item});
       if(!allModels.includes(newRowDraft.model)) setAllModels(m=>[...m,newRowDraft.model].sort());
       setMsg("Row saved.");
+      setUnsavedGuard(false);
     } catch(e) { setMsg("Save failed: "+e.message); } finally { setSavingNew(false); }
   };
 
@@ -7202,6 +7207,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // the user to fill in. No admin code needed — this only re-syncs the
   // user's own quote, it doesn't touch master data.
   const [bomRefreshPreview,setBomRefreshPreview]=useState(null); // {estRow, itemName, willAdd:[...], willRemove:[...], untouchedCount}
+  const [showBomRefreshConfirm,setShowBomRefreshConfirm]=useState(false);
   const [bomRefreshBusy,setBomRefreshBusy]=useState(false);
   const lineKey = (l)=> (l.component||"")+"‖"+(l.sub_assembly||"");
   const openBomRefreshPreview = async(estRow)=>{
@@ -9513,9 +9519,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 ),
                 h("button",{onClick:()=>setShowDatasheet(true),style:{...btnSecondary,background:"#b8590a",color:"#fff",border:"none",fontWeight:600}},"Datasheet"),
                 h("button",{onClick:readiness.ready?openOptionsTesting:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Complete Datasheets/Descriptions/pricing first",style:{...btnSecondary,background:readiness.ready?"#0f766e":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},"Options & Testing"),
-                h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line"),
-                (readiness.incompleteBomDetails||[]).some(d=>d.slNo===openRef.item_sl_no) && h("button",{onClick:()=>openBomRefreshPreview(openRef),style:{...btnSmall,border:"1px solid #a3312a",color:"#a3312a"}},"Refresh BOM from master"),
-                isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No")
+                h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line")
               )
             ),
             // Detail / Summary / Cutting Plan — each header card doubles as the
@@ -9558,7 +9562,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             !showSummarySaved&&!showCuttingPlan&&h("div",{style:fullScreenBOM?{position:"fixed",inset:0,zIndex:1000,background:"#f4f2ea",padding:20,overflowY:"auto"}:{}},
               h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
                 h("div",{style:{fontSize:13,fontWeight:700}}, fullScreenBOM?("BOM — "+(openRef?openRef.reference_number+" · Sl No "+openRef.item_sl_no:"")):""),
-                h("button",{onClick:()=>setFullScreenBOM(f=>!f),style:{...btnSecondary,fontSize:11,padding:"4px 10px"}}, fullScreenBOM?"Esc · Close full screen":"⛶ Full screen BOM")
+                h("div",{style:{display:"flex",gap:8}},
+                  h("button",{onClick:()=>setShowBomRefreshConfirm(true),style:{...btnSmall,border:"1px solid #a3312a",color:"#a3312a"}},"Refresh BOM from master"),
+                  isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No"),
+                  h("button",{onClick:()=>setFullScreenBOM(f=>!f),style:{...btnSecondary,fontSize:11,padding:"4px 10px"}}, fullScreenBOM?"Esc · Close full screen":"⛶ Full screen BOM")
+                )
               ),
               h("div",{ref:quoteTopScrollRef,onScroll:syncQuoteScrollFromTop,style:{overflowX:"auto",overflowY:"hidden",height:14}},
                 h("div",{style:{height:1,width:quoteMeasuredWidth||quoteColWidths.reduce((a,b)=>a+b,0)}})
@@ -10038,6 +10046,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
           h("button",{onClick:()=>setBomFixUnlocked(null),style:btnSecondary},"Cancel"),
           h("button",{onClick:submitBomFixLine,disabled:savingBomFix,style:{...btnPrimary,opacity:savingBomFix?0.6:1}},savingBomFix?"Saving…":"Save to BOM Master")
+        )
+      )
+    ),
+    showBomRefreshConfirm && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Refresh this Sl No's BOM from the master?"),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},"Shows a preview of what would be added or removed before anything actually changes — nothing is applied until you confirm that preview."),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setShowBomRefreshConfirm(false),style:btnSecondary},"Cancel"),
+          h("button",{onClick:()=>setShowBomRefreshConfirm(false),style:btnSecondary},"No"),
+          h("button",{onClick:()=>{ setShowBomRefreshConfirm(false); openBomRefreshPreview(openRef); },style:btnPrimary},"Yes")
         )
       )
     ),
