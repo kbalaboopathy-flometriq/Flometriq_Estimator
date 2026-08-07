@@ -212,6 +212,17 @@ async function ensureMinSpinner(startedAt, minMs){
   const wait = (minMs||900) - (Date.now()-startedAt);
   if(wait>0) await new Promise(r=>setTimeout(r,wait));
 }
+// Case/whitespace-insensitive compare key for cascade matching (Item→Size→
+// Model and similar) — real master data drifts in casing/spacing across
+// entries, and an exact string match silently breaks narrowing when it does.
+function norm(s){ return (s==null?"":String(s)).trim().toLowerCase(); }
+// Turns readiness.missing (array of {section,items}) into an actual, specific
+// message — "complete the quote first" told nobody what was actually left,
+// and a disabled button can't be clicked to find out either.
+function formatReadinessGaps(missing){
+  if(!missing || !missing.length) return "This quote isn't marked Ready yet.";
+  return "This quote isn't Ready yet — still needed:\n\n"+missing.map(m=>"• "+m.section+": "+m.items.join(", ")).join("\n");
+}
 
 const SUPABASE_URL = "https://afqioawxgcgssktdzyql.supabase.co";
 const SUPABASE_KEY = "sb_publishable_3vYQANajyTU0wBhGjmfmgQ_eMReC9pl";
@@ -1306,8 +1317,14 @@ function BomEntryForm({ onGoToTab, user }) {
   // stays typeable (predictive text via datalist), it just limits what
   // there is to type against as you go.
   const itemOptions = useMemo(()=> Array.from(new Set(modelCatalog.map(r=>r.item).filter(Boolean))).sort(), [modelCatalog]);
-  const sizeOptionsForItem = useMemo(()=> itemFilter ? Array.from(new Set(modelCatalog.filter(r=>r.item===itemFilter).map(r=>r.size).filter(Boolean))).sort() : [], [modelCatalog,itemFilter]);
-  const modelOptionsForItemSize = useMemo(()=> (itemFilter&&sizeFilter) ? Array.from(new Set(modelCatalog.filter(r=>r.item===itemFilter&&r.size===sizeFilter).map(r=>r.model))).sort() : [], [modelCatalog,itemFilter,sizeFilter]);
+  // Case/whitespace-insensitive matching — real master data drifts (extra
+  // space, different case entered on different days), and an exact "==="
+  // match meant the cascade would silently come up empty ("Type or pick a
+  // model…" with nothing to pick) any time a stored row didn't match the
+  // typed/picked Item or Size byte-for-byte, even though a human would
+  // call it the same value.
+  const sizeOptionsForItem = useMemo(()=> itemFilter ? Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilter)).map(r=>r.size).filter(Boolean))).sort() : [], [modelCatalog,itemFilter]);
+  const modelOptionsForItemSize = useMemo(()=> (itemFilter&&sizeFilter) ? Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilter)&&norm(r.size)===norm(sizeFilter)).map(r=>r.model))).sort() : [], [modelCatalog,itemFilter,sizeFilter]);
   const handleItemSelect = (val)=>{
     setItemFilter(val); setSizeFilter(""); setModelInput(""); setMsg(""); setModelNotFoundPrompt(false); setSubRows([]); setBomStatus(null);
   };
@@ -3390,10 +3407,10 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   };
 
   const itemOptionsCascadeEst = useMemo(()=> Array.from(new Set(modelCatalog.map(r=>r.item).filter(Boolean))).sort(), [modelCatalog]);
-  const sizeOptionsForItemEst = useMemo(()=> itemFilterEst ? Array.from(new Set(modelCatalog.filter(r=>r.item===itemFilterEst).map(r=>r.size).filter(Boolean))).sort() : [], [modelCatalog,itemFilterEst]);
+  const sizeOptionsForItemEst = useMemo(()=> itemFilterEst ? Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilterEst)).map(r=>r.size).filter(Boolean))).sort() : [], [modelCatalog,itemFilterEst]);
   const modelsForItemSizeEst = useMemo(()=>{
     if(!itemFilterEst||!sizeFilterEst) return null; // null = cascade not complete yet, show nothing to pick from
-    return Array.from(new Set(modelCatalog.filter(r=>r.item===itemFilterEst&&r.size===sizeFilterEst).map(r=>r.model))).sort();
+    return Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilterEst)&&norm(r.size)===norm(sizeFilterEst)).map(r=>r.model))).sort();
   }, [modelCatalog,itemFilterEst,sizeFilterEst]);
   const handleItemSelectEst = (val)=>{ setItemFilterEst(val); setSizeFilterEst(""); setModelFilter(""); };
   const handleSizeSelectEst = (val)=>{ setSizeFilterEst(val); setModelFilter(""); };
@@ -9539,7 +9556,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}},
             h("button",{onClick:openCommercialTerms,style:{...btnSmall,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Commercial Terms"),
             h("button",{onClick:openExtraPrice,style:{...btnSmall,background:"#0f766e",color:"#fff",border:"none",fontWeight:600}},"Extra Price Addition"),
-            h("button",{onClick:readiness.ready?openGlobalTestPicker:undefined,disabled:!readiness.ready,title:readiness.ready?"":"Enabled once the quote is marked Ready",style:{...btnSmall,background:readiness.ready?"#8a4b1f":colors.border,color:readiness.ready?"#fff":colors.mutedLight,border:"none",fontWeight:600}},ndeRollupSummary?("NDE Testing ("+ndeRollupSummary.count+" item"+(ndeRollupSummary.count!==1?"s":"")+", ₹"+ndeRollupSummary.total.toFixed(0)+")"):"NDE Testing"),
+            h("button",{onClick:readiness.ready?openGlobalTestPicker:()=>alert(formatReadinessGaps(readiness.missing)),title:readiness.ready?"":"Click to see what's still needed",style:{...btnSmall,background:readiness.ready?"#8a4b1f":"#fff",color:readiness.ready?"#fff":colors.muted,border:readiness.ready?"none":"1px solid "+colors.border,fontWeight:600,cursor:"pointer"}},(ndeRollupSummary?("NDE Testing ("+ndeRollupSummary.count+" item"+(ndeRollupSummary.count!==1?"s":"")+", ₹"+ndeRollupSummary.total.toFixed(0)+")"):"NDE Testing")+(readiness.ready?"":" — quote not ready yet")),
             h("div",{style:{display:"flex",gap:4,alignItems:"center"}},
               h("input",{type:"number",step:"0.1",value:globalSfInput,onChange:e=>setGlobalSfInput(e.target.value),placeholder:"New Sf",style:{...inputStyle,width:110}}),
               h("button",{onClick:applyGlobalSf,disabled:applyingGlobalSf,style:{...btnSmall,opacity:applyingGlobalSf?0.6:1}},applyingGlobalSf?"Applying…":"Apply Sf"),
@@ -9659,7 +9676,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                       : h("span",{style:{fontSize:10,color:"#0f6e56",fontWeight:700,cursor:"pointer"},onClick:(e)=>{ e.stopPropagation(); openEstimate(r); }},r.order_qty||1)
                   ),
                   h("button",{onClick:(e)=>{ e.stopPropagation(); openEstimate(r); setShowDatasheet(true); },style:{fontSize:10,padding:"4px 9px",background:"#b8590a",color:"#fff",border:"none",borderRadius:5,cursor:"pointer",fontWeight:600}},"Datasheet"),
-                  h("button",{onClick:(e)=>{ e.stopPropagation(); openEstimate(r); if(readiness.ready) openOptionsTesting(); },style:{fontSize:10,padding:"4px 9px",background:"#0f766e",color:"#fff",border:"none",borderRadius:5,cursor:"pointer",fontWeight:600}},"Options & Testing")
+                  h("button",{onClick:readiness.ready?async(e)=>{ e.stopPropagation(); await openEstimate(r); openOptionsTesting(); }:(e)=>{ e.stopPropagation(); alert(formatReadinessGaps(readiness.missing)); },title:readiness.ready?"":"Click to see what's still needed",style:{fontSize:10,padding:"4px 9px",background:readiness.ready?"#0f766e":"#fff",color:readiness.ready?"#fff":colors.muted,border:readiness.ready?"none":"1px solid "+colors.border,borderRadius:5,cursor:"pointer",fontWeight:600}},"Options & Testing"+(readiness.ready?"":" — quote not ready yet"))
                 ),
                 h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6}},
                   h("div",{onClick:(e)=>{ e.stopPropagation(); openEstimate(r); setShowSummarySaved(false); setShowCuttingPlan(false); },style:{cursor:"pointer",border:"1px solid "+colors.border,borderRadius:5,padding:6}},
