@@ -1209,6 +1209,9 @@ function BomEntryForm({ onGoToTab, user }) {
     finally{ setBulkApplying(false); }
   };
   const [allModels, setAllModels] = useState([]);
+  const [modelCatalog, setModelCatalog] = useState([]); // [{item,size,model}] from model_tbl — powers the Item→Size→Model cascade
+  const [itemFilter, setItemFilter] = useState("");
+  const [sizeFilter, setSizeFilter] = useState("");
   const [modelInput, setModelInput] = useState("");
   const [subRows, setSubRows] = useState([]);
   const [loadingSub, setLoadingSub] = useState(false);
@@ -1222,8 +1225,8 @@ function BomEntryForm({ onGoToTab, user }) {
 
   useEffect(()=>{
     (async()=>{
-      const [bomModels, items, sizes, ciTbl, saTbl, shapes, specs, rates, uoms] = await Promise.all([
-        fetchAll("bom","model"),
+      const [modelRows, items, sizes, ciTbl, saTbl, shapes, specs, rates, uoms] = await Promise.all([
+        fetchAll("model_tbl","item,size,model"),
         fetchAll("item_tbl","item"),
         fetchAll("size_tbl","size"),
         fetchAll("component_item_tbl","component,item"),
@@ -1233,7 +1236,14 @@ function BomEntryForm({ onGoToTab, user }) {
         fetchAll("material_rates","material_spec,material_grade,rate,uom"),
         fetchAll("uom_tbl","uom"),
       ]);
-      setAllModels(Array.from(new Set(bomModels.map(r=>r.model).filter(Boolean))).sort());
+      const catalog = (modelRows||[]).filter(r=>r.model);
+      setModelCatalog(catalog);
+      // allModels now reflects every model REGISTERED in model_tbl (not just
+      // ones that already have bom rows) — fixes a latent bug the Item→Size→
+      // Model cascade would otherwise have surfaced constantly: picking a
+      // freshly-registered model with zero BOM lines yet used to wrongly hit
+      // the "doesn't exist" prompt, since the old list only had bom's models.
+      setAllModels(Array.from(new Set(catalog.map(r=>r.model))).sort());
       const gradesBySpec = new Map(), rateBySpecGrade = new Map();
       rates.forEach(r=>{
         if(!r.material_spec||!r.material_grade) return;
@@ -1277,7 +1287,21 @@ function BomEntryForm({ onGoToTab, user }) {
   };
 
   const goAddModel = ()=>{ setModelNotFoundPrompt(false); onGoToTab("model_tbl"); };
-  const stayPut = ()=>{ setModelNotFoundPrompt(false); setNewRowDraft({model:modelInput.trim(),sf:3.1}); };
+  const stayPut = ()=>{ setModelNotFoundPrompt(false); setNewRowDraft({model:modelInput.trim(),item:itemFilter||"",sf:3.1}); };
+
+  // Item → Size → Model cascade — narrows the flat model list the same way
+  // the raw-material Shape→Spec→Grade cascade narrows grades. Each step
+  // stays typeable (predictive text via datalist), it just limits what
+  // there is to type against as you go.
+  const itemOptions = useMemo(()=> Array.from(new Set(modelCatalog.map(r=>r.item).filter(Boolean))).sort(), [modelCatalog]);
+  const sizeOptionsForItem = useMemo(()=> itemFilter ? Array.from(new Set(modelCatalog.filter(r=>r.item===itemFilter).map(r=>r.size).filter(Boolean))).sort() : [], [modelCatalog,itemFilter]);
+  const modelOptionsForItemSize = useMemo(()=> (itemFilter&&sizeFilter) ? Array.from(new Set(modelCatalog.filter(r=>r.item===itemFilter&&r.size===sizeFilter).map(r=>r.model))).sort() : [], [modelCatalog,itemFilter,sizeFilter]);
+  const handleItemSelect = (val)=>{
+    setItemFilter(val); setSizeFilter(""); setModelInput(""); setMsg(""); setModelNotFoundPrompt(false); setSubRows([]); setBomStatus(null);
+  };
+  const handleSizeSelect = (val)=>{
+    setSizeFilter(val); setModelInput(""); setMsg(""); setModelNotFoundPrompt(false); setSubRows([]); setBomStatus(null);
+  };
 
   const deleteSubRow = async(id)=>{
     if(!confirm("Delete this BOM line?")) return;
@@ -1578,22 +1602,43 @@ function BomEntryForm({ onGoToTab, user }) {
       isSuperAdminBom && h("button",{onClick:()=>setShowBulkRule(true),style:{...btnSecondary,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Bulk Rule")
     ),
 
-    // Main form — model selector
-    h("div",{style:{padding:16,background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,marginBottom:16,maxWidth:480}},
-      h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Model number"),
-      h("div",{style:{display:"flex",gap:8}},
-        h("input",{
-          ref:modelInputRef, list:"bom-model-list",
-          value:modelInput, onChange:e=>handleModelSelect(e.target.value),
-          onBlur:handleModelBlur,
-          style:{...inputStyle,flex:1}, placeholder:"Type or pick a model…"
-        }),
-        modelInput&&allModels.includes(modelInput.trim())&&h("button",{
-          onClick:()=>loadSubForm(modelInput.trim()),
-          style:btnSecondary
-        },"Reload")
+    // Main form — Item → Size → Model cascade
+    h("div",{style:{padding:16,background:colors.panel,border:"1px solid "+colors.border,borderRadius:8,marginBottom:16,maxWidth:640}},
+      h("div",{style:{display:"flex",gap:10,flexWrap:"wrap"}},
+        h("div",{style:{flex:1,minWidth:170}},
+          h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Item"),
+          h("input",{
+            list:"bom-item-list", value:itemFilter, onChange:e=>handleItemSelect(e.target.value),
+            style:{...inputStyle}, placeholder:"Type or pick an item…"
+          }),
+          h("datalist",{id:"bom-item-list"},itemOptions.map(m=>h("option",{key:m,value:m})))
+        ),
+        h("div",{style:{flex:1,minWidth:170,opacity:itemFilter?1:0.5}},
+          h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Size"),
+          h("input",{
+            list:"bom-size-list", value:sizeFilter, onChange:e=>handleSizeSelect(e.target.value),
+            disabled:!itemFilter,
+            style:{...inputStyle,background:itemFilter?"#fff":colors.bg}, placeholder:itemFilter?"Type or pick a size…":"Select item first"
+          }),
+          h("datalist",{id:"bom-size-list"},sizeOptionsForItem.map(m=>h("option",{key:m,value:m})))
+        ),
+        h("div",{style:{flex:1,minWidth:170,opacity:sizeFilter?1:0.5}},
+          h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Model"),
+          h("div",{style:{display:"flex",gap:8}},
+            h("input",{
+              ref:modelInputRef, list:"bom-model-list", disabled:!sizeFilter,
+              value:modelInput, onChange:e=>handleModelSelect(e.target.value),
+              onBlur:handleModelBlur,
+              style:{...inputStyle,flex:1,background:sizeFilter?"#fff":colors.bg}, placeholder:sizeFilter?"Type or pick a model…":"Select size first"
+            }),
+            modelInput&&allModels.includes(modelInput.trim())&&h("button",{
+              onClick:()=>loadSubForm(modelInput.trim()),
+              style:btnSecondary
+            },"Reload")
+          ),
+          h("datalist",{id:"bom-model-list"},modelOptionsForItemSize.map(m=>h("option",{key:m,value:m})))
+        )
       ),
-      h("datalist",{id:"bom-model-list"},allModels.map(m=>h("option",{key:m,value:m}))),
       modelNotFoundPrompt&&h("div",{style:{marginTop:12,padding:12,background:"#fbf6e8",borderRadius:6,fontSize:13}},
         h("div",{style:{marginBottom:8,fontWeight:600}},"⚠ Model \""+modelInput.trim()+"\" doesn't exist in the database."),
         h("div",{style:{marginBottom:10,color:colors.muted}},"Go to the Models master to add it first, then come back here."),
@@ -3169,19 +3214,24 @@ function UsersEditor({ user }) {
 
 /* ---- MASTER DATA LOADER (for Estimator) ---- */
 async function loadMasterData(setMasterData) {
-  const [bomModels, rateRows, specRows, uomRows, componentRows, subAssemblyRows, customModelRows, itemRows] = await Promise.all([
+  const [bomModels, rateRows, specRows, uomRows, componentRows, subAssemblyRows, modelTblRows, itemRows] = await Promise.all([
     fetchAll("bom","model"),
     fetchAll("material_rates","material_spec,material_grade,rate,uom"),
     fetchAll("material_spec","material_spec,material_shape"),
     fetchAll("uom_tbl","uom"),
     fetchAll("component_item_tbl","component,item"),
     fetchAll("subassembly_tbl","item,component,sub_assembly"),
-    fetchAll("model_tbl","model,is_custom").then(rows=>rows.filter(r=>r.is_custom)),
+    fetchAll("model_tbl","model,is_custom,item,size"),
     fetchAll("item_tbl","item"),
   ]);
+  const customModelRows = modelTblRows.filter(r=>r.is_custom);
   const customModelName = customModelRows.length ? customModelRows[0].model : null;
   const models = Array.from(new Set(bomModels.map(r=>r.model).filter(Boolean).concat(customModelName?[customModelName]:[]))).sort();
   const itemOptions = Array.from(new Set(itemRows.map(r=>r.item).filter(Boolean))).sort();
+  // Item → Size → Model cascade catalog for the Estimator sidebar — same
+  // model_tbl triplets BomEntryForm's own cascade uses, minus the synthetic
+  // "custom" model row (it has no real item/size to cascade through).
+  const modelCatalog = modelTblRows.filter(r=>r.model && !r.is_custom);
   const gradesBySpec=new Map(), rateBySpecGrade=new Map();
   rateRows.forEach(row=>{
     if(!row.material_spec||!row.material_grade) return;
@@ -3200,12 +3250,12 @@ async function loadMasterData(setMasterData) {
     if(!list.includes(row.sub_assembly)) list.push(row.sub_assembly);
   });
   subAssembliesByComponent.forEach(list=>list.sort());
-  setMasterData({ models, customModelName, itemOptions, gradesBySpec, rateBySpecGrade, allSpecs, uoms, allComponents, subAssembliesByComponent, loadingMaster:false });
+  setMasterData({ models, customModelName, itemOptions, modelCatalog, gradesBySpec, rateBySpecGrade, allSpecs, uoms, allComponents, subAssembliesByComponent, loadingMaster:false });
 }
 
 /* ---- ESTIMATOR ---- */
 function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefresh, onOpenQuote, initialModel, onConsumedInitialModel, pendingNewSlNo, onConsumedPendingNewSlNo, onGoToTab }) {
-  const { models, customModelName, itemOptions, gradesBySpec, rateBySpecGrade, allSpecs, uoms, allComponents, subAssembliesByComponent, loadingMaster } = masterData;
+  const { models, customModelName, itemOptions, modelCatalog, gradesBySpec, rateBySpecGrade, allSpecs, uoms, allComponents, subAssembliesByComponent, loadingMaster } = masterData;
   const [isCustomModel,setIsCustomModel]=useState(false);
   const [directPriceLine,setDirectPriceLine]=useState(null); // {item,description,qty,uom,sales_price,recordAs,customModelText,excel_file_name,excel_file_path,no_excel_code}
   const [dpFile,setDpFile]=useState(null);
@@ -3214,6 +3264,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const [dpCodeVerifying,setDpCodeVerifying]=useState(false);
   const [dpAuthorizedCode,setDpAuthorizedCode]=useState(""); // once a no-Excel code is redeemed this cart-editing session, reused for further Direct Price lines without re-entering
   const [modelFilter,setModelFilter]=useState(""); const [selectedModel,setSelectedModel]=useState(null);
+  const [itemFilterEst,setItemFilterEst]=useState(""); const [sizeFilterEst,setSizeFilterEst]=useState("");
   const [lines,setLines]=useState([]); const [overrides,setOverrides]=useState({});
   const [loadingLines,setLoadingLines]=useState(false); const [error,setError]=useState("");
   const [cart,setCart]=useState([]); const [showSave,setShowSave]=useState(false);
@@ -3326,7 +3377,19 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setMocMode("shape"); setFreeText(""); setParsedMatches(null);
   };
 
-  const filteredModels = useMemo(()=>{ if(!modelFilter) return models.slice(0,80); const f=modelFilter.toLowerCase(); return models.filter(m=>m.toLowerCase().includes(f)).slice(0,80); },[modelFilter,models]);
+  const itemOptionsCascadeEst = useMemo(()=> Array.from(new Set(modelCatalog.map(r=>r.item).filter(Boolean))).sort(), [modelCatalog]);
+  const sizeOptionsForItemEst = useMemo(()=> itemFilterEst ? Array.from(new Set(modelCatalog.filter(r=>r.item===itemFilterEst).map(r=>r.size).filter(Boolean))).sort() : [], [modelCatalog,itemFilterEst]);
+  const modelsForItemSizeEst = useMemo(()=>{
+    if(!itemFilterEst||!sizeFilterEst) return null; // null = cascade not complete yet, show nothing to pick from
+    return Array.from(new Set(modelCatalog.filter(r=>r.item===itemFilterEst&&r.size===sizeFilterEst).map(r=>r.model))).sort();
+  }, [modelCatalog,itemFilterEst,sizeFilterEst]);
+  const handleItemSelectEst = (val)=>{ setItemFilterEst(val); setSizeFilterEst(""); setModelFilter(""); };
+  const handleSizeSelectEst = (val)=>{ setSizeFilterEst(val); setModelFilter(""); };
+  const filteredModels = useMemo(()=>{
+    const pool = modelsForItemSizeEst===null ? [] : modelsForItemSizeEst;
+    if(!modelFilter) return pool.slice(0,80);
+    const f=modelFilter.toLowerCase(); return pool.filter(m=>m.toLowerCase().includes(f)).slice(0,80);
+  },[modelFilter,modelsForItemSizeEst]);
 
   const selectModel = async(m)=>{
     setSelectedModel(m); setOverrides({}); setLoadingLines(true); setShowMOC(false); setMocSelections({}); setMocMode("shape"); setFreeText(""); setParsedMatches(null);
@@ -4278,11 +4341,19 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     h("div",{style:{display:"flex",minHeight:"calc(100vh - 96px)"},className:"layout"},
     h("div",{className:"sidebar",style:{width:280,flexShrink:0,borderRight:"1px solid "+colors.border,background:colors.panel,display:"flex",flexDirection:"column"}},
       h("div",{style:{padding:"16px 16px 10px"}},
-        h("div",{style:{fontSize:11,letterSpacing:"0.08em",color:colors.mutedLight,marginBottom:8}},"MODEL ("+models.length+")"),
-        h("input",{value:modelFilter,onChange:e=>setModelFilter(e.target.value),placeholder:"Type to filter models…",style:{...inputStyle,fontSize:13}})
+        customModelName&&h("button",{onClick:()=>selectModel(customModelName),style:{...btnSecondary,width:"100%",fontSize:12,marginBottom:12,background:selectedModel===customModelName?colors.dark:"#fff",color:selectedModel===customModelName?"#fff":colors.text}},"Custom — no BOM"),
+        h("div",{style:{fontSize:11,letterSpacing:"0.08em",color:colors.mutedLight,marginBottom:8}},"ITEM"),
+        h("input",{list:"est-item-list",value:itemFilterEst,onChange:e=>handleItemSelectEst(e.target.value),placeholder:"Type or pick an item…",style:{...inputStyle,fontSize:13,marginBottom:8}}),
+        h("datalist",{id:"est-item-list"},itemOptionsCascadeEst.map(m=>h("option",{key:m,value:m}))),
+        h("div",{style:{fontSize:11,letterSpacing:"0.08em",color:colors.mutedLight,marginBottom:8,opacity:itemFilterEst?1:0.5}},"SIZE"),
+        h("input",{list:"est-size-list",disabled:!itemFilterEst,value:sizeFilterEst,onChange:e=>handleSizeSelectEst(e.target.value),placeholder:itemFilterEst?"Type or pick a size…":"Select item first",style:{...inputStyle,fontSize:13,marginBottom:8,background:itemFilterEst?"#fff":colors.bg,opacity:itemFilterEst?1:0.5}}),
+        h("datalist",{id:"est-size-list"},sizeOptionsForItemEst.map(m=>h("option",{key:m,value:m}))),
+        h("div",{style:{fontSize:11,letterSpacing:"0.08em",color:colors.mutedLight,marginBottom:8,opacity:sizeFilterEst?1:0.5}},"MODEL ("+(modelsForItemSizeEst===null?0:modelsForItemSizeEst.length)+")"),
+        h("input",{disabled:!sizeFilterEst,value:modelFilter,onChange:e=>setModelFilter(e.target.value),placeholder:sizeFilterEst?"Type to filter models…":"Select size first",style:{...inputStyle,fontSize:13,background:sizeFilterEst?"#fff":colors.bg,opacity:sizeFilterEst?1:0.5}})
       ),
       h("div",{style:{overflowY:"auto",flex:1}},
         loadingMaster?h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"Loading models…"):
+        !sizeFilterEst?h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"Pick an item and size above to see models."):
         filteredModels.map(m=>h("div",{key:m,onClick:()=>selectModel(m),style:{padding:"9px 16px",fontSize:13,cursor:"pointer",background:m===selectedModel?colors.dark:"transparent",color:m===selectedModel?"#fff":colors.text,borderBottom:"1px solid #f0eee5"}},m))
       ),
       h("div",{style:{padding:"10px 16px",borderTop:"1px solid "+colors.border,display:"flex",gap:6}},
@@ -6213,14 +6284,20 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [frozenColIdxQ,setFrozenColIdxQ]=useState(null);
   const [selectedColIdxQ,setSelectedColIdxQ]=useState(null);
   const [fullScreenBOM,setFullScreenBOM]=useState(false);
+  const [fullScreenSummary,setFullScreenSummary]=useState(false);
+  const [fullScreenCuttingPlan,setFullScreenCuttingPlan]=useState(false);
   const quoteTopScrollRef=useRef(null); const quoteBottomScrollRef=useRef(null);
+  const summaryTopScrollRef=useRef(null); const summaryBottomScrollRef=useRef(null);
+  const cuttingTopScrollRef=useRef(null); const cuttingBottomScrollRef=useRef(null);
   const [quoteMeasuredWidth,setQuoteMeasuredWidth]=useState(0);
+  const [summaryMeasuredWidth,setSummaryMeasuredWidth]=useState(0);
+  const [cuttingMeasuredWidth,setCuttingMeasuredWidth]=useState(0);
   const [globalSfInput,setGlobalSfInput]=useState("");
   const [lastGlobalSfSnapshot,setLastGlobalSfSnapshot]=useState(null); // {refFilter, lines:[{reference_number,item_sl_no,sl_no,sf,sales_price}], appliedValue}
   const [restoringGlobalSf,setRestoringGlobalSf]=useState(false);
   const [applyingGlobalSf,setApplyingGlobalSf]=useState(false);
   useEffect(()=>{
-    const onKey=(e)=>{ if(e.key==="Escape") setFullScreenBOM(false); };
+    const onKey=(e)=>{ if(e.key==="Escape"){ setFullScreenBOM(false); setFullScreenSummary(false); setFullScreenCuttingPlan(false); } };
     document.addEventListener("keydown",onKey);
     return ()=>document.removeEventListener("keydown",onKey);
   },[]);
@@ -6228,6 +6305,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const QUOTE_COL_WIDTHS_NO_CP=[40,170,160,170,70,70,110,85,60,90,95,70,40];
   const syncQuoteScrollFromTop=()=>{ if(quoteBottomScrollRef.current&&quoteTopScrollRef.current) quoteBottomScrollRef.current.scrollLeft=quoteTopScrollRef.current.scrollLeft; };
   const syncQuoteScrollFromBottom=()=>{ if(quoteBottomScrollRef.current&&quoteTopScrollRef.current) quoteTopScrollRef.current.scrollLeft=quoteBottomScrollRef.current.scrollLeft; };
+  const syncSummaryScrollFromTop=()=>{ if(summaryBottomScrollRef.current&&summaryTopScrollRef.current) summaryBottomScrollRef.current.scrollLeft=summaryTopScrollRef.current.scrollLeft; };
+  const syncSummaryScrollFromBottom=()=>{ if(summaryBottomScrollRef.current&&summaryTopScrollRef.current) summaryTopScrollRef.current.scrollLeft=summaryBottomScrollRef.current.scrollLeft; };
+  const syncCuttingScrollFromTop=()=>{ if(cuttingBottomScrollRef.current&&cuttingTopScrollRef.current) cuttingBottomScrollRef.current.scrollLeft=cuttingTopScrollRef.current.scrollLeft; };
+  const syncCuttingScrollFromBottom=()=>{ if(cuttingBottomScrollRef.current&&cuttingTopScrollRef.current) cuttingTopScrollRef.current.scrollLeft=cuttingBottomScrollRef.current.scrollLeft; };
   const [lineEdits,setLineEdits]=useState({}); // {refNum-slNo: {field:value}} — pending unsaved edits
   const [savingLine,setSavingLine]=useState({}); // {refNum-slNo: true} — saving in progress
   const [quoteExportRef,setQuoteExportRef]=useState(""); const [exportingQuote,setExportingQuote]=useState("");
@@ -7843,6 +7924,26 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(el.querySelector("table")) ro.observe(el.querySelector("table"));
     return ()=>ro.disconnect();
   },[openLines.length, detailWithCuttingPlan, fullScreenBOM]);
+  useEffect(()=>{
+    const el = summaryBottomScrollRef.current;
+    if(!el) return;
+    const measure = ()=>{ const table = el.querySelector("table"); if(table) setSummaryMeasuredWidth(table.scrollWidth); };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    if(el.querySelector("table")) ro.observe(el.querySelector("table"));
+    return ()=>ro.disconnect();
+  },[showSummarySaved, fullScreenSummary]);
+  useEffect(()=>{
+    const el = cuttingBottomScrollRef.current;
+    if(!el) return;
+    const measure = ()=>{ const table = el.querySelector("table"); if(table) setCuttingMeasuredWidth(table.scrollWidth); };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    if(el.querySelector("table")) ro.observe(el.querySelector("table"));
+    return ()=>ro.disconnect();
+  },[showCuttingPlan, fullScreenCuttingPlan]);
   const [summaryBasis,setSummaryBasis]=useState("reqd"); // "reqd" | "cutting"
   const [cuttingPlanIncludeCost,setCuttingPlanIncludeCostState]=useState(getCuttingPlanIncludeCostPref);
   const setCuttingPlanIncludeCost=(v)=>{ setCuttingPlanIncludeCostState(v); setCuttingPlanIncludeCostPref(v); };
@@ -9694,35 +9795,43 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             !showSummarySaved&&!showCuttingPlan&&h("div",{style:{marginTop:10}},
               h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line")
             ),
-            showSummarySaved&&h("div",{style:{marginTop:10}},
-              h("div",{style:{padding:"12px 16px",background:"#1c2b28",borderRadius:"8px 8px 0 0",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
+            showSummarySaved&&h("div",{style:fullScreenSummary?{position:"fixed",inset:0,zIndex:1000,background:colors.bg,padding:20,overflowY:"auto"}:{marginTop:10}},
+              h("div",{style:{padding:"12px 16px",background:colors.dark,borderRadius:"8px 8px 0 0",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
                 h("div",null,
                   h("div",{style:{fontWeight:700,fontSize:15,color:"#fff"}},"Summary BOM"),
                   h("div",{style:{fontSize:11,color:colors.accent,marginTop:3}},"Quote#: "+openRef.reference_number+" · Sl No "+openRef.item_sl_no),
-                  openRef.description&&h("div",{style:{fontSize:11,color:"#8ab8ad",fontStyle:"italic",marginTop:1}},openRef.description)
+                  openRef.description&&h("div",{style:{fontSize:11,color:"rgba(255,255,255,0.55)",fontStyle:"italic",marginTop:1}},openRef.description)
                 ),
-                h("div",{style:{textAlign:"right"}},
-                  h("div",{style:{fontSize:10,color:"#9a9d8f"}},new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"})),
-                  h("div",{style:{fontSize:10,color:"#9a9d8f",marginTop:2}},savedSummaryRows.length+" groups · "+openLines.length+" lines")
+                h("div",{style:{display:"flex",alignItems:"flex-start",gap:14}},
+                  h("div",{style:{textAlign:"right"}},
+                    h("div",{style:{fontSize:10,color:"rgba(255,255,255,0.45)"}},new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"})),
+                    h("div",{style:{fontSize:10,color:"rgba(255,255,255,0.45)",marginTop:2}},savedSummaryRows.length+" groups · "+openLines.length+" lines")
+                  ),
+                  h("button",{onClick:()=>setFullScreenSummary(f=>!f),style:{background:"rgba(255,255,255,0.12)",border:"1px solid rgba(255,255,255,0.25)",color:"#fff",fontSize:11,padding:"4px 10px",borderRadius:6,cursor:"pointer",whiteSpace:"nowrap"}}, fullScreenSummary?"Esc · Close full screen":"⛶ Full screen")
                 )
               ),
-              h("div",{style:{overflow:"auto",maxHeight:"65vh",border:"1px solid "+colors.border,borderTop:"none",borderRadius:"0 0 8px 8px"}},
+              h("div",{ref:summaryTopScrollRef,onScroll:syncSummaryScrollFromTop,style:{overflowX:"auto",overflowY:"hidden",height:14,border:"1px solid "+colors.border,borderTop:"none",borderBottom:"none"}},
+                h("div",{style:{height:1,width:summaryMeasuredWidth||640}})
+              ),
+              h("div",{ref:summaryBottomScrollRef,onScroll:syncSummaryScrollFromBottom,style:{overflow:"auto",maxHeight:fullScreenSummary?"calc(100vh - 140px)":"65vh",border:"1px solid "+colors.border,borderTop:"none",borderRadius:"0 0 8px 8px"}},
                 h("table",{style:{fontSize:12.5,minWidth:640,width:"100%",borderCollapse:"separate",borderSpacing:0}},
                   h("thead",null,h("tr",{style:{textAlign:"left",background:"#faf9f4"}},
-                    ["#","Material spec","Grade","Total qty","UOM","Rate","Total cost","Total sales price","Lines"].map(c=>h("th",{key:c,style:{padding:"8px 10px",whiteSpace:"nowrap",textAlign:["Total qty","Rate","Total cost","Total sales price"].includes(c)?"right":"left",fontSize:10.5,letterSpacing:"0.03em",position:"sticky",top:0,zIndex:2,background:"#faf9f4",borderBottom:"2px solid "+colors.dark}},c))
+                    ["#","Material spec","Grade","Total qty","UOM","Rate","Total cost","Total sales price","Lines"].map((c,ci)=>h("th",{key:c,style:{padding:"8px 10px",whiteSpace:"nowrap",minWidth:ci===0?40:ci===1?150:undefined,textAlign:["Total qty","Rate","Total cost","Total sales price"].includes(c)?"right":"left",fontSize:10.5,letterSpacing:"0.03em",position:"sticky",top:0,left:ci===0?0:ci===1?40:"auto",zIndex:ci<2?3:2,background:"#faf9f4",borderBottom:"2px solid "+colors.dark}},c))
                   )),
                   h("tbody",null,(()=>{
                     const rows=[]; let idx=0; let lastShape="";
                     savedSummaryRows.forEach((r,i)=>{
                       if(r.shape!==lastShape){
                         lastShape=r.shape;
-                        rows.push(h("tr",{key:"shape-"+r.shape},h("td",{colSpan:9,style:{padding:"5px 10px",color:"#6fa99a",fontSize:10,fontWeight:700,letterSpacing:"0.08em",background:"#1c2b28"}},r.shape||"OTHER")));
+                        rows.push(h("tr",{key:"shape-"+r.shape},h("td",{colSpan:9,style:{padding:"5px 10px",color:"rgba(255,255,255,0.7)",fontSize:10,fontWeight:700,letterSpacing:"0.08em",background:colors.dark}},r.shape||"OTHER")));
                       }
                       idx++;
-                      rows.push(h("tr",{key:i,style:{borderBottom:"1px solid #eceae0",background:(!r.grade||r.totalCost===0)?"#fdecea":"transparent"}},
-                        h("td",{style:{padding:"8px 10px",color:colors.mutedLight,fontSize:11}},idx),
-                        h("td",{style:{padding:"8px 10px",fontWeight:600}},r.spec),
-                        h("td",{style:{padding:"8px 10px"}},r.grade?h("span",{style:{background:"#e1f5ee",color:"#085041",fontSize:11,padding:"2px 8px",borderRadius:10}},r.grade):h("span",{style:{background:"#fdecea",color:colors.danger,fontSize:11,padding:"2px 8px",borderRadius:10}},"no grade")),
+                      const rowBg=(!r.grade||r.totalCost===0)?"#fdecea":"transparent";
+                      const stickyBg=(!r.grade||r.totalCost===0)?"#fdecea":"#fff";
+                      rows.push(h("tr",{key:i,style:{borderBottom:"1px solid #eceae0",background:rowBg}},
+                        h("td",{style:{padding:"8px 10px",color:colors.mutedLight,fontSize:11,position:"sticky",left:0,zIndex:1,background:stickyBg}},idx),
+                        h("td",{style:{padding:"8px 10px",fontWeight:600,minWidth:150,position:"sticky",left:40,zIndex:1,background:stickyBg}},r.spec),
+                        h("td",{style:{padding:"8px 10px"}},r.grade?h("span",{style:{background:"rgba(201,160,74,0.16)",color:"#7a5a1e",fontSize:11,padding:"2px 8px",borderRadius:10}},r.grade):h("span",{style:{background:"#fdecea",color:colors.danger,fontSize:11,padding:"2px 8px",borderRadius:10}},"no grade")),
                         h("td",{style:{padding:"8px 10px",textAlign:"right",fontWeight:500}},r.totalQty%1===0?r.totalQty:r.totalQty.toFixed(3)),
                         h("td",{style:{padding:"8px 10px",color:colors.muted}},r.uom),
                         h("td",{style:{padding:"8px 10px",textAlign:"right"}},fmtR(r.rate)),
@@ -9732,7 +9841,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                       ));
                     });
                     rows.push(h("tr",{key:"total",style:{background:colors.dark}},
-                      h("td",{colSpan:6,style:{padding:"9px 10px",color:"#9a9d8f",fontSize:11}},"TOTAL — "+savedSummaryRows.length+" groups from "+openLines.length+" lines"),
+                      h("td",{colSpan:6,style:{padding:"9px 10px",color:"rgba(255,255,255,0.6)",fontSize:11,position:"sticky",left:0,zIndex:1,background:colors.dark}},"TOTAL — "+savedSummaryRows.length+" groups from "+openLines.length+" lines"),
                       h("td",{style:{padding:"9px 10px",textAlign:"right",fontWeight:700,color:"#fff"}},fmtR(totalCost)),
                       h("td",{style:{padding:"9px 10px",textAlign:"right",fontWeight:700,color:colors.accent}},fmtR(totalSales)),
                       h("td",null)
@@ -9742,30 +9851,36 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 )
               )
             ),
-            showCuttingPlan&&h("div",{style:{marginTop:10}},
-              h("div",{style:{padding:"12px 16px",background:"#1c2b28",borderRadius:"8px 8px 0 0",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
+            showCuttingPlan&&h("div",{style:fullScreenCuttingPlan?{position:"fixed",inset:0,zIndex:1000,background:colors.bg,padding:20,overflowY:"auto"}:{marginTop:10}},
+              h("div",{style:{padding:"12px 16px",background:colors.dark,borderRadius:"8px 8px 0 0",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
                 h("div",null,
                   h("div",{style:{fontWeight:700,fontSize:15,color:"#fff"}},"Cutting Plan"),
                   h("div",{style:{fontSize:11,color:colors.accent,marginTop:3}},"Quote#: "+openRef.reference_number+" · Sl No "+openRef.item_sl_no),
-                  openRef.description&&h("div",{style:{fontSize:11,color:"#8ab8ad",fontStyle:"italic",marginTop:1}},openRef.description)
+                  openRef.description&&h("div",{style:{fontSize:11,color:"rgba(255,255,255,0.55)",fontStyle:"italic",marginTop:1}},openRef.description)
                 ),
-                h("div",{style:{textAlign:"right"}},
-                  h("div",{style:{fontSize:10,color:"#9a9d8f"}},new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"})),
-                  h("div",{style:{fontSize:10,color:"#9a9d8f",marginTop:2}},cuttingPlanRows.length+" groups · "+openLines.length+" lines")
+                h("div",{style:{display:"flex",alignItems:"flex-start",gap:14}},
+                  h("div",{style:{textAlign:"right"}},
+                    h("div",{style:{fontSize:10,color:"rgba(255,255,255,0.45)"}},new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"})),
+                    h("div",{style:{fontSize:10,color:"rgba(255,255,255,0.45)",marginTop:2}},cuttingPlanRows.length+" groups · "+openLines.length+" lines")
+                  ),
+                  h("button",{onClick:()=>setFullScreenCuttingPlan(f=>!f),style:{background:"rgba(255,255,255,0.12)",border:"1px solid rgba(255,255,255,0.25)",color:"#fff",fontSize:11,padding:"4px 10px",borderRadius:6,cursor:"pointer",whiteSpace:"nowrap"}}, fullScreenCuttingPlan?"Esc · Close full screen":"⛶ Full screen")
                 )
               ),
-              h("div",{style:{overflow:"auto",maxHeight:"65vh",border:"1px solid "+colors.border,borderTop:"none",borderRadius:"0 0 8px 8px"}},
+              h("div",{ref:cuttingTopScrollRef,onScroll:syncCuttingScrollFromTop,style:{overflowX:"auto",overflowY:"hidden",height:14,border:"1px solid "+colors.border,borderTop:"none",borderBottom:"none"}},
+                h("div",{style:{height:1,width:cuttingMeasuredWidth||640}})
+              ),
+              h("div",{ref:cuttingBottomScrollRef,onScroll:syncCuttingScrollFromBottom,style:{overflow:"auto",maxHeight:fullScreenCuttingPlan?"calc(100vh - 140px)":"65vh",border:"1px solid "+colors.border,borderTop:"none",borderRadius:"0 0 8px 8px"}},
                 h("table",{style:{fontSize:12.5,minWidth:640,width:"100%",borderCollapse:"separate",borderSpacing:0}},
                   h("thead",null,h("tr",{style:{textAlign:"left",background:"#faf9f4"}},
-                    (cuttingPlanIncludeCost?["#","Material spec","Grade","Cutting plan","Total cutting qty","UOM","Rate","Total cost","Lines"]:["#","Material spec","Grade","Cutting plan","Total cutting qty","UOM","Lines"]).map(c=>h("th",{key:c,style:{padding:"8px 10px",whiteSpace:"nowrap",textAlign:["Total cutting qty","Rate","Total cost"].includes(c)?"right":"left",fontSize:10.5,letterSpacing:"0.03em",position:"sticky",top:0,zIndex:2,background:"#faf9f4",borderBottom:"2px solid "+colors.dark}},c))
+                    (cuttingPlanIncludeCost?["#","Material spec","Grade","Cutting plan","Total cutting qty","UOM","Rate","Total cost","Lines"]:["#","Material spec","Grade","Cutting plan","Total cutting qty","UOM","Lines"]).map((c,ci)=>h("th",{key:c,style:{padding:"8px 10px",whiteSpace:"nowrap",minWidth:ci===0?40:ci===1?150:undefined,textAlign:["Total cutting qty","Rate","Total cost"].includes(c)?"right":"left",fontSize:10.5,letterSpacing:"0.03em",position:"sticky",top:0,left:ci===0?0:ci===1?40:"auto",zIndex:ci<2?3:2,background:"#faf9f4",borderBottom:"2px solid "+colors.dark}},c))
                   )),
                   h("tbody",null,(()=>{
                     const rows=[];
                     cuttingPlanRows.forEach((r,i)=>{
                       rows.push(h("tr",{key:i,style:{borderBottom:"1px solid #eceae0"}},
-                        h("td",{style:{padding:"8px 10px",color:colors.mutedLight,fontSize:11}},i+1),
-                        h("td",{style:{padding:"8px 10px",fontWeight:600}},r.spec),
-                        h("td",{style:{padding:"8px 10px"}},r.grade?h("span",{style:{background:"#e1f5ee",color:"#085041",fontSize:11,padding:"2px 8px",borderRadius:10}},r.grade):h("span",{style:{color:colors.mutedLight,fontSize:11}},"(no grade)")),
+                        h("td",{style:{padding:"8px 10px",color:colors.mutedLight,fontSize:11,position:"sticky",left:0,zIndex:1,background:"#fff"}},i+1),
+                        h("td",{style:{padding:"8px 10px",fontWeight:600,minWidth:150,position:"sticky",left:40,zIndex:1,background:"#fff"}},r.spec),
+                        h("td",{style:{padding:"8px 10px"}},r.grade?h("span",{style:{background:"rgba(201,160,74,0.16)",color:"#7a5a1e",fontSize:11,padding:"2px 8px",borderRadius:10}},r.grade):h("span",{style:{color:colors.mutedLight,fontSize:11}},"(no grade)")),
                         h("td",{style:{padding:"8px 10px"}},r.cuttingPlan),
                         h("td",{style:{padding:"8px 10px",textAlign:"right",fontWeight:500}},r.totalQty%1===0?r.totalQty:r.totalQty.toFixed(3)),
                         h("td",{style:{padding:"8px 10px",color:colors.muted}},r.uom),
@@ -9775,7 +9890,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                       ));
                     });
                     rows.push(h("tr",{key:"total",style:{background:colors.dark}},
-                      h("td",{colSpan:cuttingPlanIncludeCost?6:4,style:{padding:"9px 10px",color:"#9a9d8f",fontSize:11}},"TOTAL — "+cuttingPlanRows.length+" groups from "+openLines.length+" lines"),
+                      h("td",{colSpan:cuttingPlanIncludeCost?6:4,style:{padding:"9px 10px",color:"rgba(255,255,255,0.6)",fontSize:11,position:"sticky",left:0,zIndex:1,background:colors.dark}},"TOTAL — "+cuttingPlanRows.length+" groups from "+openLines.length+" lines"),
                       cuttingPlanIncludeCost&&h("td",{style:{padding:"9px 10px",textAlign:"right",fontWeight:700,color:"#fff"}},fmtR(cuttingPlanRows.reduce((s,r)=>s+r.totalCost,0))),
                       h("td",null)
                     ));
@@ -16864,7 +16979,7 @@ function App() {
     setSessionCompanyId(id);
     try{ if(id) sessionStorage.setItem("flometriq_session_company",id); else sessionStorage.removeItem("flometriq_session_company"); }catch(e){}
   };
-  const [masterData,setMasterData]=useState({models:[],customModelName:null,itemOptions:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],uoms:[],allComponents:[],subAssembliesByComponent:new Map(),loadingMaster:true});
+  const [masterData,setMasterData]=useState({models:[],customModelName:null,itemOptions:[],modelCatalog:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],uoms:[],allComponents:[],subAssembliesByComponent:new Map(),loadingMaster:true});
   const [quoteToOpen,setQuoteToOpen]=useState(null); // {reference_number,item_sl_no} bridge from Estimator's save popup to Quotes
   const [openModelTarget,setOpenModelTarget]=useState(null); // model string bridge from BOM Coverage's "Open BOM" button to Estimator
   const [pendingNewSlNo,setPendingNewSlNo]=useState(null); // {reference_number,item_sl_no} bridge from Quotes' "+ New Sl No" to Estimator
