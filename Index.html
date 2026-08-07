@@ -3927,9 +3927,28 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     if(!selectedModel){ alert("Select a model first."); return; }
     if(computedLines.length===0){ alert("This model has no BOM lines loaded — nothing to add. Try reselecting it, or Refresh from the sidebar."); return; }
     const toAdd=computedLines.map(l=>({model:selectedModel,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec||"",grade:l.selGrade||(l.hasSpec?"":""),qty_required:l.qty,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.salesPrice,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||""}));
-    setCart(c=>c.concat(toAdd));
-    if(holdingNewSlNo) return; // already know the Quote#/Sl No — no need to ask again
-    setTimeout(()=>{ setShowAddGateway(true); setGatewayStep("quote"); setGatewayRef(""); setGatewaySiblings(null); setGatewaySlNoInput(""); setGatewaySlNoWarn(false); loadQuoteOptions(); }, 0);
+    return toAdd;
+  };
+  // Footer "Save estimate" button — replaces the old "Add this model to the
+  // cart" (which, once a Quote#/Sl No was already known via the banner,
+  // silently added to the cart and left the only visible next step — "Save
+  // to estimate" — scrolled off-screen above the BOM table). This merges
+  // add-to-cart and save into one click, and passes the freshly-merged cart
+  // directly into the save functions (cartOverride) instead of relying on
+  // `cart` state, which wouldn't have caught up yet inside this same click.
+  const saveEstimateFromBom = async()=>{
+    const toAdd = addCurrentModelToCart();
+    if(!toAdd) return; // addCurrentModelToCart already alerted why
+    const newCart = cart.concat(toAdd);
+    setCart(()=>newCart);
+    if(!holdingNewSlNo){
+      // Fresh session, no Quote#/Sl No known yet — ask for it. This gateway
+      // popup is itself the visible feedback for this click.
+      setShowAddGateway(true); setGatewayStep("quote"); setGatewayRef(""); setGatewaySiblings(null); setGatewaySlNoInput(""); setGatewaySlNoWarn(false); loadQuoteOptions();
+      return;
+    }
+    if(holdingNewSlNo.isNewQuote){ setShowSave(true); return; } // needs header details first — no way around that popup
+    await saveExistingSlNoDirect(false, newCart);
   };
 
   const removeFromCart = (idx)=>setCart(c=>c.filter((_,i)=>i!==idx));
@@ -4080,11 +4099,12 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       if(onOpenQuote) onOpenQuote(reference_number, item_sl_no, false);
     }
   };
-  const saveExistingSlNoDirect = async(skipDatasheetPrompt)=>{
-    if(cart.length===0){ alert("Add at least one model's lines to the cart first."); return false; }
+  const saveExistingSlNoDirect = async(skipDatasheetPrompt, cartOverride)=>{
+    const effectiveCart = cartOverride || cart;
+    if(effectiveCart.length===0){ alert("Add at least one model's lines to the cart first."); return false; }
     if(!refDesc.trim()){ alert("Description is required — it should have auto-filled once the model loaded; enter one manually if this item has no Description Master entry yet."); return false; }
     setSimpleSaving(true);
-    const ok = await saveReference();
+    const ok = await saveReference(cartOverride);
     setSimpleSaving(false);
     if(ok && holdingNewSlNo && !skipDatasheetPrompt) await afterNewSlNoSave();
     return ok;
@@ -4138,15 +4158,17 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setRefNumber(""); setQuoteDecision(null);
   };
 
-  const saveReference = async()=>{
+  const saveReference = async(cartOverride)=>{
+    const effectiveCart = cartOverride || cart;
     setSaveMsg("");
-    if(!refNumber.trim()){setSaveMsg("Enter a Quote#.");return;}
-    if(!String(itemSlNo).trim()){setSaveMsg("Enter a Sl No.");return;}
-    if(!enquiryNumber.trim()){setSaveMsg("Enter an Enquiry number.");return;}
-    if(!refDesc.trim()){setSaveMsg("Description is required for every Sl No.");return;}
-    if(customerName.trim() && !customerCountry.trim()){setSaveMsg("This customer has no country on file. Add one in Master Data → Customers before continuing — currency and conversion rate depend on it.");return;}
-    if(currency!=="INR" && !(Number(conversionRate)>0)){setSaveMsg("Enter a conversion rate (1 "+currency+" = ? INR) before saving — required for any non-INR quote.");return;}
-    if(cart.length===0){setSaveMsg("Add at least one model's lines to the estimate first.");return;}
+    const fail = (m)=>{ setSaveMsg(m); if(!showSave) alert(m); };
+    if(!refNumber.trim()){fail("Enter a Quote#.");return;}
+    if(!String(itemSlNo).trim()){fail("Enter a Sl No.");return;}
+    if(!enquiryNumber.trim()){fail("Enter an Enquiry number.");return;}
+    if(!refDesc.trim()){fail("Description is required for every Sl No.");return;}
+    if(customerName.trim() && !customerCountry.trim()){fail("This customer has no country on file. Add one in Master Data → Customers before continuing — currency and conversion rate depend on it.");return;}
+    if(currency!=="INR" && !(Number(conversionRate)>0)){fail("Enter a conversion rate (1 "+currency+" = ? INR) before saving — required for any non-INR quote.");return;}
+    if(effectiveCart.length===0){fail("Add at least one model's lines to the estimate first.");return;}
     const ref=refNumber.trim();
     const slNo=Number(itemSlNo);
     if(savingRef) return; // guards against a double-click sneaking a second save through before the button disables
@@ -4165,8 +4187,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         ? "Sl No "+slNo+" already exists under Quote# \""+ref+"\". Saving now will overwrite its existing line items. Proceed?"
         : "Quote# \""+ref+"\" already exists. This will add a new line item as Sl No "+slNo+" alongside its existing Sl No(s) ("+usedSlNos.join(", ")+"). Proceed?";
       if(!confirm(msg)) { setSavingRef(false); setSaveMsg("Save cancelled — nothing was changed. Click \"Confirm save\" again if you want to proceed."); return; }
-    }
-    setGatewayConfirmedNewSlNo(false);
+    }    setGatewayConfirmedNewSlNo(false);
     // Which company this quote is issued under is resolved once, at the
     // moment the Quote# is FIRST created, and never changes afterward —
     // even if a different Super Admin later edits or re-saves it. If the
@@ -4176,7 +4197,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       : (user.role==="super_admin" ? sessionCompanyId : (user.company_id||null));
     let estimateId, createdNewHeader=false;
     try {
-      const headerModel = (cart[0]&&cart[0].model) || selectedModel || "";
+      const headerModel = (effectiveCart[0]&&effectiveCart[0].model) || selectedModel || "";
       const {data:existing}=await sb.from("estimates").select("id").eq("reference_number",ref).eq("item_sl_no",slNo).limit(1);
       const headerPayload={description:refDesc,model:headerModel,enquiry_number:enquiryNumber.trim(),enquiry_date:enquiryDate||null,quote_date:quoteDate||null,currency:currency||"INR",conversion_rate:(currency==="INR")?1:(Number(conversionRate)||1),customer_name:customerName.trim(),customer_address:customerAddress.trim(),contact_name:contactName.trim(),contact_designation:contactDesignation.trim(),signatory_name:signatoryName.trim(),signatory_designation:signatoryDesignation.trim(),updated_at:new Date().toISOString()};
       if(existing&&existing.length>0){
@@ -4189,9 +4210,10 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         estimateId=created.id; createdNewHeader=true;
         promoteCompanyToLead(resolvedCompanyId, headerPayload.customer_name);
       }
-      const rows=cart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||"",is_direct_price:l.is_direct_price===true,validation_status:l.validation_status||null,excel_file_name:l.excel_file_name||null,excel_file_path:l.excel_file_path||null,no_excel_code_used:l.no_excel_code_used||null,added_by:l.added_by||null,custom_item:l.custom_item||null,custom_model_recorded:l.custom_model_recorded||null}));
+      const rows=effectiveCart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||"",is_direct_price:l.is_direct_price===true,validation_status:l.validation_status||null,excel_file_name:l.excel_file_name||null,excel_file_path:l.excel_file_path||null,no_excel_code_used:l.no_excel_code_used||null,added_by:l.added_by||null,custom_item:l.custom_item||null,custom_model_recorded:l.custom_model_recorded||null}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
-      setSaveMsg("Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).");
+      const successMsg = "Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).";
+      setSaveMsg(successMsg); if(!showSave) alert(successMsg);
       setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setConversionRate("1"); setCustomerName(""); setCustomerAddress(""); setContactName(""); setContactDesignation(""); setSignatoryName(""); setSignatoryDesignation(""); setExistingQuoteHeader(null); setShowSave(false);
       return true;
     } catch(e){
@@ -4203,7 +4225,8 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       if(createdNewHeader && estimateId){
         try{ await sb.from("estimates").delete().eq("id",estimateId); }catch(cleanupErr){}
       }
-      setSaveMsg("Save failed: "+(e.message||"unknown"));
+      const failMsg = "Save failed: "+(e.message||"unknown");
+      setSaveMsg(failMsg); alert(failMsg); // always alert on a thrown failure, even with the modal open — this is a hard failure, not a validation nudge
       return false;
     } finally{setSavingRef(false);}
   };
@@ -4655,7 +4678,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         h("datalist",{id:"spec-list-est"},allSpecs.map(s=>h("option",{key:s,value:s}))),
         h("div",{style:{marginTop:14,display:"flex",gap:8,flexWrap:"wrap"}},
           h("button",{onClick:()=>{ if(!confirm("Clear all "+lines.length+" line item(s) from this draft? This cannot be undone.")) return; setLines([]); setOverrides({}); },disabled:lines.length===0,style:{...btnSecondary,color:colors.danger,borderColor:"#f0b8b8",opacity:lines.length===0?0.5:1}},"Clear all lines"),
-          h("button",{onClick:addCurrentModelToCart,style:{...btnPrimary,marginLeft:"auto"}},"Add this model to the cart")
+          h("button",{onClick:saveEstimateFromBom,disabled:simpleSaving,style:{...btnPrimary,marginLeft:"auto",opacity:simpleSaving?0.6:1}},simpleSaving?"Saving…":"Save estimate")
         )
       )
     ),
@@ -11911,8 +11934,7 @@ const MANUAL_SECTIONS = [
               "Fix any line missing a Grade \u2014 the count of items still needing one shows in red until you're done.",
               "Use the Show in MOC checkboxes to control which lines appear on the datasheet's Material Data section later.",
               "Switch between the Detail / Summary / Cutting Plan cards to check totals different ways before saving.",
-              "Click \"Add this model to the cart\" to push this model's lines into your cart \u2014 renamed from \"+ Add to estimate\" since it was easy to mistake for the final save.",
-              "Fill in Quote#, Sl No, and the other header fields, then Save \u2014 this becomes one line item of a quote."
+              "Click \"Save estimate\" at the bottom \u2014 it adds this model's lines and saves in one step. A brand-new quote asks for header details (Customer, Enquiry#, etc.) first; an existing quote's Sl No saves straight away."
             ]
           },
           {
