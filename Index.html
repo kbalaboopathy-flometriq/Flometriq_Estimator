@@ -216,6 +216,28 @@ async function ensureMinSpinner(startedAt, minMs){
 // Model and similar) — real master data drifts in casing/spacing across
 // entries, and an exact string match silently breaks narrowing when it does.
 function norm(s){ return (s==null?"":String(s)).trim().toLowerCase(); }
+// Natural/numeric-aware string comparator — plain .sort() treats "150nb" as
+// less than "50nb" because it compares character-by-character ("1" < "5"),
+// which silently mis-orders any list of model/size names once sizes cross a
+// digit-length boundary (2-digit vs 3-digit vs 4-digit). This splits each
+// string into alternating text/number chunks and compares number chunks
+// numerically instead of as text — handles size (NB) AND class rating (CL)
+// tokens the same way, with no size-specific lookup table to maintain.
+// STANDARD going forward: any list of model or size names gets sorted with
+// this, never a bare .sort().
+function naturalCompare(a,b){
+  const chunk = s => { const out=[]; String(s).replace(/(\d+)|(\D+)/g,(_,d,t)=>{ out.push(d!=null?parseInt(d,10):t); return ""; }); return out; };
+  const ax=chunk(a), bx=chunk(b);
+  const len=Math.max(ax.length,bx.length);
+  for(let i=0;i<len;i++){
+    const av=ax[i], bv=bx[i];
+    if(av===undefined) return -1;
+    if(bv===undefined) return 1;
+    if(typeof av==="number" && typeof bv==="number"){ if(av!==bv) return av-bv; }
+    else { const c=String(av).localeCompare(String(bv)); if(c) return c; }
+  }
+  return 0;
+}
 // Turns readiness.missing (array of {section,items}) into an actual, specific
 // message — "complete the quote first" told nobody what was actually left,
 // and a disabled button can't be clicked to find out either.
@@ -1266,7 +1288,7 @@ function BomEntryForm({ onGoToTab, user }) {
       // Model cascade would otherwise have surfaced constantly: picking a
       // freshly-registered model with zero BOM lines yet used to wrongly hit
       // the "doesn't exist" prompt, since the old list only had bom's models.
-      setAllModels(Array.from(new Set(catalog.map(r=>r.model))).sort());
+      setAllModels(Array.from(new Set(catalog.map(r=>r.model))).sort(naturalCompare));
       const gradesBySpec = new Map(), rateBySpecGrade = new Map();
       rates.forEach(r=>{
         if(!r.material_spec||!r.material_grade) return;
@@ -1323,8 +1345,8 @@ function BomEntryForm({ onGoToTab, user }) {
   // model…" with nothing to pick) any time a stored row didn't match the
   // typed/picked Item or Size byte-for-byte, even though a human would
   // call it the same value.
-  const sizeOptionsForItem = useMemo(()=> itemFilter ? Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilter)).map(r=>r.size).filter(Boolean))).sort() : [], [modelCatalog,itemFilter]);
-  const modelOptionsForItemSize = useMemo(()=> (itemFilter&&sizeFilter) ? Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilter)&&norm(r.size)===norm(sizeFilter)).map(r=>r.model))).sort() : [], [modelCatalog,itemFilter,sizeFilter]);
+  const sizeOptionsForItem = useMemo(()=> itemFilter ? Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilter)).map(r=>r.size).filter(Boolean))).sort(naturalCompare) : [], [modelCatalog,itemFilter]);
+  const modelOptionsForItemSize = useMemo(()=> (itemFilter&&sizeFilter) ? Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilter)&&norm(r.size)===norm(sizeFilter)).map(r=>r.model))).sort(naturalCompare) : [], [modelCatalog,itemFilter,sizeFilter]);
   const handleItemSelect = (val)=>{
     setItemFilter(val); setSizeFilter(""); setModelInput(""); setMsg(""); setModelNotFoundPrompt(false); setSubRows([]); setBomStatus(null);
   };
@@ -1852,7 +1874,7 @@ function MasterEditor({ tableKey, user }) {
     } finally { setModelsExportBusy(false); }
   };
 
-  useEffect(()=>{ if(tableKey==="bom") fetchAll("bom","model").then(d=>setAllModels(Array.from(new Set(d.map(r=>r.model).filter(Boolean))).sort())); },[tableKey]);
+  useEffect(()=>{ if(tableKey==="bom") fetchAll("bom","model").then(d=>setAllModels(Array.from(new Set(d.map(r=>r.model).filter(Boolean))).sort(naturalCompare))); },[tableKey]);
 
   // BOM cleanup workflow: focus the BOM screen on one model at a time,
   // group its lines by Component, and track a Dirty/Cleaning Up/Clean flag
@@ -2264,7 +2286,7 @@ function MasterEditor({ tableKey, user }) {
   const [renameOld,setRenameOld]=useState(""); const [renameNew,setRenameNew]=useState("");
   const [renameBusy,setRenameBusy]=useState(false); const [renameMsg,setRenameMsg]=useState("");
   const [allModelNamesForRename,setAllModelNamesForRename]=useState([]);
-  useEffect(()=>{ if(tableKey==="model_tbl") fetchAll("model_tbl","model").then(d=>setAllModelNamesForRename(Array.from(new Set(d.map(r=>r.model).filter(Boolean))).sort())); },[tableKey]);
+  useEffect(()=>{ if(tableKey==="model_tbl") fetchAll("model_tbl","model").then(d=>setAllModelNamesForRename(Array.from(new Set(d.map(r=>r.model).filter(Boolean))).sort(naturalCompare))); },[tableKey]);
   const renameModel = async()=>{
     setRenameMsg("");
     if(!renameOld){ setRenameMsg("Pick the model to rename."); return; }
@@ -3255,7 +3277,7 @@ async function loadMasterData(setMasterData) {
   ]);
   const customModelRows = modelTblRows.filter(r=>r.is_custom);
   const customModelName = customModelRows.length ? customModelRows[0].model : null;
-  const models = Array.from(new Set(bomModels.map(r=>r.model).filter(Boolean).concat(customModelName?[customModelName]:[]))).sort();
+  const models = Array.from(new Set(bomModels.map(r=>r.model).filter(Boolean).concat(customModelName?[customModelName]:[]))).sort(naturalCompare);
   const itemOptions = Array.from(new Set(itemRows.map(r=>r.item).filter(Boolean))).sort();
   // Item → Size → Model cascade catalog for the Estimator sidebar — same
   // model_tbl triplets BomEntryForm's own cascade uses, minus the synthetic
@@ -3407,10 +3429,10 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   };
 
   const itemOptionsCascadeEst = useMemo(()=> Array.from(new Set(modelCatalog.map(r=>r.item).filter(Boolean))).sort(), [modelCatalog]);
-  const sizeOptionsForItemEst = useMemo(()=> itemFilterEst ? Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilterEst)).map(r=>r.size).filter(Boolean))).sort() : [], [modelCatalog,itemFilterEst]);
+  const sizeOptionsForItemEst = useMemo(()=> itemFilterEst ? Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilterEst)).map(r=>r.size).filter(Boolean))).sort(naturalCompare) : [], [modelCatalog,itemFilterEst]);
   const modelsForItemSizeEst = useMemo(()=>{
     if(!itemFilterEst||!sizeFilterEst) return null; // null = cascade not complete yet, show nothing to pick from
-    return Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilterEst)&&norm(r.size)===norm(sizeFilterEst)).map(r=>r.model))).sort();
+    return Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilterEst)&&norm(r.size)===norm(sizeFilterEst)).map(r=>r.model))).sort(naturalCompare);
   }, [modelCatalog,itemFilterEst,sizeFilterEst]);
   const handleItemSelectEst = (val)=>{ setItemFilterEst(val); setSizeFilterEst(""); setModelFilter(""); };
   const handleSizeSelectEst = (val)=>{ setSizeFilterEst(val); setModelFilter(""); };
@@ -16331,7 +16353,7 @@ function ReportsScreen({ user, onOpenModel }) {
   useEffect(()=>{ load(); },[load]);
 
   const allItems = useMemo(()=> Array.from(new Set(modelRows.map(r=>r.item).filter(Boolean))).sort(), [modelRows]);
-  const allModelNames = useMemo(()=> Array.from(new Set(modelRows.map(r=>r.model).filter(Boolean))).sort(), [modelRows]);
+  const allModelNames = useMemo(()=> Array.from(new Set(modelRows.map(r=>r.model).filter(Boolean))).sort(naturalCompare), [modelRows]);
   const allCategories = useMemo(()=> Array.from(new Set(modelRows.map(r=>r.category).filter(Boolean))).sort(), [modelRows]);
   const filtersActive = itemFilter||modelFilter||categoryFilter||search;
 
