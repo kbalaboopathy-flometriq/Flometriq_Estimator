@@ -10,6 +10,7 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tabler-icons/3.44.0/tabler-icons.min.css" />
 <style>
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
@@ -24,6 +25,8 @@ table { width: 100%; border-collapse: collapse; }
   .topbar-user { display: none !important; }
   .menu-tabs { overflow-x: auto; white-space: nowrap; }
 }
+@keyframes hourglass-flip { 0%,100% { transform: rotate(0deg); } 50% { transform: rotate(180deg); } }
+.hourglass-spin { display: inline-block; animation: hourglass-flip 1.4s ease-in-out infinite; }
 </style>
 </head>
 <body>
@@ -199,6 +202,15 @@ function setUnsavedGuard(dirty, message, saveFn){
 function confirmLeaveIfDirty(){
   if(!window.__unsavedGuard.dirty) return true;
   return confirm(window.__unsavedGuard.message);
+}
+// Keeps a "Saving…" spinner on screen for at least minMs even when the save
+// itself finishes faster — a save that flashes and vanishes in 80ms reads as
+// broken/untrustworthy even when it worked. startedAt is a Date.now() taken
+// right before the actual write begins (after any confirm() prompt, so the
+// artificial delay doesn't stack on top of a real user pause).
+async function ensureMinSpinner(startedAt, minMs){
+  const wait = (minMs||900) - (Date.now()-startedAt);
+  if(wait>0) await new Promise(r=>setTimeout(r,wait));
 }
 
 const SUPABASE_URL = "https://afqioawxgcgssktdzyql.supabase.co";
@@ -3980,6 +3992,18 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     onOpenQuote(gatewayRef.trim(), firstSlNo);
   };
   const gatewayGoToSlNoStep = ()=>{ setGatewaySlNoInput(""); setGatewaySlNoWarn(false); setGatewayStep("slNo"); };
+  // Country is never stored on `estimates` itself — it only ever lives in
+  // local state, set when a customer is freshly picked via CustomerSelect.
+  // Every path below that inherits a header from an EXISTING quote (add
+  // another Sl No) was copying name/address/currency forward but never
+  // re-deriving country, so the "no country on file" save-guard fired even
+  // for customers that plainly have one — same lookup-by-name pattern the
+  // Quotes screen's own header editor already uses for this exact problem.
+  const fetchCustomerCountry = async(name)=>{
+    if(!name || !name.trim()) return "";
+    const { data } = await sb.from("companies").select("billing_country").eq("company_name",name.trim()).maybeSingle();
+    return (data && data.billing_country) || "";
+  };
   const gatewaySlNoContinue = async()=>{
     const slNo = Number(gatewaySlNoInput);
     if(!slNo || slNo<=0) return;
@@ -3998,6 +4022,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setExistingQuoteHeader({ usedSlNos: gatewaySiblings.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
     setGatewayConfirmedNewSlNo(true);
     setShowAddGateway(false);
+    setCustomerCountry(await fetchCustomerCountry(head.customer_name));
   };
   const [holdingNewSlNo,setHoldingNewSlNo]=useState(null); // {reference_number,item_sl_no,isNewQuote} banner shown while building this line
   useEffect(()=>{
@@ -4025,6 +4050,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       setSignatoryName(head.signatory_name||""); setSignatoryDesignation(head.signatory_designation||"");
       setRefNumber(ref); setItemSlNo(String(pendingNewSlNo.item_sl_no)); setRefDesc("");
       setGatewayConfirmedNewSlNo(true);
+      setCustomerCountry(await fetchCustomerCountry(head.customer_name));
       setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no, isNewQuote});
       // Existing quote: header already carries over, and Description will
       // auto-fill once a model's BOM loads — no separate popup needed here.
@@ -4133,7 +4159,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
 
   // "Create another line item" — lock in the shared header fields from the
   // existing quote and let the person type a new Sl No for this new BOM.
-  const chooseAddLineItem = ()=>{
+  const chooseAddLineItem = async()=>{
     const head = quoteDecision.rows[0];
     setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
     setCurrency(head.currency||"INR"); setConversionRate(String(head.conversion_rate||1));
@@ -4144,6 +4170,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setExistingQuoteHeader({ usedSlNos: quoteDecision.rows.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
     setItemSlNo("");
     setQuoteDecision(null);
+    setCustomerCountry(await fetchCustomerCountry(head.customer_name));
   };
 
   // "Display existing quote" — hand off to the Quotes tab. If there's more than
@@ -4188,6 +4215,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         : "Quote# \""+ref+"\" already exists. This will add a new line item as Sl No "+slNo+" alongside its existing Sl No(s) ("+usedSlNos.join(", ")+"). Proceed?";
       if(!confirm(msg)) { setSavingRef(false); setSaveMsg("Save cancelled — nothing was changed. Click \"Confirm save\" again if you want to proceed."); return; }
     }    setGatewayConfirmedNewSlNo(false);
+    const saveStartedAt = Date.now(); // "hold the hourglass" — a save that resolves in 80ms still reads as instant/untrustworthy; ensureMinSpinner below pads it out
     // Which company this quote is issued under is resolved once, at the
     // moment the Quote# is FIRST created, and never changes afterward —
     // even if a different Super Admin later edits or re-saves it. If the
@@ -4228,7 +4256,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       const failMsg = "Save failed: "+(e.message||"unknown");
       setSaveMsg(failMsg); alert(failMsg); // always alert on a thrown failure, even with the modal open — this is a hard failure, not a validation nudge
       return false;
-    } finally{setSavingRef(false);}
+    } finally{ await ensureMinSpinner(saveStartedAt); setSavingRef(false); }
   };
 
 
@@ -4247,7 +4275,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           },
           disabled:cart.length===0||simpleSaving,
           style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"none",cursor:(cart.length===0||simpleSaving)?"not-allowed":"pointer",background:(cart.length===0||simpleSaving)?"#b5d4f4":"#0c447c",color:"#fff"}
-        },simpleSaving?"Saving…":"Save to estimate"),
+        },simpleSaving?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Save to estimate"),
         h("button",{onClick:()=>attemptCloseOrNew("new"),style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"1px solid #85b7eb",background:"#fff",color:"#0c447c",cursor:"pointer"}},"New"),
         h("button",{onClick:()=>attemptCloseOrNew("close"),style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"1px solid #85b7eb",background:"#fff",color:"#0c447c",cursor:"pointer"}},"Close")
       )
@@ -4257,7 +4285,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         h("div",{style:{fontSize:14,fontWeight:700,marginBottom:6}},"Unsaved changes"),
         h("div",{style:{fontSize:12.5,color:colors.mutedLight,marginBottom:16}},cart.length+" line(s) in the cart haven't been saved to this Sl No yet."),
         h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
-          h("button",{onClick:saveAllAndNavigate,disabled:closeActionBusy,style:{width:"100%",padding:"9px",fontSize:13,fontWeight:600,borderRadius:6,border:"none",background:"#0c447c",color:"#fff",cursor:"pointer",opacity:closeActionBusy?0.6:1}},closeActionBusy?"Saving…":"Save all and "+closeAction),
+          h("button",{onClick:saveAllAndNavigate,disabled:closeActionBusy,style:{width:"100%",padding:"9px",fontSize:13,fontWeight:600,borderRadius:6,border:"none",background:"#0c447c",color:"#fff",cursor:"pointer",opacity:closeActionBusy?0.6:1}},closeActionBusy?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Save all and "+closeAction),
           h("button",{onClick:()=>setCloseAction(null),disabled:closeActionBusy,style:{width:"100%",padding:"9px",fontSize:13,fontWeight:600,borderRadius:6,border:"1px solid "+colors.border,background:"#fff",cursor:"pointer"}},"Go back"),
           h("button",{onClick:discardAndNavigate,disabled:closeActionBusy,style:{width:"100%",padding:"9px",fontSize:13,fontWeight:600,borderRadius:6,border:"1px solid #f0997b",background:"#fff",color:colors.danger,cursor:"pointer"}},closeAction==="close"?"Close without saving":"Start new without saving")
         ),
@@ -4275,8 +4303,8 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           ),
           h("div",{style:{display:"flex",alignItems:"center"}},
             h("span", {style:{background:"rgba(29,158,117,0.25)",color:"#6fa99a",fontSize:12,padding:"4px 10px",borderRadius:20}}, selectedModel),
-            h("button",{onClick:abandonModelSelection,title:"Cancel — deselect this model entirely (same as pressing Esc)",style:{background:"rgba(184,71,47,0.25)",border:"none",borderRadius:6,width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",color:"#f09595",fontSize:14,marginLeft:10}},
-              h("i",{className:"ti ti-x","aria-hidden":"true"})
+            h("button",{onClick:abandonModelSelection,title:"Cancel — deselect this model entirely (same as pressing Esc)",style:{display:"flex",alignItems:"center",gap:5,background:"rgba(184,71,47,0.25)",border:"none",borderRadius:6,padding:"6px 10px",cursor:"pointer",color:"#f09595",fontSize:12,marginLeft:10}},
+              h("i",{className:"ti ti-x","aria-hidden":"true"}),"Cancel"
             )
           )
         ),
@@ -4678,7 +4706,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         h("datalist",{id:"spec-list-est"},allSpecs.map(s=>h("option",{key:s,value:s}))),
         h("div",{style:{marginTop:14,display:"flex",gap:8,flexWrap:"wrap"}},
           h("button",{onClick:()=>{ if(!confirm("Clear all "+lines.length+" line item(s) from this draft? This cannot be undone.")) return; setLines([]); setOverrides({}); },disabled:lines.length===0,style:{...btnSecondary,color:colors.danger,borderColor:"#f0b8b8",opacity:lines.length===0?0.5:1}},"Clear all lines"),
-          h("button",{onClick:saveEstimateFromBom,disabled:simpleSaving,style:{...btnPrimary,marginLeft:"auto",opacity:simpleSaving?0.6:1}},simpleSaving?"Saving…":"Save estimate")
+          h("button",{onClick:saveEstimateFromBom,disabled:simpleSaving,style:{...btnPrimary,marginLeft:"auto",opacity:simpleSaving?0.6:1}},simpleSaving?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Save estimate")
         )
       )
     ),
@@ -4875,7 +4903,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
             h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
               saveMsg&&h("div",{style:{fontSize:12,color:saveMsg.startsWith("Save failed")||saveMsg.startsWith("Enter")||saveMsg.startsWith("Add")?colors.danger:"#2d7a4f"}},saveMsg),
               h("button",{onClick:()=>{setShowSave(false);setSaveMaximised(false);},style:btnSecondary},"Cancel"),
-              h("button",{onClick:async()=>{ const ok=await saveReference(); if(ok){ setShowSave(false); setSaveMaximised(false); if(holdingNewSlNo) await afterNewSlNoSave(); } },disabled:savingRef,style:btnPrimary},savingRef?"Saving…":"Confirm save")
+              h("button",{onClick:async()=>{ const ok=await saveReference(); if(ok){ setShowSave(false); setSaveMaximised(false); if(holdingNewSlNo) await afterNewSlNoSave(); } },disabled:savingRef,style:btnPrimary},savingRef?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Confirm save")
             )
           )
         )
