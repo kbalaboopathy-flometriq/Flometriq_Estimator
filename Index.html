@@ -41,7 +41,7 @@ table { width: 100%; border-collapse: collapse; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-09T13:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-09T15:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -16556,9 +16556,25 @@ const ISO273_LOOSE = [
   [28.0,"M24"],[30.0,"M27"],[34.0,"M30"],[37.0,"M33"],[41.0,"M36"],[44.0,"M39"],
   [48.0,"M42"],[52.0,"M45"],[56.0,"M48"],[66.0,"M56"],[76.0,"M64"],
 ];
+// Real bug found and fixed 9 Aug: the previous version used a uniform
+// "+0.6" padding on each table entry as a threshold, not genuine nearest-
+// neighbor matching — reproduced exactly: a 12.7mm hole returned M12
+// (correct answer is M10) purely because 12.0+0.6=12.6 sat just under
+// 12.7, causing the lookup to leapfrog straight over M10 even though
+// 12.7mm is genuinely much closer to M10's own table value (12.0mm) than
+// to M12's (14.5mm). Confirmed by cross-checking against the imperial
+// side, which was already correct (3/8" UNC for a 12.7mm hole) — and
+// 3/8"'s real nearest-metric-equivalent is M10, not M12, so the two
+// halves of the same result were contradicting each other. Fixed with
+// genuine nearest-distance matching — picks whichever table entry is
+// numerically closest to the actual hole, no threshold artifacts.
 function nearestMetricStud(holeMm){
-  for(const [lim,size] of ISO273_LOOSE) if(holeMm<=lim+0.6) return size;
-  return "M64+";
+  let best = ISO273_LOOSE[0], bestDist = Math.abs(holeMm-best[0]);
+  for(const entry of ISO273_LOOSE){
+    const dist = Math.abs(holeMm-entry[0]);
+    if(dist < bestDist){ bestDist = dist; best = entry; }
+  }
+  return best[1];
 }
 // Reverse lookup for the imperial/UNC side — verified against the actual
 // parsed ASME B16.5 data (all 115 rows): hole diameter = bolt diameter +
@@ -16696,10 +16712,21 @@ function BoltingCalculator({ user }){
     const nutSpec = boltType==="stud"
       ? (studSizeMetric+" Hex Nut, ISO 4032"+(nut?" (height "+nut.height+"mm, across-flats "+nut.across_flats+"mm)":""))
       : (studSizeMetric+" Hex Bolt, ISO 4014"+(hexBolt?" (head height "+hexBolt.head_height+"mm, across-flats "+hexBolt.head_across_flats+"mm)":""));
+    // Weight — thumb-rule cylinder approximation (nominal diameter × final
+    // length, not actual thread root diameter — standard practice for a
+    // quick estimate, same convention as commercial bolt-weight tables).
+    // Density: 7.85 g/cm³, ASTM A193 Grade B7 (chrome-moly alloy steel) —
+    // per the user's own instruction to use B7 as the thumb-rule material.
+    const B7_DENSITY_G_PER_CM3 = 7.85;
+    const nominalDiaMm = parseFloat(String(studSizeMetric||"").replace(/^M/,""))||0;
+    const volumeMm3 = Math.PI * Math.pow(nominalDiaMm/2, 2) * finalLen;
+    const weightPerBoltKg = (volumeMm3/1000) * B7_DENSITY_G_PER_CM3 / 1000;
+    const totalWeightKg = noOfBolts ? weightPerBoltKg*noOfBolts : null;
     setResult({
       boltType, facingType, ringNumber:ring?ring.ring_number:null,
       studSizeMetric, studSizeImperial, studSizeNative, rawLen:rawLen.toFixed(1), finalLen, nutSpec,
       qtyBolts:noOfBolts, qtyNuts:noOfBolts?(boltType==="stud"?noOfBolts*2:noOfBolts):null,
+      weightPerBoltKg, totalWeightKg,
       flangeLabel: mode==="standard"?flangeLabel(selectedFlange):"Manual entry",
       validated: mode==="standard"?!!selectedFlange.validated:true,
       T1,T2,G,W,
@@ -16723,6 +16750,8 @@ function BoltingCalculator({ user }){
       ["Calculated length (mm)",result.rawLen],
       ["Recommended length (mm, rounded up)",result.finalLen],
       ["Nut/bolt spec",result.nutSpec],
+      ["Weight per bolt (A193 B7, thumb-rule, kg)",result.weightPerBoltKg.toFixed(3)],
+      result.totalWeightKg!=null?["Total weight (kg)",result.totalWeightKg.toFixed(2)]:null,
       result.qtyBolts?["Quantity",result.qtyBolts+" "+(result.boltType==="stud"?"studs":"bolts")+", "+result.qtyNuts+" nuts"]:null,
       [result.validated?"Data status":"⚠ Data status","Validated"],
     ].filter(Boolean);
@@ -16747,6 +16776,7 @@ function BoltingCalculator({ user }){
         gasket_thickness:result.G, gasket_overridden:gasketOverridden, washer_thickness:result.W||null,
         facing_type:result.facingType, ring_number:result.ringNumber,
         bolt_size:result.studSizeMetric, bolt_size_imperial:result.studSizeImperial, bolt_length:result.finalLen, nut_spec:result.nutSpec,
+        weight_per_bolt_kg:result.weightPerBoltKg, total_weight_kg:result.totalWeightKg,
         qty_bolts:result.qtyBolts, qty_nuts:result.qtyNuts, created_by:user.username,
       });
       setSaveMsg("Calculation saved to history.");
@@ -16767,9 +16797,23 @@ function BoltingCalculator({ user }){
 
     mode==="standard"&&h("div",{style:{marginBottom:14}},
       h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Flange"),
-      h("input",{value:flangeSearch,onChange:e=>{setFlangeSearch(e.target.value);setSelectedFlange(null);},placeholder:loadingMaster?"Loading flange data…":"Type e.g. 50nb asme","aria-label":"Flange search",style:{...inputStyle}}),
+      h("input",{
+        value:flangeSearch,
+        onChange:e=>{setFlangeSearch(e.target.value);setSelectedFlange(null);},
+        onBlur:()=>{
+          // Real limit-to-list enforcement: leaving unmatched text behind
+          // reverts instead of sitting there looking like a valid entry —
+          // same pattern the Customer field already uses. Calculate already
+          // blocked an unselected flange (line ~16662/16673); this closes
+          // the visual gap where free text could look picked when it wasn't.
+          if(selectedFlange){ setFlangeSearch(flangeLabel(selectedFlange)); }
+          else { setFlangeSearch(""); }
+        },
+        placeholder:loadingMaster?"Loading flange data…":"Type e.g. 50nb asme","aria-label":"Flange search",
+        style:{...inputStyle, border:"1px solid "+(selectedFlange?"#1c8c75":colors.border)}
+      }),
       flangeSearch&&!selectedFlange&&flangeMatches.length>0&&h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,marginTop:4,maxHeight:220,overflowY:"auto"}},
-        flangeMatches.map(r=>h("div",{key:r.id,onClick:()=>chooseFlange(r),style:{padding:"8px 10px",fontSize:13,cursor:"pointer",borderBottom:"1px solid #f0eee5"}},
+        flangeMatches.map(r=>h("div",{key:r.id,onMouseDown:e=>e.preventDefault(),onClick:()=>chooseFlange(r),style:{padding:"8px 10px",fontSize:13,cursor:"pointer",borderBottom:"1px solid #f0eee5"}},
           flangeLabel(r), !r.validated&&h("span",{style:{marginLeft:8,fontSize:10,color:"#8a4b1f",background:"#faeeda",padding:"1px 6px",borderRadius:8}},"not validated")
         ))
       ),
@@ -16855,6 +16899,8 @@ function BoltingCalculator({ user }){
         result.studSizeNative&&h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Native standard spec"),h("div",{style:{fontSize:13}},result.studSizeNative)),
         h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Length"),h("div",{style:{fontSize:15,fontWeight:600}},result.finalLen+"mm")),
         h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Nut/bolt spec"),h("div",{style:{fontSize:13}},result.nutSpec)),
+        h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Weight per bolt (A193 B7, thumb-rule)"),h("div",{style:{fontSize:15,fontWeight:600}},result.weightPerBoltKg.toFixed(3)+" kg")),
+        result.totalWeightKg!=null&&h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Total weight ("+result.qtyBolts+" "+(result.boltType==="stud"?"studs":"bolts")+")"),h("div",{style:{fontSize:15,fontWeight:600,color:colors.accent}},result.totalWeightKg.toFixed(2)+" kg")),
         result.qtyBolts&&h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Quantity"),h("div",{style:{fontSize:13}},result.qtyBolts+" "+(result.boltType==="stud"?"studs":"bolts")+", "+result.qtyNuts+" nuts"))
       )
     ),
@@ -16882,7 +16928,7 @@ function BoltingCalcHistoryViewer({ user }){
       description:r.bolt_type==="stud"?"Stud Bolt":"Hex Bolt",
       createdBy:r.created_by, createdAt:new Date(r.created_at).getTime(),
       headers:["Parameter","Value"],
-      rows:[["Flange",r.flange_label],["Bolt type",r.bolt_type],["Facing/gasket type",r.facing_type==="RTJ"?("RTJ (Ring "+r.ring_number+")"):"Standard (RF)"],["Bolt size (metric)",r.bolt_size],["Nearest imperial (UNC)",r.bolt_size_imperial],["Length (mm)",r.bolt_length],["Nut/bolt spec",r.nut_spec],[r.facing_type==="RTJ"?"Flange gap (mm)":"Gasket (mm)",r.gasket_thickness],["Washer (mm)",r.washer_thickness||"none"],["Quantity",(r.qty_bolts||"—")+" bolts, "+(r.qty_nuts||"—")+" nuts"]],
+      rows:[["Flange",r.flange_label],["Bolt type",r.bolt_type],["Facing/gasket type",r.facing_type==="RTJ"?("RTJ (Ring "+r.ring_number+")"):"Standard (RF)"],["Bolt size (metric)",r.bolt_size],["Nearest imperial (UNC)",r.bolt_size_imperial],["Length (mm)",r.bolt_length],["Nut/bolt spec",r.nut_spec],["Weight per bolt (A193 B7, kg)",r.weight_per_bolt_kg!=null?Number(r.weight_per_bolt_kg).toFixed(3):"—"],["Total weight (kg)",r.total_weight_kg!=null?Number(r.total_weight_kg).toFixed(2):"—"],[r.facing_type==="RTJ"?"Flange gap (mm)":"Gasket (mm)",r.gasket_thickness],["Washer (mm)",r.washer_thickness||"none"],["Quantity",(r.qty_bolts||"—")+" bolts, "+(r.qty_nuts||"—")+" nuts"]],
       footerRows:[], filename:"bolting_calc_"+r.id+".pdf"
     });
   };
