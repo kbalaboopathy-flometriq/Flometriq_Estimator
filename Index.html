@@ -41,7 +41,7 @@ table { width: 100%; border-collapse: collapse; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-09T11:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-09T13:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -443,6 +443,67 @@ function buildPriceDataSection(currency, orderQty, totalSalesValue, conversionRa
     { key:"price-total", label:"Total Price - "+cur, value: fmt2(roundTo5(rateDisplay*qty)) }
   ];
   return { title: "Price Data", rows };
+}
+// Computes the same kind of folded Sales total the Quote PDF's Price
+// Summary page is meant to show — base BOM cost + Extra Price + (Pro-rata
+// NDE Testing, only when that choice has actually been made) — so
+// Datasheet pricing (screen, Excel, standalone PDF, and the annexure
+// inside the full Quote PDF) reflects the real total instead of just the
+// base BOM lines, which is why Pro-rata never showed up there before.
+// REAL BUG FOUND while fixing this (confirmed by a precise numeric match —
+// a reported "wrong" unit price was almost exactly half the correct one):
+// stored estimate_lines.sales_price is only refreshed when a line is
+// actively edited and saved. If order_qty changes AFTER that (a very
+// normal thing to do), every stored sales_price goes silently stale —
+// while the BOM footer, which recomputes live from qty_required × order_qty
+// × rate × sf on every render, never has this problem. An earlier version
+// of this helper trusted the stored sum, inheriting that same staleness
+// risk. Fixed by recomputing everything live from raw fields (matching the
+// BOM footer's own trusted formula exactly) instead of trusting
+// sales_price anywhere — including the cross-Sl-No value-share weighting
+// used for Pro-rata Testing's redistribution, which had the identical risk
+// for any OTHER Sl No whose order_qty had changed since its lines were
+// last saved.
+// Read-only: deliberately does NOT call resolveTestingMode, so viewing a
+// Datasheet never pops the Pro-rata/Separate confirm() prompt or writes a
+// choice — if no choice exists yet, this treats it as "separate" (no
+// fold), which is genuinely true until Generate PDF is actually run.
+async function computeSlNoFoldedSalesTotal(referenceNumber, itemSlNo, orderQty){
+  const qty = orderQty||1;
+  if(!referenceNumber || !itemSlNo) return 0;
+  const [{data:modeRow},{data:slExtraRows},{data:slTestingRows},{data:allEstimates},{data:allLines},{data:globalTestingRows}] = await Promise.all([
+    sb.from("quote_testing_mode_tbl").select("mode").eq("reference_number",referenceNumber).maybeSingle(),
+    sb.from("quote_sl_extra_price_tbl").select("price").eq("reference_number",referenceNumber).eq("item_sl_no",itemSlNo),
+    sb.from("quote_sl_testing_tbl").select("price").eq("reference_number",referenceNumber).eq("item_sl_no",itemSlNo),
+    sb.from("estimates").select("item_sl_no,order_qty").eq("reference_number",referenceNumber),
+    sb.from("estimate_lines").select("item_sl_no,qty_required,rate,sf").eq("reference_number",referenceNumber),
+    sb.from("quote_global_testing_tbl").select("test_name,rate").eq("reference_number",referenceNumber)
+  ]);
+  // Same formula the BOM footer itself uses — live, never stale.
+  const liveGrandTotal = (slNo, qtyForSl)=> (allLines||[]).filter(l=>l.item_sl_no===slNo).reduce((s,l)=>{
+    const q = (Number(l.qty_required)||0) * (qtyForSl||1);
+    const rate = Number(l.rate)||0;
+    const sf = Number(l.sf)||3.1;
+    return s + q*rate*sf;
+  },0);
+  const thisEst = (allEstimates||[]).find(e=>e.item_sl_no===itemSlNo);
+  const baseGrandTotal = liveGrandTotal(itemSlNo, thisEst ? thisEst.order_qty : qty);
+  const testingMode = modeRow ? modeRow.mode : "separate";
+  const slExtraTotal = (slExtraRows||[]).reduce((s,r)=>s+(Number(r.price)||0),0);
+  const slTestingTotal = (slTestingRows||[]).reduce((s,r)=>s+(Number(r.price)||0),0);
+  let globalFoldShare = 0;
+  if(testingMode==="prorata" && (globalTestingRows||[]).length){
+    const valueByItem = new Map();
+    (allEstimates||[]).forEach(est=>{ valueByItem.set(est.item_sl_no, liveGrandTotal(est.item_sl_no, est.order_qty)); });
+    const totalQuoteValue = Array.from(valueByItem.values()).reduce((s,v)=>s+v,0) || 1;
+    const share = (valueByItem.get(itemSlNo)||0) / totalQuoteValue;
+    const testNames = Array.from(new Set(globalTestingRows.map(r=>r.test_name)));
+    testNames.forEach(name=>{
+      const combined = globalTestingRows.filter(r=>r.test_name===name).reduce((s,r)=>s+(Number(r.rate)||0),0);
+      globalFoldShare += combined*share;
+    });
+  }
+  return baseGrandTotal + slExtraTotal + (testingMode==="prorata" ? slTestingTotal + globalFoldShare : 0);
 }
 // Inserts a blank spacer row between every row in an array (not around the
 // whole array) — used to put breathing room between every BOM/datasheet line
@@ -4285,7 +4346,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     if(!enquiryNumber.trim()){fail("Enter an Enquiry number.");return;}
     if(!refDesc.trim()){fail("Description is required for every Sl No.");return;}
     if(customerName.trim() && !customerCountry.trim()){fail("This customer has no country on file. Add one in Master Data → Customers before continuing — currency and conversion rate depend on it.");return;}
-    if(currency!=="INR" && !(Number(conversionRate)>0)){fail("Enter a conversion rate (1 "+currency+" = ? INR) before saving — required for any non-INR quote.");return;}
+    if(currency!=="INR" && !(Number(conversionRate)>10)){fail("Enter a valid conversion rate (1 "+currency+" = ? INR, must be greater than 10) before saving — required for any non-INR quote.");return;}
     if(effectiveCart.length===0){fail("Add at least one model's lines to the estimate first.");return;}
     const ref=refNumber.trim();
     const slNo=Number(itemSlNo);
@@ -5043,6 +5104,27 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   const [fillOpen,setFillOpen] = useState(false);
   const [sectionIdx,setSectionIdx] = useState(0);
 
+  // Folded Sales total (base BOM + Extra Price + Pro-rata NDE Testing, when
+  // chosen) — kept in state since it needs an async fetch. The fallback
+  // (used while loading) is computed the SAME live way — qty_required ×
+  // order_qty × rate × sf — as the real fetch and as the BOM footer itself,
+  // never from the possibly-stale stored sales_price field.
+  const baseUnitPriceInrLive = useMemo(()=>(openLines||[]).reduce((s,l)=>{
+    const q=(Number(l.qty_required)||0)*(Number(openRef.order_qty)||1);
+    const rate=Number(l.rate)||0;
+    const sf=Number(l.sf)||3.1;
+    return s+q*rate*sf;
+  },0),[openLines, openRef.order_qty]);
+  const [foldedTotalSalesValue,setFoldedTotalSalesValue] = useState(null);
+  useEffect(()=>{
+    let cancelled=false;
+    computeSlNoFoldedSalesTotal(openRef.reference_number, openRef.item_sl_no, openRef.order_qty).then(v=>{
+      if(!cancelled) setFoldedTotalSalesValue(v);
+    });
+    return ()=>{ cancelled=true; };
+  },[openRef.reference_number, openRef.item_sl_no, openRef.order_qty]);
+  const totalSalesValueFolded = foldedTotalSalesValue ?? baseUnitPriceInrLive;
+
   // Which sub-assemblies are relevant for this item's Material Data — from
   // Item MOC Rules (set once per item under Master Data), not a per-line
   // tick box anymore. Grades still come from the real line data below.
@@ -5254,7 +5336,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       getSectionRows(section).forEach(row=>rows.push([row.label, row.value, "", ""]));
       rows.push([]);
     });
-    const totalSalesValue = (openLines||[]).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+    const totalSalesValue = totalSalesValueFolded;
     const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate);
     rows.push([priceSection.title]);
     priceSection.rows.forEach(row=>rows.push([row.label, row.value, "", ""]));
@@ -5297,7 +5379,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       body.push([{content:(section.bomSection?"Material Data":section.title), colSpan:2, styles:{fontStyle:"bold", font:"times", fontSize:11}}]);
       filledRows.forEach(row=>body.push([row.label, row.value]));
     });
-    const totalSalesValue = (openLines||[]).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+    const totalSalesValue = totalSalesValueFolded;
     const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate);
     body.push([{content:priceSection.title, colSpan:2, styles:{fontStyle:"bold", font:"times", fontSize:11}}]);
     priceSection.rows.forEach(row=>body.push([row.label, row.value]));
@@ -5375,7 +5457,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
           );
         }),
         (()=>{
-          const totalSalesValue = (openLines||[]).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+          const totalSalesValue = totalSalesValueFolded;
           const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate);
           return h("div",{style:{marginBottom:10,border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
             h("div",{style:{background:"#1c8c75",color:"#fff",padding:"6px 14px",fontSize:12,fontWeight:700}},"Price Data"),
@@ -6814,7 +6896,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const effCurrency = (headerDraft.currency||"").trim()!=="" ? headerDraft.currency : (quoteHeaderRow?quoteHeaderRow.currency:"INR");
     const currencyChanged = (headerDraft.currency||"").trim()!=="" && headerDraft.currency!==(quoteHeaderRow?quoteHeaderRow.currency:"INR");
     const effConvRate = (headerDraft.conversion_rate||"").trim()!=="" ? Number(headerDraft.conversion_rate) : (currencyChanged ? 0 : (quoteHeaderRow?quoteHeaderRow.conversion_rate:1));
-    if(effCurrency!=="INR" && !(Number(effConvRate)>0)){ alert("Enter a conversion rate (1 "+effCurrency+" = ? INR) before saving — required for any non-INR quote."); return; }
+    if(effCurrency!=="INR" && !(Number(effConvRate)>10)){ alert("Enter a valid conversion rate (1 "+effCurrency+" = ? INR, must be greater than 10) before saving — required for any non-INR quote."); return; }
     if(!headerCustomerCountry.trim() && (isRevisionRef?quoteHeaderRow?.customer_name:(headerDraft.customer_name||"").trim())){ alert("This customer has no country on file. Add one in Master Data → Customers before continuing — currency and conversion rate depend on it."); return; }
     setSavingHeader(true);
     try{
@@ -8588,7 +8670,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const mocRow = mocRuleCache.get(itemName);
       const allSections = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocRow, slLines, est.model, est.item_sl_no);
       const sectionsRows = allSections.filter(sec=>sec.rows.some(r=>r.value!==undefined && r.value!==null && String(r.value).trim()!==""));
-      const totalSalesValue = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+      const totalSalesValue = await computeSlNoFoldedSalesTotal(est.reference_number, est.item_sl_no, est.order_qty);
       sectionsRows.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
       list.push({ slNo: est.item_sl_no, model: est.model||"", itemName, sectionsRows });
     }
@@ -10095,11 +10177,34 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 )
               )
             ),
-            !showCuttingPlan&&h("div",{style:{display:"flex",justifyContent:"flex-end",gap:24,marginTop:10,fontSize:13,flexWrap:"wrap"}},
-              h("div",null,h("div",{style:{fontSize:10,color:colors.mutedLight}},"UNIT COST (1 unit)"),h("div",{style:{fontWeight:600}},fmtR(totalCost))),
-              h("div",null,h("div",{style:{fontSize:10,color:colors.mutedLight}},"TOTAL ORDER COST (×"+orderQty+")"),h("div",{style:{fontWeight:700}},fmtR(totalOrderCost))),
-              h("div",null,h("div",{style:{fontSize:10,color:colors.mutedLight}},"TOTAL SALES PRICE (×"+orderQty+")"),h("div",{style:{fontWeight:700,color:colors.accent}},fmtR(totalOrderSales)))
-            )
+            !showCuttingPlan&&(()=>{
+              const isNonInr = openRef.currency && openRef.currency!=="INR";
+              const fx = Number(openRef.conversion_rate)||1;
+              const unitCostTrue = orderQty>0 ? totalOrderCost/orderQty : totalOrderCost;
+              const unitSaleTrue = orderQty>0 ? totalOrderSales/orderQty : totalOrderSales;
+              const cell = (label,value,extra)=>h("div",null,
+                h("div",{style:{fontSize:10,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em"}},label),
+                h("div",{style:{fontWeight:700,fontSize:16,color:colors.text,marginTop:3}},value),
+                extra
+              );
+              const saleCell = (label,value)=>h("div",null,
+                h("div",{style:{fontSize:10,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em"}},label),
+                h("div",{style:{fontWeight:700,fontSize:16,color:colors.accent,marginTop:3}},fmtR(value)),
+                isNonInr&&h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2,fontWeight:600}},fmtR(value/fx)+" "+openRef.currency)
+              );
+              return h("div",{style:{marginTop:12,padding:"14px 18px",background:"#fff",border:"1px solid "+colors.border,borderRadius:8,maxWidth:520,marginLeft:"auto"}},
+                h("div",{style:{display:"grid",gridTemplateColumns:"1fr 0.6fr 1fr",gap:"4px 20px",paddingBottom:12,borderBottom:"1px solid #eceae0",marginBottom:12}},
+                  cell("Unit cost", fmtR(unitCostTrue)),
+                  cell("Qty", orderQty),
+                  cell("Total cost", fmtR(totalOrderCost))
+                ),
+                h("div",{style:{display:"grid",gridTemplateColumns:"1fr 0.6fr 1fr",gap:"4px 20px"}},
+                  saleCell("Unit sale", unitSaleTrue),
+                  cell("Qty", orderQty),
+                  saleCell("Total sale", totalOrderSales)
+                )
+              );
+            })()
           )
         )
       )
