@@ -16374,6 +16374,16 @@ function nearestImperialStud(holeMm){
   for(const [size,label] of UNC_SIZES) if(boltIn<=size+0.01) return label+" UNC";
   return "3-1/2\"+ UNC";
 }
+// Shared across BoltingCalculator and FlangeChart — label format is
+// per-standard, not one fixed template (ANSI "lbs", AWWA "Class", DIN "PN",
+// BS10 "Table"), so both screens show flange type/spec identically.
+function flangeLabel(r){
+  if(r.standard==="ASME B16.5"||r.standard==="ASME B16.47") return r.nb+" "+r.standard+" "+r.class_rating+"lbs"+(r.flange_type?" "+r.flange_type:"");
+  if(r.standard==="AWWA C207") return r.nb+" AWWA C207 Class "+r.class_rating+(r.flange_type?" "+r.flange_type:"");
+  if(r.standard&&r.standard.indexOf("DIN")===0) return r.nb+" "+r.standard+" "+r.class_rating+(r.flange_type?" "+r.flange_type:"");
+  if(r.standard==="BS 10") return r.nb+" BS10 "+r.class_rating+(r.flange_type?" "+r.flange_type:"");
+  return [r.nb,r.standard,r.class_rating,r.flange_type].filter(Boolean).join(" ");
+}
 function BoltingCalculator({ user }){
   const [mode,setMode]=useState("standard"); // "standard" | "manual"
   const [flangeRows,setFlangeRows]=useState([]);
@@ -16390,16 +16400,6 @@ function BoltingCalculator({ user }){
       fetchAll("ring_joint_tbl","*"),
     ]).then(([f,n,hb,g,rj])=>{ setFlangeRows(f); setNutRows(n); setHexBoltRows(hb); setGasketDefaults(g); setRingJointRows(rj); setLoadingMaster(false); });
   },[]);
-
-  const flangeLabel = (r)=>{
-    // Label format is per-standard, not one fixed template — the vocabulary
-    // genuinely differs (ANSI "lbs", AWWA "Class", DIN "PN", BS10 "Table").
-    if(r.standard==="ASME B16.5"||r.standard==="ASME B16.47") return r.nb+" "+r.standard+" "+r.class_rating+"lbs"+(r.flange_type?" "+r.flange_type:"");
-    if(r.standard==="AWWA C207") return r.nb+" AWWA C207 Class "+r.class_rating+(r.flange_type?" "+r.flange_type:"");
-    if(r.standard&&r.standard.indexOf("DIN")===0) return r.nb+" "+r.standard+" "+r.class_rating+(r.flange_type?" "+r.flange_type:"");
-    if(r.standard==="BS 10") return r.nb+" BS10 "+r.class_rating+(r.flange_type?" "+r.flange_type:"");
-    return [r.nb,r.standard,r.class_rating,r.flange_type].filter(Boolean).join(" ");
-  };
 
   const [flangeSearch,setFlangeSearch]=useState("");
   const [selectedFlange,setSelectedFlange]=useState(null);
@@ -16728,14 +16728,20 @@ function FlangeChart({ user }){
     (!classFilter||r.class_rating===classFilter) &&
     (!typeFilter||r.flange_type===typeFilter) &&
     (!unvalidatedOnly||!r.validated)
-  ).sort((a,b)=> (a.standard||"").localeCompare(b.standard||"") || naturalCompare(a.class_rating,b.class_rating) || naturalCompare(a.nb,b.nb)),[rows,stdFilter,classFilter,typeFilter,unvalidatedOnly]);
+  ).sort((a,b)=> (a.standard||"").localeCompare(b.standard||"") || naturalCompare(a.class_rating,b.class_rating) || (a.flange_type||"").localeCompare(b.flange_type||"") || naturalCompare(a.nb,b.nb)),[rows,stdFilter,classFilter,typeFilter,unvalidatedOnly]);
 
-  // Grouped by Standard, then Class — a header row precedes each group.
+  // Group label = Standard+Class+Type combined via the shared flangeLabel
+  // convention (ANSI "lbs", AWWA "Class", DIN "PN", BS10 "Table"), same
+  // formatting the Bolting Calculator uses — just without the NB prefix,
+  // since NB varies row-to-row within a group. Standard stays the primary
+  // sort key so groups of the same standard are never split apart even
+  // though the group key itself is the combined label.
+  const groupLabel = (r)=> flangeLabel({...r, nb:""}).replace(/^\s+/,"");
   const grouped = useMemo(()=>{
     const groups=[]; const map=new Map();
     filtered.forEach(r=>{
-      const key = (r.standard||"—")+"|||"+(r.class_rating||"—");
-      if(!map.has(key)){ const g={standard:r.standard||"—", classRating:r.class_rating||"—", rows:[]}; map.set(key,g); groups.push(g); }
+      const key = groupLabel(r);
+      if(!map.has(key)){ const g={label:key, rows:[]}; map.set(key,g); groups.push(g); }
       map.get(key).rows.push(r);
     });
     return groups;
@@ -16831,8 +16837,8 @@ function FlangeChart({ user }){
           [isAdmin?"":null,"NB","OD","BCD / PCD","No. of Bolts","Hole dia","Bolt (metric)","Thickness","Source","Status"].filter((v,i)=>i>0||isAdmin).map((c,i)=>h("th",{key:i,style:{padding:"7px 9px",fontSize:10.5}},c))
         )),
         h("tbody",null, grouped.map(g=>[
-          h("tr",{key:g.standard+"|"+g.classRating+"|hdr"},
-            h("td",{colSpan:isAdmin?9:8,style:{padding:"8px 9px",fontSize:11.5,fontWeight:700,background:"#f3f1e8",borderTop:"1px solid "+colors.border,borderBottom:"1px solid "+colors.border}},g.standard+" — Class "+g.classRating)
+          h("tr",{key:g.label+"|hdr"},
+            h("td",{colSpan:isAdmin?9:8,style:{padding:"8px 9px",fontSize:11.5,fontWeight:700,background:"#f3f1e8",borderTop:"1px solid "+colors.border,borderBottom:"1px solid "+colors.border}},g.label)
           ),
           ...g.rows.map(r=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
             isAdmin&&h("td",{style:{padding:"6px 9px"}},h("input",{type:"checkbox",checked:!!selected[r.id],onChange:e=>setSelected(s=>({...s,[r.id]:e.target.checked}))})),
