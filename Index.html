@@ -1059,8 +1059,12 @@ function MenuTabs({ user, active, onChange }) {
         {key:"saved",label:"Quotes"},
       ]},
     ]},
-    { label:"Engineering Calc", tabs:[
-      {key:"calcs",label:"Engineering Calc"},
+    { label:"Engineering Calc", subgroups:[
+      { label:"Engineering Calc", tabs:[
+        {key:"calcs",label:"ASME VIII Thickness"},
+        {key:"bolting_calc",label:"Bolting Calculator"},
+        {key:"flange_chart",label:"Flange Chart"},
+      ]},
     ]},
     { label:"Dashboards", tabs:[
       {key:"dashboards",label:"Dashboards"},
@@ -16332,7 +16336,490 @@ function CalcHistoryViewer({ user }) {
 }
 
 
-/* ---- REPORTS ---- */
+/* ---- BOLTING CALCULATOR ---- */
+// Stud vs Hex Bolt: a stud is a plain threaded rod with a nut on BOTH ends;
+// a hex bolt has a head on one end (no thread projection needed under it)
+// and a nut on the other. Different length formula per type — user must
+// pick, no default (explicit instruction: always ask).
+function boltLengthFormula(boltType, t1, t2, gasket, nutHeight, washerThk, threadProjPerEnd){
+  const washerCount = boltType==="stud" ? 2 : 1; // under both nuts on a stud; just the one nut on a hex bolt
+  const nutCount = boltType==="stud" ? 2 : 1;
+  const projEnds = boltType==="stud" ? 2 : 1;
+  return t1 + t2 + gasket + (nutCount*nutHeight) + (washerCount*washerThk) + (projEnds*threadProjPerEnd);
+}
+// ISO 273 loose-fit clearance hole -> nearest metric stud size, same lookup
+// used for the original worked example and for the ASME B16.5 seed data.
+const ISO273_LOOSE = [
+  [2.6,"M2"],[3.6,"M3"],[4.8,"M4"],[5.8,"M5"],[7.0,"M6"],[10.0,"M8"],[12.0,"M10"],
+  [14.5,"M12"],[16.5,"M14"],[18.5,"M16"],[22.0,"M18"],[24.0,"M20"],[26.0,"M22"],
+  [28.0,"M24"],[30.0,"M27"],[34.0,"M30"],[37.0,"M33"],[41.0,"M36"],[44.0,"M39"],
+  [48.0,"M42"],[52.0,"M45"],[56.0,"M48"],[66.0,"M56"],[76.0,"M64"],
+];
+function nearestMetricStud(holeMm){
+  for(const [lim,size] of ISO273_LOOSE) if(holeMm<=lim+0.6) return size;
+  return "M64+";
+}
+// Reverse lookup for the imperial/UNC side — verified against the actual
+// parsed ASME B16.5 data (all 115 rows): hole diameter = bolt diameter +
+// 1/8" consistently, not assumed. Snaps up to the next standard UNC size,
+// same "never round down" convention as everything else here.
+const UNC_SIZES = [
+  [0.25,"1/4\""],[0.375,"3/8\""],[0.5,"1/2\""],[0.625,"5/8\""],[0.75,"3/4\""],
+  [0.875,"7/8\""],[1,"1\""],[1.125,"1-1/8\""],[1.25,"1-1/4\""],[1.375,"1-3/8\""],
+  [1.5,"1-1/2\""],[1.625,"1-5/8\""],[1.75,"1-3/4\""],[1.875,"1-7/8\""],[2,"2\""],
+  [2.25,"2-1/4\""],[2.5,"2-1/2\""],[2.75,"2-3/4\""],[3,"3\""],[3.25,"3-1/4\""],[3.5,"3-1/2\""],
+];
+function nearestImperialStud(holeMm){
+  const boltIn = (holeMm/25.4) - 0.125;
+  for(const [size,label] of UNC_SIZES) if(boltIn<=size+0.01) return label+" UNC";
+  return "3-1/2\"+ UNC";
+}
+function BoltingCalculator({ user }){
+  const [mode,setMode]=useState("standard"); // "standard" | "manual"
+  const [flangeRows,setFlangeRows]=useState([]);
+  const [nutRows,setNutRows]=useState([]);
+  const [hexBoltRows,setHexBoltRows]=useState([]);
+  const [gasketDefaults,setGasketDefaults]=useState([]);
+  const [loadingMaster,setLoadingMaster]=useState(true);
+  useEffect(()=>{
+    Promise.all([
+      fetchAll("flange_std_tbl","*"),
+      fetchAll("iso4032_nut_tbl","*"),
+      fetchAll("iso4014_hexbolt_tbl","*"),
+      fetchAll("gasket_default_tbl","*"),
+      fetchAll("ring_joint_tbl","*"),
+    ]).then(([f,n,hb,g,rj])=>{ setFlangeRows(f); setNutRows(n); setHexBoltRows(hb); setGasketDefaults(g); setRingJointRows(rj); setLoadingMaster(false); });
+  },[]);
+
+  const flangeLabel = (r)=>{
+    // Label format is per-standard, not one fixed template — the vocabulary
+    // genuinely differs (ANSI "lbs", AWWA "Class", DIN "PN", BS10 "Table").
+    if(r.standard==="ASME B16.5"||r.standard==="ASME B16.47") return r.nb+" "+r.standard+" "+r.class_rating+"lbs"+(r.flange_type?" "+r.flange_type:"");
+    if(r.standard==="AWWA C207") return r.nb+" AWWA C207 Class "+r.class_rating+(r.flange_type?" "+r.flange_type:"");
+    if(r.standard&&r.standard.indexOf("DIN")===0) return r.nb+" "+r.standard+" "+r.class_rating+(r.flange_type?" "+r.flange_type:"");
+    if(r.standard==="BS 10") return r.nb+" BS10 "+r.class_rating+(r.flange_type?" "+r.flange_type:"");
+    return [r.nb,r.standard,r.class_rating,r.flange_type].filter(Boolean).join(" ");
+  };
+
+  const [flangeSearch,setFlangeSearch]=useState("");
+  const [selectedFlange,setSelectedFlange]=useState(null);
+  const flangeMatches = useMemo(()=>{
+    if(!flangeSearch.trim()) return [];
+    const f=flangeSearch.toLowerCase();
+    return flangeRows.filter(r=>flangeLabel(r).toLowerCase().includes(f)).slice(0,40);
+  },[flangeSearch,flangeRows]);
+
+  const [boltType,setBoltType]=useState(""); // "" = not chosen yet — always ask, no default
+  const [facingType,setFacingType]=useState(""); // "" = not chosen yet — "RF" | "RTJ", always ask, no default
+  const [ringJointRows,setRingJointRows]=useState([]);
+  const [t1,setT1]=useState(""); const [t2,setT2]=useState("");
+  const [gasket,setGasket]=useState(""); const [gasketOverridden,setGasketOverridden]=useState(false);
+  const [washer,setWasher]=useState(""); // "" = none/skip, never treated as 0
+  const [showGasketCaution,setShowGasketCaution]=useState(false);
+  const [pendingGasketVal,setPendingGasketVal]=useState("");
+  const [result,setResult]=useState(null);
+  const [saveMsg,setSaveMsg]=useState(""); const [saving,setSaving]=useState(false);
+
+  const gasketDefaultFor = (classRating)=>{
+    const row=gasketDefaults.find(g=>g.class_rating===classRating);
+    return row?row.default_thickness:null;
+  };
+
+  const chooseFlange=(r)=>{
+    setSelectedFlange(r); setFlangeSearch(flangeLabel(r)); setResult(null);
+    const def=gasketDefaultFor(r.class_rating);
+    if(def!=null){ setGasket(String(def)); setGasketOverridden(false); }
+    // Auto-fill both flange thicknesses from the picked row when the data
+    // has it (Blind flanges do now) — still editable, e.g. when bolting to
+    // a different-class flange with its own thickness.
+    if(r.flange_thickness){ setT1(String(r.flange_thickness)); setT2(String(r.flange_thickness)); }
+    setFacingType(""); // force a fresh Facing choice per flange — RTJ availability depends on this row's NPS+Class
+  };
+
+  // RTJ isn't available in Manual mode — the ring lookup needs a real NPS+Class
+  // to key off, and Manual mode has neither. Switching modes clears whatever
+  // Facing choice was made, same "ask again" treatment as picking a new flange.
+  const setModeAndReset = (m)=>{ setMode(m); setFacingType(""); };
+
+  const ringJointFor = (nps, classRating) => ringJointRows.find(r=>r.nps===nps && r.class_rating===classRating);
+
+  const onGasketChange=(val)=>{
+    const def = selectedFlange ? gasketDefaultFor(selectedFlange.class_rating) : null;
+    if(def!=null && val.trim() && Number(val)!==Number(def)){
+      setPendingGasketVal(val); setShowGasketCaution(true);
+    } else {
+      setGasket(val); setGasketOverridden(false);
+    }
+  };
+
+  const calculate=()=>{
+    if(!boltType){ alert("Pick Stud Bolt or Hex Bolt first — there's no default, this changes the length formula."); return; }
+    if(!facingType){ alert("Pick a Facing/Gasket type first (RF or RTJ) — there's no default."); return; }
+    if(facingType==="RTJ" && mode!=="standard"){ alert("RTJ needs a real NPS + Class to look up the ring from — not available in Manual entry mode."); return; }
+    let ring=null;
+    if(facingType==="RTJ"){
+      if(!selectedFlange){ alert("Pick a flange from the list first."); return; }
+      ring = ringJointFor(selectedFlange.nps, selectedFlange.class_rating);
+      if(!ring){ alert("No RTJ ring data on file for this exact NPS + Class combination yet."); return; }
+      if(ring.flange_gap==null){ alert("This ring's flange-gap value isn't in the table yet (only rings R11–R51 have it so far) — can't calculate length for this size."); return; }
+    }
+    const T1=Number(t1)||0, T2=Number(t2)||0, W=Number(washer)||0;
+    const G = facingType==="RTJ" ? Number(ring.flange_gap) : (Number(gasket)||0);
+    if(T1<=0||T2<=0){ alert("Enter both flange thicknesses."); return; }
+    if(facingType==="RF" && G<=0){ alert("Enter a gasket thickness."); return; }
+    let holeDia, studSizeNative, studSizeMetric, studSizeImperial, noOfBolts=null, flangeInfo=null;
+    if(mode==="standard"){
+      if(!selectedFlange){ alert("Pick a flange from the list first."); return; }
+      holeDia = Number(selectedFlange.bolt_hole_dia)||0;
+      studSizeMetric = selectedFlange.bolt_size_metric_equiv || nearestMetricStud(holeDia);
+      studSizeNative = selectedFlange.bolt_size_native || "";
+      noOfBolts = selectedFlange.no_of_bolts;
+      flangeInfo = selectedFlange;
+    } else {
+      holeDia = Number(hole)||0;
+      if(holeDia<=0){ alert("Enter the bolt hole diameter."); return; }
+      studSizeMetric = nearestMetricStud(holeDia);
+      studSizeNative = "";
+    }
+    studSizeImperial = nearestImperialStud(holeDia); // always computed, both directions — same treatment regardless of source standard
+    const nut = nutRows.find(n=>n.thread_size===studSizeMetric);
+    const hexBolt = hexBoltRows.find(n=>n.thread_size===studSizeMetric);
+    const nutHeight = boltType==="stud" ? (nut?nut.height:0) : (hexBolt?hexBolt.head_height:0);
+    // Thread projection: ~2x pitch per exposed end, same convention as the
+    // original worked example (M10 -> 1.5mm pitch -> ~3mm per end).
+    const pitch = nut?nut.pitch:1.5;
+    const projPerEnd = pitch*2;
+    const rawLen = boltLengthFormula(boltType, T1, T2, G, nutHeight, W, projPerEnd);
+    // Round up to the next standard 5mm commercial length — never round down.
+    const finalLen = Math.ceil(rawLen/5)*5;
+    const nutSpec = boltType==="stud"
+      ? (studSizeMetric+" Hex Nut, ISO 4032"+(nut?" (height "+nut.height+"mm, across-flats "+nut.across_flats+"mm)":""))
+      : (studSizeMetric+" Hex Bolt, ISO 4014"+(hexBolt?" (head height "+hexBolt.head_height+"mm, across-flats "+hexBolt.head_across_flats+"mm)":""));
+    setResult({
+      boltType, facingType, ringNumber:ring?ring.ring_number:null,
+      studSizeMetric, studSizeImperial, studSizeNative, rawLen:rawLen.toFixed(1), finalLen, nutSpec,
+      qtyBolts:noOfBolts, qtyNuts:noOfBolts?(boltType==="stud"?noOfBolts*2:noOfBolts):null,
+      flangeLabel: mode==="standard"?flangeLabel(selectedFlange):"Manual entry",
+      validated: mode==="standard"?!!selectedFlange.validated:true,
+      T1,T2,G,W,
+    });
+  };
+  const [hole,setHole]=useState("");
+
+  const exportCalcPDF=()=>{
+    if(!result) return;
+    const rows=[
+      ["Flange",result.flangeLabel],
+      ["Bolt type",result.boltType==="stud"?"Stud Bolt":"Hex Bolt"],
+      ["",""],["--- INPUTS ---",""],
+      ["Facing / gasket type",result.facingType==="RTJ"?("RTJ (Ring "+result.ringNumber+")"):"Standard (RF)"],
+      ["Flange 1 thickness (mm)",result.T1],["Flange 2 thickness (mm)",result.T2],
+      [result.facingType==="RTJ"?"Flange gap (mm)":"Gasket thickness (mm)",result.G],["Washer thickness (mm)",result.W||"none"],
+      ["",""],["--- RESULT ---",""],
+      ["Stud/bolt size (metric)",result.studSizeMetric],
+      ["Nearest imperial (UNC)",result.studSizeImperial],
+      result.studSizeNative?["Native standard spec",result.studSizeNative]:null,
+      ["Calculated length (mm)",result.rawLen],
+      ["Recommended length (mm, rounded up)",result.finalLen],
+      ["Nut/bolt spec",result.nutSpec],
+      result.qtyBolts?["Quantity",result.qtyBolts+" "+(result.boltType==="stud"?"studs":"bolts")+", "+result.qtyNuts+" nuts"]:null,
+      [result.validated?"Data status":"⚠ Data status","Validated"],
+    ].filter(Boolean);
+    generatePDF({
+      title:"Bolting Calculation", refNumber:result.flangeLabel,
+      description:result.boltType==="stud"?"Stud Bolt":"Hex Bolt",
+      createdBy:user.username, createdAt:Date.now(),
+      headers:["Parameter","Value"], rows, footerRows:[],
+      filename:"bolting_calc_"+Date.now()+".pdf"
+    });
+  };
+
+  const saveCalc=async()=>{
+    if(!result) return; setSaving(true); setSaveMsg("");
+    try{
+      await sb.from("bolting_calc_history_tbl").insert({
+        flange_label:result.flangeLabel, bolt_type:result.boltType,
+        standard: mode==="standard"&&selectedFlange?selectedFlange.standard:null,
+        class_rating: mode==="standard"&&selectedFlange?selectedFlange.class_rating:null,
+        flange_type: mode==="standard"&&selectedFlange?selectedFlange.flange_type:null,
+        nb: mode==="standard"&&selectedFlange?selectedFlange.nb:null,
+        gasket_thickness:result.G, gasket_overridden:gasketOverridden, washer_thickness:result.W||null,
+        facing_type:result.facingType, ring_number:result.ringNumber,
+        bolt_size:result.studSizeMetric, bolt_size_imperial:result.studSizeImperial, bolt_length:result.finalLen, nut_spec:result.nutSpec,
+        qty_bolts:result.qtyBolts, qty_nuts:result.qtyNuts, created_by:user.username,
+      });
+      setSaveMsg("Calculation saved to history.");
+    } catch(e){ setSaveMsg("Save failed: "+e.message); } finally{ setSaving(false); }
+  };
+
+  const cancelCalc=()=>{
+    setSelectedFlange(null); setFlangeSearch(""); setBoltType(""); setFacingType(""); setT1(""); setT2("");
+    setGasket(""); setGasketOverridden(false); setWasher(""); setHole(""); setResult(null); setSaveMsg("");
+  };
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:760}},
+    h("h2",{style:{margin:"0 0 14px",fontSize:18,fontWeight:700}},"Bolting Calculator"),
+    h("div",{style:{display:"flex",gap:8,marginBottom:16}},
+      h("button",{onClick:()=>setModeAndReset("standard"),style:{padding:"6px 14px",borderRadius:6,fontSize:12,border:"none",cursor:"pointer",background:mode==="standard"?colors.dark:"#fff",color:mode==="standard"?"#fff":colors.text,border:"1px solid "+colors.border}},"Standard + NB"),
+      h("button",{onClick:()=>setModeAndReset("manual"),style:{padding:"6px 14px",borderRadius:6,fontSize:12,border:"1px solid "+colors.border,cursor:"pointer",background:mode==="manual"?colors.dark:"#fff",color:mode==="manual"?"#fff":colors.text}},"Manual entry")
+    ),
+
+    mode==="standard"&&h("div",{style:{marginBottom:14}},
+      h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Flange"),
+      h("input",{value:flangeSearch,onChange:e=>{setFlangeSearch(e.target.value);setSelectedFlange(null);},placeholder:loadingMaster?"Loading flange data…":"Type e.g. 50nb asme","aria-label":"Flange search",style:{...inputStyle}}),
+      flangeSearch&&!selectedFlange&&flangeMatches.length>0&&h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,marginTop:4,maxHeight:220,overflowY:"auto"}},
+        flangeMatches.map(r=>h("div",{key:r.id,onClick:()=>chooseFlange(r),style:{padding:"8px 10px",fontSize:13,cursor:"pointer",borderBottom:"1px solid #f0eee5"}},
+          flangeLabel(r), !r.validated&&h("span",{style:{marginLeft:8,fontSize:10,color:"#8a4b1f",background:"#faeeda",padding:"1px 6px",borderRadius:8}},"not validated")
+        ))
+      ),
+      flangeSearch&&!selectedFlange&&flangeMatches.length===0&&!loadingMaster&&h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"No match — only ASME B16.5 is loaded so far; AWWA/DIN/B16.47/BS10 are a follow-up data batch."),
+      selectedFlange&&h("div",{style:{fontSize:11,color:colors.muted,marginTop:6}},
+        "OD "+selectedFlange.od+"mm · BCD "+selectedFlange.bcd+"mm · "+selectedFlange.no_of_bolts+" bolts · hole "+selectedFlange.bolt_hole_dia+"mm"+(selectedFlange.flange_thickness?" · thickness "+selectedFlange.flange_thickness+"mm (auto-filled below)":"")+
+        (selectedFlange.max_pressure_ambient?" · max "+selectedFlange.max_pressure_ambient+" bar (ambient)":"")
+      ),
+      selectedFlange&&!selectedFlange.flange_thickness&&h("div",{style:{fontSize:11,color:"#8a4b1f",marginTop:4}},"Flange thickness isn't in the table yet for this row — enter both flange thicknesses manually below.")
+    ),
+    mode==="manual"&&h("div",{style:{marginBottom:4}},
+      h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Bolt hole diameter (mm)"),
+      h("input",{value:hole,onChange:e=>setHole(e.target.value),placeholder:"e.g. 12",style:{...inputStyle,maxWidth:200}})
+    ),
+
+    h("div",{style:{marginTop:14,marginBottom:14}},
+      h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Bolt type — required"),
+      h("div",{style:{display:"flex",gap:8}},
+        h("button",{onClick:()=>setBoltType("stud"),style:{flex:1,padding:10,borderRadius:6,fontSize:13,cursor:"pointer",textAlign:"center",border:boltType==="stud"?"1.5px solid #0f6e56":"1px solid "+colors.border,background:boltType==="stud"?"#e1f5ee":"#fff",color:boltType==="stud"?"#085041":colors.text,fontWeight:boltType==="stud"?600:400}},"Stud Bolt (2 nuts)"),
+        h("button",{onClick:()=>setBoltType("hex"),style:{flex:1,padding:10,borderRadius:6,fontSize:13,cursor:"pointer",textAlign:"center",border:boltType==="hex"?"1.5px solid #0f6e56":"1px solid "+colors.border,background:boltType==="hex"?"#e1f5ee":"#fff",color:boltType==="hex"?"#085041":colors.text,fontWeight:boltType==="hex"?600:400}},"Hex Bolt (head + 1 nut)")
+      )
+    ),
+
+    h("div",{style:{marginBottom:14}},
+      h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Facing / Gasket type — required"),
+      h("div",{style:{display:"flex",gap:8}},
+        h("button",{onClick:()=>setFacingType("RF"),style:{flex:1,padding:10,borderRadius:6,fontSize:13,cursor:"pointer",textAlign:"center",border:facingType==="RF"?"1.5px solid #0f6e56":"1px solid "+colors.border,background:facingType==="RF"?"#e1f5ee":"#fff",color:facingType==="RF"?"#085041":colors.text,fontWeight:facingType==="RF"?600:400}},"Standard (RF) — flat/spiral-wound gasket"),
+        h("button",{onClick:()=>mode==="standard"?setFacingType("RTJ"):alert("RTJ needs a real NPS + Class to look up the ring from — only available in Standard + NB mode."),style:{flex:1,padding:10,borderRadius:6,fontSize:13,cursor:"pointer",textAlign:"center",opacity:mode==="standard"?1:0.5,border:facingType==="RTJ"?"1.5px solid #0f6e56":"1px solid "+colors.border,background:facingType==="RTJ"?"#e1f5ee":"#fff",color:facingType==="RTJ"?"#085041":colors.text,fontWeight:facingType==="RTJ"?600:400}},"RTJ — metal ring, no gasket field"+(mode==="standard"?"":" (Standard+NB only)"))
+      )
+    ),
+
+    h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:14}},
+      h("div",{style:{flex:1,minWidth:130}},
+        h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Flange 1 thk (mm)"),
+        h("input",{value:t1,onChange:e=>setT1(e.target.value),style:{...inputStyle}})
+      ),
+      h("div",{style:{flex:1,minWidth:130}},
+        h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Flange 2 thk (mm)"),
+        h("input",{value:t2,onChange:e=>setT2(e.target.value),style:{...inputStyle}})
+      ),
+      h("div",{style:{flex:1,minWidth:150}},
+        h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},facingType==="RTJ"?"Ring joint (looked up)":"Gasket thickness (mm)"),
+        facingType==="RTJ"
+          ? (()=>{ const rj = selectedFlange?ringJointFor(selectedFlange.nps,selectedFlange.class_rating):null;
+              return rj
+                ? h("div",{style:{padding:"9px 11px",border:"1px solid "+colors.border,borderRadius:6,fontSize:13,background:colors.bg}},
+                    "Ring "+rj.ring_number+(rj.flange_gap!=null?" · gap "+rj.flange_gap+"mm":" · gap not on file"),
+                    !rj.validated&&h("div",{style:{fontSize:10,color:"#8a4b1f",marginTop:3}},"not yet validated")
+                  )
+                : h("div",{style:{padding:"9px 11px",border:"1px solid "+colors.border,borderRadius:6,fontSize:13,color:colors.mutedLight,background:colors.bg}},"pick a flange to look up its ring");
+            })()
+          : h("input",{value:gasket,onChange:e=>onGasketChange(e.target.value),style:{...inputStyle,border:gasketOverridden?"1px solid #b8472f":inputStyle.border}}),
+        facingType!=="RTJ"&&selectedFlange&&gasketDefaultFor(selectedFlange.class_rating)!=null&&!gasketOverridden&&h("div",{style:{fontSize:10,color:"#0f6e56",marginTop:3}},"recommended (thickest-possible default)")
+      ),
+      h("div",{style:{flex:1,minWidth:150}},
+        h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Washer thk (mm, optional)"),
+        h("input",{value:washer,onChange:e=>setWasher(e.target.value),placeholder:"None — skip",style:{...inputStyle}})
+      )
+    ),
+
+    showGasketCaution&&h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:20,width:360}},
+        h("div",{style:{fontSize:14,fontWeight:600,marginBottom:6}},"Override recommended gasket thickness?"),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14}},
+          "Class "+(selectedFlange?selectedFlange.class_rating:"")+" typically uses "+gasketDefaultFor(selectedFlange?selectedFlange.class_rating:"")+"mm. You entered "+pendingGasketVal+"mm — this changes the length calculation."),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+          h("button",{onClick:()=>{ setGasket(pendingGasketVal); setGasketOverridden(true); setShowGasketCaution(false); },style:{padding:8,borderRadius:6,border:"1px solid "+colors.border,background:"#fff",fontSize:12.5,cursor:"pointer"}},"Use "+pendingGasketVal+"mm anyway"),
+          h("button",{onClick:()=>{ setGasket(String(gasketDefaultFor(selectedFlange.class_rating))); setGasketOverridden(false); setShowGasketCaution(false); },style:{padding:8,borderRadius:6,border:"none",background:colors.dark,color:"#fff",fontSize:12.5,cursor:"pointer"}},"Keep recommended")
+        )
+      )
+    ),
+
+    h("button",{onClick:calculate,style:{...btnPrimary,marginBottom:14}},"Calculate"),
+
+    result&&h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,background:"#fff",padding:16,marginBottom:14}},
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,letterSpacing:"0.05em"}},"RESULT — "+(result.boltType==="stud"?"STUD BOLT":"HEX BOLT")+" — "+(result.facingType==="RTJ"?("RTJ, Ring "+result.ringNumber):"RF")),
+        !result.validated&&h("div",{style:{fontSize:10.5,color:"#8a4b1f",background:"#faeeda",padding:"2px 8px",borderRadius:10}},"Not yet validated")
+      ),
+      h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px 20px"}},
+        h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Stud/bolt size (metric)"),h("div",{style:{fontSize:15,fontWeight:600}},result.studSizeMetric)),
+        h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Nearest imperial (UNC)"),h("div",{style:{fontSize:15,fontWeight:600}},result.studSizeImperial)),
+        result.studSizeNative&&h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Native standard spec"),h("div",{style:{fontSize:13}},result.studSizeNative)),
+        h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Length"),h("div",{style:{fontSize:15,fontWeight:600}},result.finalLen+"mm")),
+        h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Nut/bolt spec"),h("div",{style:{fontSize:13}},result.nutSpec)),
+        result.qtyBolts&&h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Quantity"),h("div",{style:{fontSize:13}},result.qtyBolts+" "+(result.boltType==="stud"?"studs":"bolts")+", "+result.qtyNuts+" nuts"))
+      )
+    ),
+
+    h("div",{style:{display:"flex",gap:8,paddingTop:14,borderTop:"1px solid "+colors.border}},
+      h("button",{onClick:exportCalcPDF,disabled:!result,style:{...btnSecondary,opacity:result?1:0.5}},"Export PDF"),
+      h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
+        h("button",{onClick:cancelCalc,style:btnSecondary},"Cancel"),
+        h("button",{onClick:saveCalc,disabled:!result||saving,style:{...btnPrimary,opacity:(!result||saving)?0.6:1}},saving?"Saving…":"Save calculation")
+      )
+    ),
+    saveMsg&&h("div",{style:{marginTop:8,fontSize:12,color:saveMsg.startsWith("Save failed")?colors.danger:"#2d7a4f"}},saveMsg)
+  );
+}
+
+/* ---- BOLTING CALC HISTORY ---- */
+function BoltingCalcHistoryViewer({ user }){
+  const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
+  const load=()=>{ sb.from("bolting_calc_history_tbl").select("*").eq("created_by",user.username).order("created_at",{ascending:false}).limit(50).then(({data})=>{ setRows(data||[]); setLoading(false); }); };
+  useEffect(load,[user.username]);
+  const del=async(id)=>{ if(!confirm("Delete this saved calculation?")) return; await sb.from("bolting_calc_history_tbl").delete().eq("id",id); load(); };
+  const exportRowPDF=(r)=>{
+    generatePDF({
+      title:"Bolting Calculation", refNumber:r.flange_label,
+      description:r.bolt_type==="stud"?"Stud Bolt":"Hex Bolt",
+      createdBy:r.created_by, createdAt:new Date(r.created_at).getTime(),
+      headers:["Parameter","Value"],
+      rows:[["Flange",r.flange_label],["Bolt type",r.bolt_type],["Facing/gasket type",r.facing_type==="RTJ"?("RTJ (Ring "+r.ring_number+")"):"Standard (RF)"],["Bolt size (metric)",r.bolt_size],["Nearest imperial (UNC)",r.bolt_size_imperial],["Length (mm)",r.bolt_length],["Nut/bolt spec",r.nut_spec],[r.facing_type==="RTJ"?"Flange gap (mm)":"Gasket (mm)",r.gasket_thickness],["Washer (mm)",r.washer_thickness||"none"],["Quantity",(r.qty_bolts||"—")+" bolts, "+(r.qty_nuts||"—")+" nuts"]],
+      footerRows:[], filename:"bolting_calc_"+r.id+".pdf"
+    });
+  };
+  return h("div",{style:{padding:"20px 24px"}},
+    h("h2",{style:{margin:"0 0 14px",fontSize:18,fontWeight:700}},"Saved calculations"),
+    loading?h("div",{style:{color:colors.mutedLight}},"Loading…"):
+    rows.length===0?h("div",{style:{color:colors.mutedLight,fontSize:13}},"No saved calculations yet."):
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,overflow:"hidden"}},
+      h("div",{style:{display:"grid",gridTemplateColumns:"1.6fr 1fr 1fr 0.8fr 0.9fr",padding:"8px 12px",background:"#faf9f4",fontSize:10.5,color:colors.mutedLight,borderBottom:"1px solid "+colors.border}},
+        h("div",null,"Flange"),h("div",null,"Bolt type"),h("div",null,"Stud/bolt"),h("div",null,"Saved"),h("div",null)
+      ),
+      rows.map(r=>h("div",{key:r.id,style:{display:"grid",gridTemplateColumns:"1.6fr 1fr 1fr 0.8fr 0.9fr",padding:"9px 12px",fontSize:12.5,borderBottom:"1px solid #f0eee5",alignItems:"center"}},
+        h("div",null,r.flange_label),
+        h("div",null,r.bolt_type==="stud"?"Stud":"Hex bolt"),
+        h("div",null,r.bolt_size+" x "+r.bolt_length+"mm"),
+        h("div",{style:{color:colors.muted}},new Date(r.created_at).toLocaleDateString("en-IN",{day:"2-digit",month:"short"})),
+        h("div",{style:{display:"flex",gap:10,justifyContent:"flex-end"}},
+          h("i",{className:"ti ti-file-type-pdf",onClick:()=>exportRowPDF(r),style:{cursor:"pointer",color:colors.muted,fontSize:15},title:"Export PDF"}),
+          h("i",{className:"ti ti-trash",onClick:()=>del(r.id),style:{cursor:"pointer",color:"#b8472f",fontSize:15},title:"Delete"})
+        )
+      ))
+    )
+  );
+}
+
+/* ---- FLANGE CHART ---- */
+function FlangeChart({ user }){
+  const isAdmin = user && (user.role==="admin"||user.role==="super_admin");
+  const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
+  const [stdFilter,setStdFilter]=useState(""); const [classFilter,setClassFilter]=useState(""); const [typeFilter,setTypeFilter]=useState("");
+  const [unvalidatedOnly,setUnvalidatedOnly]=useState(false);
+  const [edits,setEdits]=useState({}); // id -> {field:value}
+  const [selected,setSelected]=useState({}); // id -> true
+  const [saving,setSaving]=useState(false);
+  const load=()=>{ fetchAll("flange_std_tbl","*").then(d=>{ setRows(d); setLoading(false); }); };
+  useEffect(load,[]);
+
+  const standards = useMemo(()=>Array.from(new Set(rows.map(r=>r.standard))).sort(),[rows]);
+  const classes = useMemo(()=>Array.from(new Set(rows.filter(r=>!stdFilter||r.standard===stdFilter).map(r=>r.class_rating))).sort(naturalCompare),[rows,stdFilter]);
+  const types = useMemo(()=>Array.from(new Set(rows.filter(r=>!stdFilter||r.standard===stdFilter).map(r=>r.flange_type).filter(Boolean))).sort(),[rows,stdFilter]);
+
+  const filtered = useMemo(()=>rows.filter(r=>
+    (!stdFilter||r.standard===stdFilter) &&
+    (!classFilter||r.class_rating===classFilter) &&
+    (!typeFilter||r.flange_type===typeFilter) &&
+    (!unvalidatedOnly||!r.validated)
+  ).sort((a,b)=>naturalCompare(a.nb,b.nb)),[rows,stdFilter,classFilter,typeFilter,unvalidatedOnly]);
+
+  const setEdit=(id,field,val)=>setEdits(e=>({...e,[id]:{...e[id],[field]:val}}));
+  const valOf=(r,field)=> (edits[r.id]&&edits[r.id][field]!==undefined) ? edits[r.id][field] : r[field];
+
+  const saveChanges=async()=>{
+    setSaving(true);
+    try{
+      for(const id of Object.keys(edits)){
+        await sb.from("flange_std_tbl").update(edits[id]).eq("id",id);
+      }
+      setEdits({}); load();
+    } catch(e){ alert("Save failed: "+e.message); } finally{ setSaving(false); }
+  };
+  const cancelAll=()=>setEdits({});
+  const deleteSelected=async()=>{
+    const ids=Object.keys(selected).filter(id=>selected[id]);
+    if(ids.length===0) return;
+    if(!confirm("Delete "+ids.length+" row(s)? This can't be undone.")) return;
+    for(const id of ids) await sb.from("flange_std_tbl").delete().eq("id",id);
+    setSelected({}); load();
+  };
+  const markValidated=async()=>{
+    const ids=Object.keys(selected).filter(id=>selected[id]);
+    if(ids.length===0) return;
+    for(const id of ids) await sb.from("flange_std_tbl").update({validated:true,validated_by:user.username,validated_at:new Date().toISOString()}).eq("id",id);
+    setSelected({}); load();
+  };
+  const addRow=async()=>{
+    const {data}=await sb.from("flange_std_tbl").insert({standard:stdFilter||"ASME B16.5",class_rating:classFilter||"",nb:"",validated:false}).select().single();
+    if(data){ load(); }
+  };
+
+  const exportChartPDF=()=>{
+    const rows2=filtered.map(r=>[r.nb, (r.od||"")+"mm", (r.bcd||"")+"mm", r.no_of_bolts, (r.bolt_hole_dia||"")+"mm", r.bolt_size_metric_equiv||"", r.validated?"Validated":"Not validated"]);
+    generatePDF({
+      title:"Flange Chart", refNumber:(stdFilter||"All standards")+" "+(classFilter||"")+" "+(typeFilter||""),
+      description:"Filtered flange dimension reference",
+      createdBy:user.username, createdAt:Date.now(),
+      headers:["NB","OD","BCD","Bolts","Hole dia","Bolt (metric)","Status"],
+      rows:rows2, footerRows:[], filename:"flange_chart_"+Date.now()+".pdf"
+    });
+  };
+
+  const pill=(label,active,onClick)=>h("div",{key:label,onClick,style:{padding:"6px 12px",background:active?colors.dark:"#fff",color:active?"#fff":colors.text,fontSize:12,borderRadius:20,cursor:"pointer",border:"1px solid "+colors.border}},label);
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("h2",{style:{margin:"0 0 14px",fontSize:18,fontWeight:700}},"Flange Chart"),
+    h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}},
+      pill("All standards",!stdFilter,()=>{setStdFilter("");setClassFilter("");setTypeFilter("");}),
+      standards.map(s=>pill(s,stdFilter===s,()=>{setStdFilter(s);setClassFilter("");setTypeFilter("");}))
+    ),
+    h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:14,alignItems:"center"}},
+      pill("All classes",!classFilter,()=>setClassFilter("")),
+      classes.map(c=>pill(c,classFilter===c,()=>setClassFilter(c))),
+      types.length>0&&pill("All types",!typeFilter,()=>setTypeFilter("")),
+      types.map(t=>pill(t,typeFilter===t,()=>setTypeFilter(t))),
+      h("div",{onClick:()=>setUnvalidatedOnly(u=>!u),style:{marginLeft:"auto",padding:"6px 12px",background:unvalidatedOnly?"#faeeda":"#fff",color:"#8a4b1f",fontSize:11.5,borderRadius:20,cursor:"pointer",border:"1px solid "+colors.border,display:"flex",alignItems:"center",gap:5}},
+        h("i",{className:"ti ti-alert-triangle","aria-hidden":"true",style:{fontSize:13}}),"Unvalidated only"
+      )
+    ),
+    loading?h("div",{style:{color:colors.mutedLight}},"Loading…"):
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,overflowX:"auto",marginBottom:14}},
+      h("table",{style:{fontSize:12.5,width:"100%",minWidth:820}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          [isAdmin?"":null,"NB","OD","BCD","Bolts","Hole dia","Bolt (metric)","Status"].filter((v,i)=>i>0||isAdmin).map((c,i)=>h("th",{key:i,style:{padding:"7px 9px",fontSize:10.5}},c))
+        )),
+        h("tbody",null,filtered.map(r=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
+          isAdmin&&h("td",{style:{padding:"6px 9px"}},h("input",{type:"checkbox",checked:!!selected[r.id],onChange:e=>setSelected(s=>({...s,[r.id]:e.target.checked}))})),
+          h("td",{style:{padding:"6px 9px"}},isAdmin?h("input",{value:valOf(r,"nb")||"",onChange:e=>setEdit(r.id,"nb",e.target.value),style:{width:70,border:"1px solid "+colors.border,borderRadius:4,padding:"3px 5px",fontSize:12}}):r.nb),
+          h("td",{style:{padding:"6px 9px"}},isAdmin?h("input",{value:valOf(r,"od")||"",onChange:e=>setEdit(r.id,"od",e.target.value),style:{width:60,border:"1px solid "+colors.border,borderRadius:4,padding:"3px 5px",fontSize:12}}):r.od),
+          h("td",{style:{padding:"6px 9px"}},isAdmin?h("input",{value:valOf(r,"bcd")||"",onChange:e=>setEdit(r.id,"bcd",e.target.value),style:{width:60,border:"1px solid "+colors.border,borderRadius:4,padding:"3px 5px",fontSize:12}}):r.bcd),
+          h("td",{style:{padding:"6px 9px"}},r.no_of_bolts),
+          h("td",{style:{padding:"6px 9px"}},r.bolt_hole_dia),
+          h("td",{style:{padding:"6px 9px"}},r.bolt_size_metric_equiv),
+          h("td",{style:{padding:"6px 9px"}},r.validated?h("span",{style:{color:"#0f6e56"}},"✓ Validated"):h("span",{style:{fontSize:10.5,color:"#8a4b1f",background:"#faeeda",padding:"1px 7px",borderRadius:8}},"Not validated"))
+        )))
+      )
+    ),
+    h("div",{style:{display:"flex",gap:8,alignItems:"center",paddingTop:10,borderTop:"1px solid "+colors.border,flexWrap:"wrap"}},
+      isAdmin&&h("button",{onClick:addRow,style:btnSecondary},"+ Add row"),
+      h("button",{onClick:exportChartPDF,style:{...btnSecondary,display:"flex",alignItems:"center",gap:6}},h("i",{className:"ti ti-file-type-pdf","aria-hidden":"true"}),"Export PDF"),
+      isAdmin&&h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
+        h("button",{onClick:markValidated,style:{...btnSecondary,color:"#0f6e56"}},"Mark selected validated"),
+        h("button",{onClick:cancelAll,style:btnSecondary},"Cancel all"),
+        h("button",{onClick:deleteSelected,style:{...btnSecondary,color:"#b8472f",border:"1px solid #b8472f"}},"Delete selected"),
+        h("button",{onClick:saveChanges,disabled:saving,style:{...btnPrimary,background:"#0f6e56",opacity:saving?0.6:1}},saving?"Saving…":"Save changes")
+      )
+    )
+  );
+}
+
 function ReportsScreen({ user, onOpenModel }) {
   const [showMode,setShowMode]=useState("available"); // "available" | "missing" | "all"
   const [loading,setLoading]=useState(true);
@@ -17160,6 +17647,8 @@ function App() {
     tab==="data_backup"?h(DataBackupScreen,{user}):
     tab==="abandoned_quotes_cleanup"?h(AbandonedQuotesCleanupScreen,{user,onChanged:refreshAbandonedCount}):
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
+    tab==="bolting_calc"?h("div",null,h(BoltingCalculator,{user}),h(BoltingCalcHistoryViewer,{user})):
+    tab==="flange_chart"?h(FlangeChart,{user}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
