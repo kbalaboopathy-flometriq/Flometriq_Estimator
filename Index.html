@@ -6229,21 +6229,45 @@ function AddCustomerPanel({ onClose, onAdded }){
 // header in Estimator and the Quotes screen's Quote Header panel. Selecting
 // (or adding) a company fires onSelect with the address (as separate lines)
 // and primary contact, so the caller can auto-fill Address/Attention.
+// Search-as-you-type against the server (debounced, 25-row cap, matches the
+// app's own standing "no unbounded loads" rule) instead of preloading the
+// whole Customers table into one combo — with 4,000+ companies and growing,
+// that preload silently truncated at Supabase's default per-request row cap
+// (no explicit order on the old query), so real customers could go missing
+// from the picker with zero error, purely by chance of unspecified row
+// order. The old code also loaded ALL of `contacts` unconditionally on every
+// mount — same unbounded-load pattern, fixed here too by only fetching
+// contacts for the companies actually matched by the current search.
 function CustomerSelect({ value, onSelect, disabled }){
-  const [options,setOptions] = useState([]);
+  const [queryText,setQueryText] = useState(value||"");
+  const [matches,setMatches] = useState([]); // [{company_name,billing_*,contacts:[...]}]
   const [showAdd,setShowAdd] = useState(false);
-  const loadOptions = useCallback(async()=>{
-    const { data: cos } = await sb.from("companies").select("company_name,billing_street,billing_city,billing_state,billing_pin,billing_country");
-    const { data: cts } = await sb.from("contacts").select("company_name,contact_name,designation,is_primary");
-    const byCompany = new Map();
-    (cos||[]).forEach(c=>byCompany.set(c.company_name,{...c,contacts:[]}));
-    (cts||[]).forEach(ct=>{ const e=byCompany.get(ct.company_name); if(e) e.contacts.push(ct); });
-    setOptions(Array.from(byCompany.values()).sort((a,b)=>a.company_name.localeCompare(b.company_name)));
-  },[]);
-  useEffect(()=>{ loadOptions(); },[loadOptions]);
-  const pick = (name)=>{
-    const match = options.find(c=>c.company_name===name);
-    if(!match){ onSelect({company_name:name,address:"",contact_name:"",contact_designation:"",billing_country:""}); return; }
+  const listId = useMemo(()=>"cust-dl-"+Math.random().toString(36).slice(2,9),[]);
+
+  useEffect(()=>{ setQueryText(value||""); },[value]);
+
+  useEffect(()=>{
+    const q = queryText.trim();
+    if(q.length<2){ setMatches([]); return; }
+    let cancelled=false;
+    const t = setTimeout(async()=>{
+      const { data: cos } = await sb.from("companies").select("company_name,billing_street,billing_city,billing_state,billing_pin,billing_country").ilike("company_name","%"+q+"%").order("company_name").limit(25);
+      if(cancelled) return;
+      const names = (cos||[]).map(c=>c.company_name);
+      let cts = [];
+      if(names.length){
+        const { data } = await sb.from("contacts").select("company_name,contact_name,designation,is_primary").in("company_name",names);
+        cts = data||[];
+      }
+      const byCompany = new Map();
+      (cos||[]).forEach(c=>byCompany.set(c.company_name,{...c,contacts:[]}));
+      cts.forEach(ct=>{ const e=byCompany.get(ct.company_name); if(e) e.contacts.push(ct); });
+      if(!cancelled) setMatches(Array.from(byCompany.values()));
+    },300);
+    return ()=>{ cancelled=true; clearTimeout(t); };
+  },[queryText]);
+
+  const pick = (match)=>{
     const primary = match.contacts.find(ct=>ct.is_primary==="Yes") || match.contacts[0];
     onSelect({
       company_name: match.company_name,
@@ -6252,11 +6276,36 @@ function CustomerSelect({ value, onSelect, disabled }){
       contact_designation: primary?primary.designation||"":"",
       billing_country: match.billing_country||""
     });
+    setQueryText(match.company_name);
   };
+
+  const handleChange = (v)=>{
+    setQueryText(v);
+    const hit = matches.find(m=>m.company_name===v);
+    if(hit) pick(hit);
+  };
+
+  const handleBlur = ()=>{
+    const v = queryText.trim();
+    if(!v){ onSelect({company_name:"",address:"",contact_name:"",contact_designation:"",billing_country:""}); return; }
+    const hit = matches.find(m=>m.company_name===v);
+    if(hit){ pick(hit); return; }
+    if(v!==(value||"")) setQueryText(value||""); // typed text isn't a real match — revert
+  };
+
   return h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
-    h(LimitToListCombo,{value,disabled,onChange:pick,options:options.map(c=>c.company_name),placeholder:"Select…",style:{...inputStyle,flex:1,background:disabled?"#f4f2ea":"#fff"}}),
+    h("div",{style:{position:"relative",flex:1}},
+      h("input",{
+        list:listId, value:queryText, disabled,
+        onChange:e=>handleChange(e.target.value),
+        onBlur:handleBlur,
+        placeholder:"Type to search customers…",
+        style:{...inputStyle,width:"100%",background:disabled?"#f4f2ea":"#fff"}
+      }),
+      h("datalist",{id:listId},matches.map(m=>h("option",{key:m.company_name,value:m.company_name})))
+    ),
     !disabled && h("button",{type:"button",onClick:()=>setShowAdd(true),style:{border:"1px solid "+colors.border,background:"#fff",color:"#1c8c75",fontSize:10.5,padding:"6px 8px",borderRadius:5,cursor:"pointer",whiteSpace:"nowrap"}},"+ Add new"),
-    showAdd && h(AddCustomerPanel,{onClose:()=>setShowAdd(false),onAdded: async(payload)=>{ await loadOptions(); onSelect(payload); }})
+    showAdd && h(AddCustomerPanel,{onClose:()=>setShowAdd(false),onAdded: async(payload)=>{ setQueryText(payload.company_name); onSelect(payload); }})
   );
 }
 
