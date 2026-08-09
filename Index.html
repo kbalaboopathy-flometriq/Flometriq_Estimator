@@ -41,7 +41,7 @@ table { width: 100%; border-collapse: collapse; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-09T15:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-09T16:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8756,6 +8756,28 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         });
       });
       const isRevisionPdf = quoteExportRef.includes("-Rev-");
+
+      // Single shared grand total — Cover Letter's "Total Basic Price" and
+      // Annexure II's Price Summary grand total both read THIS value now,
+      // instead of each computing their own separately. Real bug found and
+      // fixed here: the Cover Letter's own formula only summed raw BOM
+      // sales_price × order_qty, missing Extra Price and Pro-rata Testing
+      // entirely — which is why it disagreed with the Annexure (which
+      // already folds both in). Using one shared value instead of two
+      // independently-written formulas guarantees they can never drift
+      // apart again, rather than just patching this one instance of it.
+      const extraPriceTotal = (extraPriceForPdf||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
+      const testingSeparateTotal = testingMode==="separate" ? ((slTestingAll||[]).reduce((s,l)=>s+(Number(l.price)||0),0) + (globalTestingAll||[]).reduce((s,l)=>s+(Number(l.rate)||0),0)) : 0;
+      const grandTotalInr = estimatesRows.reduce((s,est)=>{
+        const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+        const baseUnitPriceInr = slLines.reduce((ss,l)=>ss+(Number(l.sales_price)||0),0);
+        const qty = est.order_qty||1;
+        const slExtraTotal = (slExtraByItem.get(est.item_sl_no)||[]).reduce((ss,l)=>ss+(Number(l.price)||0),0);
+        const slTestingTotal = (slTestingByItem.get(est.item_sl_no)||[]).reduce((ss,l)=>ss+(Number(l.price)||0),0);
+        const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) + ((globalFoldTotalByItem.get(est.item_sl_no)||0)/qty) : 0);
+        return s+(baseUnitPriceInr+foldedPerUnit)*qty;
+      },0) + extraPriceTotal + testingSeparateTotal;
+
       const {data:revChangesRows} = isRevisionPdf ? await sb.from("revision_changes").select("*").eq("revision_ref",quoteExportRef).order("changed_at",{ascending:true}) : {data:[]};
       const revChangesForPdf = revChangesRows||[];
       const first = estimatesRows[0];
@@ -8829,17 +8851,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       }
       doc.setFont("times","bold"); doc.text("Sub:",12,y); doc.setFont("times","normal");
       doc.text("Our Techno Commercial offer for the above",24,y); y+=14;
-      const totalSalesAll = linesRows.reduce((s,l)=>{
-        const est=estimatesRows.find(e=>e.item_sl_no===l.item_sl_no);
-        return s+(Number(l.sales_price)||0)*((est&&est.order_qty)||1);
-      },0);
       const quoteCurrency = first.currency||"INR";
       const quoteIsInr = quoteCurrency==="INR";
       const quoteFx = Number(first.conversion_rate)||1;
       const coverLetterBody = [
         ["Delivery", effDelivery],
         ["Validity", effValidity],
-        ["Total Basic Price", quoteCurrency+" "+fmtR(quoteIsInr?totalSalesAll:(totalSalesAll/quoteFx))]
+        ["Total Basic Price", quoteCurrency+" "+fmtR(quoteIsInr?grandTotalInr:(grandTotalInr/quoteFx))]
       ];
       doc.autoTable({
         startY:y,
@@ -9071,17 +9089,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         return [est.item_sl_no, modelItemMap.get(est.model)||est.model||"—", est.description||"—",
           fmtR(quoteIsInr?unitPriceInr:(unitPriceInr/quoteFx)), qty, fmtR(quoteIsInr?totalInr:(totalInr/quoteFx))];
       });
-      const extraPriceTotal = extraPriceForPdf.reduce((s,l)=>s+(Number(l.price)||0),0);
-      const testingSeparateTotal = testingMode==="separate" ? ((slTestingAll||[]).reduce((s,l)=>s+(Number(l.price)||0),0) + (globalTestingAll||[]).reduce((s,l)=>s+(Number(l.rate)||0),0)) : 0;
-      const grandTotalInr = estimatesRows.reduce((s,est)=>{
-        const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
-        const baseUnitPriceInr = slLines.reduce((ss,l)=>ss+(Number(l.sales_price)||0),0);
-        const qty = est.order_qty||1;
-        const slExtraTotal = (slExtraByItem.get(est.item_sl_no)||[]).reduce((ss,l)=>ss+(Number(l.price)||0),0);
-        const slTestingTotal = (slTestingByItem.get(est.item_sl_no)||[]).reduce((ss,l)=>ss+(Number(l.price)||0),0);
-        const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) + ((globalFoldTotalByItem.get(est.item_sl_no)||0)/qty) : 0);
-        return s+(baseUnitPriceInr+foldedPerUnit)*qty;
-      },0) + extraPriceTotal + testingSeparateTotal;
+      // grandTotalInr, extraPriceTotal, testingSeparateTotal already computed
+      // once, early — shared with the Cover Letter's Total Basic Price so
+      // the two documents can never disagree.
       const grandTotalDisplay = quoteIsInr ? grandTotalInr : (grandTotalInr/quoteFx);
       const summaryHead = ["S.No","Item","Description","Unit price ("+quoteCurrency+")","Qty","Total ("+quoteCurrency+")"];
       const summaryAmountCols = [3,4,5];
