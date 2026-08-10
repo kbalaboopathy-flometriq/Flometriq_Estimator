@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-10T03:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-10T05:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -4463,6 +4463,21 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           disabled:cart.length===0||simpleSaving,
           style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"none",cursor:(cart.length===0||simpleSaving)?"not-allowed":"pointer",background:(cart.length===0||simpleSaving)?"#b5d4f4":"#0c447c",color:"#fff"}
         },simpleSaving?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Save to estimate"),
+        h("button",{
+          onClick:()=>{
+            // Cancel abandons THIS in-progress Sl No add and returns to the
+            // specific quote it belongs to — same bridge already used by
+            // "Back to Quote" elsewhere — rather than "New" (generic Quotes
+            // list) or "Close" (leaves entirely, goes home). For a brand-new
+            // quote being created (no existing quote to go back to yet),
+            // falls back to the same behavior as "New".
+            if(cart.length>0 && !confirm("You have "+cart.length+" unsaved line(s) in the cart. Cancel without saving?")) return;
+            resetCart();
+            if(holdingNewSlNo && !holdingNewSlNo.isNewQuote && onOpenQuote) onOpenQuote(holdingNewSlNo.reference_number, null, false);
+            else if(onGoToTab) onGoToTab("saved");
+          },
+          style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"1px solid #85b7eb",background:"#fff",color:"#0c447c",cursor:"pointer"}
+        },"Cancel"),
         h("button",{onClick:()=>attemptCloseOrNew("new"),style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"1px solid #85b7eb",background:"#fff",color:"#0c447c",cursor:"pointer"}},"New"),
         h("button",{onClick:()=>attemptCloseOrNew("close"),style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"1px solid #85b7eb",background:"#fff",color:"#0c447c",cursor:"pointer"}},"Close")
       )
@@ -6848,6 +6863,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     } finally { setAmendBusy(false); }
   };
   const [showNewSlNoModal,setShowNewSlNoModal]=useState(false);
+  const [showCartScreen,setShowCartScreen]=useState(false);
   const [newSlNoInput,setNewSlNoInput]=useState("");
   const [newSlNoError,setNewSlNoError]=useState("");
   const [newSlNoStep,setNewSlNoStep]=useState("input"); // "input" | "confirm"
@@ -8239,7 +8255,19 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const totalOrderSales=totalSales;
   const updateOrderQty=async(val)=>{
     const n=Number(val)||1; setOrderQty(n);
-    if(openRef) await sb.from("estimates").update({order_qty:n}).eq("id",openRef.id);
+    if(openRef){
+      const {error} = await sb.from("estimates").update({order_qty:n}).eq("id",openRef.id);
+      if(error){ alert("Couldn't save the new quantity: "+error.message); return; }
+      // Real bug fixed here: the write to Supabase always succeeded, but
+      // the in-memory `refs` list (what re-opening a Sl No actually reads
+      // its starting qty from) never got patched — so switching to a
+      // different Sl No and back would silently reload the OLD qty from
+      // that stale list, even though the new value was sitting correctly
+      // in the database the whole time. Same fix pattern as fixHeaderModel,
+      // already proven elsewhere in this file.
+      setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,order_qty:n}:r));
+      setOpenRef(r=>r?{...r,order_qty:n}:r);
+    }
   };
   const [showSummarySaved,setShowSummarySaved]=useState(false);
   const [showCuttingPlan,setShowCuttingPlan]=useState(false);
@@ -9624,7 +9652,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("button",{onClick:openBomFix,style:{...btnSmall,fontSize:11,padding:"4px 9px",border:"1px solid #a3312a",color:"#a3312a"}},isAdmin?"Fix now":"Enter code to fix")
           ),
           h("div",{style:{display:"flex",gap:8}},
-            h("button",{onClick:()=>{ setNewSlNoInput(""); setNewSlNoError(""); setNewSlNoStep("input"); setShowNewSlNoModal(true); },style:{...btnSmall,border:"1px solid "+colors.border,display:"flex",alignItems:"center",gap:5}},h("i",{className:"ti ti-shopping-cart","aria-hidden":"true",style:{fontSize:13}}),"Go to Cart"),
+            h("button",{onClick:()=>setShowCartScreen(true),style:{...btnSmall,border:"1px solid "+colors.border,display:"flex",alignItems:"center",gap:5}},h("i",{className:"ti ti-shopping-cart","aria-hidden":"true",style:{fontSize:13}}),"Go to Cart"),
             isAdmin && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete this Revision"),
             isAdmin && h("button",{onClick:openDeleteEntireQuote,style:{...btnSmall,background:colors.danger,color:"#fff",border:"none",fontWeight:600}},"Delete Entire Quote"),
             h("button",{onClick:()=>attemptCloseOrNewQuotes("close"),style:{padding:"6px 14px",fontSize:12,fontWeight:600,borderRadius:5,border:"none",background:colors.danger,color:"#fff",cursor:"pointer"}},"Close")
@@ -10469,6 +10497,47 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             )
       )
     ),
+    // Cart screen — Screen 1 of the Go to Cart flow. Just a friendlier list
+    // of this quote's REAL, already-created Sl Nos (not a separate staging
+    // mechanism) plus a button into the existing, untouched "+ New Sl No"
+    // flow. "Goto BOM" reuses the exact same openEstimate() the rest of
+    // this screen already uses; "Remove" reuses the exact same deleteSlNo()
+    // (careful delete-everywhere, with its own confirmation) — no new
+    // removal logic invented here.
+    showCartScreen && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:680,maxWidth:"100%",maxHeight:"85vh",overflow:"auto",padding:"20px 22px"}},
+        h("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,paddingBottom:12,borderBottom:"1px solid "+colors.border}},
+          h("span",{style:{fontSize:14,fontWeight:700}},"Cart — "+refFilter),
+          h("button",{onClick:()=>setShowCartScreen(false),style:{border:"1px solid #1c8c75",background:"#eef6f3",color:"#0f6e56",padding:"7px 13px",borderRadius:6,fontSize:12.5,fontWeight:600,cursor:"pointer",display:"flex",alignItems:"center",gap:5}},h("i",{className:"ti ti-arrow-left","aria-hidden":"true",style:{fontSize:13}}),"Back to quote "+refFilter)
+        ),
+        h("button",{
+          onClick:()=>{ setShowCartScreen(false); setNewSlNoInput(""); setNewSlNoError(""); setNewSlNoStep("input"); setShowNewSlNoModal(true); },
+          style:{...btnPrimary,marginBottom:18}
+        },"+ Add New Sl No. To Cart"),
+        h("div",{style:{fontSize:11,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:8}},"Cart — existing Sl Nos on this quote"),
+        h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,overflow:"hidden"}},
+          h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:13}},
+            h("thead",null,h("tr",{style:{background:"#faf9f4",borderBottom:"2px solid "+colors.dark,textAlign:"left"}},
+              h("th",{style:{padding:"8px 10px"}},"Sl No"),h("th",{style:{padding:"8px 10px"}},"Item"),h("th",{style:{padding:"8px 10px"}},"Model"),h("th",{style:{padding:"8px 10px"}},"Qty"),h("th",{style:{padding:"8px 10px"}},"")
+            )),
+            h("tbody",null,
+              refs.filter(r=>r.reference_number===refFilter).length===0
+                ? h("tr",null,h("td",{colSpan:5,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},"No Sl Nos on this quote yet."))
+                : refs.filter(r=>r.reference_number===refFilter).sort((a,b)=>a.item_sl_no-b.item_sl_no).map(r=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
+                    h("td",{style:{padding:"8px 10px",fontWeight:700,color:"#0f6e56"}},r.item_sl_no),
+                    h("td",{style:{padding:"8px 10px"}},modelItemMap.get(r.model)||r.model||"—"),
+                    h("td",{style:{padding:"8px 10px"}},r.model||"—"),
+                    h("td",{style:{padding:"8px 10px"}},r.order_qty||1),
+                    h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
+                      h("button",{onClick:async()=>{ setShowCartScreen(false); await openEstimate(r); },style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Goto BOM"),
+                      isAdmin && h("button",{onClick:()=>deleteSlNo(r),disabled:deletingSlNo===r.id,style:{border:"none",background:"transparent",color:colors.danger,cursor:"pointer",fontSize:12}},deletingSlNo===r.id?"…":"Remove")
+                    )
+                  ))
+            )
+          )
+        )
+      )
+    ),
     showNewSlNoModal && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
       h("div",{style:{background:"#fff",borderRadius:8,width:420,padding:"20px 22px",display:"flex",gap:16}},
         h("div",{style:{width:100,flexShrink:0,borderRight:"1px solid "+colors.border,paddingRight:12}},
@@ -10997,12 +11066,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("thead",null,h("tr",null,
             ["Test","Sl No","Item","Rate"].map((l,i)=>h("th",{key:l,style:{textAlign:i===3?"right":"left",padding:"5px 6px",color:colors.muted,fontSize:11.5}},l))
           )),
-          h("tbody",null,globalRateReviewRows.map((r,idx)=>h("tr",{key:idx,style:{borderTop:"1px solid "+colors.border}},
-            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.test_name),
-            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.item_sl_no),
-            h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.itemName),
-            h("td",{style:{padding:"5px 6px",textAlign:"right"}},h("input",{value:r.rate,onChange:e=>setGlobalRateReviewRows(rows=>rows.map((row,i)=>i===idx?{...row,rate:e.target.value}:row)),style:{width:90,fontSize:12,padding:"4px 6px",textAlign:"right"}}))
-          )))
+          h("tbody",null,globalRateReviewRows.map((r,idx)=>{
+            const t = testTypeOptions.find(tt=>tt.test_name===r.test_name);
+            const exceedsMax = t && t.max_charge!=null && r.rate!=="" && Number(r.rate) > Number(t.max_charge);
+            return h("tr",{key:idx,style:{borderTop:"1px solid "+colors.border}},
+              h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.test_name),
+              h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.item_sl_no),
+              h("td",{style:{padding:"5px 6px",fontSize:12.5}},r.itemName),
+              h("td",{style:{padding:"5px 6px",textAlign:"right"}},
+                h("input",{value:r.rate,onChange:e=>setGlobalRateReviewRows(rows=>rows.map((row,i)=>i===idx?{...row,rate:e.target.value}:row)),style:{width:90,fontSize:12,padding:"4px 6px",textAlign:"right",border:exceedsMax?"1px solid #8a4b1f":undefined}}),
+                // Accurate max_charge warning — same fix as the per-Sl-No
+                // Testing tab; the review step already invites free editing
+                // ("Edit anything before continuing"), this just makes sure
+                // going past the master's real limit is visible.
+                exceedsMax ? h("div",{style:{fontSize:10,color:"#8a4b1f",marginTop:2}},"⚠ Max "+Number(t.max_charge).toFixed(2)) : null
+              )
+            );
+          }))
         ),
         h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:8}},
           h("p",{style:{fontSize:12.5,fontWeight:600,margin:0}},"Combined total: ₹"+globalRateReviewRows.reduce((s,r)=>s+(Number(r.rate)||0),0).toFixed(2))
@@ -18239,7 +18319,13 @@ function NewTestingLineForm({ testTypeOptions, suggestPrice, unitPrice, onAdd })
   const [testName,setTestName]=useState("");
   const [price,setPrice]=useState("");
   const suggested = testName ? suggestPrice(testName) : "";
-  const exceeds = price!=="" && Number(price) > unitPrice;
+  const selectedType = testName ? testTypeOptions.find(tt=>tt.test_name===testName) : null;
+  // The warning now actually checks against the Test Types Master's own
+  // max_charge — previously it compared against unitPrice instead, a
+  // completely different number that had nothing to do with the master's
+  // real limit. max_charge is still editable-past (option 3), just honest
+  // about what's being compared now.
+  const exceedsMax = selectedType && selectedType.max_charge!=null && price!=="" && Number(price) > Number(selectedType.max_charge);
   return h("div",{style:{marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:10}},
     h("div",{style:{display:"flex",gap:8,alignItems:"flex-end"}},
       h("div",{style:{flex:1}},
@@ -18252,7 +18338,7 @@ function NewTestingLineForm({ testTypeOptions, suggestPrice, unitPrice, onAdd })
       h("button",{onClick:()=>{ onAdd(testName,price); setTestName(""); setPrice(""); },style:btnPrimary},"+ Add")
     ),
     testName && suggested!=="" ? h("p",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:4}},"Suggested from Test Types Master: "+suggested+" — edit freely above") : null,
-    exceeds ? h("p",{style:{fontSize:11,color:"#8a4b1f",marginTop:4}},"⚠ Exceeds this Sl No's item price ("+unitPrice.toFixed(2)+")") : null
+    exceedsMax ? h("p",{style:{fontSize:11,color:"#8a4b1f",marginTop:4}},"⚠ Exceeds this test's max charge of "+Number(selectedType.max_charge).toFixed(2)+" (Test Types Master)") : null
   );
 }
 
