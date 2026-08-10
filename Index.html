@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-10T07:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-10T10:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1373,6 +1373,7 @@ function BomEntryForm({ onGoToTab, user }) {
   const [cloneDuplicateInfo, setCloneDuplicateInfo] = useState(null); // {item,size,model} of the pre-existing clash
   const [cloneBusy, setCloneBusy] = useState(false);
   const [cloneMsg, setCloneMsg] = useState("");
+  const [cloneRefreshing, setCloneRefreshing] = useState(false);
 
   // Full-screen + frozen-header/frozen-first-columns + mirrored top scrollbar
   // for the BOM lines table — same pattern as the Estimator's BOM table.
@@ -1494,6 +1495,22 @@ function BomEntryForm({ onGoToTab, user }) {
     if(!subRows.length){ alert("Nothing to clone — this model has no BOM lines yet."); return; }
     setCloneNewSize(""); setCloneNewModel(""); setCloneAddModelMode(false); setCloneAddCategory("");
     setCloneDuplicateInfo(null); setCloneMsg(""); setShowCloneDialog(true);
+  };
+  // Refresh — the dialog's Size/Model option lists come from `modelCatalog`,
+  // loaded once when this screen mounted. If another user (or this one, in
+  // another tab) added a size/model since then, the dropdowns here would be
+  // stale even though the actual clash-check at submit time always re-reads
+  // fresh. Re-fetches model_tbl and updates modelCatalog/allModels so the
+  // options themselves are current too, without closing the dialog.
+  const refreshCloneCatalog = async()=>{
+    setCloneRefreshing(true);
+    try{
+      const { data, error:err } = await sb.from("model_tbl").select("item,size,model");
+      if(err){ setCloneMsg("Refresh failed: "+err.message); return; }
+      const catalog = (data||[]).filter(r=>r.model);
+      setModelCatalog(catalog);
+      setAllModels(Array.from(new Set(catalog.map(r=>r.model))).sort(naturalCompare));
+    } finally { setCloneRefreshing(false); }
   };
   const closeCloneDialog = ()=>{
     setShowCloneDialog(false); setCloneNewSize(""); setCloneNewModel("");
@@ -1992,7 +2009,8 @@ function BomEntryForm({ onGoToTab, user }) {
           canEditBom&&!editAllMode&&subRows.length>0&&h("button",{onClick:openCloneDialog,style:{...btnSecondary,padding:"10px 18px",fontWeight:600}},"Clone this BOM"),
           subRows.length>0&&h("button",{onClick:deleteEntireBomForModel,style:{...btnDanger,padding:"10px 18px",fontSize:13,fontWeight:700,border:"2px solid "+colors.danger}},"Delete BOM"),
           h("button",{onClick:downloadCleanupTracker,style:{...btnSecondary,padding:"9px 14px"}},"Download cleanup tracker"),
-          h("button",{onClick:()=>setFullScreenBomEntry(f=>!f),style:{...btnSecondary,padding:"9px 14px"}}, fullScreenBomEntry?"Esc · Close full screen":"⛶ Full screen")
+          h("button",{onClick:()=>setFullScreenBomEntry(f=>!f),style:{...btnSecondary,padding:"9px 14px"}}, fullScreenBomEntry?"Esc · Close full screen":"⛶ Full screen"),
+          h("button",{onClick:closeBomEntryForm,style:{...btnSecondary,padding:"9px 14px"}},"Close")
         )
       ),
       loadingSub?h("div",{style:{padding:20,color:colors.mutedLight,fontSize:13}},"Loading…"):
@@ -2141,6 +2159,7 @@ function BomEntryForm({ onGoToTab, user }) {
           cloneMsg && h("div",{style:{fontSize:12,color:colors.danger,marginBottom:10}},cloneMsg),
 
           !cloneAddModelMode && h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:8}},
+            h("button",{onClick:refreshCloneCatalog,disabled:cloneBusy||cloneRefreshing,style:btnSecondary},cloneRefreshing?"Refreshing…":"Refresh"),
             h("button",{onClick:closeCloneDialog,disabled:cloneBusy,style:btnSecondary},"Cancel"),
             h("button",{onClick:()=>executeClone(),disabled:cloneBusy||!cloneNewSize||!cloneNewModel.trim(),style:btnPrimary},cloneBusy?"Cloning…":"Clone BOM")
           )
@@ -5375,6 +5394,39 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   const [saved,setSaved] = useState(false);
   const [fillOpen,setFillOpen] = useState(false);
   const [sectionIdx,setSectionIdx] = useState(0);
+  const isAdmin = user?.role==="admin"||user?.role==="super_admin";
+  // Combo "+ Add to list" for dropdown fields during real fill-out (10 Aug).
+  // Admin/super_admin adds immediately; a plain user needs a one-time code
+  // (reusing the existing gated_action_pin_tbl mechanism, same one the
+  // Incomplete BOM fix flow already uses — action type "datasheet_option_add").
+  const [addingOptionKey,setAddingOptionKey] = useState(null);
+  const [optionCode,setOptionCode] = useState("");
+  const [optionAddBusy,setOptionAddBusy] = useState(false);
+  const [optionAddMsg,setOptionAddMsg] = useState("");
+  const appendOptionLocally = (fieldKey, value)=>{
+    setTemplate(t=>t?{...t, sections:t.sections.map(sec=>({...sec, fields:sec.fields.map(f=>f.key===fieldKey?{...f, options:[...(f.options||[]), value]}:f)}))}:t);
+  };
+  const addDatasheetOption = async(field, rawValue)=>{
+    const value = (rawValue||"").trim();
+    if(!value) return;
+    setOptionAddBusy(true); setOptionAddMsg("");
+    try{
+      if(!isAdmin){
+        const res = await verifyAndConsumeGatedPin("datasheet_option_add", optionCode, user?.username||"unknown", "datasheet_master_fields", itemName+":"+field.key, "Added \""+value+"\" to \""+field.label+"\"");
+        if(!res.ok){ setOptionAddMsg(res.message); setOptionAddBusy(false); return; }
+      }
+      const { data:row } = await sb.from("datasheet_master_fields").select("id,options").eq("item",itemName).eq("field_key",field.key).maybeSingle();
+      if(!row){ setOptionAddMsg("Couldn't find this field's master row."); setOptionAddBusy(false); return; }
+      const newOptions = [...(row.options?row.options.split("|"):[]), value].join("|");
+      const { error:err } = await sb.from("datasheet_master_fields").update({options:newOptions}).eq("id",row.id);
+      if(err){ setOptionAddMsg("Save failed: "+err.message); setOptionAddBusy(false); return; }
+      await logAudit("EDIT","datasheet_master_fields",itemName,"Added \""+value+"\" to \""+field.label+"\" via datasheet fill-out",user?.username||"unknown",{options:row.options},{options:newOptions});
+      appendOptionLocally(field.key, value);
+      setField(field.key, value);
+      setAddingOptionKey(null); setOptionCode(""); setOptionAddMsg("");
+    } catch(e){ setOptionAddMsg("Failed: "+e.message); }
+    finally { setOptionAddBusy(false); }
+  };
 
   // Folded Sales total (base BOM + Extra Price + Pro-rata NDE Testing, when
   // chosen) — kept in state since it needs an async fetch. The fallback
@@ -5758,15 +5810,27 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
                 ? h("input",{value:model||(openLines&&openLines[0]&&openLines[0].model)||"",disabled:true,style:{...inputStyle,background:"#f4f2ea"}})
               : field.type==="dropdown"
                 ? h(React.Fragment,null,
-                    h("select",{value:values["__custom__"+field.key]?"__custom__":(values[field.key]!==undefined?values[field.key]:(field.default||"")),onChange:e=>{
-                      if(e.target.value==="__custom__") setValues(vv=>({...vv,["__custom__"+field.key]:true,[field.key]:""}));
-                      else setValues(vv=>({...vv,["__custom__"+field.key]:false,[field.key]:e.target.value}));
-                    },style:{...inputStyle,...changedStyle}},
-                      h("option",{value:""},"— select —"),
-                      field.options.map(o=>h("option",{key:o,value:o},o)),
-                      h("option",{value:"__custom__"},"Other (type below)")
-                    ),
-                    values["__custom__"+field.key] && h("input",{placeholder:"Type custom value",value:values[field.key]||"",onChange:e=>setField(field.key,e.target.value),style:{...inputStyle,marginTop:6,...changedStyle}})
+                    h(LimitToListCombo,{value:values[field.key]!==undefined?values[field.key]:(field.default||""),onChange:v=>{ setField(field.key,v); if(addingOptionKey===field.key){ setAddingOptionKey(null); setOptionCode(""); setOptionAddMsg(""); } },options:field.options,limitToList:false,placeholder:"Type or pick a value…",style:{...inputStyle,...changedStyle}}),
+                    (()=>{
+                      const v = (values[field.key]!==undefined?values[field.key]:(field.default||"")).trim();
+                      const known = v && field.options.some(o=>o.toLowerCase()===v.toLowerCase());
+                      if(!v || known) return null;
+                      return h("div",{style:{marginTop:6,padding:"6px 8px",background:"#fbf6e8",borderRadius:6,fontSize:11.5}},
+                        addingOptionKey!==field.key
+                          ? h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center"}},
+                              h("span",null,"\""+v+"\" isn't in the list."),
+                              h("button",{onClick:()=>{ setAddingOptionKey(field.key); setOptionCode(""); setOptionAddMsg(""); },style:{...btnSecondary,padding:"3px 8px",fontSize:11}},"+ Add to list")
+                            )
+                          : h(React.Fragment,null,
+                              !isAdmin && h("input",{placeholder:"One-time code from an Admin",value:optionCode,onChange:e=>setOptionCode(e.target.value),style:{...inputStyle,marginBottom:6,fontSize:12}}),
+                              optionAddMsg && h("div",{style:{color:colors.danger,marginBottom:6}},optionAddMsg),
+                              h("div",{style:{display:"flex",gap:6}},
+                                h("button",{onClick:()=>addDatasheetOption(field,v),disabled:optionAddBusy,style:{...btnPrimary,padding:"3px 10px",fontSize:11}},optionAddBusy?"Adding…":"Confirm add"),
+                                h("button",{onClick:()=>{ setAddingOptionKey(null); setOptionCode(""); setOptionAddMsg(""); },disabled:optionAddBusy,style:{...btnSecondary,padding:"3px 10px",fontSize:11}},"Cancel")
+                              )
+                            )
+                      );
+                    })()
                   )
                 : h("input",{value:values[field.key]!==undefined?values[field.key]:(field.default||""),onChange:e=>setField(field.key,e.target.value),style:{...inputStyle,...changedStyle}})
             );})
@@ -6134,7 +6198,8 @@ function ItemMocRulesEditor({ user }){
   );
 }
 
-function DatasheetMasterEditor({ onGoToTab }){
+function DatasheetMasterEditor({ onGoToTab, user }){
+  const isAdmin = user?.role==="admin"||user?.role==="super_admin";
   const [itemMasterList,setItemMasterList] = useState([]); // [{item, hsn_code}] from item_tbl
   const [itemsWithMaster,setItemsWithMaster] = useState(new Set());
   const [selectedItem,setSelectedItem] = useState("");
@@ -6149,11 +6214,44 @@ function DatasheetMasterEditor({ onGoToTab }){
   const [newItemHsn,setNewItemHsn] = useState("");
   const [addingItem,setAddingItem] = useState(false);
   const fileInputRef = useRef(null);
+  // One-time code for "datasheet_option_add" — plain users adding a new
+  // combo value from the real fill-out screen (see DatasheetModal) need one
+  // of these. Reuses the same gated_action_pin_tbl mechanism the Incomplete
+  // BOM fix flow already uses, just a different action_type, upserted so
+  // regenerating always replaces the old (unused-or-not) code.
+  const [genCodeBusy,setGenCodeBusy] = useState(false);
+  const [genCodeMsg,setGenCodeMsg] = useState("");
+  const [justGenCode,setJustGenCode] = useState("");
+  const generateOptionAddCode = async()=>{
+    setGenCodeBusy(true); setGenCodeMsg(""); setJustGenCode("");
+    try{
+      const code = String(Math.floor(100000+Math.random()*900000));
+      const { data:existing } = await sb.from("gated_action_pin_tbl").select("id").eq("action_type","datasheet_option_add").maybeSingle();
+      if(existing) await sb.from("gated_action_pin_tbl").update({pin:code,is_used:false}).eq("id",existing.id);
+      else await sb.from("gated_action_pin_tbl").insert({action_type:"datasheet_option_add",pin:code,is_used:false});
+      await logAudit("UPDATE","gated_action_pin_tbl","datasheet_option_add","Generated a one-time code for adding new datasheet dropdown values",user?.username||"unknown",null,null);
+      setJustGenCode(code);
+    } catch(e){ setGenCodeMsg("Couldn't generate: "+e.message); }
+    finally { setGenCodeBusy(false); }
+  };
 
   const [addSecNo,setAddSecNo]=useState(1); const [addSecTitle,setAddSecTitle]=useState("");
   const [addIsBom,setAddIsBom]=useState(false); const [addLabel,setAddLabel]=useState("");
   const [addType,setAddType]=useState("text"); const [addOptions,setAddOptions]=useState("");
   const [addBomMatch,setAddBomMatch]=useState(""); const [addDefault,setAddDefault]=useState("");
+  // Combo-style option editors (10 Aug) — type one value, press Add, it
+  // becomes a removable chip. Replaces hand-editing the raw "a|b|c" string.
+  // Underlying storage is unchanged (still one pipe-joined string per
+  // field) — this is purely a friendlier way to build that string.
+  const [newOptEditVal,setNewOptEditVal]=useState("");
+  const [newOptAddVal,setNewOptAddVal]=useState("");
+  const appendOption = (current, value)=>{
+    const v = (value||"").trim();
+    if(!v) return current;
+    const list = (current||"").split("|").map(s=>s.trim()).filter(Boolean);
+    if(list.some(o=>o.toLowerCase()===v.toLowerCase())) return current;
+    return [...list, v].join("|");
+  };
 
   const [mastersSummary,setMastersSummary] = useState([]); // [{item, count}]
   const loadItems = useCallback(async()=>{
@@ -6316,6 +6414,13 @@ function DatasheetMasterEditor({ onGoToTab }){
     h("h2",{style:{margin:"0 0 4px",fontSize:18,fontWeight:700}},"Datasheet Master"),
     h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},"One master per item. Drop an Excel file to build or replace it, or add fields by hand below. The Quotes \"Datasheet\" button reads straight from here."),
 
+    isAdmin && h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"10px 14px",marginBottom:16,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}},
+      h("div",{style:{fontSize:11.5,color:colors.muted}},"One-time code for a plain user adding a new dropdown value while filling out a datasheet:"),
+      h("button",{onClick:generateOptionAddCode,disabled:genCodeBusy,style:{...btnSecondary,padding:"4px 10px",fontSize:11.5}},genCodeBusy?"Generating…":"Generate code"),
+      justGenCode && h("span",{style:{fontSize:16,fontWeight:700,letterSpacing:2,color:"#085041"}},justGenCode),
+      genCodeMsg && h("span",{style:{fontSize:11.5,color:colors.danger}},genCodeMsg)
+    ),
+
     // Drag & drop upload zone
     h("div",{
       onDragOver:e=>{e.preventDefault();setDragOver(true);},
@@ -6411,9 +6516,12 @@ function DatasheetMasterEditor({ onGoToTab }){
                 h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:6}},
                   h("input",{value:editDraft.field_label,onChange:e=>setEditDraft(d=>({...d,field_label:e.target.value})),style:{...inputStyle,width:180,fontSize:12}}),
                   h("select",{value:editDraft.field_type,onChange:e=>setEditDraft(d=>({...d,field_type:e.target.value})),style:{...inputStyle,width:110,fontSize:12}},["text","dropdown","bom","auto_model"].map(t=>h("option",{key:t,value:t},t))),
-                  editDraft.field_type==="dropdown" && h("input",{placeholder:"Options separated by |",value:editDraft.options,onChange:e=>setEditDraft(d=>({...d,options:e.target.value})),style:{...inputStyle,flex:1,minWidth:260,fontSize:12}}),
                   editDraft.field_type==="bom" && h("input",{placeholder:"BOM match keyword",value:editDraft.bom_match,onChange:e=>setEditDraft(d=>({...d,bom_match:e.target.value})),style:{...inputStyle,width:200,fontSize:12}}),
-                  editDraft.field_type==="text" && h("input",{placeholder:"Default value",value:editDraft.default_value,onChange:e=>setEditDraft(d=>({...d,default_value:e.target.value})),style:{...inputStyle,width:180,fontSize:12}})
+                  (editDraft.field_type==="text"||editDraft.field_type==="dropdown") && h("input",{placeholder:"Default value (optional)",value:editDraft.default_value,onChange:e=>setEditDraft(d=>({...d,default_value:e.target.value})),style:{...inputStyle,width:180,fontSize:12}})
+                ),
+                editDraft.field_type==="dropdown" && h("div",{style:{display:"flex",gap:6,marginBottom:8}},
+                  h("input",{placeholder:"Add a value…",value:newOptEditVal,onChange:e=>setNewOptEditVal(e.target.value),onKeyDown:e=>{ if(e.key==="Enter"){ e.preventDefault(); setEditDraft(d=>({...d,options:appendOption(d.options,newOptEditVal)})); setNewOptEditVal(""); } },style:{...inputStyle,flex:1,minWidth:220,fontSize:12}}),
+                  h("button",{onClick:()=>{ setEditDraft(d=>({...d,options:appendOption(d.options,newOptEditVal)})); setNewOptEditVal(""); },style:{...btnSecondary,padding:"4px 12px",fontSize:12}},"+ Add")
                 ),
                 editDraft.field_type==="dropdown" && h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}},
                   editDraft.options.split("|").map(s=>s.trim()).filter(Boolean).map((opt,oi)=>h("span",{key:oi,style:{display:"inline-flex",alignItems:"center",gap:5,background:"#eaf9f4",border:"1px solid #8fd0bf",borderRadius:12,padding:"2px 4px 2px 10px",fontSize:11}},
@@ -6448,9 +6556,18 @@ function DatasheetMasterEditor({ onGoToTab }){
         h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}},
           h("input",{placeholder:"Field label",value:addLabel,onChange:e=>setAddLabel(e.target.value),style:{...inputStyle,width:180}}),
           !addIsBom && h("select",{value:addType,onChange:e=>setAddType(e.target.value),style:{...inputStyle,width:120}},["text","dropdown"].map(t=>h("option",{key:t,value:t},t))),
-          !addIsBom && addType==="dropdown" && h("input",{placeholder:"Options separated by |",value:addOptions,onChange:e=>setAddOptions(e.target.value),style:{...inputStyle,width:260}}),
           addIsBom && h("input",{placeholder:"BOM match keyword (defaults to label)",value:addBomMatch,onChange:e=>setAddBomMatch(e.target.value),style:{...inputStyle,width:220}}),
           !addIsBom && h("input",{placeholder:"Default value (optional)",value:addDefault,onChange:e=>setAddDefault(e.target.value),style:{...inputStyle,width:180}})
+        ),
+        !addIsBom && addType==="dropdown" && h("div",{style:{display:"flex",gap:6,marginBottom:8}},
+          h("input",{placeholder:"Add a value…",value:newOptAddVal,onChange:e=>setNewOptAddVal(e.target.value),onKeyDown:e=>{ if(e.key==="Enter"){ e.preventDefault(); setAddOptions(o=>appendOption(o,newOptAddVal)); setNewOptAddVal(""); } },style:{...inputStyle,flex:1,minWidth:220,fontSize:12}}),
+          h("button",{onClick:()=>{ setAddOptions(o=>appendOption(o,newOptAddVal)); setNewOptAddVal(""); },style:{...btnSecondary,padding:"4px 12px",fontSize:12}},"+ Add")
+        ),
+        !addIsBom && addType==="dropdown" && h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}},
+          addOptions.split("|").map(s=>s.trim()).filter(Boolean).map((opt,oi)=>h("span",{key:oi,style:{display:"inline-flex",alignItems:"center",gap:5,background:"#eaf9f4",border:"1px solid #8fd0bf",borderRadius:12,padding:"2px 4px 2px 10px",fontSize:11}},
+            opt,
+            h("button",{onClick:()=>setAddOptions(o=>o.split("|").map(s=>s.trim()).filter(Boolean).filter((_,idx)=>idx!==oi).join("|")),style:{background:"none",border:"none",cursor:"pointer",color:"#7a1f1f",fontSize:12,padding:"0 4px"}},"✕")
+          ))
         ),
         h("button",{onClick:addField,disabled:!addLabel.trim(),style:btnPrimary},"+ Add field")
       )
@@ -18429,7 +18546,7 @@ function App() {
     tab==="faq"?h(FaqScreen,null):
     tab==="version_history"?h(VersionHistoryScreen,null):
     tab==="allowable_stress"?h(AllowableStressEditor,{user}):
-    tab==="datasheet_master"?h(DatasheetMasterEditor,{onGoToTab:setTab}):
+    tab==="datasheet_master"?h(DatasheetMasterEditor,{onGoToTab:setTab,user}):
     tab==="item_moc_rules"?h(ItemMocRulesEditor,{user}):
     tab==="company_master"?h(CompanyMasterEditor,{user}):
     tab==="description_master"?h(DescriptionMasterEditor,{user}):
