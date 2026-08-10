@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-10T10:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-10T11:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -437,12 +437,12 @@ function buildPriceDataSection(currency, orderQty, totalSalesValue, conversionRa
   const isInr = cur === "INR";
   const fx = Number(conversionRate)||1;
   const qty = r2(orderQty)||0;
-  const rateInr = qty>0 ? r2(totalSalesValue/qty) : r2(totalSalesValue);
-  const rateDisplay = isInr ? rateInr : (fx>0 ? r2(rateInr/fx) : 0);
+  const totalDisplay = isInr ? Number(totalSalesValue)||0 : (fx>0 ? (Number(totalSalesValue)||0)/fx : 0);
+  const { unit, total } = roundedUnitTotal(totalDisplay, qty);
   const rows = [
-    { key:"price-rate", label:"Rate - "+cur, value: fmt2(roundTo5(rateDisplay)) },
+    { key:"price-rate", label:"Rate - "+cur, value: fmt2(unit) },
     { key:"price-qty", label:"Qty", value: fmt2(qty)+" Nos" },
-    { key:"price-total", label:"Total Price - "+cur, value: fmt2(roundTo5(rateDisplay*qty)) }
+    { key:"price-total", label:"Total Price - "+cur, value: fmt2(total) }
   ];
   return { title: "Price Data", rows };
 }
@@ -624,6 +624,23 @@ function fmt(n) {
 // through this — they keep using fmt() as before.
 function roundTo5(n){ if(typeof n!=="number"||isNaN(n)) return 0; return Math.round(n/5)*5; }
 function fmtR(n){ return fmt(roundTo5(Number(n)||0)); }
+// Real bug found 10 Aug: a raw total and its raw per-unit rate were each
+// being passed through fmtR/roundTo5 SEPARATELY (e.g. fmtR(unit) alongside
+// fmtR(total)) — since the true unrounded unit rarely lands on a multiple
+// of 5, the two independent roundings routinely disagreed by ±5/±10/±15,
+// so "Unit × Qty" on screen didn't equal the "Total" shown right next to
+// it, in the BOM Detail card, the Annexure II Price Summary, and the
+// Datasheet's own Price Data section — three different call sites, same
+// root cause. Fix: round the unit ONCE, then derive Total as
+// rounded_unit × qty, so what's displayed always multiplies out correctly
+// — matches what a customer would check by hand, and matches Excel, which
+// was never wrong (it never rounds mid-calculation).
+function roundedUnitTotal(rawTotal, qty){
+  const q = Number(qty)||0;
+  const unit = q>0 ? roundTo5(Number(rawTotal||0)/q) : roundTo5(Number(rawTotal||0));
+  const total = unit*q;
+  return { unit, total };
+}
 function colLabel(c) { return c.replace(/_/g," ").replace(/\b\w/g,m=>m.toUpperCase()); }
 
 // Pulls a canonical Incoterm code out of free-form text like "Ex-Works Our
@@ -9136,6 +9153,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const slTestingByItem = new Map(); (slTestingAll||[]).forEach(r=>{ if(!slTestingByItem.has(r.item_sl_no)) slTestingByItem.set(r.item_sl_no,[]); slTestingByItem.get(r.item_sl_no).push(r); });
       const {data:globalTestingAll} = await sb.from("quote_global_testing_tbl").select("*").eq("reference_number",quoteExportRef);
       const globalTestingByItem = new Map(); (globalTestingAll||[]).forEach(r=>{ if(!globalTestingByItem.has(r.item_sl_no)) globalTestingByItem.set(r.item_sl_no,[]); globalTestingByItem.get(r.item_sl_no).push(r); });
+      // Live per-Sl-No base sales total (qty_required × orderQty × rate × sf)
+      // — the same trusted formula as computeSlNoFoldedSalesTotal / the BOM
+      // footer, NOT the stored estimate_lines.sales_price sum, which can go
+      // stale whenever order_qty changes after a line was last saved. Shared
+      // by the global-testing value-share weighting below, grandTotalInr,
+      // and the Price Summary table so none of them can drift or trust a
+      // stale figure independently.
+      const slNoBaseTotalInr = (est)=>{
+        const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+        const q = est.order_qty||1;
+        return slLines.reduce((s,l)=>{
+          const qr=(Number(l.qty_required)||0)*q;
+          const rate=Number(l.rate)||0;
+          const sf=Number(l.sf)||3.1;
+          return s+qr*rate*sf;
+        },0);
+      };
       // Global testing redistribution: each test's combined total (across
       // all items it was applied to — always "all items" per the confirmed
       // design) is reallocated proportional to each item's own (price×qty)
@@ -9143,9 +9177,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // individually-computed rate.
       const valueByItem = new Map();
       estimatesRows.forEach(est=>{
-        const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
-        const baseUnitPriceInr = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
-        valueByItem.set(est.item_sl_no, baseUnitPriceInr*(est.order_qty||1));
+        valueByItem.set(est.item_sl_no, slNoBaseTotalInr(est));
       });
       const totalQuoteValue = Array.from(valueByItem.values()).reduce((s,v)=>s+v,0) || 1;
       const globalTestNames = Array.from(new Set((globalTestingAll||[]).map(r=>r.test_name)));
@@ -9170,15 +9202,19 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // apart again, rather than just patching this one instance of it.
       const extraPriceTotal = (extraPriceForPdf||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
       const testingSeparateTotal = testingMode==="separate" ? ((slTestingAll||[]).reduce((s,l)=>s+(Number(l.price)||0),0) + (globalTestingAll||[]).reduce((s,l)=>s+(Number(l.rate)||0),0)) : 0;
-      const grandTotalInr = estimatesRows.reduce((s,est)=>{
-        const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
-        const baseUnitPriceInr = slLines.reduce((ss,l)=>ss+(Number(l.sales_price)||0),0);
-        const qty = est.order_qty||1;
-        const slExtraTotal = (slExtraByItem.get(est.item_sl_no)||[]).reduce((ss,l)=>ss+(Number(l.price)||0),0);
-        const slTestingTotal = (slTestingByItem.get(est.item_sl_no)||[]).reduce((ss,l)=>ss+(Number(l.price)||0),0);
-        const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) + ((globalFoldTotalByItem.get(est.item_sl_no)||0)/qty) : 0);
-        return s+(baseUnitPriceInr+foldedPerUnit)*qty;
-      },0) + extraPriceTotal + testingSeparateTotal;
+      // Folded total (base + Extra Price + Pro-rata Testing) for one Sl No —
+      // computed as real totals throughout, never a per-unit share that then
+      // gets multiplied back by qty (that round trip was the second bug
+      // found 10 Aug: it silently mixed an already-total base value with a
+      // genuinely-per-unit folded share before re-multiplying, on top of
+      // the stale-sales_price risk above).
+      const slNoFoldedTotalInr = (est)=>{
+        const slExtraTotal = (slExtraByItem.get(est.item_sl_no)||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
+        const slTestingTotal = (slTestingByItem.get(est.item_sl_no)||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
+        const testingFold = testingMode==="prorata" ? slTestingTotal + (globalFoldTotalByItem.get(est.item_sl_no)||0) : 0;
+        return slNoBaseTotalInr(est) + slExtraTotal + testingFold;
+      };
+      const grandTotalInr = estimatesRows.reduce((s,est)=>s+slNoFoldedTotalInr(est),0) + extraPriceTotal + testingSeparateTotal;
 
       const {data:revChangesRows} = isRevisionPdf ? await sb.from("revision_changes").select("*").eq("revision_ref",quoteExportRef).order("changed_at",{ascending:true}) : {data:[]};
       const revChangesForPdf = revChangesRows||[];
@@ -9480,16 +9516,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       doc.addPage();
       const summaryStartPage = doc.internal.getNumberOfPages();
       const summaryRows = estimatesRows.map(est=>{
-        const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
-        const baseUnitPriceInr = slLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
         const qty = est.order_qty||1;
-        const slExtraTotal = (slExtraByItem.get(est.item_sl_no)||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
-        const slTestingTotal = (slTestingByItem.get(est.item_sl_no)||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
-        const foldedPerUnit = (slExtraTotal/qty) + (testingMode==="prorata" ? (slTestingTotal/qty) + ((globalFoldTotalByItem.get(est.item_sl_no)||0)/qty) : 0);
-        const unitPriceInr = baseUnitPriceInr + foldedPerUnit;
-        const totalInr = unitPriceInr*qty;
+        const totalInr = slNoFoldedTotalInr(est);
+        const totalDisplay = quoteIsInr ? totalInr : (quoteFx>0 ? totalInr/quoteFx : 0);
+        const { unit, total } = roundedUnitTotal(totalDisplay, qty);
         return [est.item_sl_no, modelItemMap.get(est.model)||est.model||"—", est.description||"—",
-          fmtR(quoteIsInr?unitPriceInr:(unitPriceInr/quoteFx)), qty, fmtR(quoteIsInr?totalInr:(totalInr/quoteFx))];
+          fmt(unit), qty, fmt(total)];
       });
       // grandTotalInr, extraPriceTotal, testingSeparateTotal already computed
       // once, early — shared with the Cover Letter's Total Basic Price so
@@ -10593,28 +10625,37 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             !showCuttingPlan&&(()=>{
               const isNonInr = openRef.currency && openRef.currency!=="INR";
               const fx = Number(openRef.conversion_rate)||1;
-              const unitCostTrue = orderQty>0 ? totalOrderCost/orderQty : totalOrderCost;
-              const unitSaleTrue = orderQty>0 ? totalOrderSales/orderQty : totalOrderSales;
+              // Round the unit once, derive Total as rounded_unit × qty — a
+              // raw total and its raw per-unit rate used to be rounded to
+              // the nearest 5 SEPARATELY, so "Unit × Qty" on screen didn't
+              // reliably equal "Total" shown right next to it (found 10 Aug
+              // via a real reported mismatch, e.g. 33,680 × 2 showing as
+              // 67,355 instead of 67,360). Same fix as the Annexure II
+              // Price Summary and the Datasheet's own Price Data section —
+              // all three had this independently.
+              const costR = roundedUnitTotal(totalOrderCost, orderQty);
+              const salesR = roundedUnitTotal(totalOrderSales, orderQty);
+              const salesConvR = isNonInr ? roundedUnitTotal(fx>0?totalOrderSales/fx:0, orderQty) : null;
               const cell = (label,value,extra)=>h("div",null,
                 h("div",{style:{fontSize:10,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em"}},label),
                 h("div",{style:{fontWeight:700,fontSize:16,color:colors.text,marginTop:3}},value),
                 extra
               );
-              const saleCell = (label,value)=>h("div",null,
+              const saleCell = (label,value,convertedValue)=>h("div",null,
                 h("div",{style:{fontSize:10,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em"}},label),
-                h("div",{style:{fontWeight:700,fontSize:16,color:colors.accent,marginTop:3}},fmtR(value)),
-                isNonInr&&h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2,fontWeight:600}},fmtR(value/fx)+" "+openRef.currency)
+                h("div",{style:{fontWeight:700,fontSize:16,color:colors.accent,marginTop:3}},fmt(value)),
+                isNonInr&&h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2,fontWeight:600}},fmt(convertedValue)+" "+openRef.currency)
               );
               return h("div",{style:{marginTop:12,padding:"14px 18px",background:"#fff",border:"1px solid "+colors.border,borderRadius:8,maxWidth:520,marginLeft:"auto"}},
                 h("div",{style:{display:"grid",gridTemplateColumns:"1fr 0.6fr 1fr",gap:"4px 20px",paddingBottom:12,borderBottom:"1px solid #eceae0",marginBottom:12}},
-                  cell("Unit cost", fmtR(unitCostTrue)),
+                  cell("Unit cost", fmt(costR.unit)),
                   cell("Qty", orderQty),
-                  cell("Total cost", fmtR(totalOrderCost))
+                  cell("Total cost", fmt(costR.total))
                 ),
                 h("div",{style:{display:"grid",gridTemplateColumns:"1fr 0.6fr 1fr",gap:"4px 20px"}},
-                  saleCell("Unit sale", unitSaleTrue),
+                  saleCell("Unit sale", salesR.unit, salesConvR?salesConvR.unit:null),
                   cell("Qty", orderQty),
-                  saleCell("Total sale", totalOrderSales)
+                  saleCell("Total sale", salesR.total, salesConvR?salesConvR.total:null)
                 )
               );
             })()
