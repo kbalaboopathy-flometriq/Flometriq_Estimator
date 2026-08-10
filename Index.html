@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-10T05:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-10T06:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1361,6 +1361,19 @@ function BomEntryForm({ onGoToTab, user }) {
   const [modelNotFoundPrompt, setModelNotFoundPrompt] = useState(false);
   const modelInputRef = useRef(null);
 
+  // Clone this BOM — copies the currently-loaded model's lines verbatim
+  // into a new Size+Model under the same (locked) Item. See handling below,
+  // after modelCatalog/naturalCompare/canEditBom are all in scope.
+  const [showCloneDialog, setShowCloneDialog] = useState(false);
+  const [cloneNewSize, setCloneNewSize] = useState("");
+  const [cloneNewModel, setCloneNewModel] = useState("");
+  const [cloneAddModelMode, setCloneAddModelMode] = useState(false);
+  const [cloneAddCategory, setCloneAddCategory] = useState("");
+  const [cloneCategoryOptions, setCloneCategoryOptions] = useState([]);
+  const [cloneDuplicateInfo, setCloneDuplicateInfo] = useState(null); // {item,size,model} of the pre-existing clash
+  const [cloneBusy, setCloneBusy] = useState(false);
+  const [cloneMsg, setCloneMsg] = useState("");
+
   // Full-screen + frozen-header/frozen-first-columns + mirrored top scrollbar
   // for the BOM lines table — same pattern as the Estimator's BOM table.
   const [fullScreenBomEntry,setFullScreenBomEntry]=useState(false);
@@ -1457,6 +1470,105 @@ function BomEntryForm({ onGoToTab, user }) {
   };
   const handleSizeSelect = (val)=>{
     setSizeFilter(val); setModelInput(""); setMsg(""); setModelNotFoundPrompt(false); setSubRows([]); setBomStatus(null);
+  };
+
+  // Models already registered under the SAME Item + the clone's NEW Size —
+  // mirrors modelOptionsForItemSize above but keyed off cloneNewSize instead
+  // of the source sizeFilter, so the "New model" combo only ever offers
+  // models that actually belong to this Item/Size pair.
+  const cloneModelOptionsForNewSize = useMemo(()=> (itemFilter&&cloneNewSize) ? Array.from(new Set(modelCatalog.filter(r=>norm(r.item)===norm(itemFilter)&&norm(r.size)===norm(cloneNewSize)).map(r=>r.model))).sort(naturalCompare) : [], [modelCatalog,itemFilter,cloneNewSize]);
+
+  const openCloneDialog = ()=>{
+    if(!subRows.length){ alert("Nothing to clone — this model has no BOM lines yet."); return; }
+    setCloneNewSize(""); setCloneNewModel(""); setCloneAddModelMode(false); setCloneAddCategory("");
+    setCloneDuplicateInfo(null); setCloneMsg(""); setShowCloneDialog(true);
+  };
+  const closeCloneDialog = ()=>{
+    setShowCloneDialog(false); setCloneNewSize(""); setCloneNewModel("");
+    setCloneAddModelMode(false); setCloneAddCategory(""); setCloneDuplicateInfo(null); setCloneMsg("");
+  };
+  const handleCloneSizeSelect = (val)=>{
+    setCloneNewSize(val); setCloneNewModel(""); setCloneAddModelMode(false); setCloneDuplicateInfo(null); setCloneMsg("");
+  };
+  const handleCloneModelChangeForClone = (val)=>{
+    setCloneNewModel(val); setCloneAddModelMode(false); setCloneDuplicateInfo(null); setCloneMsg("");
+  };
+  // Item+Size+Model is the real unique key this app relies on everywhere
+  // BOM/Estimator look a model up by name alone — so the duplicate check
+  // searches the WHOLE catalog for a matching model name, not just this
+  // Item+Size pair, and blocks either way (exact combo clash, or the same
+  // model name already used under a different Item/Size).
+  const checkCloneModel = ()=>{
+    const val = cloneNewModel.trim();
+    setCloneDuplicateInfo(null); setCloneAddModelMode(false); setCloneMsg("");
+    if(!val) return;
+    const hit = modelCatalog.find(r=>norm(r.model)===norm(val));
+    if(hit){ setCloneDuplicateInfo({item:hit.item,size:hit.size,model:hit.model}); }
+    else { setCloneAddModelMode(true); if(!cloneCategoryOptions.length) fetchAll("category_tbl","category").then(d=>setCloneCategoryOptions(Array.from(new Set(d.map(r=>r.category).filter(Boolean))).sort())); }
+  };
+  const goCloneDuplicate = ()=>{
+    if(!cloneDuplicateInfo) return;
+    setItemFilter(cloneDuplicateInfo.item); setSizeFilter(cloneDuplicateInfo.size); setModelInput(cloneDuplicateInfo.model);
+    loadSubForm(cloneDuplicateInfo.model);
+    closeCloneDialog();
+  };
+  // Real clone — literal duplicate, no size-based recalculation of any kind.
+  // Re-verifies against a fresh model_tbl read right before writing (not the
+  // possibly-stale local modelCatalog) so a clash created by someone else in
+  // the meantime is still caught; if found, nothing is written at all.
+  const executeClone = async(justAddedModel)=>{
+    const newSize = cloneNewSize.trim(), newModel = (justAddedModel||cloneNewModel).trim();
+    if(!newSize){ setCloneMsg("Pick a new size."); return; }
+    if(!newModel){ setCloneMsg("Pick or add a new model."); return; }
+    setCloneBusy(true); setCloneMsg("");
+    try{
+      const { data:freshCatalog, error:catErr } = await sb.from("model_tbl").select("item,size,model");
+      if(catErr) throw catErr;
+      const clash = (freshCatalog||[]).find(r=>norm(r.model)===norm(newModel));
+      if(clash){
+        setCloneDuplicateInfo({item:clash.item,size:clash.size,model:clash.model});
+        setCloneMsg(""); setCloneBusy(false); return;
+      }
+      const sourceModel = modelInput.trim();
+      const newRows = subRows.map(r=>{
+        const c = {...r};
+        delete c.id;
+        c.item = itemFilter; c.size = newSize; c.model = newModel;
+        return c;
+      });
+      const { data:inserted, error:insErr } = await sb.from("bom").insert(newRows).select();
+      if(insErr) throw insErr;
+      await logAudit("INSERT","bom",newModel,"Cloned BOM from \""+sourceModel+"\" ("+newRows.length+" line"+(newRows.length===1?"":"s")+") into new model \""+newModel+"\" (Item="+itemFilter+", Size="+newSize+")",user?.username||"unknown",null,{lineCount:newRows.length,sourceModel});
+      setModelCatalog(m=>[...m,{item:itemFilter,size:newSize,model:newModel}]);
+      if(!allModels.includes(newModel)) setAllModels(m=>[...m,newModel].sort(naturalCompare));
+      setEditingRowId(null); setEditRowDraft({}); setEditAllMode(false); setEditAllDrafts({});
+      setSizeFilter(newSize); setModelInput(newModel);
+      setSubRows(inserted||[]);
+      setBomStatus("Dirty");
+      closeCloneDialog();
+    } catch(e){ setCloneMsg("Clone failed: "+e.message); }
+    finally { setCloneBusy(false); }
+  };
+  // Brand-new model, taken to the same field set as Master Data → Models'
+  // own "New model" form (item/size/category + free-text model — see the
+  // model_tbl tableDef) rather than a quick one-field add, then proceeds
+  // straight into the clone once the model exists.
+  const addCloneModelAndContinue = async()=>{
+    const newModel = cloneNewModel.trim();
+    if(!newModel){ setCloneMsg("Enter a model number."); return; }
+    setCloneBusy(true); setCloneMsg("");
+    try{
+      const { data:freshCatalog, error:catErr } = await sb.from("model_tbl").select("item,size,model");
+      if(catErr) throw catErr;
+      const clash = (freshCatalog||[]).find(r=>norm(r.model)===norm(newModel));
+      if(clash){ setCloneDuplicateInfo({item:clash.item,size:clash.size,model:clash.model}); setCloneAddModelMode(false); setCloneBusy(false); return; }
+      const payload = { item:itemFilter, size:cloneNewSize.trim(), model:newModel, category:cloneAddCategory||"" };
+      const { error:insErr } = await sb.from("model_tbl").insert(payload);
+      if(insErr) throw insErr;
+      await logAudit("INSERT","model_tbl",newModel,"New model \""+newModel+"\" added (Item="+itemFilter+", Size="+cloneNewSize.trim()+") while cloning a BOM",user?.username||"unknown",null,payload);
+      setCloneAddModelMode(false);
+      await executeClone(newModel);
+    } catch(e){ setCloneMsg("Add model failed: "+e.message); setCloneBusy(false); }
   };
 
   const deleteSubRow = async(id)=>{
@@ -1840,6 +1952,7 @@ function BomEntryForm({ onGoToTab, user }) {
             h("button",{onClick:saveAllEdits,disabled:savingAll,style:{...btnPrimary,padding:"10px 18px",background:"#0f6e56"}},savingAll?"Saving…":"Save all changes"),
             h("button",{onClick:cancelEditAll,disabled:savingAll,style:{...btnSecondary,padding:"10px 18px",fontWeight:600}},"Cancel all")
           ),
+          canEditBom&&!editAllMode&&subRows.length>0&&h("button",{onClick:openCloneDialog,style:{...btnSecondary,padding:"10px 18px",fontWeight:600}},"Clone this BOM"),
           subRows.length>0&&h("button",{onClick:deleteEntireBomForModel,style:{...btnDanger,padding:"10px 18px",fontSize:13,fontWeight:700,border:"2px solid "+colors.danger}},"Delete BOM"),
           h("button",{onClick:downloadCleanupTracker,style:{...btnSecondary,padding:"9px 14px"}},"Download cleanup tracker"),
           h("button",{onClick:()=>setFullScreenBomEntry(f=>!f),style:{...btnSecondary,padding:"9px 14px"}}, fullScreenBomEntry?"Esc · Close full screen":"⛶ Full screen")
@@ -1951,6 +2064,59 @@ function BomEntryForm({ onGoToTab, user }) {
           bulkPreview.length>0 && h("div",{style:{display:"flex",gap:8}},
             h("button",{onClick:applyBulkRule,disabled:bulkApplying||!bulkPreview.some(x=>x.checked),style:{...btnPrimary,background:"#0f6e56"}},bulkApplying?"Applying…":"Go ahead ("+bulkPreview.filter(x=>x.checked).length+" selected)"),
             h("button",{onClick:()=>setBulkPreview(null),style:btnSecondary},"Back to match")
+          )
+        )
+      )
+    ),
+
+    // Clone this BOM — Item locked, New Size + New Model cascading combos,
+    // Item+Size+Model duplicate block (no override, nothing written), and a
+    // hand-off to the real Models master add form for a brand-new model.
+    showCloneDialog && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:300,padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:440,maxWidth:"94vw",padding:"20px 22px"}},
+        h("div",{style:{fontSize:15,fontWeight:700,marginBottom:2}},"Clone this BOM"),
+        h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},"Copies all "+subRows.length+" line"+(subRows.length===1?"":"s")+" from \""+modelInput.trim()+"\" into a new size and model."),
+
+        !cloneDuplicateInfo && h(React.Fragment,null,
+          h("div",{style:{marginBottom:10}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Item"),
+            h("input",{value:itemFilter,disabled:true,style:{...inputStyle,background:colors.bg,color:colors.mutedLight}})
+          ),
+          h("div",{style:{marginBottom:10}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"New size"),
+            h(LimitToListCombo,{value:cloneNewSize,onChange:handleCloneSizeSelect,options:sizeOptionsForItem,limitToList:false,placeholder:"Type or pick a size…",style:inputStyle})
+          ),
+          h("div",{style:{marginBottom:cloneAddModelMode?10:4}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"New model number"),
+            h(LimitToListCombo,{value:cloneNewModel,onChange:handleCloneModelChangeForClone,options:cloneModelOptionsForNewSize,limitToList:false,disabled:!cloneNewSize,onBlur:checkCloneModel,placeholder:cloneNewSize?"Type or pick a model…":"Pick a size first",style:{...inputStyle,background:cloneNewSize?"#fff":colors.bg}})
+          ),
+
+          cloneAddModelMode && h("div",{style:{padding:"10px 12px",background:"#fbf6e8",borderRadius:6,marginBottom:10}},
+            h("div",{style:{fontSize:11.5,marginBottom:8}},"\""+cloneNewModel.trim()+"\" isn't a registered model yet. Add it to the Models master to continue."),
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Category"),
+            h(LimitToListCombo,{value:cloneAddCategory,onChange:setCloneAddCategory,options:cloneCategoryOptions,limitToList:false,placeholder:"Category…",style:{...inputStyle,marginBottom:10}}),
+            h("div",{style:{display:"flex",gap:8}},
+              h("button",{onClick:addCloneModelAndContinue,disabled:cloneBusy,style:{...btnPrimary,flex:1}},cloneBusy?"Adding…":"Add model and continue"),
+              h("button",{onClick:()=>{setCloneAddModelMode(false);setCloneNewModel("");},disabled:cloneBusy,style:{...btnSecondary,flex:1}},"Cancel")
+            )
+          ),
+
+          cloneMsg && h("div",{style:{fontSize:12,color:colors.danger,marginBottom:10}},cloneMsg),
+
+          !cloneAddModelMode && h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:8}},
+            h("button",{onClick:closeCloneDialog,disabled:cloneBusy,style:btnSecondary},"Cancel"),
+            h("button",{onClick:()=>executeClone(),disabled:cloneBusy||!cloneNewSize||!cloneNewModel.trim(),style:btnPrimary},cloneBusy?"Cloning…":"Clone BOM")
+          )
+        ),
+
+        cloneDuplicateInfo && h(React.Fragment,null,
+          h("div",{style:{padding:"10px 12px",background:"#fdecea",borderRadius:6,marginBottom:14,fontSize:12.5}},
+            h("div",{style:{fontWeight:700,marginBottom:4,color:colors.danger}},"This model already exists"),
+            h("div",{style:{color:colors.muted}},cloneDuplicateInfo.item+" · "+cloneDuplicateInfo.size+" · "+cloneDuplicateInfo.model+" already has a BOM. Item, size, and model together must be unique — cloning here isn't allowed. Nothing has been created.")
+          ),
+          h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+            h("button",{onClick:closeCloneDialog,style:btnSecondary},"Cancel"),
+            h("button",{onClick:goCloneDuplicate,style:btnPrimary},"Go to that BOM")
           )
         )
       )
