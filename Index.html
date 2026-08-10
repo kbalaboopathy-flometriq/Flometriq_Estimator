@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-10T06:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-10T07:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1451,6 +1451,18 @@ function BomEntryForm({ onGoToTab, user }) {
 
   const goAddModel = ()=>{ setModelNotFoundPrompt(false); onGoToTab("model_tbl"); };
   const stayPut = ()=>{ setModelNotFoundPrompt(false); setNewRowDraft({model:modelInput.trim(),item:itemFilter||"",sf:3.1}); };
+  // Close — this screen is a plain nav tab with no parent/modal to return
+  // to, so "closing" means resetting back to the blank Item→Size→Model
+  // picker. Reuses the same dirty-check the rest of this screen already
+  // relies on (confirmLeaveIfDirty/window.__unsavedGuard) rather than a new
+  // mechanism — a plain confirm(), matching this screen's existing pattern.
+  const closeBomEntryForm = ()=>{
+    if(!confirmLeaveIfDirty()) return;
+    setUnsavedGuard(false);
+    setItemFilter(""); setSizeFilter(""); setModelInput(""); setSubRows([]); setBomStatus(null);
+    setModelNotFoundPrompt(false); setEditingRowId(null); setEditRowDraft({}); setEditAllMode(false); setEditAllDrafts({});
+    setFullScreenBomEntry(false);
+  };
 
   // Item → Size → Model cascade — narrows the flat model list the same way
   // the raw-material Shape→Spec→Grade cascade narrows grades. Each step
@@ -1496,15 +1508,25 @@ function BomEntryForm({ onGoToTab, user }) {
   // Item+Size+Model is the real unique key this app relies on everywhere
   // BOM/Estimator look a model up by name alone — so the duplicate check
   // searches the WHOLE catalog for a matching model name, not just this
-  // Item+Size pair, and blocks either way (exact combo clash, or the same
-  // model name already used under a different Item/Size).
-  const checkCloneModel = ()=>{
+  // Item+Size pair. EXCEPTION (confirmed 10 Aug, exact-match scope only):
+  // if the match is the SAME Item+Size+Model and that model genuinely has
+  // zero rows in `bom` yet, it's just an empty registered shell — clone
+  // straight through it silently (no block, no message) rather than
+  // treating it as a real duplicate. A name match under a DIFFERENT
+  // Item/Size still blocks unconditionally, even with zero lines, since
+  // that's a genuine naming collision against the app's real global key.
+  const checkCloneModel = async()=>{
     const val = cloneNewModel.trim();
     setCloneDuplicateInfo(null); setCloneAddModelMode(false); setCloneMsg("");
     if(!val) return;
     const hit = modelCatalog.find(r=>norm(r.model)===norm(val));
-    if(hit){ setCloneDuplicateInfo({item:hit.item,size:hit.size,model:hit.model}); }
-    else { setCloneAddModelMode(true); if(!cloneCategoryOptions.length) fetchAll("category_tbl","category").then(d=>setCloneCategoryOptions(Array.from(new Set(d.map(r=>r.category).filter(Boolean))).sort())); }
+    if(!hit){ setCloneAddModelMode(true); if(!cloneCategoryOptions.length) fetchAll("category_tbl","category").then(d=>setCloneCategoryOptions(Array.from(new Set(d.map(r=>r.category).filter(Boolean))).sort())); return; }
+    const isExactCombo = norm(hit.item)===norm(itemFilter) && norm(hit.size)===norm(cloneNewSize);
+    if(isExactCombo){
+      const { count, error:cntErr } = await sb.from("bom").select("id",{count:"exact",head:true}).eq("model",hit.model);
+      if(!cntErr && !count){ return; } // empty shell, exact combo — silent pass-through, nothing to block
+    }
+    setCloneDuplicateInfo({item:hit.item,size:hit.size,model:hit.model});
   };
   const goCloneDuplicate = ()=>{
     if(!cloneDuplicateInfo) return;
@@ -1515,7 +1537,11 @@ function BomEntryForm({ onGoToTab, user }) {
   // Real clone — literal duplicate, no size-based recalculation of any kind.
   // Re-verifies against a fresh model_tbl read right before writing (not the
   // possibly-stale local modelCatalog) so a clash created by someone else in
-  // the meantime is still caught; if found, nothing is written at all.
+  // the meantime is still caught. Same exact-combo-plus-zero-lines exception
+  // as checkCloneModel above — an empty shell under the exact same
+  // Item+Size+Model is not blocked, and since the model_tbl row already
+  // exists in that case, the clone writes only the `bom` rows, no new
+  // model_tbl insert.
   const executeClone = async(justAddedModel)=>{
     const newSize = cloneNewSize.trim(), newModel = (justAddedModel||cloneNewModel).trim();
     if(!newSize){ setCloneMsg("Pick a new size."); return; }
@@ -1526,8 +1552,16 @@ function BomEntryForm({ onGoToTab, user }) {
       if(catErr) throw catErr;
       const clash = (freshCatalog||[]).find(r=>norm(r.model)===norm(newModel));
       if(clash){
-        setCloneDuplicateInfo({item:clash.item,size:clash.size,model:clash.model});
-        setCloneMsg(""); setCloneBusy(false); return;
+        const isExactCombo = norm(clash.item)===norm(itemFilter) && norm(clash.size)===norm(newSize);
+        let silentOk = false;
+        if(isExactCombo){
+          const { count, error:cntErr } = await sb.from("bom").select("id",{count:"exact",head:true}).eq("model",clash.model);
+          silentOk = !cntErr && !count;
+        }
+        if(!silentOk){
+          setCloneDuplicateInfo({item:clash.item,size:clash.size,model:clash.model});
+          setCloneMsg(""); setCloneBusy(false); return;
+        }
       }
       const sourceModel = modelInput.trim();
       const newRows = subRows.map(r=>{
@@ -1538,8 +1572,8 @@ function BomEntryForm({ onGoToTab, user }) {
       });
       const { data:inserted, error:insErr } = await sb.from("bom").insert(newRows).select();
       if(insErr) throw insErr;
-      await logAudit("INSERT","bom",newModel,"Cloned BOM from \""+sourceModel+"\" ("+newRows.length+" line"+(newRows.length===1?"":"s")+") into new model \""+newModel+"\" (Item="+itemFilter+", Size="+newSize+")",user?.username||"unknown",null,{lineCount:newRows.length,sourceModel});
-      setModelCatalog(m=>[...m,{item:itemFilter,size:newSize,model:newModel}]);
+      await logAudit("INSERT","bom",newModel,"Cloned BOM from \""+sourceModel+"\" ("+newRows.length+" line"+(newRows.length===1?"":"s")+") into "+(clash?"existing empty model \"":"new model \"")+newModel+"\" (Item="+itemFilter+", Size="+newSize+")",user?.username||"unknown",null,{lineCount:newRows.length,sourceModel});
+      if(!clash) setModelCatalog(m=>[...m,{item:itemFilter,size:newSize,model:newModel}]);
       if(!allModels.includes(newModel)) setAllModels(m=>[...m,newModel].sort(naturalCompare));
       setEditingRowId(null); setEditRowDraft({}); setEditAllMode(false); setEditAllDrafts({});
       setSizeFilter(newSize); setModelInput(newModel);
@@ -1881,7 +1915,10 @@ function BomEntryForm({ onGoToTab, user }) {
   return h("div",{style:{padding:"20px 24px"}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},
       h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"BOM Entry Form"),
-      isSuperAdminBom && h("button",{onClick:()=>setShowBulkRule(true),style:{...btnSecondary,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Bulk Rule")
+      h("div",{style:{display:"flex",gap:8}},
+        isSuperAdminBom && h("button",{onClick:()=>setShowBulkRule(true),style:{...btnSecondary,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Bulk Rule"),
+        (itemFilter||modelInput.trim())&&h("button",{onClick:closeBomEntryForm,style:btnSecondary},"Close")
+      )
     ),
 
     // Main form — Item → Size → Model cascade
