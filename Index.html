@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-10T11:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-11T01:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1338,10 +1338,15 @@ function BomEntryForm({ onGoToTab, user }) {
       const { data:matched, error:err } = await sb.from("bom").select("*").ilike("model",bulkModelPattern.trim()+"%").eq("sub_assembly",bulkSubAssembly);
       if(err) throw err;
       const prevChecked = new Map((bulkPreview||[]).map(p=>[p.row.id,p.checked]));
+      // Same shape resync as the single-row/edit-all editors — only
+      // recompute when this rule is actually changing the spec, so a
+      // UOM-only bulk edit doesn't touch shape at all.
+      const bulkNewShape = bulkNewSpec ? (specShapeLookup.get(bulkNewSpec)||"") : null;
       const nextPreview = (matched||[]).map(row=>({
         row,
         checked: prevChecked.has(row.id) ? prevChecked.get(row.id) : true,
         newSpec: bulkNewSpec||row.material_spec, newUom: bulkNewUom||row.uom,
+        newShape: bulkNewSpec ? bulkNewShape : row.material_shape,
       }));
       setBulkPreview(nextPreview);
     } catch(e){ alert("Preview failed: "+e.message); }
@@ -1355,7 +1360,9 @@ function BomEntryForm({ onGoToTab, user }) {
     setBulkApplying(true);
     try{
       for(const x of toApply){
-        await sb.from("bom").update({ material_spec: x.newSpec, uom: x.newUom }).eq("id",x.row.id);
+        const payload = { material_spec: x.newSpec, uom: x.newUom };
+        if(bulkNewSpec) payload.material_shape = x.newShape;
+        await sb.from("bom").update(payload).eq("id",x.row.id);
       }
       await logAudit("UPDATE","bom","bulk rule","Bulk Rule: "+toApply.length+" line(s) — Model \""+bulkModelPattern+"*\" / Sub Assembly \""+bulkSubAssembly+"\" \u2192 Spec="+(bulkNewSpec||"(unchanged)")+", UOM="+(bulkNewUom||"(unchanged)"),user?.username||"unknown",null,{count:toApply.length});
       alert("Applied to "+toApply.length+" line"+(toApply.length===1?"":"s")+".");
@@ -1654,7 +1661,15 @@ function BomEntryForm({ onGoToTab, user }) {
   const startEditRow = (row)=>{ setEditingRowId(row.id); setEditRowDraft({...row}); setUnsavedGuard(true,"You have an unsaved BOM line edit. Leave anyway?"); };
   const cancelEditRow = ()=>{ setEditingRowId(null); setEditRowDraft({}); setUnsavedGuard(false); };
   const setEditField = (field,value)=>{
-    setEditRowDraft(d=>{ const next={...d,[field]:value}; if(field==="material_spec") delete next.grade; if(field==="component") delete next.sub_assembly; return next; });
+    setEditRowDraft(d=>{
+      const next={...d,[field]:value};
+      // Shape must follow spec — left stale otherwise (root cause of the
+      // 2026-08-11 shape-drift data fix). Re-derive from the same
+      // spec→shape map the cutting-plan shortcut already uses.
+      if(field==="material_spec"){ delete next.grade; next.material_shape = specShapeLookup.get(value)||""; }
+      if(field==="component") delete next.sub_assembly;
+      return next;
+    });
   };
   const editComponentOptions = useMemo(()=>{
     if(!masterData) return [];
@@ -1698,7 +1713,8 @@ function BomEntryForm({ onGoToTab, user }) {
   const setEditAllField = (id,field,value)=>{
     setEditAllDrafts(d=>{
       const row={...(d[id]||{}),[field]:value};
-      if(field==="material_spec") delete row.grade;
+      // Same shape resync as the single-row editor above.
+      if(field==="material_spec"){ delete row.grade; row.material_shape = specShapeLookup.get(value)||""; }
       if(field==="component") delete row.sub_assembly;
       return {...d,[id]:row};
     });
@@ -4393,7 +4409,29 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setEditingCartIdx(null); setCartEditDraft({});
   };
 
-  const clearEstimate = ()=>{ if(!confirm("Clear the current estimate and all cart items?")) return; setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setCurrency("INR");setConversionRate("1");setCustomerName("");setCustomerAddress("");setContactName("");setContactDesignation("");setSignatoryName("");setSignatoryDesignation("");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg(""); };
+  // Second-step code confirm for actions destructive enough that no role
+  // (including super admin) should be able to clear/skip it via muscle
+  // memory. A fresh random code is shown only in this dialog and must be
+  // typed back — nothing is pre-generated, nothing is ever seen in advance.
+  const [codeConfirm,setCodeConfirm]=useState(null); // {title,message,actionLabel,onConfirm}
+  const [codeConfirmInput,setCodeConfirmInput]=useState("");
+  const requestCodeConfirm = (title,message,actionLabel,onConfirm)=>{
+    setCodeConfirm({code:String(Math.floor(100000+Math.random()*900000)),title,message,actionLabel,onConfirm});
+    setCodeConfirmInput("");
+  };
+
+  const clearEstimate = ()=>{
+    if(!confirm("Clear the current estimate and all cart items?")) return;
+    requestCodeConfirm(
+      "Confirm clearing the cart",
+      "This removes "+cart.length+" unsaved Sl No"+(cart.length===1?"":"s")+" and all header details entered for this quote. This can't be undone.",
+      "Clear all",
+      ()=>{
+        logAudit("UPDATE","estimate_cart","clear-cart",cart.length+" unsaved cart item(s) and header cleared before saving"+(refNumber?" (Quote# "+refNumber+")":""),user?.username||"unknown",null,null);
+        setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setCurrency("INR");setConversionRate("1");setCustomerName("");setCustomerAddress("");setContactName("");setContactDesignation("");setSignatoryName("");setSignatoryDesignation("");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg("");
+      }
+    );
+  };
 
   // ---- "+ Add to estimate" gateway: Quote# first, then branch ----
   const gatewayLookup = async()=>{
@@ -4734,6 +4772,24 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       )
     ),
     // MOC Selection Popup
+    codeConfirm && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 22px",width:340,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},codeConfirm.title),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14,lineHeight:1.5}},codeConfirm.message),
+        h("div",{style:{background:colors.bg,borderRadius:6,padding:"10px 0",textAlign:"center",marginBottom:12}},
+          h("span",{style:{fontSize:20,fontWeight:700,letterSpacing:4}},codeConfirm.code)
+        ),
+        h("input",{type:"text",value:codeConfirmInput,onChange:e=>setCodeConfirmInput(e.target.value),placeholder:"Enter the code above",style:{width:"100%",boxSizing:"border-box",padding:"8px 10px",fontSize:13,border:"1px solid "+colors.border,borderRadius:6,marginBottom:14}}),
+        h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
+          h("button",{onClick:()=>setCodeConfirm(null),style:btnSecondary},"Cancel"),
+          h("button",{
+            disabled:codeConfirmInput.trim()!==codeConfirm.code,
+            onClick:()=>{ const fn=codeConfirm.onConfirm; setCodeConfirm(null); fn(); },
+            style:{...btnDanger,opacity:codeConfirmInput.trim()!==codeConfirm.code?0.5:1}
+          },codeConfirm.actionLabel)
+        )
+      )
+    ),
     showMOC && h("div", {style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"40px 16px",overflowY:"auto"}},
       h("div", {style:{background:"#fff",borderRadius:12,width:"100%",maxWidth:580,boxShadow:"0 8px 32px rgba(0,0,0,0.18)",overflow:"hidden"}},
         // Header
@@ -5151,7 +5207,10 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         ),
         h("datalist",{id:"spec-list-est"},allSpecs.map(s=>h("option",{key:s,value:s}))),
         h("div",{style:{marginTop:14,display:"flex",gap:8,flexWrap:"wrap"}},
-          h("button",{onClick:()=>{ if(!confirm("Clear all "+lines.length+" line item(s) from this draft? This cannot be undone.")) return; setLines([]); setOverrides({}); },disabled:lines.length===0,style:{...btnSecondary,color:colors.danger,borderColor:"#f0b8b8",opacity:lines.length===0?0.5:1}},"Clear all lines"),
+          h("button",{onClick:()=>{
+            if(!confirm("Clear all "+lines.length+" line item(s) from this draft? This cannot be undone.")) return;
+            requestCodeConfirm("Confirm clearing the lines","This removes all "+lines.length+" line item(s) from the current draft BOM. This can't be undone.","Clear all lines",()=>{ setLines([]); setOverrides({}); });
+          },disabled:lines.length===0,style:{...btnSecondary,color:colors.danger,borderColor:"#f0b8b8",opacity:lines.length===0?0.5:1}},"Clear all lines"),
           h("button",{onClick:saveEstimateFromBom,disabled:simpleSaving,style:{...btnPrimary,marginLeft:"auto",opacity:simpleSaving?0.6:1}},simpleSaving?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Save estimate")
         )
       )
@@ -6980,6 +7039,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [lastGlobalSfSnapshot,setLastGlobalSfSnapshot]=useState(null); // {refFilter, lines:[{reference_number,item_sl_no,sl_no,sf,sales_price}], appliedValue}
   const [restoringGlobalSf,setRestoringGlobalSf]=useState(false);
   const [applyingGlobalSf,setApplyingGlobalSf]=useState(false);
+  // Second-step code confirm — same mechanism as the Estimator's Clear all
+  // gates. A fresh random code shown only in this dialog, never
+  // pre-generated, so no role (including super admin) can bypass it.
+  const [codeConfirm,setCodeConfirm]=useState(null); // {title,message,actionLabel,onConfirm}
+  const [codeConfirmInput,setCodeConfirmInput]=useState("");
+  const requestCodeConfirm = (title,message,actionLabel,onConfirm)=>{
+    setCodeConfirm({code:String(Math.floor(100000+Math.random()*900000)),title,message,actionLabel,onConfirm});
+    setCodeConfirmInput("");
+  };
   useEffect(()=>{
     const onKey=(e)=>{ if(e.key==="Escape"){ setFullScreenBOM(false); setFullScreenSummary(false); setFullScreenCuttingPlan(false); } };
     document.addEventListener("keydown",onKey);
@@ -8449,8 +8517,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(!v || v<=0){ alert("Enter a valid Sf value first."); return; }
     if(!refFilter) return;
     if(!confirm("This will overwrite the Sf on every line item across ALL Sl Nos in Quote# \""+refFilter+"\" to "+v+" and recalculate cost and sales price. This cannot be undone. Continue?")) return;
-    if(isQuoteLocked(quoteAnyNonDraft()?"Locked":"Draft",user)){ setAuthGate({requiredType:"edit",action:()=>doApplyGlobalSf(v)}); return; }
-    doApplyGlobalSf(v);
+    requestCodeConfirm(
+      "Confirm global Sf change",
+      "This overwrites Sf on every line across all Sl Nos in Quote# \""+refFilter+"\" to "+v+". This can't be undone, and applies even for super admin.",
+      "Apply Sf",
+      ()=>{
+        if(isQuoteLocked(quoteAnyNonDraft()?"Locked":"Draft",user)){ setAuthGate({requiredType:"edit",action:()=>doApplyGlobalSf(v)}); return; }
+        doApplyGlobalSf(v);
+      }
+    );
   };
 
   // Same idea, scoped to just the currently open Sl No's own lines.
@@ -10927,8 +11002,25 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
+    codeConfirm && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 22px",width:340,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},codeConfirm.title),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14,lineHeight:1.5}},codeConfirm.message),
+        h("div",{style:{background:colors.bg,borderRadius:6,padding:"10px 0",textAlign:"center",marginBottom:12}},
+          h("span",{style:{fontSize:20,fontWeight:700,letterSpacing:4}},codeConfirm.code)
+        ),
+        h("input",{type:"text",value:codeConfirmInput,onChange:e=>setCodeConfirmInput(e.target.value),placeholder:"Enter the code above",style:{width:"100%",boxSizing:"border-box",padding:"8px 10px",fontSize:13,border:"1px solid "+colors.border,borderRadius:6,marginBottom:14}}),
+        h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
+          h("button",{onClick:()=>setCodeConfirm(null),style:btnSecondary},"Cancel"),
+          h("button",{
+            disabled:codeConfirmInput.trim()!==codeConfirm.code,
+            onClick:()=>{ const fn=codeConfirm.onConfirm; setCodeConfirm(null); fn(); },
+            style:{...btnDanger,opacity:codeConfirmInput.trim()!==codeConfirm.code?0.5:1}
+          },codeConfirm.actionLabel)
+        )
+      )
+    ),
     authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action }),
-    pdfPreview && h(PdfPreviewModal,{ doc:pdfPreview.doc, filename:pdfPreview.filename, buildDoc:pdfPreview.buildDoc, quickEditDefaults:pdfPreview.quickEditDefaults, onClose:()=>setPdfPreview(null) }),
     showDeleteQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Delete "+revisionLabelOf(refFilter)+" of "+refFilter.replace(/-Rev-\d+$/,"")+"?"),
