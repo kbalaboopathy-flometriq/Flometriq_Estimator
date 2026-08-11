@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-11T02:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-11T03:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -9157,6 +9157,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       });
       numberQuotePages(doc,W);
       setPdfPreview({doc, filename:quoteExportRef.replace(/\s+/g,"_")+"_BOM"+(withSales?"":"_cost")+".pdf"});
+    } catch(e){
+      console.error("Export BOM PDF failed", e);
+      alert("Could not generate the BOM PDF: "+e.message);
     } finally { setExportingQuote(""); }
   };
 
@@ -9195,28 +9198,33 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [pendingTestingMode,setPendingTestingMode]=useState("separate");
   const attemptGenerateQuotePdf = async ()=>{
     if(!quoteExportRef) return;
-    const currCurrency = quoteHeaderRow?.currency||"INR";
-    const currConvRate = quoteHeaderRow?.conversion_rate;
-    if(currCurrency!=="INR" && !(Number(currConvRate)>0)){
-      alert("Can't generate the PDF — this quote's currency is "+currCurrency+" but no conversion rate is set. Open the Quote Header panel and enter 1 "+currCurrency+" = ? INR first.");
-      return;
-    }
-    if(!headerCustomerCountry.trim()){
-      alert("Can't generate the PDF — this customer has no country on file. Add one in Master Data → Customers before continuing.");
-      return;
-    }
-    const gate = await checkExtraPriceGate(quoteExportRef);
-    if(!gate.hasLines && !gate.declined){
-      if(confirm("Does this quote have any Extra Price Additions?\n\nOK = add some now\nCancel = none needed")){
-        await openExtraPrice();
-        return; // user adds lines, then clicks Generate PDF again
-      } else {
-        await declineExtraPrice(quoteExportRef);
+    try {
+      const currCurrency = quoteHeaderRow?.currency||"INR";
+      const currConvRate = quoteHeaderRow?.conversion_rate;
+      if(currCurrency!=="INR" && !(Number(currConvRate)>0)){
+        alert("Can't generate the PDF — this quote's currency is "+currCurrency+" but no conversion rate is set. Open the Quote Header panel and enter 1 "+currCurrency+" = ? INR first.");
+        return;
       }
+      if(!headerCustomerCountry.trim()){
+        alert("Can't generate the PDF — this customer has no country on file. Add one in Master Data → Customers before continuing.");
+        return;
+      }
+      const gate = await checkExtraPriceGate(quoteExportRef);
+      if(!gate.hasLines && !gate.declined){
+        if(confirm("Does this quote have any Extra Price Additions?\n\nOK = add some now\nCancel = none needed")){
+          await openExtraPrice();
+          return; // user adds lines, then clicks Generate PDF again
+        } else {
+          await declineExtraPrice(quoteExportRef);
+        }
+      }
+      const testingMode = await resolveTestingMode(quoteExportRef, user?.username);
+      if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setPendingTestingMode(testingMode); setShowNoDocsGenerateConfirm(true); return; }
+      generateQuotePdf(testingMode);
+    } catch(e){
+      console.error("Generate Quote PDF setup failed", e);
+      alert("Could not start PDF generation: "+e.message);
     }
-    const testingMode = await resolveTestingMode(quoteExportRef, user?.username);
-    if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setPendingTestingMode(testingMode); setShowNoDocsGenerateConfirm(true); return; }
-    generateQuotePdf(testingMode);
   };
   const generateQuotePdf = async(testingMode="separate")=>{
     if(!quoteExportRef) return;
