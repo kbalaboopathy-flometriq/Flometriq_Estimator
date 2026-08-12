@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-11T07:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-11T09:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -3724,7 +3724,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const [gatewayBusy,setGatewayBusy]=useState(false);
   const [simpleSaving,setSimpleSaving]=useState(false);
   const [gatewayConfirmedNewSlNo,setGatewayConfirmedNewSlNo]=useState(false);
-  const [saveMaximised,setSaveMaximised]=useState(false);
+  const [saveMaximised,setSaveMaximised]=useState(true); // always maximized on open — a long header form (first Sl No of a new quote) could otherwise push Save/totals below the fold with no scroll to reach them
   const [refNumber,setRefNumber]=useState(""); const [refDesc,setRefDesc]=useState("");
   const [descMasterPrompt,setDescMasterPrompt]=useState(null); // item name once we've decided to prompt for it
   const [descMasterBuilderItem,setDescMasterBuilderItem]=useState(null); // item name while the inline builder modal is open
@@ -5301,7 +5301,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
             h("button",{onClick:()=>setSaveMaximised(v=>!v),title:saveMaximised?"Restore":"Maximise",style:{background:"rgba(255,255,255,0.1)",border:"none",borderRadius:6,width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",color:"#cde8e2",fontSize:14}},
               h("i",{className:saveMaximised?"ti ti-arrows-minimize":"ti ti-arrows-maximize","aria-hidden":"true"})
             ),
-            h("button",{onClick:()=>{setShowSave(false);setSaveMaximised(false);},title:"Close",style:{background:"rgba(184,71,47,0.3)",border:"none",borderRadius:6,width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",color:"#f09595",fontSize:14}},
+            h("button",{onClick:()=>{setShowSave(false);setSaveMaximised(true);},title:"Close",style:{background:"rgba(184,71,47,0.3)",border:"none",borderRadius:6,width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",color:"#f09595",fontSize:14}},
               h("i",{className:"ti ti-x","aria-hidden":"true"})
             )
           )
@@ -5426,8 +5426,8 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
             ),
             h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
               saveMsg&&h("div",{style:{fontSize:12,color:saveMsg.startsWith("Save failed")||saveMsg.startsWith("Enter")||saveMsg.startsWith("Add")?colors.danger:"#2d7a4f"}},saveMsg),
-              h("button",{onClick:()=>{setShowSave(false);setSaveMaximised(false);},style:btnSecondary},"Cancel"),
-              h("button",{onClick:async()=>{ const ok=await saveReference(); if(ok){ setShowSave(false); setSaveMaximised(false); if(holdingNewSlNo) await afterNewSlNoSave(); } },disabled:savingRef,style:btnPrimary},savingRef?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Confirm save")
+              h("button",{onClick:()=>{setShowSave(false);setSaveMaximised(true);},style:btnSecondary},"Cancel"),
+              h("button",{onClick:async()=>{ const ok=await saveReference(); if(ok){ setShowSave(false); setSaveMaximised(true); if(holdingNewSlNo) await afterNewSlNoSave(); } },disabled:savingRef,style:btnPrimary},savingRef?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Confirm save")
             )
           )
         )
@@ -7114,6 +7114,61 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const resolveDraftConfirm = (proceed)=>{
     setDraftConfirm(null);
     if(draftConfirmResolveRef.current){ draftConfirmResolveRef.current(proceed); draftConfirmResolveRef.current=null; }
+  };
+  // Incomplete-quote-PDF gate — Customer, Signatory, and Signatory
+  // Designation are required for a real (non-draft) quote PDF. Missing any
+  // of them: regular users choose "print as draft" (watermarked, no
+  // friction) or redeem a one-time admin code for the clean version.
+  // Admin/super admin skip this gate entirely — their PDF is always clean,
+  // draft or not. Reuses the same gated_action_pin_tbl mechanism as every
+  // other one-time-code gate in this app (action_type "incomplete_quote_pdf").
+  const isAdminOrAbove = user?.role==="admin" || user?.role==="super_admin";
+  const missingHeaderFieldsForPdf = useMemo(()=>{
+    if(!quoteHeaderRow) return [];
+    const missing = [];
+    if(!(quoteHeaderRow.customer_name||"").trim()) missing.push("Customer");
+    if(!(quoteHeaderRow.signatory_name||"").trim()) missing.push("Signatory");
+    if(!(quoteHeaderRow.signatory_designation||"").trim()) missing.push("Signatory Designation");
+    return missing;
+  },[quoteHeaderRow]);
+  const [incompletePdfGate,setIncompletePdfGate]=useState(null); // {missing}
+  const [pdfGateShowCode,setPdfGateShowCode]=useState(false);
+  const [pdfGateCode,setPdfGateCode]=useState("");
+  const [pdfGateBusy,setPdfGateBusy]=useState(false);
+  const [pdfGateErr,setPdfGateErr]=useState("");
+  const incompletePdfResolveRef = useRef(null);
+  const askIncompletePdfChoice = (missing)=> new Promise(resolve=>{
+    incompletePdfResolveRef.current = resolve;
+    setPdfGateShowCode(false); setPdfGateCode(""); setPdfGateErr("");
+    setIncompletePdfGate({missing});
+  });
+  const resolveIncompletePdf = (watermark)=>{ // watermark: true = draft, false = clean, null = cancelled
+    setIncompletePdfGate(null);
+    if(incompletePdfResolveRef.current){ incompletePdfResolveRef.current(watermark); incompletePdfResolveRef.current=null; }
+  };
+  const submitPdfGateCode = async()=>{
+    setPdfGateBusy(true); setPdfGateErr("");
+    const result = await verifyAndConsumeGatedPin("incomplete_quote_pdf", pdfGateCode, user?.username||"unknown", "estimates", quoteExportRef, "Printed an incomplete quote PDF without the draft watermark");
+    setPdfGateBusy(false);
+    if(!result.ok){ setPdfGateErr(result.message||"That code didn't work."); return; }
+    resolveIncompletePdf(false);
+  };
+  // Admin-only: generate the one-time override code (same upsert pattern as
+  // the datasheet_option_add code generator elsewhere in this app).
+  const [genPdfCodeBusy,setGenPdfCodeBusy]=useState(false);
+  const [genPdfCodeMsg,setGenPdfCodeMsg]=useState("");
+  const [justGenPdfCode,setJustGenPdfCode]=useState("");
+  const generateIncompletePdfCode = async()=>{
+    setGenPdfCodeBusy(true); setGenPdfCodeMsg(""); setJustGenPdfCode("");
+    try{
+      const code = String(Math.floor(100000+Math.random()*900000));
+      const { data:existing } = await sb.from("gated_action_pin_tbl").select("id").eq("action_type","incomplete_quote_pdf").maybeSingle();
+      if(existing) await sb.from("gated_action_pin_tbl").update({pin:code,is_used:false}).eq("id",existing.id);
+      else await sb.from("gated_action_pin_tbl").insert({action_type:"incomplete_quote_pdf",pin:code,is_used:false});
+      await logAudit("UPDATE","gated_action_pin_tbl","incomplete_quote_pdf","Generated a one-time code to print an incomplete quote PDF without the draft watermark",user?.username||"unknown",null,null);
+      setJustGenPdfCode(code);
+    } catch(e){ setGenPdfCodeMsg("Couldn't generate: "+e.message); }
+    finally { setGenPdfCodeBusy(false); }
   };
   useEffect(()=>{
     const onKey=(e)=>{ if(e.key==="Escape"){ setFullScreenBOM(false); setFullScreenSummary(false); setFullScreenCuttingPlan(false); } };
@@ -9248,6 +9303,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // a single file, matching the section layout of the reference template.
   const [showNoDocsGenerateConfirm,setShowNoDocsGenerateConfirm]=useState(false);
   const [pendingTestingMode,setPendingTestingMode]=useState("separate");
+  const [pendingWatermark,setPendingWatermark]=useState(false);
   const attemptGenerateQuotePdf = async ()=>{
     if(!quoteExportRef) return;
     try {
@@ -9261,6 +9317,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         alert("Can't generate the PDF — this customer has no country on file. Add one in Master Data → Customers before continuing.");
         return;
       }
+      let watermark = false;
+      if(missingHeaderFieldsForPdf.length && !isAdminOrAbove){
+        const choice = await askIncompletePdfChoice(missingHeaderFieldsForPdf);
+        if(choice===null) return; // cancelled
+        watermark = choice; // true = draft, false = code redeemed
+      }
       const gate = await checkExtraPriceGate(quoteExportRef);
       if(!gate.hasLines && !gate.declined){
         if(confirm("Does this quote have any Extra Price Additions?\n\nOK = add some now\nCancel = none needed")){
@@ -9271,14 +9333,14 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         }
       }
       const testingMode = await resolveTestingMode(quoteExportRef, user?.username);
-      if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setPendingTestingMode(testingMode); setShowNoDocsGenerateConfirm(true); return; }
-      generateQuotePdf(testingMode);
+      if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setPendingTestingMode(testingMode); setPendingWatermark(watermark); setShowNoDocsGenerateConfirm(true); return; }
+      generateQuotePdf(testingMode, watermark);
     } catch(e){
       console.error("Generate Quote PDF setup failed", e);
       alert("Could not start PDF generation: "+e.message);
     }
   };
-  const generateQuotePdf = async(testingMode="separate")=>{
+  const generateQuotePdf = async(testingMode="separate", watermark=false)=>{
     if(!quoteExportRef) return;
     setGeneratingQuotePdf(true);
     try {
@@ -9810,6 +9872,19 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       });
 
       numberQuotePages(doc, W);
+      if(watermark){
+        const pageCount = doc.internal.getNumberOfPages();
+        for(let p=1;p<=pageCount;p++){
+          doc.setPage(p);
+          const pw = doc.internal.pageSize.getWidth();
+          const ph = doc.internal.pageSize.getHeight();
+          doc.setFont("helvetica","bold");
+          doc.setFontSize(60);
+          doc.setTextColor(230,195,190); // light, faded — no opacity plugin dependency, just a pale color
+          doc.text("DRAFT", pw/2, ph/2, {angle:35, align:"center"});
+          doc.setTextColor(...dark); // restore for anything drawn after (safety, though this is the last step per page)
+        }
+      }
       return doc;
       }; // end buildDoc
 
@@ -10353,6 +10428,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             pdfGenCounts.total>0 && h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginTop:8,paddingTop:8,borderTop:"1px solid #eceae0"}},
               h("div",{style:{fontSize:11,color:colors.text}},h("strong",null,pdfGenCounts.total),h("span",{style:{color:colors.mutedLight}}," generated")),
               pdfGenCounts.byUser.map(u=>h("span",{key:u.user,style:{fontSize:10.5,background:"#f4f2ea",borderRadius:5,padding:"3px 8px"}},u.user+" "+u.count))
+            ),
+            isAdminOrAbove && h("div",{style:{marginTop:8,paddingTop:8,borderTop:"1px solid #eceae0"}},
+              h("button",{onClick:generateIncompletePdfCode,disabled:genPdfCodeBusy,style:{...btnSecondary,padding:"4px 10px",fontSize:11}},genPdfCodeBusy?"Generating…":"Generate incomplete-PDF override code"),
+              justGenPdfCode && h("div",{style:{fontSize:12,marginTop:6}},"Code: ",h("strong",null,justGenPdfCode)," — give this to whoever needs to print past a missing Customer/Signatory."),
+              genPdfCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genPdfCodeMsg)
             )
           )
         ),
@@ -11120,6 +11200,36 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
+    incompletePdfGate && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 20px",width:400,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"This quote isn't fully ready"),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14,lineHeight:1.6}},
+          incompletePdfGate.missing.join(", ")+" "+(incompletePdfGate.missing.length===1?"is":"are")+" missing. A real quote PDF needs Customer, Signatory, and Signatory Designation filled in."
+        ),
+        !pdfGateShowCode ? h(React.Fragment,null,
+          h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+            h("button",{onClick:()=>resolveIncompletePdf(true),style:{textAlign:"left",padding:"10px 12px",border:"1px solid "+colors.border,borderRadius:6,background:colors.bg,cursor:"pointer"}},
+              h("div",{style:{fontSize:13,fontWeight:600}},"Print as draft"),
+              h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginTop:2}},"Downloads immediately, watermarked \"DRAFT\"")
+            ),
+            h("button",{onClick:()=>{ setPdfGateShowCode(true); setPdfGateErr(""); },style:{textAlign:"left",padding:"10px 12px",border:"1px solid "+colors.border,borderRadius:6,background:colors.bg,cursor:"pointer"}},
+              h("div",{style:{fontSize:13,fontWeight:600}},"Enter admin code"),
+              h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginTop:2}},"One-time code from Admin — unlocks the full PDF")
+            )
+          ),
+          h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:12}},
+            h("button",{onClick:()=>resolveIncompletePdf(null),style:btnSecondary},"Cancel")
+          )
+        ) : h(React.Fragment,null,
+          h("input",{value:pdfGateCode,onChange:e=>setPdfGateCode(e.target.value),placeholder:"Enter the one-time code",style:{...inputStyle,marginBottom:8}}),
+          pdfGateErr && h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},pdfGateErr),
+          h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+            h("button",{onClick:()=>setPdfGateShowCode(false),style:btnSecondary},"Back"),
+            h("button",{onClick:submitPdfGateCode,disabled:pdfGateBusy,style:{...btnPrimary,opacity:pdfGateBusy?0.6:1}},pdfGateBusy?"Checking…":"Confirm")
+          )
+        )
+      )
+    ),
     authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action }),
     pdfPreview && h(PdfPreviewModal,{ doc:pdfPreview.doc, filename:pdfPreview.filename, buildDoc:pdfPreview.buildDoc, quickEditDefaults:pdfPreview.quickEditDefaults, onClose:()=>setPdfPreview(null) }),
     showDeleteQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
@@ -11238,7 +11348,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{fontSize:12.5,color:colors.mutedLight,marginBottom:16}},"Do you want to attach documents before generating this quote?"),
         h("div",{style:{display:"flex",gap:8}},
           h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); openDocumentsPanel(); },style:{...btnPrimary,flex:1}},"Yes"),
-          h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); generateQuotePdf(pendingTestingMode); },style:{...btnSecondary,flex:1}},"No, generate anyway")
+          h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); generateQuotePdf(pendingTestingMode, pendingWatermark); },style:{...btnSecondary,flex:1}},"No, generate anyway")
         )
       )
     ),
