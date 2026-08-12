@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-11T06:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-11T07:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -6856,6 +6856,58 @@ function CustomerSelect({ value, onSelect, disabled }){
   );
 }
 
+// Master Data's own customer picker — same live-search pattern as
+// CustomerSelect above, but returns the FULL company row (id, is_archived,
+// etc.) since Master Data needs the whole record for Edit/Archive, not just
+// the trimmed quote-header fields CustomerSelect provides. Deliberately a
+// separate component rather than overloading CustomerSelect, since the two
+// screens need different onSelect payload shapes.
+function MasterCustomerSelect({ value, onSelect, disabled }){
+  const [queryText,setQueryText] = useState(value||"");
+  const [matches,setMatches] = useState([]);
+  const listId = useMemo(()=>"mcust-dl-"+Math.random().toString(36).slice(2,9),[]);
+
+  useEffect(()=>{ setQueryText(value||""); },[value]);
+
+  useEffect(()=>{
+    const q = queryText.trim();
+    if(q.length<2){ setMatches([]); return; }
+    let cancelled=false;
+    const t = setTimeout(async()=>{
+      const { data } = await sb.from("companies").select("*").ilike("company_name","%"+q+"%").order("company_name").limit(25);
+      if(!cancelled) setMatches(data||[]);
+    },300);
+    return ()=>{ cancelled=true; clearTimeout(t); };
+  },[queryText]);
+
+  const pick = (match)=>{ onSelect(match); setQueryText(match.company_name); };
+
+  const handleChange = (v)=>{
+    setQueryText(v);
+    const hit = matches.find(m=>m.company_name===v);
+    if(hit) pick(hit);
+  };
+
+  const handleBlur = ()=>{
+    const v = queryText.trim();
+    if(!v){ onSelect(null); return; }
+    const hit = matches.find(m=>m.company_name===v);
+    if(hit){ pick(hit); return; }
+    if(v!==(value||"")) setQueryText(value||""); // typed text isn't a real match — revert
+  };
+
+  return h("div",{style:{position:"relative",width:280}},
+    h("input",{
+      list:listId, value:queryText, disabled,
+      onChange:e=>handleChange(e.target.value),
+      onBlur:handleBlur,
+      placeholder:"Type to search customers…",
+      style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%"}
+    }),
+    h("datalist",{id:listId},matches.map(m=>h("option",{key:m.id,value:m.company_name})))
+  );
+}
+
 // Multiple free-text notes per quote, no date tracking, ordered by Sl No —
 // mirrors the old Access subform (quote number as the parent key).
 function QuoteNotesPanel({ referenceNumber, user }){
@@ -12303,8 +12355,6 @@ function CustomersScreen({ user }){
   const [newRow,setNewRow] = useState(null); // inline-editable blank/prefilled row, or null
   const [savingRow,setSavingRow] = useState(false);
   const [scanBusy,setScanBusy] = useState(false);
-  const [wildSearch,setWildSearch] = useState("");
-  const [wildResultsOpen,setWildResultsOpen] = useState(false);
   const [pendingContactAfterCompany,setPendingContactAfterCompany] = useState(null); // contact fields to insert once a new company is saved
   const [dupAlert,setDupAlert] = useState(null); // {existing, extracted} — shown when an uploaded contact name already exists under the matched company
 
@@ -12544,23 +12594,9 @@ function CustomersScreen({ user }){
         )
       ),
       h("div",{style:{display:"flex",gap:10,flexWrap:"wrap"}},
-        h("div",{style:{width:240}},
+        h("div",null,
           h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Customer"),
-          h("select",{value:selected?selected.id:"",onChange:e=>{ const c=companies.find(x=>String(x.id)===e.target.value); if(c) setSelected(c); },style:{...inputStyle,padding:"7px 9px",fontSize:12}},
-            h("option",{value:""},"Select…"),
-            companies.slice().sort((a,b)=>(a.company_name||"").localeCompare(b.company_name||"")).map(c=>h("option",{key:c.id,value:c.id},c.company_name))
-          )
-        ),
-        h("div",{style:{width:260,position:"relative"}},
-          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Search (wildcard)"),
-          h("input",{value:wildSearch,onChange:e=>{ setWildSearch(e.target.value); setWildResultsOpen(true); },onFocus:()=>setWildResultsOpen(true),placeholder:"Type any part of the name…",style:{...inputStyle,padding:"7px 9px",fontSize:12}}),
-          wildResultsOpen && wildSearch.trim() && h("div",{style:{position:"absolute",top:"100%",left:0,right:0,background:"#fff",border:"1px solid "+colors.border,borderRadius:6,marginTop:2,zIndex:5,maxHeight:180,overflowY:"auto"}},
-            (()=>{
-              const matches = companies.filter(c=>(c.company_name||"").toLowerCase().includes(wildSearch.trim().toLowerCase()));
-              if(matches.length===0) return h("div",{style:{padding:"8px 10px",fontSize:11.5,color:colors.mutedLight}},"No matches");
-              return matches.map(c=>h("div",{key:c.id,onClick:()=>{ setSelected(c); setWildSearch(""); setWildResultsOpen(false); },style:{padding:"8px 10px",fontSize:12,cursor:"pointer",borderBottom:"1px solid #eceae0"}},c.company_name));
-            })()
-          )
+          h(MasterCustomerSelect,{value:selected?selected.company_name:"",onSelect:c=>setSelected(c)})
         )
       )
     ),
