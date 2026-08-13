@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-11T11:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-11T12:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8316,6 +8316,70 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     finally{ setSavingLine(s=>{ const n={...s}; delete n[key]; return n; }); }
   };
 
+  // Refresh Price — Draft only, no exceptions (not even super admin). Always
+  // does a fresh live material_rates query rather than trusting the cached
+  // rateBySpecGrade Map, since that's only loaded once on mount and could be
+  // stale relative to a rate change made mid-session. Same cost/sales_price
+  // formula and Validated-line revert rule as saveLineEdit above, for
+  // consistency with how every other price change on a line is handled.
+  const [showRefreshPriceConfirm,setShowRefreshPriceConfirm]=useState(false);
+  const [refreshingPrice,setRefreshingPrice]=useState(false);
+  const [refreshingLinePrice,setRefreshingLinePrice]=useState({});
+  const applyRefreshedLine = async(line, newRate)=>{
+    const qty = Number(getLineVal(line,"qty_required"))||0;
+    const sf = Number(getLineVal(line,"sf"))||3.1;
+    const cost = Number((qty*(orderQty||1)*newRate).toFixed(4));
+    const sales_price = Number((cost*sf).toFixed(4));
+    if(Number(line.rate)===Number(newRate)) return false; // already current, nothing to write
+    const payload = {rate:newRate, cost, sales_price};
+    if(line.is_direct_price===true && line.validation_status==="Validated" && Number(line.sales_price)!==sales_price){
+      payload.validation_status="Pending"; payload.validated_by=null; payload.validated_at=null;
+    }
+    if(line.reference_number.includes("-Rev-")){
+      await logRevisionChange(line.reference_number,"bom",line.sl_no+"|rate",line.rate,newRate,line.item_sl_no);
+      setBomChangedRows(s=>new Set([...s, line.item_sl_no+"|"+line.sl_no]));
+    }
+    await sb.from("estimate_lines").update(payload).eq("reference_number",line.reference_number).eq("item_sl_no",line.item_sl_no).eq("sl_no",line.sl_no);
+    setOpenLines(ls=>ls.map(l=>l.reference_number===line.reference_number&&l.sl_no===line.sl_no?{...l,...payload}:l));
+    return true;
+  };
+  const refreshAllLinePrices = async()=>{
+    setShowRefreshPriceConfirm(false);
+    if(quoteAnyNonDraft()){ alert("This offer's already been sent to the customer — price can't change now. Make an amended offer if this needs updating."); return; }
+    if(!openLines.length) return;
+    setRefreshingPrice(true);
+    try{
+      const specs = [...new Set(openLines.map(l=>getLineVal(l,"material_spec")).filter(Boolean))];
+      const { data:freshRates } = await sb.from("material_rates").select("material_spec,material_grade,rate").in("material_spec",specs);
+      const freshMap = new Map((freshRates||[]).map(r=>[r.material_spec+"||"+r.material_grade, r.rate||0]));
+      let changed = 0;
+      for(const line of openLines){
+        const spec = getLineVal(line,"material_spec"); const grade = getLineVal(line,"grade");
+        if(!spec||!grade) continue;
+        const newRate = freshMap.get(spec+"||"+grade);
+        if(newRate===undefined) continue; // no current rate for this combo — leave it alone rather than zeroing it out
+        if(await applyRefreshedLine(line, newRate)) changed++;
+      }
+      await logAudit("UPDATE","estimate_lines",openRef.reference_number+"-"+openRef.item_sl_no,"Refreshed pricing to current material rates — "+changed+" of "+openLines.length+" line(s) changed",user?.username||"unknown",null,null);
+      alert(changed===0?"Every line was already at the current rate.":changed+" line(s) updated to current rates.");
+    } catch(e){ alert("Couldn't refresh pricing: "+e.message); }
+    finally { setRefreshingPrice(false); }
+  };
+  const refreshLinePrice = async(line)=>{
+    if(quoteAnyNonDraft()){ alert("This offer's already been sent to the customer — price can't change now. Make an amended offer if this needs updating."); return; }
+    const spec = getLineVal(line,"material_spec"); const grade = getLineVal(line,"grade");
+    if(!spec||!grade) return;
+    const key = line.reference_number+"-"+line.sl_no;
+    setRefreshingLinePrice(s=>({...s,[key]:true}));
+    try{
+      const { data } = await sb.from("material_rates").select("rate").eq("material_spec",spec).eq("material_grade",grade).maybeSingle();
+      if(!data){ alert("No current rate found for this spec/grade — nothing to refresh."); return; }
+      const changed = await applyRefreshedLine(line, data.rate||0);
+      if(changed) await logAudit("UPDATE","estimate_lines",line.reference_number+"-"+line.item_sl_no,"Refreshed pricing on line "+line.sl_no+" ("+(line.component||"")+") to current material rate",user?.username||"unknown",null,null);
+    } catch(e){ alert("Couldn't refresh this line's price: "+e.message); }
+    finally { setRefreshingLinePrice(s=>{ const n={...s}; delete n[key]; return n; }); }
+  };
+
   const getLineVal=(line,field)=>{
     const key=line.reference_number+"-"+line.sl_no;
     const edits=lineEdits[key]||{};
@@ -10659,6 +10723,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 h("div",{style:{fontSize:13,fontWeight:700}}, fullScreenBOM?("BOM — "+(openRef?openRef.reference_number+" · Sl No "+openRef.item_sl_no:"")):""),
                 h("div",{style:{display:"flex",gap:8}},
                   h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line"),
+                  h("button",{
+                    onClick:()=>{ if(quoteAnyNonDraft()){ alert("This offer's already been sent to the customer — price can't change now. Make an amended offer if this needs updating."); return; } setShowRefreshPriceConfirm(true); },
+                    disabled:refreshingPrice,
+                    style: quoteAnyNonDraft()
+                      ? {...btnSmall,border:"1px solid "+colors.border,color:colors.mutedLight,background:"#f4f2ea"}
+                      : {...btnSmall,border:"1px solid #0f6e56",color:"#0f6e56",opacity:refreshingPrice?0.6:1}
+                  }, refreshingPrice?"Refreshing…":"Refresh price"),
                   h("button",{onClick:()=>setShowBomRefreshConfirm(true),style:{...btnSmall,border:"1px solid #a3312a",color:"#a3312a"}},"Refresh BOM from master"),
                   isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No"),
                   h("button",{onClick:()=>setFullScreenBOM(f=>!f),style:{...btnSecondary,fontSize:11,padding:"4px 10px"}}, fullScreenBOM?"Esc · Close full screen":"⛶ Full screen BOM")
@@ -10749,6 +10820,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                     h("td",{style:{padding:"5px 6px",whiteSpace:"nowrap"}},
                       h("div",{style:{display:"flex",gap:4}},
                         isDirty&&!isSaving&&h("button",{onClick:()=>saveLineEdit(l),style:{background:"#e1f5ee",color:"#0f6e56",border:"0.5px solid #9fe1cb",borderRadius:4,padding:"4px 8px",fontSize:11,cursor:"pointer"}},"Save"),
+                        h("button",{
+                          title:"Refresh this line's price to the current rate",
+                          onClick:()=>refreshLinePrice(l),
+                          disabled:!!refreshingLinePrice[key],
+                          style:{background:"transparent",color: quoteAnyNonDraft()?colors.mutedLight:"#0f6e56",border:"0.5px solid "+(quoteAnyNonDraft()?colors.border:"#9fe1cb"),borderRadius:4,padding:"4px 6px",fontSize:11,cursor:"pointer",opacity:refreshingLinePrice[key]?0.5:1}
+                        }, h("i",{className:"ti ti-refresh","aria-hidden":"true",style:{fontSize:12,display:"block"}})),
                         h("button",{onClick:()=>deleteEstimateLine(l.reference_number,l.item_sl_no,l.sl_no),style:{...btnDanger,padding:"4px 8px"}},"✕")
                       )
                     )
@@ -11307,6 +11384,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("button",{onClick:()=>setShowBomRefreshConfirm(false),style:btnSecondary},"Cancel"),
           h("button",{onClick:()=>setShowBomRefreshConfirm(false),style:btnSecondary},"No"),
           h("button",{onClick:()=>{ setShowBomRefreshConfirm(false); openBomRefreshPreview(openRef); },style:btnPrimary},"Yes")
+        )
+      )
+    ),
+    showRefreshPriceConfirm && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Refresh pricing on all "+openLines.length+" line(s)?"),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},"Re-checks the current rate for every line's spec + grade and updates cost and sales price to match. Spec, grade, and quantities aren't touched — only the rate-derived numbers."),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setShowRefreshPriceConfirm(false),style:btnSecondary},"Cancel"),
+          h("button",{onClick:refreshAllLinePrices,style:btnPrimary},"Refresh")
         )
       )
     ),
