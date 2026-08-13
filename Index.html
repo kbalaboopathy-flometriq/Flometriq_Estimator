@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-11T12:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-11T13:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -4670,7 +4670,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     // this exact Sl No as new (not an overwrite) one step earlier — asking
     // twice for the same thing already confirmed would just be annoying.
     setSavingRef(true);
-    const { data: siblingRows } = await sb.from("estimates").select("item_sl_no,company_id").eq("reference_number",ref);
+    const { data: siblingRows } = await sb.from("estimates").select("item_sl_no,company_id,quote_status").eq("reference_number",ref);
     if(siblingRows && siblingRows.length>0 && !gatewayConfirmedNewSlNo){
       const usedSlNos = siblingRows.map(r=>r.item_sl_no);
       const isOverwrite = usedSlNos.includes(slNo);
@@ -4687,6 +4687,15 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     const resolvedCompanyId = (siblingRows && siblingRows.length>0)
       ? (siblingRows.find(r=>r.company_id)||{}).company_id || null
       : (user.role==="super_admin" ? sessionCompanyId : (user.company_id||null));
+    // A new Sl No must inherit whatever status its siblings already have —
+    // quote_status is meant to apply uniformly across every Sl No on a
+    // quote (see doChangeQuoteStatus, which updates all of them together).
+    // Leaving this unset let it silently fall back to the estimates table's
+    // column default, which isn't necessarily "Draft" — the exact bug that
+    // caused Refresh Price to wrongly treat a genuinely-Draft quote as sent.
+    const resolvedQuoteStatus = (siblingRows && siblingRows.length>0)
+      ? (siblingRows.find(r=>r.quote_status)||{}).quote_status || "Draft"
+      : "Draft";
     let estimateId, createdNewHeader=false;
     try {
       const headerModel = (effectiveCart[0]&&effectiveCart[0].model) || selectedModel || "";
@@ -4697,7 +4706,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         await sb.from("estimates").update(headerPayload).eq("id",estimateId);
         await sb.from("estimate_lines").delete().eq("reference_number",ref).eq("item_sl_no",slNo);
       } else {
-        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,company_id:resolvedCompanyId,created_by:user.username}).select().single();
+        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,quote_status:resolvedQuoteStatus,company_id:resolvedCompanyId,created_by:user.username}).select().single();
         if(err) throw err;
         estimateId=created.id; createdNewHeader=true;
         promoteCompanyToLead(resolvedCompanyId, headerPayload.customer_name);
