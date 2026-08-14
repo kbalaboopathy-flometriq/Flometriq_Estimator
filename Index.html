@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-14T01:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-14T02:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -7212,10 +7212,65 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const askDraftConfirm = (missing)=> new Promise(resolve=>{
     draftConfirmResolveRef.current = resolve;
     setDraftConfirm({missing});
+    // Fresh state every time this modal opens — a skip decision from a
+    // previous Generate PDF attempt on this (or another) quote should never
+    // carry over.
+    setBomSkipConfirmed(new Set());
+    setBomSkipCodeTarget(null); setBomSkipCodeInput(""); setBomSkipCodeError("");
   });
   const resolveDraftConfirm = (proceed)=>{
     setDraftConfirm(null);
     if(draftConfirmResolveRef.current){ draftConfirmResolveRef.current(proceed); draftConfirmResolveRef.current=null; }
+  };
+  // Per-line skip for Incomplete BOM entries only — every OTHER readiness
+  // gap (Commercial Terms, Datasheet, Description, Pending validation)
+  // stays a hard block with no override here, by design. A skip is final
+  // once confirmed (admin: instant; regular user: one-time code) — there's
+  // no unticking. Once every Incomplete BOM line is accounted for (skipped
+  // or genuinely fixed — a line just disappears from the list on its own
+  // once its BOM gap is filled) AND nothing non-BOM remains, Generate
+  // fires immediately with no further "are you sure" prompt, since each
+  // line was already individually confirmed on the way there.
+  const isAdminOrAbove = user?.role==="admin" || user?.role==="super_admin";
+  const [bomSkipConfirmed,setBomSkipConfirmed]=useState(new Set()); // Set of slNo
+  const [bomSkipCodeTarget,setBomSkipCodeTarget]=useState(null); // slNo (number), "all", or null
+  const [bomSkipCodeInput,setBomSkipCodeInput]=useState("");
+  const [bomSkipCodeError,setBomSkipCodeError]=useState("");
+  const [bomSkipBusy,setBomSkipBusy]=useState(false);
+  const skipBomLine = (slNo)=>{
+    if(isAdminOrAbove){ setBomSkipConfirmed(s=>new Set([...s,slNo])); return; }
+    setBomSkipCodeTarget(slNo); setBomSkipCodeInput(""); setBomSkipCodeError("");
+  };
+  const skipAllBomLines = (allSlNos)=>{
+    if(isAdminOrAbove){ setBomSkipConfirmed(new Set(allSlNos)); return; }
+    setBomSkipCodeTarget("all"); setBomSkipCodeInput(""); setBomSkipCodeError("");
+  };
+  const submitBomSkipCode = async(allSlNos)=>{
+    setBomSkipBusy(true); setBomSkipCodeError("");
+    const isAll = bomSkipCodeTarget==="all";
+    const res = await verifyAndConsumeGatedPin("skip_incomplete_bom_line", bomSkipCodeInput, user?.username||"unknown", "estimates", quoteExportRef, isAll?"Skipped all Incomplete BOM lines":("Skipped Sl No "+bomSkipCodeTarget+" Incomplete BOM"));
+    setBomSkipBusy(false);
+    if(!res.ok){ setBomSkipCodeError(res.message||"That code didn't work."); return; }
+    if(isAll) setBomSkipConfirmed(new Set(allSlNos));
+    else setBomSkipConfirmed(s=>new Set([...s,bomSkipCodeTarget]));
+    setBomSkipCodeTarget(null); setBomSkipCodeInput("");
+  };
+  // Admin-only: generate the one-time skip code (same upsert pattern as the
+  // incomplete_quote_pdf / datasheet_option_add code generators elsewhere).
+  const [genBomSkipCodeBusy,setGenBomSkipCodeBusy]=useState(false);
+  const [genBomSkipCodeMsg,setGenBomSkipCodeMsg]=useState("");
+  const [justGenBomSkipCode,setJustGenBomSkipCode]=useState("");
+  const generateBomSkipCode = async()=>{
+    setGenBomSkipCodeBusy(true); setGenBomSkipCodeMsg(""); setJustGenBomSkipCode("");
+    try{
+      const code = String(Math.floor(100000+Math.random()*900000));
+      const { data:existing } = await sb.from("gated_action_pin_tbl").select("id").eq("action_type","skip_incomplete_bom_line").maybeSingle();
+      if(existing) await sb.from("gated_action_pin_tbl").update({pin:code,is_used:false}).eq("id",existing.id);
+      else await sb.from("gated_action_pin_tbl").insert({action_type:"skip_incomplete_bom_line",pin:code,is_used:false});
+      await logAudit("UPDATE","gated_action_pin_tbl","skip_incomplete_bom_line","Generated a one-time code to skip an Incomplete BOM line when generating a quote PDF",user?.username||"unknown",null,null);
+      setJustGenBomSkipCode(code);
+    } catch(e){ setGenBomSkipCodeMsg("Couldn't generate: "+e.message); }
+    finally { setGenBomSkipCodeBusy(false); }
   };
   // Incomplete-quote-PDF gate — Customer, Signatory, and Signatory
   // Designation are required for a real (non-draft) quote PDF. Missing any
@@ -7227,7 +7282,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // NOTE: missingHeaderFieldsForPdf itself lives further down, right after
   // quoteHeaderRow is actually declared — it depends on quoteHeaderRow, and
   // quoteHeaderRow doesn't exist yet at this point in the component.
-  const isAdminOrAbove = user?.role==="admin" || user?.role==="super_admin";
   const [incompletePdfGate,setIncompletePdfGate]=useState(null); // {missing}
   const [pdfGateShowCode,setPdfGateShowCode]=useState(false);
   const [pdfGateCode,setPdfGateCode]=useState("");
@@ -8191,7 +8245,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const slLines = (allLinesForBom||[]).filter(l=>l.item_sl_no===est.item_sl_no);
       const missingParams = rule.parameters.filter(p=> !slLines.some(l=> (p.match_field==="sub_assembly"?l.sub_assembly:l.component)===p.match_value));
       if(missingParams.length){
-        missing.push({section:"Sl No "+est.item_sl_no, items:["Incomplete BOM (\""+itemName+"\") — missing: "+missingParams.map(p=>p.label||p.match_value).join(", ")]});
+        missing.push({section:"Sl No "+est.item_sl_no, items:["Incomplete BOM (\""+itemName+"\") — missing: "+missingParams.map(p=>p.label||p.match_value).join(", ")], type:"bom", slNo:est.item_sl_no});
         incompleteBomDetails.push({slNo:est.item_sl_no, itemName, missingParams});
       } else {
         bomDoneCount++;
@@ -10600,8 +10654,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             ),
             isAdminOrAbove && h("div",{style:{marginTop:8,paddingTop:8,borderTop:"1px solid #eceae0"}},
               h("button",{onClick:generateIncompletePdfCode,disabled:genPdfCodeBusy,style:{...btnSecondary,padding:"4px 10px",fontSize:11}},genPdfCodeBusy?"Generating…":"Generate incomplete-PDF override code"),
-              justGenPdfCode && h("div",{style:{fontSize:12,marginTop:6}},"Code: ",h("strong",null,justGenPdfCode)," — give this to whoever needs to print past a missing Customer/Signatory."),
-              genPdfCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genPdfCodeMsg)
+              justGenPdfCode && h("div",{style:{fontSize:12,marginTop:6}},"Code: ",h("strong",null,justGenPdfCode),"  — give this to whoever needs to print past a missing Customer/Signatory."),
+              genPdfCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genPdfCodeMsg),
+              h("button",{onClick:generateBomSkipCode,disabled:genBomSkipCodeBusy,style:{...btnSecondary,padding:"4px 10px",fontSize:11,marginTop:8}},genBomSkipCodeBusy?"Generating…":"Generate skip-BOM-line code"),
+              justGenBomSkipCode && h("div",{style:{fontSize:12,marginTop:6}},"Code: ",h("strong",null,justGenBomSkipCode)," — give this to whoever needs to skip an Incomplete BOM line (one line, or Select all, per code)."),
+              genBomSkipCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genBomSkipCodeMsg)
             )
           )
         ),
@@ -11367,22 +11424,63 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
-    draftConfirm && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
-      h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 20px",width:420,maxWidth:"100%",maxHeight:"80vh",display:"flex",flexDirection:"column"}},
+    draftConfirm && (()=>{
+      const bomMissing = draftConfirm.missing.filter(m=>m.type==="bom");
+      const otherMissing = draftConfirm.missing.filter(m=>m.type!=="bom");
+      const allSlNos = bomMissing.map(m=>m.slNo);
+      const allBomSkipped = bomMissing.every(m=>bomSkipConfirmed.has(m.slNo));
+      const canGenerate = allBomSkipped && otherMissing.length===0;
+      return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 20px",width:440,maxWidth:"100%",maxHeight:"85vh",display:"flex",flexDirection:"column"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"This quote isn't fully ready"),
-        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:12,lineHeight:1.5}},"You can generate it as a draft anyway, or go back and fill in what's missing."),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:12,lineHeight:1.5}},
+          bomMissing.length
+            ? "Tick each Incomplete BOM line to skip it — skipping is final and can't be undone here. Generate unlocks once every line below is ticked or fixed."
+            : "Go back and fill in what's missing."
+        ),
         h("div",{style:{background:colors.bg,borderRadius:6,padding:"10px 12px",overflowY:"auto",flex:1,marginBottom:14,fontSize:11.5,lineHeight:1.6}},
-          draftConfirm.missing.map((m,i)=>h("div",{key:i,style:{marginBottom:6}},
-            h("span",{style:{fontWeight:700}},m.section),h("br"),
-            h("span",{style:{color:colors.mutedLight}},m.items.join(", "))
-          ))
+          bomMissing.length>0 && h(React.Fragment,null,
+            h("label",{style:{display:"flex",alignItems:"center",gap:8,padding:"4px 0 8px",borderBottom:"1px solid "+colors.border,fontWeight:700,cursor:allBomSkipped?"default":"pointer",opacity:allBomSkipped?0.55:1,marginBottom:6}},
+              h("input",{type:"checkbox",checked:allBomSkipped,disabled:allBomSkipped,onChange:()=>skipAllBomLines(allSlNos)}),
+              "Select all Incomplete BOM lines"
+            ),
+            bomMissing.map((m,i)=>{
+              const done = bomSkipConfirmed.has(m.slNo);
+              return h("label",{key:"bom-"+i,style:{display:"flex",alignItems:"flex-start",gap:8,padding:"6px 0",borderBottom:"1px solid #f0efe8",cursor:done?"default":"pointer"}},
+                h("input",{type:"checkbox",checked:done,disabled:done,onChange:()=>skipBomLine(m.slNo),style:{marginTop:2}}),
+                h("div",{style:{opacity:done?0.55:1}},
+                  h("span",{style:{fontWeight:700}},m.section,done&&h("i",{className:"ti ti-lock",style:{marginLeft:6,fontSize:11,color:colors.mutedLight}})),h("br"),
+                  h("span",{style:{color:colors.mutedLight}},m.items.join(", "))
+                )
+              );
+            })
+          ),
+          otherMissing.length>0 && h("div",{style:{marginTop:bomMissing.length?10:0,paddingTop:bomMissing.length?8:0,borderTop:bomMissing.length?"1px solid "+colors.border:"none"}},
+            otherMissing.map((m,i)=>h("div",{key:"other-"+i,style:{marginBottom:6}},
+              h("span",{style:{fontWeight:700}},m.section),h("br"),
+              h("span",{style:{color:colors.mutedLight}},m.items.join(", "))
+            ))
+          )
+        ),
+        bomSkipCodeTarget!==null && h("div",{style:{display:"flex",alignItems:"center",gap:8,background:"#fffaf0",border:"1px solid #f0d9a8",borderRadius:6,padding:"8px 10px",marginBottom:12,fontSize:11.5}},
+          h("i",{className:"ti ti-lock",style:{color:"#854f0b",fontSize:14}}),
+          h("span",{style:{flex:1,color:"#854f0b"}},
+            "One-time code to skip "+(bomSkipCodeTarget==="all"?"all lines":"Sl No "+bomSkipCodeTarget)+" — this can't be undone once confirmed.",
+            bomSkipCodeError && h("div",{style:{color:colors.danger,marginTop:2}},bomSkipCodeError)
+          ),
+          h("input",{type:"text",value:bomSkipCodeInput,onChange:e=>setBomSkipCodeInput(e.target.value),placeholder:"Code",style:{width:80,padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}}),
+          h("button",{onClick:()=>submitBomSkipCode(allSlNos),disabled:bomSkipBusy||!bomSkipCodeInput.trim(),style:{...btnSecondary,padding:"5px 10px",fontSize:11}},bomSkipBusy?"…":"Confirm")
+        ),
+        canGenerate && bomMissing.length>0 && h("div",{style:{display:"flex",alignItems:"center",gap:6,color:"#0f6e56",fontSize:11.5,marginBottom:10}},
+          h("i",{className:"ti ti-check"}),"All lines skipped. Generate fires immediately — no further draft confirmation."
         ),
         h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
           h("button",{onClick:()=>resolveDraftConfirm(false),style:btnSecondary},"Go back and fix"),
-          h("button",{onClick:()=>resolveDraftConfirm(true),style:{...btnDanger}},"Generate draft anyway")
+          h("button",{onClick:()=>resolveDraftConfirm(true),disabled:!canGenerate,style:{...btnDanger,opacity:canGenerate?1:0.5,cursor:canGenerate?"pointer":"not-allowed"}},"Generate")
         )
       )
-    ),
+    );
+    })(),
     incompletePdfGate && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 20px",width:400,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"This quote isn't fully ready"),
