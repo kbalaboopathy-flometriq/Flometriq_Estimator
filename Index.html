@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-14T03:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-14T04:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -9047,10 +9047,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const totalOrderCost=totalCost;
   const totalOrderSales=totalSales;
   const updateOrderQty=async(val)=>{
-    const n=Number(val)||1; setOrderQty(n);
+    const n=Number(val)||1; const prevOrderQty=orderQty; setOrderQty(n);
     if(openRef){
       const {error} = await sb.from("estimates").update({order_qty:n}).eq("id",openRef.id);
-      if(error){ alert("Couldn't save the new quantity: "+error.message); return; }
+      if(error){ alert("Couldn't save the new quantity: "+error.message); setOrderQty(prevOrderQty); return; }
       // Real bug fixed here: the write to Supabase always succeeded, but
       // the in-memory `refs` list (what re-opening a Sl No actually reads
       // its starting qty from) never got patched — so switching to a
@@ -9060,6 +9060,36 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // already proven elsewhere in this file.
       setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,order_qty:n}:r));
       setOpenRef(r=>r?{...r,order_qty:n}:r);
+      // Root-cause fix (14 Aug): every already-saved line's cost/sales_price
+      // was computed against whatever order_qty was true AT THE TIME that
+      // line was last saved — left untouched here, they silently go stale
+      // the moment order_qty changes, since nothing else in the app ever
+      // revisits an already-saved line's stored price. Confirmed via a real
+      // data audit (FEX260528: every line's stored cost excluded order_qty
+      // entirely). Recompute and write every line now — same formula and
+      // Validated-reverts-to-Pending guard as applyRefreshedLine, so a
+      // qty-driven price change behaves identically to a manual one
+      // everywhere else that depends on it. Cost/sales_price aren't logged
+      // per-line on revisions, matching saveLineEdit's own convention that
+      // they're derived, not a real user-facing edit — one summary audit
+      // entry covers the whole batch instead.
+      let changed = 0;
+      for(const line of openLines){
+        const qty = Number(getLineVal(line,"qty_required"))||0;
+        const rate = Number(getLineVal(line,"rate"))||0;
+        const sf = Number(getLineVal(line,"sf"))||3.1;
+        const cost = Number((qty*n*rate).toFixed(4));
+        const sales_price = Number((cost*sf).toFixed(4));
+        if(Number(line.cost)===cost && Number(line.sales_price)===sales_price) continue; // already correct
+        const payload = {cost, sales_price};
+        if(line.is_direct_price===true && line.validation_status==="Validated" && Number(line.sales_price)!==sales_price){
+          payload.validation_status="Pending"; payload.validated_by=null; payload.validated_at=null;
+        }
+        await sb.from("estimate_lines").update(payload).eq("reference_number",line.reference_number).eq("item_sl_no",line.item_sl_no).eq("sl_no",line.sl_no);
+        setOpenLines(ls=>ls.map(l=>l.reference_number===line.reference_number&&l.sl_no===line.sl_no?{...l,...payload}:l));
+        changed++;
+      }
+      if(changed>0) await logAudit("UPDATE","estimate_lines",openRef.reference_number+"-"+openRef.item_sl_no,"Order Qty changed to "+n+" — recomputed cost/sales_price on "+changed+" of "+openLines.length+" line(s) to match",user?.username||"unknown",null,null);
     }
   };
   const [showSummarySaved,setShowSummarySaved]=useState(false);
