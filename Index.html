@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-14T06:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-15T00:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -250,6 +250,10 @@ function norm(s){ return (s==null?"":String(s)).trim().toLowerCase(); }
 // a one-item list so they keep working untouched until next edited/saved,
 // at which point they upgrade to the new shape automatically.
 function mocParamValues(p){ return (p.match_values && p.match_values.length) ? p.match_values : (p.match_value ? [p.match_value] : []); }
+// Standard world country list for the Customer form's Country dropdown —
+// static reference data, doesn't need a DB round-trip. India first (by far
+// the most common for this business), rest alphabetical.
+const WORLD_COUNTRIES = ["India","Afghanistan","Albania","Algeria","Andorra","Angola","Antigua and Barbuda","Argentina","Armenia","Australia","Austria","Azerbaijan","Bahamas","Bahrain","Bangladesh","Barbados","Belarus","Belgium","Belize","Benin","Bhutan","Bolivia","Bosnia and Herzegovina","Botswana","Brazil","Brunei","Bulgaria","Burkina Faso","Burundi","Cambodia","Cameroon","Canada","Cape Verde","Central African Republic","Chad","Chile","China","Colombia","Comoros","Congo","Costa Rica","Croatia","Cuba","Cyprus","Czech Republic","Democratic Republic of the Congo","Denmark","Djibouti","Dominica","Dominican Republic","East Timor","Ecuador","Egypt","El Salvador","Equatorial Guinea","Eritrea","Estonia","Eswatini","Ethiopia","Fiji","Finland","France","Gabon","Gambia","Georgia","Germany","Ghana","Greece","Grenada","Guatemala","Guinea","Guinea-Bissau","Guyana","Haiti","Honduras","Hungary","Iceland","Indonesia","Iran","Iraq","Ireland","Israel","Italy","Ivory Coast","Jamaica","Japan","Jordan","Kazakhstan","Kenya","Kiribati","Kosovo","Kuwait","Kyrgyzstan","Laos","Latvia","Lebanon","Lesotho","Liberia","Libya","Liechtenstein","Lithuania","Luxembourg","Madagascar","Malawi","Malaysia","Maldives","Mali","Malta","Marshall Islands","Mauritania","Mauritius","Mexico","Micronesia","Moldova","Monaco","Mongolia","Montenegro","Morocco","Mozambique","Myanmar","Namibia","Nauru","Nepal","Netherlands","New Zealand","Nicaragua","Niger","Nigeria","North Korea","North Macedonia","Norway","Oman","Pakistan","Palau","Palestine","Panama","Papua New Guinea","Paraguay","Peru","Philippines","Poland","Portugal","Qatar","Romania","Russia","Rwanda","Saint Kitts and Nevis","Saint Lucia","Saint Vincent and the Grenadines","Samoa","San Marino","Sao Tome and Principe","Saudi Arabia","Senegal","Serbia","Seychelles","Sierra Leone","Singapore","Slovakia","Slovenia","Solomon Islands","Somalia","South Africa","South Korea","South Sudan","Spain","Sri Lanka","Sudan","Suriname","Sweden","Switzerland","Syria","Taiwan","Tajikistan","Tanzania","Thailand","Togo","Tonga","Trinidad and Tobago","Tunisia","Turkey","Turkmenistan","Tuvalu","Uganda","Ukraine","United Arab Emirates","United Kingdom","United States","Uruguay","Uzbekistan","Vanuatu","Vatican City","Venezuela","Vietnam","Yemen","Zambia","Zimbabwe"];
 // Natural/numeric-aware string comparator — plain .sort() treats "150nb" as
 // less than "50nb" because it compares character-by-character ("1" < "5"),
 // which silently mis-orders any list of model/size names once sizes cross a
@@ -5403,7 +5407,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           ),
           h("div",{style:{flex:1,minWidth:220}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Customer"),
-            h(CustomerSelect,{value:customerName,disabled:!!existingQuoteHeader,onSelect:(p)=>{ setCustomerName(p.company_name); setCustomerAddress(p.address); if(p.contact_name) setContactName(p.contact_name); if(p.contact_designation) setContactDesignation(p.contact_designation); setCustomerCountry(p.billing_country||""); const isIndia=(p.billing_country||"").trim().toLowerCase()==="india"; setCurrency(isIndia?"INR":"USD"); if(isIndia) setConversionRate("1"); }})
+            h(CustomerSelect,{value:customerName,disabled:!!existingQuoteHeader,user,onSelect:(p)=>{ setCustomerName(p.company_name); setCustomerAddress(p.address); if(p.contact_name) setContactName(p.contact_name); if(p.contact_designation) setContactDesignation(p.contact_designation); setCustomerCountry(p.billing_country||""); const isIndia=(p.billing_country||"").trim().toLowerCase()==="india"; setCurrency(isIndia?"INR":"USD"); if(isIndia) setConversionRate("1"); }})
           ),
           h("div",{style:{flex:1,minWidth:180}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Address"),
@@ -6850,74 +6854,6 @@ function MasterSelect({ value, onChange, options, table, valueCol, fieldLabel, p
   );
 }
 
-// Adds a new company to Customers and selects it — the "can't find it? add
-// it" side panel, matching the same pattern as AddToMasterPanel but with the
-// extra address fields a customer actually needs.
-function AddCustomerPanel({ onClose, onAdded }){
-  const [f,setF] = useState({company_name:"",zone:"",billing_street:"",billing_city:"",billing_state:"",billing_pin:"",billing_country:"",source:""});
-  const [saving,setSaving] = useState(false);
-  const [err,setErr] = useState("");
-  const [dupWarning,setDupWarning] = useState("");
-  const [zoneOptions,setZoneOptions] = useState([]);
-  const loadZones = useCallback(async()=>{
-    const { data } = await sb.from("zone_tbl").select("value").order("value");
-    setZoneOptions((data||[]).map(r=>r.value));
-  },[]);
-  useEffect(()=>{ loadZones(); },[loadZones]);
-  const fld = (key,placeholder)=>h("input",{value:f[key],onChange:e=>setF(d=>({...d,[key]:e.target.value})),placeholder,style:{...inputStyle,padding:"9px 11px",fontSize:13,marginBottom:8}});
-  const checkDup = async(name)=>{
-    if(!name.trim()){ setDupWarning(""); return; }
-    const { data } = await sb.from("companies").select("company_name").ilike("company_name",name.trim()).limit(1);
-    setDupWarning((data&&data.length>0) ? "\""+data[0].company_name+"\" already exists — check before adding a duplicate." : "");
-  };
-  const save = async()=>{
-    if(!f.company_name.trim()){ setErr("Enter a customer name."); return; }
-    if(!f.zone){ setErr("Zone is required."); return; }
-    if(!f.billing_street.trim()){ setErr("Street is required."); return; }
-    if(!f.billing_city.trim()){ setErr("City is required."); return; }
-    if(!f.billing_country.trim()){ setErr("Country is required."); return; }
-    setSaving(true); setErr("");
-    try{
-      let payload = {...f, company_name:f.company_name.trim()};
-      payload = await autoAssignNewCompany(payload, "quick_add");
-      const { error } = await sb.from("companies").insert(payload);
-      if(error) throw error;
-      if(payload.owner_employee_name) await logOwnershipChange(payload.company_name, "", payload.owner_employee_name, "Auto", "quick_add");
-      const address=[f.billing_street,f.billing_city,f.billing_state,f.billing_pin,f.billing_country].filter(Boolean).join("\n");
-      onAdded({company_name:f.company_name.trim(), address, contact_name:"", contact_designation:"", billing_country:f.billing_country.trim()});
-      onClose();
-    } catch(e){ setErr(e.message||"Could not save."); }
-    finally{ setSaving(false); }
-  };
-  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.35)",zIndex:1200,display:"flex",justifyContent:"flex-end"}},
-    h("div",{style:{width:340,maxWidth:"90vw",height:"100%",background:"#fff",boxShadow:"-2px 0 12px rgba(0,0,0,0.15)",padding:"20px 22px",display:"flex",flexDirection:"column"}},
-      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Add new customer"),
-      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"Adds a customer to the Customers module and selects it for this quote."),
-      h("input",{value:f.company_name,onChange:e=>setF(d=>({...d,company_name:e.target.value})),onBlur:e=>checkDup(e.target.value),placeholder:"Customer name *",style:{...inputStyle,padding:"9px 11px",fontSize:13,marginBottom:8}}),
-      dupWarning && h("div",{style:{fontSize:11,color:colors.danger,marginTop:-4,marginBottom:8}},dupWarning),
-      h("div",{style:{marginBottom:8}},
-        h(MasterSelect,{value:f.zone,onChange:v=>setF(d=>({...d,zone:v})),options:zoneOptions,table:"zone_tbl",valueCol:"value",fieldLabel:"Zone",placeholder:"Select zone… *",style:{padding:"9px 11px",fontSize:13},refreshOptions:loadZones})
-      ),
-      fld("billing_street","Street *"),
-      fld("billing_city","City *"),
-      fld("billing_state","State"),
-      fld("billing_pin","PIN / Zip"),
-      fld("billing_country","Country *"),
-      h("select",{value:f.source,onChange:e=>setF(d=>({...d,source:e.target.value})),style:{...inputStyle,padding:"9px 11px",fontSize:13,marginBottom:8}},
-        h("option",{value:""},"Source…"),
-        h("option",{value:"Referral"},"Referral"),h("option",{value:"Google Ads"},"Google Ads"),
-        h("option",{value:"Social media"},"Social media"),h("option",{value:"Exhibition"},"Exhibition"),
-        h("option",{value:"Cold outreach"},"Cold outreach"),h("option",{value:"Other"},"Other")
-      ),
-      err&&h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},err),
-      h("div",{style:{marginTop:"auto",display:"flex",justifyContent:"flex-end",gap:8}},
-        h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
-        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save and use")
-      )
-    )
-  );
-}
-
 // Strict select (no free text) for Customer, everywhere it's used — quote
 // header in Estimator and the Quotes screen's Quote Header panel. Selecting
 // (or adding) a company fires onSelect with the address (as separate lines)
@@ -6931,7 +6867,7 @@ function AddCustomerPanel({ onClose, onAdded }){
 // order. The old code also loaded ALL of `contacts` unconditionally on every
 // mount — same unbounded-load pattern, fixed here too by only fetching
 // contacts for the companies actually matched by the current search.
-function CustomerSelect({ value, onSelect, disabled }){
+function CustomerSelect({ value, onSelect, disabled, user }){
   const [queryText,setQueryText] = useState(value||"");
   const [matches,setMatches] = useState([]); // [{company_name,billing_*,contacts:[...]}]
   const [showAdd,setShowAdd] = useState(false);
@@ -6998,7 +6934,25 @@ function CustomerSelect({ value, onSelect, disabled }){
       h("datalist",{id:listId},matches.map(m=>h("option",{key:m.company_name,value:m.company_name})))
     ),
     !disabled && h("button",{type:"button",onClick:()=>setShowAdd(true),style:{border:"1px solid "+colors.border,background:"#fff",color:"#1c8c75",fontSize:10.5,padding:"6px 8px",borderRadius:5,cursor:"pointer",whiteSpace:"nowrap"}},"+ Add new"),
-    showAdd && h(AddCustomerPanel,{onClose:()=>setShowAdd(false),onAdded: async(payload)=>{ setQueryText(payload.company_name); onSelect(payload); }})
+    // Same customer form as Master Data → Customers — no separate "quick add"
+    // version. Adapts CustomerCompanyForm's raw save payload into the shape
+    // this picker's own onSelect already expects everywhere it's used.
+    showAdd && h(CustomerCompanyForm,{
+      user,
+      onCancel:()=>setShowAdd(false),
+      onSaved:(savedCompany, savedContact)=>{
+        setShowAdd(false);
+        const payload = {
+          company_name: savedCompany.company_name,
+          address: [savedCompany.billing_street,savedCompany.billing_city,savedCompany.billing_state,savedCompany.billing_pin,savedCompany.billing_country].filter(Boolean).join("\n"),
+          contact_name: savedContact ? savedContact.contact_name : "",
+          contact_designation: savedContact ? savedContact.designation : "",
+          billing_country: savedCompany.billing_country||""
+        };
+        setQueryText(payload.company_name);
+        onSelect(payload);
+      }
+    })
   );
 }
 
@@ -10730,7 +10684,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               ),
               h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}},
                 h("div",{style:{width:220}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Customer"),
-                  h(CustomerSelect,{value:headerDraft.customer_name,onSelect:(p)=>{ const isIndia=(p.billing_country||"").trim().toLowerCase()==="india"; setHeaderCustomerCountry(p.billing_country||""); setHeaderDraft(d=>({...d,customer_name:p.company_name,customer_address:p.address,contact_name:p.contact_name||d.contact_name,contact_designation:p.contact_designation||d.contact_designation,currency:isIndia?"INR":"USD",conversion_rate:isIndia?"1":d.conversion_rate})); }})
+                  h(CustomerSelect,{value:headerDraft.customer_name,user,onSelect:(p)=>{ const isIndia=(p.billing_country||"").trim().toLowerCase()==="india"; setHeaderCustomerCountry(p.billing_country||""); setHeaderDraft(d=>({...d,customer_name:p.company_name,customer_address:p.address,contact_name:p.contact_name||d.contact_name,contact_designation:p.contact_designation||d.contact_designation,currency:isIndia?"INR":"USD",conversion_rate:isIndia?"1":d.conversion_rate})); }})
                 ),
                 h("div",{style:{width:190}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Address"),h("textarea",{rows:5,value:headerDraft.customer_address,onChange:e=>setHeaderDraft(d=>({...d,customer_address:e.target.value})),placeholder:"Street\nCity\nState\nPIN\nCountry",style:{...inputStyle,padding:"6px 8px",fontSize:12,resize:"vertical",fontFamily:"inherit"}})),
                 h("div",{style:{width:140}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Attention — Contact"),h("input",{value:headerDraft.contact_name,onChange:e=>setHeaderDraft(d=>({...d,contact_name:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
@@ -12567,14 +12521,42 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
     const { data } = await sb.from("companies").select("company_name").ilike("company_name",name.trim()).limit(1);
     setDupWarning((data&&data.length>0) ? "\""+data[0].company_name+"\" already exists — check before adding a duplicate." : "");
   };
+
+  // India State -> City cascade. States load once (state_zone_tbl doubles as
+  // the state master); cities re-fetch whenever the relevant state changes,
+  // scoped to that state (city_tbl, seeded 14 Aug). Billing and Shipping are
+  // independent — different states pull different city lists.
+  const [indiaStates,setIndiaStates] = useState([]);
+  useEffect(()=>{ sb.from("state_zone_tbl").select("state").order("state").then(({data})=>setIndiaStates((data||[]).map(r=>r.state).filter(Boolean))); },[]);
+  const [billingCities,setBillingCities] = useState([]);
+  const [shippingCities,setShippingCities] = useState([]);
+  useEffect(()=>{
+    if(f.billing_country!=="India" || !f.billing_state){ setBillingCities([]); return; }
+    sb.from("city_tbl").select("city").eq("state",f.billing_state).order("city").then(({data})=>setBillingCities((data||[]).map(r=>r.city)));
+  },[f.billing_country,f.billing_state]);
+  useEffect(()=>{
+    if(f.shipping_country!=="India" || !f.shipping_state){ setShippingCities([]); return; }
+    sb.from("city_tbl").select("city").eq("state",f.shipping_state).order("city").then(({data})=>setShippingCities((data||[]).map(r=>r.city)));
+  },[f.shipping_country,f.shipping_state]);
+
+  // Optional "add a contact too" sub-form — only offered when creating a
+  // brand-new customer (editing an existing one already has its own contact
+  // management on the Customers screen). Saved in the same action as the
+  // company, right after it's inserted.
+  const [addContact,setAddContact] = useState(false);
+  const [contactF,setContactF] = useState({contact_name:"",designation:"",email:"",phone:"",department:"",is_primary:"Yes"});
+  const setContact = (k,v)=>setContactF(d=>({...d,[k]:v}));
+
   const save = async()=>{
     if(!f.company_name.trim()){ alert("Customer name is required."); return; }
     if(!f.zone){ alert("Zone is required."); return; }
     if(!f.billing_street.trim()){ alert("Street is required."); return; }
     if(!f.billing_city.trim()){ alert("City is required."); return; }
     if(!f.billing_country.trim()){ alert("Country is required."); return; }
+    if(addContact && !contactF.contact_name.trim()){ alert("Contact name is required (or uncheck \"Add a contact too\")."); return; }
     setSaving(true);
     try {
+      let savedContact = null;
       if(f.id){
         const {id,...rest} = f;
         await sb.from("companies").update(rest).eq("id",id);
@@ -12587,14 +12569,55 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
         const { error } = await sb.from("companies").insert(payload);
         if(error) throw error;
         if(payload.owner_employee_name) await logOwnershipChange(payload.company_name, "", payload.owner_employee_name, "Auto", user?.username||"unknown");
+        if(addContact){
+          const contactPayload = {...contactF, company_name:f.company_name.trim(), created_by:user?.username||"unknown"};
+          const { error: cErr } = await sb.from("contacts").insert(contactPayload);
+          if(cErr) throw cErr;
+          savedContact = contactPayload;
+        }
       }
-      onSaved(f);
+      onSaved(f, savedContact);
     } catch(e){ console.error("Save customer failed",e); alert("Save failed: "+e.message); }
     finally { setSaving(false); }
   };
   const row2 = (l1,k1,l2,k2)=>h("div",{style:{display:"flex",gap:10,marginBottom:8}},
     h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},l1), h("input",{value:f[k1]||"",onChange:e=>set(k1,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
     h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},l2), h("input",{value:f[k2]||"",onChange:e=>set(k2,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
+  );
+  // Country dropdown (real list, WORLD_COUNTRIES) for either address block.
+  // Changing country resets that block's state/city — a state picked for
+  // one country is meaningless once the country changes.
+  const countryField = (label,key)=>h("div",{style:{flex:1}},
+    h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},label),
+    h("select",{value:f[key]||"",onChange:e=>setF(d=>({...d,[key]:e.target.value,[key.replace("country","state")]:"",[key.replace("country","city")]:""})),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+      h("option",{value:""},"Select country…"),
+      WORLD_COUNTRIES.map(c=>h("option",{key:c,value:c},c))
+    )
+  );
+  // State: a real dropdown (state_zone_tbl) when Country is India, since
+  // that's where the State->City cascade actually applies — free text for
+  // every other country, since there's no equivalent reference data for the
+  // rest of the world.
+  const stateField = (label,countryKey,stateKey)=> h("div",{style:{flex:1}},
+    h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},label),
+    f[countryKey]==="India"
+      ? h("select",{value:f[stateKey]||"",onChange:e=>setF(d=>({...d,[stateKey]:e.target.value,[stateKey.replace("state","city")]:""})),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+          h("option",{value:""},"Select state…"),
+          indiaStates.map(s=>h("option",{key:s,value:s},s))
+        )
+      : h("input",{value:f[stateKey]||"",onChange:e=>set(stateKey,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})
+  );
+  // City: dropdown from city_tbl, scoped to the picked State, only for
+  // India — free text otherwise. Disabled until a State is picked (India)
+  // so the list is never confusingly empty/unscoped.
+  const cityField = (label,countryKey,stateKey,cityKey,citiesForBlock)=> h("div",{style:{flex:1}},
+    h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},label),
+    f[countryKey]==="India"
+      ? h("select",{value:f[cityKey]||"",disabled:!f[stateKey],onChange:e=>set(cityKey,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,opacity:f[stateKey]?1:0.6}},
+          h("option",{value:""},f[stateKey]?"Select city…":"Pick a state first"),
+          citiesForBlock.map(c=>h("option",{key:c,value:c},c))
+        )
+      : h("input",{value:f[cityKey]||"",onChange:e=>set(cityKey,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})
   );
   return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
@@ -12614,18 +12637,18 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
       row2("Website","website","Phone","phone"),
       h("div",{style:{display:"flex",gap:10,marginBottom:8}},
         h("div",{style:{flex:1}},
-          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Zone *"),
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Zone * "+(f.billing_state||f.billing_country?"(auto-set from address below, editable)":"")),
           h(MasterSelect,{value:f.zone,onChange:v=>set("zone",v),options:zoneOptions,table:"zone_tbl",valueCol:"value",fieldLabel:"Zone",placeholder:"Select zone…",style:{padding:"7px 9px",fontSize:12},refreshOptions:loadZones})
         ),
         h("div",{style:{flex:1}})
       ),
       h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,margin:"10px 0 6px"}},"BILLING ADDRESS"),
-      row2("Street *","billing_street","City *","billing_city"),
-      row2("State","billing_state","Country *","billing_country"),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, countryField("Country *","billing_country"), h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Street *"), h("input",{value:f.billing_street||"",onChange:e=>set("billing_street",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, stateField("State","billing_country","billing_state"), cityField("City *","billing_country","billing_state","billing_city",billingCities)),
       row2("PIN / Zip","billing_pin","GST / Tax ID","gst_tax_id"),
       h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,margin:"10px 0 6px"}},"SHIPPING ADDRESS"),
-      row2("Street","shipping_street","City","shipping_city"),
-      row2("State","shipping_state","Country","shipping_country"),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, countryField("Country","shipping_country"), h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Street"), h("input",{value:f.shipping_street||"",onChange:e=>set("shipping_street",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, stateField("State","shipping_country","shipping_state"), cityField("City","shipping_country","shipping_state","shipping_city",shippingCities)),
       row2("PIN / Zip","shipping_pin","Source","source"),
       row2("Account owner","account_owner","Notes","notes"),
       h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,margin:"10px 0 6px"}},"CRM"),
@@ -12641,6 +12664,27 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
           h("select",{value:f.owner_employee_name||"",disabled:user?.role!=="super_admin",onChange:e=>set("owner_employee_name",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,opacity:user?.role!=="super_admin"?0.6:1}},
             h("option",{value:""},"—"),
             employeeOptionsForOwner.map(name=>h("option",{key:name,value:name},name))
+          )
+        )
+      ),
+      !f.id && h("div",{style:{marginTop:8}},
+        h("label",{style:{display:"flex",alignItems:"center",gap:8,fontSize:12.5,color:colors.text,cursor:"pointer",marginBottom:addContact?8:0}},
+          h("input",{type:"checkbox",checked:addContact,onChange:e=>setAddContact(e.target.checked)}),
+          "Add a contact for this customer too"
+        ),
+        addContact && h("div",{style:{background:"#f4f2ea",borderRadius:8,padding:"10px 12px",marginBottom:4}},
+          h("div",{style:{marginBottom:8}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Contact name *"), h("input",{value:contactF.contact_name,onChange:e=>setContact("contact_name",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+          h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+            h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Designation"), h("input",{value:contactF.designation,onChange:e=>setContact("designation",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+            h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Department"), h("input",{value:contactF.department,onChange:e=>setContact("department",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
+          ),
+          h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+            h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Email"), h("input",{value:contactF.email,onChange:e=>setContact("email",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+            h("div",{style:{flex:1}}, h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Phone"), h("input",{value:contactF.phone,onChange:e=>setContact("phone",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
+          ),
+          h("label",{style:{display:"flex",alignItems:"center",gap:6,fontSize:11.5,color:colors.text,cursor:"pointer"}},
+            h("input",{type:"checkbox",checked:contactF.is_primary==="Yes",onChange:e=>setContact("is_primary",e.target.checked?"Yes":"No")}),
+            "Primary contact for this customer"
           )
         )
       ),
@@ -13300,33 +13344,18 @@ function CustomersScreen({ user }){
     ),
     companyFormOpen && h(CustomerCompanyForm,{
       initial: companyFormOpen==="new"?null:companyFormOpen, user,
-      onCancel:()=>{ setCompanyFormOpen(null); setPendingContactAfterCompany(null); },
-      onSaved: async(savedCompany)=>{
+      onCancel:()=>setCompanyFormOpen(null),
+      onSaved: async(savedCompany, savedContact)=>{
         setCompanyFormOpen(null);
         await loadCompanies();
         // Refresh `selected` too — otherwise the info panel keeps showing
         // whatever was loaded before this edit, even though the save itself
-        // succeeded.
+        // succeeded. The contact (if any) is already saved by
+        // CustomerCompanyForm itself at this point — just refresh the list.
         if(savedCompany && savedCompany.company_name){
           const { data: freshCompanies } = await sb.from("companies").select("*").order("company_name");
           const match = (freshCompanies||[]).find(c=>c.company_name===savedCompany.company_name);
-          if(match) setSelected(match);
-        }
-        if(pendingContactAfterCompany && savedCompany && savedCompany.company_name){
-          await sb.from("contacts").insert({
-            company_name: savedCompany.company_name,
-            contact_name: pendingContactAfterCompany.contact_name,
-            designation: pendingContactAfterCompany.designation,
-            email: pendingContactAfterCompany.email,
-            phone: pendingContactAfterCompany.phone,
-            department: pendingContactAfterCompany.department,
-            is_primary: pendingContactAfterCompany.is_primary,
-            created_by: user?.username||"customers_screen"
-          });
-          setPendingContactAfterCompany(null);
-          const { data: freshCompanies2 } = await sb.from("companies").select("*").order("company_name");
-          const match2 = (freshCompanies2||[]).find(c=>c.company_name===savedCompany.company_name);
-          if(match2){ setSelected(match2); await loadContacts(match2.company_name); }
+          if(match){ setSelected(match); if(savedContact) await loadContacts(match.company_name); }
         }
       }
     }),
