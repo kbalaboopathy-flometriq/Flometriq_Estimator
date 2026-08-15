@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-14T04:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-14T05:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -244,6 +244,12 @@ async function ensureMinSpinner(startedAt, minMs){
 // Model and similar) — real master data drifts in casing/spacing across
 // entries, and an exact string match silently breaks narrowing when it does.
 function norm(s){ return (s==null?"":String(s)).trim().toLowerCase(); }
+// Item MOC Rules: a parameter's acceptable values are an OR list
+// (match_values) — any one of them satisfies that line. Older rules saved
+// before this existed only have a single match_value string; read those as
+// a one-item list so they keep working untouched until next edited/saved,
+// at which point they upgrade to the new shape automatically.
+function mocParamValues(p){ return (p.match_values && p.match_values.length) ? p.match_values : (p.match_value ? [p.match_value] : []); }
 // Natural/numeric-aware string comparator — plain .sort() treats "150nb" as
 // less than "50nb" because it compares character-by-character ("1" < "5"),
 // which silently mis-orders any list of model/size names once sizes cross a
@@ -5623,7 +5629,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   const mocLines = useMemo(()=>{
     if(!mocRow) return [];
     const params = mocRow.parameters||[];
-    return (openLines||[]).filter(l=> params.some(p=> (p.match_field==="sub_assembly"?l.sub_assembly:l.component)===p.match_value));
+    return (openLines||[]).filter(l=> params.some(p=> mocParamValues(p).includes(p.match_field==="sub_assembly"?l.sub_assembly:l.component)));
   }, [openLines, mocRow]);
   const bomMatches = useMemo(()=>{
     if(!template) return {};
@@ -6182,7 +6188,7 @@ function buildMasterRowsFromParse(item, sections, helperFields){
 function ItemMocRulesEditor({ user }){
   const [itemMasterList,setItemMasterList] = useState([]);
   const [selectedItem,setSelectedItem] = useState("");
-  const [parameters,setParameters] = useState([]); // [{label, match_field, match_value, value_source}]
+  const [parameters,setParameters] = useState([]); // [{label, match_field, match_values:[], value_source}]
   const [loading,setLoading] = useState(false);
   const [saving,setSaving] = useState(false);
   const [existingRowId,setExistingRowId] = useState(null);
@@ -6240,7 +6246,8 @@ function ItemMocRulesEditor({ user }){
         const targetSubAssemblies = new Set((targetBom||[]).map(r=>r.sub_assembly).filter(Boolean));
         parameters.forEach(p=>{
           const pool = p.match_field==="sub_assembly" ? targetSubAssemblies : targetComponents;
-          if(p.match_value && !pool.has(p.match_value)) warnings.push({item:targetItem,label:p.label||"(unlabeled)"});
+          const vals = mocParamValues(p);
+          if(vals.length && !vals.some(v=>pool.has(v))) warnings.push({item:targetItem,label:p.label||"(unlabeled)"});
         });
         const { data: existing } = await sb.from("item_moc_rules").select("id").eq("item",targetItem).maybeSingle();
         if(existing){
@@ -6259,13 +6266,35 @@ function ItemMocRulesEditor({ user }){
     finally{ setCopying(false); }
   };
 
-  const addParam = ()=> { setUnsavedGuard(true,"You have unsaved Item MOC Rules changes. Leave anyway?"); setParameters(p=>[...p,{label:"",match_field:"sub_assembly",match_value:"",value_source:"grade"}]); };
+  const addParam = ()=> { setUnsavedGuard(true,"You have unsaved Item MOC Rules changes. Leave anyway?"); setParameters(p=>[...p,{label:"",match_field:"sub_assembly",match_values:[],value_source:"grade"}]); };
   const updateParam = (idx,patch)=> { setUnsavedGuard(true,"You have unsaved Item MOC Rules changes. Leave anyway?"); setParameters(p=>p.map((row,i)=>i===idx?{...row,...patch}:row)); };
   const removeParam = (idx)=> { setUnsavedGuard(true,"You have unsaved Item MOC Rules changes. Leave anyway?"); setParameters(p=>p.filter((_,i)=>i!==idx)); };
+  // Adds/removes one value from a parameter's OR list. Also drops the old
+  // singular match_value once a parameter is touched here, so a save always
+  // writes the new shape going forward.
+  const addParamValue = (idx,val)=>{
+    if(!val) return;
+    setUnsavedGuard(true,"You have unsaved Item MOC Rules changes. Leave anyway?");
+    setParameters(p=>p.map((row,i)=>{
+      if(i!==idx) return row;
+      const vals = mocParamValues(row);
+      if(vals.includes(val)) return row;
+      const {match_value, ...rest} = row;
+      return {...rest, match_values:[...vals,val]};
+    }));
+  };
+  const removeParamValue = (idx,val)=>{
+    setUnsavedGuard(true,"You have unsaved Item MOC Rules changes. Leave anyway?");
+    setParameters(p=>p.map((row,i)=>{
+      if(i!==idx) return row;
+      const {match_value, ...rest} = row;
+      return {...rest, match_values:mocParamValues(row).filter(v=>v!==val)};
+    }));
+  };
 
   const save = async()=>{
     if(!selectedItem){ alert("Pick an item first."); return; }
-    if(parameters.some(p=>!p.label.trim()||!p.match_value.trim())){ alert("Every parameter needs a label and a matched component/sub-assembly value."); return; }
+    if(parameters.some(p=>!p.label.trim()||mocParamValues(p).length===0)){ alert("Every parameter needs a label and at least one matched component/sub-assembly value."); return; }
     setSaving(true);
     try{
       const payload = { item:selectedItem, parameters, updated_at:new Date().toISOString() };
@@ -6306,25 +6335,40 @@ function ItemMocRulesEditor({ user }){
               h("th",{style:{padding:"7px 9px",fontSize:10.5}},"#"),
               h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Label"),
               h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Match on"),
-              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Matched value"),
+              h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Matched values (any one satisfies this line)"),
               h("th",{style:{padding:"7px 9px",fontSize:10.5}},"Value from"),
               h("th",{style:{padding:"7px 9px",fontSize:10.5}},"")
             )),
             h("tbody",null,
-              parameters.map((p,idx)=>h("tr",{key:idx,style:{borderTop:"1px solid #eceae0"}},
+              parameters.map((p,idx)=>{
+                const pool = p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents;
+                const vals = mocParamValues(p);
+                const remaining = pool.filter(v=>!vals.includes(v));
+                return h("tr",{key:idx,style:{borderTop:"1px solid #eceae0"}},
                 h("td",{style:{padding:"6px 9px",color:colors.mutedLight}},idx+1),
                 h("td",{style:{padding:"6px 9px"}},h("input",{value:p.label,onChange:e=>updateParam(idx,{label:e.target.value}),placeholder:"e.g. Body",style:{...inputStyle,padding:"5px 7px",fontSize:12}})),
-                h("td",{style:{padding:"6px 9px"}},h("select",{value:p.match_field,onChange:e=>updateParam(idx,{match_field:e.target.value,match_value:""}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:"component"},"Component"),h("option",{value:"sub_assembly"},"Sub Assembly"))),
-                h("td",{style:{padding:"6px 9px"}},
-                  h(LimitToListCombo,{value:p.match_value,onChange:v=>updateParam(idx,{match_value:v}),options:(p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents),placeholder:"Select…",style:{...inputStyle,padding:"5px 7px",fontSize:12}}),
-                  (p.match_field==="sub_assembly"?bomSubAssemblies:bomComponents).length===0 && h("div",{style:{fontSize:9.5,color:colors.danger,marginTop:2}},"No "+(p.match_field==="sub_assembly"?"Sub Assembly":"Component")+" values found in this item's BOM.")
+                h("td",{style:{padding:"6px 9px"}},h("select",{value:p.match_field,onChange:e=>updateParam(idx,{match_field:e.target.value,match_values:[]}),style:{...inputStyle,padding:"5px 7px",fontSize:12}},h("option",{value:"component"},"Component"),h("option",{value:"sub_assembly"},"Sub Assembly"))),
+                h("td",{style:{padding:"6px 9px",minWidth:220}},
+                  h("div",{style:{display:"flex",flexWrap:"wrap",gap:4,marginBottom:vals.length?5:0}},
+                    vals.map(v=>h("span",{key:v,style:{display:"inline-flex",alignItems:"center",gap:5,background:"#eaf2fb",color:"#0c447c",borderRadius:4,padding:"2px 7px",fontSize:11}},
+                      v, h("span",{onClick:()=>removeParamValue(idx,v),style:{cursor:"pointer",fontWeight:700}},"✕")
+                    ))
+                  ),
+                  h("div",{style:{display:"flex",gap:4}},
+                    h("select",{id:"moc-val-add-"+idx,style:{...inputStyle,padding:"5px 7px",fontSize:12,flex:1},disabled:remaining.length===0},
+                      remaining.length===0
+                        ? h("option",{value:""},vals.length?"All BOM values added":"No values found in this item's BOM")
+                        : remaining.map(v=>h("option",{key:v,value:v},v))
+                    ),
+                    h("button",{type:"button",disabled:remaining.length===0,onClick:()=>{ const sel=document.getElementById("moc-val-add-"+idx); if(sel&&sel.value) addParamValue(idx,sel.value); },style:{...btnSmall,fontSize:11,padding:"5px 9px"}},"+ Add")
+                  )
                 ),
                 h("td",{style:{padding:"6px 9px"}},
                   h("label",{style:{marginRight:10,fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="grade",onChange:()=>updateParam(idx,{value_source:"grade"}),style:{marginRight:4}}),"Grade"),
                   h("label",{style:{fontSize:11.5}},h("input",{type:"radio",checked:p.value_source==="spec",onChange:()=>updateParam(idx,{value_source:"spec"}),style:{marginRight:4}}),"Spec")
                 ),
                 h("td",{style:{padding:"6px 9px"}},h("button",{onClick:()=>removeParam(idx),style:{...btnSmall,fontSize:10.5,padding:"3px 8px",color:colors.danger}},"Remove"))
-              ))
+              );})
             )
           )
         : h("div",{style:{background:"#f4f2ea",borderRadius:8,padding:12,display:"flex",flexDirection:"column",gap:8,marginBottom:10}},
@@ -6339,7 +6383,7 @@ function ItemMocRulesEditor({ user }){
                 h("span",{style:{color:colors.mutedLight,fontSize:14}},"⠿"),
                 h("div",null,
                   h("div",{style:{fontWeight:600,fontSize:12.5}},(idx+1)+". "+(p.label||"(unlabeled)")),
-                  h("div",{style:{fontSize:11,color:colors.muted}},(p.match_field==="sub_assembly"?"Sub Assembly":"Component")+" = "+(p.match_value||"—")+" · from "+(p.value_source==="spec"?"Spec":"Grade"))
+                  h("div",{style:{fontSize:11,color:colors.muted}},(p.match_field==="sub_assembly"?"Sub Assembly":"Component")+" = "+(mocParamValues(p).join(" or ")||"—")+" · from "+(p.value_source==="spec"?"Spec":"Grade"))
                 )
               ),
               h("div",{style:{display:"flex",gap:4}},
@@ -8243,9 +8287,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       if(!rule || !rule.parameters || rule.parameters.length===0) return; // no rule defined — nothing to check
       bomCheckedCount++;
       const slLines = (allLinesForBom||[]).filter(l=>l.item_sl_no===est.item_sl_no);
-      const missingParams = rule.parameters.filter(p=> !slLines.some(l=> (p.match_field==="sub_assembly"?l.sub_assembly:l.component)===p.match_value));
+      const missingParams = rule.parameters.filter(p=> !slLines.some(l=> mocParamValues(p).includes(p.match_field==="sub_assembly"?l.sub_assembly:l.component)));
       if(missingParams.length){
-        missing.push({section:"Sl No "+est.item_sl_no, items:["Incomplete BOM (\""+itemName+"\") — missing: "+missingParams.map(p=>p.label||p.match_value).join(", ")], type:"bom", slNo:est.item_sl_no});
+        missing.push({section:"Sl No "+est.item_sl_no, items:["Incomplete BOM (\""+itemName+"\") — missing: "+missingParams.map(p=>p.label||mocParamValues(p).join(" or ")).join(", ")], type:"bom", slNo:est.item_sl_no});
         incompleteBomDetails.push({slNo:est.item_sl_no, itemName, missingParams});
       } else {
         bomDoneCount++;
@@ -8335,7 +8379,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const goFixBomNow = ()=>{
     setShowBomFixPrompt(false);
     const detail = (readiness.incompleteBomDetails||[])[0];
-    if(detail) alert("Missing on \""+detail.itemName+"\": "+detail.missingParams.map(p=>p.label||p.match_value).join(", ")+".\n\nAdd it to the BOM Master below. Note: this fixes future quotes using this item — you may also need to add the line to THIS quote's own BOM separately.");
+    if(detail) alert("Missing on \""+detail.itemName+"\": "+detail.missingParams.map(p=>p.label||mocParamValues(p).join(" or ")).join(", ")+".\n\nAdd it to the BOM Master below. Note: this fixes future quotes using this item — you may also need to add the line to THIS quote's own BOM separately.");
     if(onGoToTab) onGoToTab("bom");
   };
   const submitBomFixCode = async()=>{
@@ -8345,9 +8389,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     setShowBomFixCodeEntry(false);
     if(detail){
       setBomFixUnlocked(detail);
+      // A parameter can accept several OR values now — default the fix
+      // draft to the first one; the user can still retype it before saving.
+      const firstVal = mocParamValues(detail.missingParams[0])[0] || "";
       setBomFixDraft({
-        component: detail.missingParams[0].match_field==="component" ? detail.missingParams[0].match_value : "",
-        sub_assembly: detail.missingParams[0].match_field==="sub_assembly" ? detail.missingParams[0].match_value : "",
+        component: detail.missingParams[0].match_field==="component" ? firstVal : "",
+        sub_assembly: detail.missingParams[0].match_field==="sub_assembly" ? firstVal : "",
         material_spec:""
       });
     }
@@ -10539,7 +10586,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           ),
           readiness.categories.bomComplete!=="all" && readiness.incompleteBomDetails && readiness.incompleteBomDetails.length>0 && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"8px 12px",marginTop:8,marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}},
             h("div",{style:{fontSize:12,color:"#a3312a"}},
-              h("strong",null,"Incomplete BOM"),": this item's master template is missing a required component — "+readiness.incompleteBomDetails.map(d=>"Sl No "+d.slNo+" (\""+d.itemName+"\"): "+d.missingParams.map(p=>p.label||p.match_value).join(", ")).join("; ")
+              h("strong",null,"Incomplete BOM"),": this item's master template is missing a required component — "+readiness.incompleteBomDetails.map(d=>"Sl No "+d.slNo+" (\""+d.itemName+"\"): "+d.missingParams.map(p=>p.label||mocParamValues(p).join(" or ")).join(", ")).join("; ")
             ),
             h("button",{onClick:openBomFix,style:{...btnSmall,fontSize:11,padding:"4px 9px",border:"1px solid #a3312a",color:"#a3312a"}},isAdmin?"Fix now":"Enter code to fix")
           ),
@@ -11624,7 +11671,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:420,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"This item's BOM master is incomplete"),
         h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},
-          (readiness.incompleteBomDetails||[]).map(d=>"\""+d.itemName+"\" is missing: "+d.missingParams.map(p=>p.label||p.match_value).join(", ")).join(" ")+" — no quote built from this item can satisfy this rule until the master BOM is fixed. Fix it now?"
+          (readiness.incompleteBomDetails||[]).map(d=>"\""+d.itemName+"\" is missing: "+d.missingParams.map(p=>p.label||mocParamValues(p).join(" or ")).join(", ")).join(" ")+" — no quote built from this item can satisfy this rule until the master BOM is fixed. Fix it now?"
         ),
         h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
           h("button",{onClick:()=>setShowBomFixPrompt(false),style:btnSecondary},"No"),
