@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-15T02:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-15T03:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1193,6 +1193,9 @@ function MenuTabs({ user, active, onChange }) {
       ]},
     ]},
     { label:"CRM", subgroups:[
+      { label:"Major Projects", tabs:[
+        {key:"major_projects",label:"Projects"},
+      ]},
       { label:"Funnel", tabs:[
         {key:"crm_funnel",label:"Funnel"},
       ]},
@@ -15706,6 +15709,372 @@ function StatusChangeHistoryReport(){
   );
 }
 
+// ============================================================
+// Major Projects module (Phase 2 — Project & Package CRUD)
+// Pre-lead pipeline, sits ABOVE the existing Company/Quote flow. See the
+// 15 Aug session handoff for the full design rationale. Nothing here is
+// ADNOC-specific — End User and Main EPC are just Companies, same picker
+// used everywhere else, so this works identically for Aramco, IOCL, BPCL,
+// SABIC, HPCL, DEWA, or any future account.
+// ============================================================
+
+function MajorProjectsScreen({ user }){
+  const [view,setView] = useState("list"); // "list" | "detail"
+  const [projects,setProjects] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [search,setSearch] = useState("");
+  const [selectedProject,setSelectedProject] = useState(null);
+  const [packages,setPackages] = useState([]);
+  const [loadingPackages,setLoadingPackages] = useState(false);
+  const [showProjectForm,setShowProjectForm] = useState(false);
+  const [editingProject,setEditingProject] = useState(null);
+  const [showPackageForm,setShowPackageForm] = useState(false);
+  const [editingPackage,setEditingPackage] = useState(null);
+
+  const loadProjects = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("major_project_tbl").select("*").order("created_at",{ascending:false});
+    setProjects(data||[]);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ loadProjects(); },[loadProjects]);
+
+  const loadPackages = useCallback(async(projectId)=>{
+    setLoadingPackages(true);
+    const { data } = await sb.from("major_project_package_tbl").select("*").eq("project_id",projectId).order("created_at",{ascending:false});
+    setPackages(data||[]);
+    setLoadingPackages(false);
+  },[]);
+
+  const openProject = (p)=>{ setSelectedProject(p); setView("detail"); loadPackages(p.id); };
+  const backToList = ()=>{ setView("list"); setSelectedProject(null); setPackages([]); loadProjects(); };
+
+  const filtered = projects.filter(p=>{
+    const q = search.trim().toLowerCase();
+    if(!q) return true;
+    return (p.project_name||"").toLowerCase().includes(q)
+      || (p.end_user_company_name||"").toLowerCase().includes(q)
+      || (p.main_epc_company_name||"").toLowerCase().includes(q);
+  });
+
+  if(view==="detail" && selectedProject){
+    return h(React.Fragment,null,
+      h("div",{style:{padding:"20px 24px"}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16,flexWrap:"wrap",gap:10}},
+          h("div",null,
+            h("button",{onClick:backToList,style:{...btnSmall,marginBottom:8}},"← All projects"),
+            h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},selectedProject.project_name),
+            h("div",{style:{fontSize:12.5,color:colors.muted,marginTop:4}},
+              selectedProject.end_user_company_name+" · EPC: "+selectedProject.main_epc_company_name
+            )
+          ),
+          h("button",{onClick:()=>{setEditingProject(selectedProject);setShowProjectForm(true);},style:btnSecondary},"Edit project")
+        ),
+        h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:20}},
+          h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
+            h("div",{style:{fontSize:10,color:colors.mutedLight}},"Stage"),
+            h("div",{style:{fontSize:13,fontWeight:700}},selectedProject.project_stage||"—")
+          ),
+          h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
+            h("div",{style:{fontSize:10,color:colors.mutedLight}},"Est. value"),
+            h("div",{style:{fontSize:13,fontWeight:700}},selectedProject.estimated_value?fmt(selectedProject.estimated_value):"—")
+          ),
+          h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
+            h("div",{style:{fontSize:10,color:colors.mutedLight}},"Primary sales rep"),
+            h("div",{style:{fontSize:13,fontWeight:700}},selectedProject.primary_sales_rep||"—")
+          ),
+          h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
+            h("div",{style:{fontSize:10,color:colors.mutedLight}},"Location"),
+            h("div",{style:{fontSize:13,fontWeight:700}},selectedProject.location||"—")
+          )
+        ),
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
+          h("h3",{style:{margin:0,fontSize:14,fontWeight:700}},"Packages / OEM opportunities"),
+          h("button",{onClick:()=>{setEditingPackage(null);setShowPackageForm(true);},style:btnPrimary},"+ Add package")
+        ),
+        loadingPackages ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
+        packages.length===0 ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"No packages yet — add the first one.") :
+        h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+          packages.map(pkg=>h("div",{key:pkg.id,onClick:()=>{setEditingPackage(pkg);setShowPackageForm(true);},style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"12px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
+            h("div",null,
+              h("div",{style:{fontWeight:700,fontSize:13}},pkg.package_name),
+              h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},
+                (pkg.confirmed_oem?("OEM: "+pkg.confirmed_oem+" · "):"")+"Sales rep: "+(pkg.sales_rep||"—")
+                +(pkg.linked_reference_number?(" · Linked to "+pkg.linked_reference_number):"")
+              )
+            ),
+            h("div",{style:{display:"flex",alignItems:"center",gap:10}},
+              pkg.next_followup_date && h("div",{style:{fontSize:11,color:colors.mutedLight}},"Next: "+pkg.next_followup_date),
+              h("span",{style:{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,background:"#eaf2fb",color:"#0c447c"}},pkg.oem_status)
+            )
+          ))
+        )
+      ),
+      showProjectForm && h(MajorProjectFormModal,{
+        initial:editingProject, user,
+        onCancel:()=>{setShowProjectForm(false);setEditingProject(null);},
+        onSaved:(saved)=>{ setShowProjectForm(false); setEditingProject(null); setSelectedProject(saved); loadProjects(); }
+      }),
+      showPackageForm && h(MajorProjectPackageFormModal,{
+        project:selectedProject, initial:editingPackage, user,
+        onCancel:()=>{setShowPackageForm(false);setEditingPackage(null);},
+        onSaved:()=>{ setShowPackageForm(false); setEditingPackage(null); loadPackages(selectedProject.id); }
+      })
+    );
+  }
+
+  return h(React.Fragment,null,
+    h("div",{style:{padding:"20px 24px"}},
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
+        h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Major Projects"),
+        h("div",{style:{display:"flex",gap:8}},
+          h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search project, end user, EPC…",style:{...inputStyle,width:260}}),
+          h("button",{onClick:()=>{setEditingProject(null);setShowProjectForm(true);},style:{...btnPrimary,fontWeight:600}},"+ New Project")
+        )
+      ),
+      loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
+      filtered.length===0 ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"No projects yet — click + New Project to add the first one (any major EPC account: Aramco, IOCL, BPCL, SABIC, HPCL, DEWA, or others).") :
+      h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+        h("div",{style:{display:"grid",gridTemplateColumns:"2fr 1.4fr 1.4fr 1fr 1fr 1fr",padding:"8px 14px",background:colors.bg,fontSize:10.5,fontWeight:700,color:colors.muted}},
+          h("div",null,"Project"),h("div",null,"End user"),h("div",null,"Main EPC"),h("div",null,"Stage"),h("div",null,"Est. value"),h("div",null,"Sales rep")
+        ),
+        filtered.map((p,i)=>h("div",{key:p.id,onClick:()=>openProject(p),style:{display:"grid",gridTemplateColumns:"2fr 1.4fr 1.4fr 1fr 1fr 1fr",padding:"10px 14px",cursor:"pointer",background:i%2===0?"#fff":"#e6f1fb",fontSize:12.5,borderTop:"1px solid "+colors.border,alignItems:"center"}},
+          h("div",{style:{fontWeight:600}},p.project_name),
+          h("div",null,p.end_user_company_name),
+          h("div",null,p.main_epc_company_name),
+          h("div",null,p.project_stage||"—"),
+          h("div",null,p.estimated_value?fmt(p.estimated_value):"—"),
+          h("div",null,p.primary_sales_rep||"—")
+        ))
+      )
+    ),
+    showProjectForm && h(MajorProjectFormModal,{
+      initial:editingProject, user,
+      onCancel:()=>{setShowProjectForm(false);setEditingProject(null);},
+      onSaved:()=>{ setShowProjectForm(false); setEditingProject(null); loadProjects(); }
+    })
+  );
+}
+
+function MajorProjectFormModal({ initial, onCancel, onSaved, user }){
+  const [f,setF] = useState(initial || {
+    project_name:"", end_user_company_name:"", main_epc_company_name:"", location:"",
+    project_number:"", epc_award_date:"", project_stage:"Tender", expected_completion:"",
+    estimated_value:"", primary_sales_rep:"", secondary_sales_rep:"", priority:"Medium", source:"", notes:""
+  });
+  const [saving,setSaving] = useState(false);
+  const [stages,setStages] = useState([]);
+  const [employees,setEmployees] = useState([]);
+  const [suggestedOwner,setSuggestedOwner] = useState("");
+  const [ownerSuggestChecked,setOwnerSuggestChecked] = useState(false);
+  const set = (k,v)=>setF(d=>({...d,[k]:v}));
+
+  useEffect(()=>{
+    sb.from("major_project_stage_tbl").select("stage").order("sort_order").then(({data})=>setStages((data||[]).map(r=>r.stage)));
+    sb.from("employee_tbl").select("employee_name").order("employee_name").then(({data})=>setEmployees((data||[]).map(r=>r.employee_name).filter(Boolean)));
+  },[]);
+
+  // Ownership auto-suggest — fires when Main EPC is picked (new project
+  // only), looks up that company's billing address the same way the
+  // existing Customer/Zone engine does, and offers it as a suggestion —
+  // never silently assigns. User can accept with one click or just pick
+  // someone else from the dropdown; either way it's a conscious choice.
+  useEffect(()=>{
+    if(initial || !f.main_epc_company_name.trim()){ return; }
+    let cancelled=false;
+    (async()=>{
+      const { data: co } = await sb.from("companies").select("billing_state,billing_country").ilike("company_name",f.main_epc_company_name.trim()).limit(1).maybeSingle();
+      if(!co) return;
+      const owner = await resolveOwnerForAddress(co.billing_state, co.billing_country);
+      if(!cancelled && owner){ setSuggestedOwner(owner); setOwnerSuggestChecked(true); }
+    })();
+    return ()=>{ cancelled=true; };
+  },[f.main_epc_company_name,initial]);
+
+  const save = async()=>{
+    if(!f.project_name.trim()){ alert("Project name is required."); return; }
+    if(!f.end_user_company_name.trim()){ alert("End user is required."); return; }
+    if(!f.main_epc_company_name.trim()){ alert("Main EPC is required."); return; }
+    if(!f.primary_sales_rep){ alert("Primary sales rep is required — accept the suggestion or pick one."); return; }
+    setSaving(true);
+    try{
+      const payload = {...f, estimated_value: f.estimated_value?Number(f.estimated_value):null, epc_award_date: f.epc_award_date||null, expected_completion: f.expected_completion||null};
+      if(f.id){
+        const {id,...rest} = payload;
+        await sb.from("major_project_tbl").update({...rest,updated_at:new Date().toISOString()}).eq("id",id);
+        onSaved({...f});
+      } else {
+        const { data, error } = await sb.from("major_project_tbl").insert({...payload, created_by:user?.username||"unknown"}).select().single();
+        if(error) throw error;
+        onSaved(data);
+      }
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally{ setSaving(false); }
+  };
+
+  const field = (label,key,type)=>h("div",{style:{flex:1}},
+    h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},label),
+    h("input",{type:type||"text",value:f[key]||"",onChange:e=>set(key,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})
+  );
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:600,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:14}},f.id?"Edit project":"New major project"),
+      field("Project name *","project_name"),
+      h("div",{style:{height:8}}),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"End user (e.g. ADNOC, Aramco, IOCL) *"),
+          h(CustomerSelect,{value:f.end_user_company_name,user,onSelect:(p)=>set("end_user_company_name",p.company_name)})
+        ),
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Main EPC contractor *"),
+          h(CustomerSelect,{value:f.main_epc_company_name,user,onSelect:(p)=>set("main_epc_company_name",p.company_name)})
+        )
+      ),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, field("Location","location"), field("Project number","project_number")),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, field("EPC award date","epc_award_date","date"), field("Expected completion","expected_completion","date")),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Project stage"),
+          h("select",{value:f.project_stage,onChange:e=>set("project_stage",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+            stages.map(s=>h("option",{key:s,value:s},s))
+          )
+        ),
+        field("Estimated value","estimated_value","number")
+      ),
+      suggestedOwner && !f.id && f.primary_sales_rep!==suggestedOwner && h("div",{style:{display:"flex",alignItems:"center",gap:8,background:"#eaf2fb",border:"1px solid #85b7eb",borderRadius:6,padding:"8px 10px",marginBottom:8,fontSize:11.5}},
+        h("span",{style:{flex:1,color:"#0c447c"}},"Territory suggests "+suggestedOwner+" as owner — confirm or pick someone else below."),
+        h("button",{onClick:()=>set("primary_sales_rep",suggestedOwner),style:{...btnSmall,padding:"4px 10px",fontSize:11}},"Use "+suggestedOwner)
+      ),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Primary sales rep *"),
+          h("select",{value:f.primary_sales_rep,onChange:e=>set("primary_sales_rep",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+            h("option",{value:""},"Select…"),
+            employees.map(name=>h("option",{key:name,value:name},name))
+          )
+        ),
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Secondary sales rep"),
+          h("select",{value:f.secondary_sales_rep||"",onChange:e=>set("secondary_sales_rep",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+            h("option",{value:""},"—"),
+            employees.map(name=>h("option",{key:name,value:name},name))
+          )
+        )
+      ),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Priority"),
+          h("select",{value:f.priority,onChange:e=>set("priority",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+            h("option",{value:"High"},"High"),h("option",{value:"Medium"},"Medium"),h("option",{value:"Low"},"Low")
+          )
+        ),
+        field("Source","source")
+      ),
+      h("div",{style:{marginBottom:8}},
+        h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Notes"),
+        h("textarea",{value:f.notes||"",onChange:e=>set("notes",e.target.value),rows:2,style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%",resize:"vertical"}})
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
+        h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save project")
+      )
+    )
+  );
+}
+
+function MajorProjectPackageFormModal({ project, initial, onCancel, onSaved, user }){
+  const [f,setF] = useState(initial || {
+    package_name:"", oem_status:"Unknown", confirmed_oem:"",
+    product_type:"", size:"", rating:"", material:"", quantity:"", service:"",
+    estimated_value:"", technical_spec:"", rfq_expected_date:"", competitor:"", vendor_list_status:"",
+    sales_rep: project.primary_sales_rep||"", next_action:"", next_followup_date:"", notes:""
+  });
+  const [saving,setSaving] = useState(false);
+  const [statuses,setStatuses] = useState([]);
+  const [employees,setEmployees] = useState([]);
+  const set = (k,v)=>setF(d=>({...d,[k]:v}));
+
+  useEffect(()=>{
+    sb.from("major_project_oem_status_tbl").select("status").order("sort_order").then(({data})=>setStatuses((data||[]).map(r=>r.status)));
+    sb.from("employee_tbl").select("employee_name").order("employee_name").then(({data})=>setEmployees((data||[]).map(r=>r.employee_name).filter(Boolean)));
+  },[]);
+
+  const save = async()=>{
+    if(!f.package_name.trim()){ alert("Package name is required."); return; }
+    setSaving(true);
+    try{
+      const payload = {...f, estimated_value: f.estimated_value?Number(f.estimated_value):null, rfq_expected_date: f.rfq_expected_date||null, next_followup_date: f.next_followup_date||null};
+      if(f.id){
+        const {id,linked_reference_number,...rest} = payload;
+        await sb.from("major_project_package_tbl").update({...rest,updated_at:new Date().toISOString()}).eq("id",id);
+      } else {
+        const {linked_reference_number,...rest} = payload;
+        await sb.from("major_project_package_tbl").insert({...rest, project_id:project.id, created_by:user?.username||"unknown"});
+      }
+      onSaved();
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally{ setSaving(false); }
+  };
+
+  const field = (label,key,type)=>h("div",{style:{flex:1}},
+    h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},label),
+    h("input",{type:type||"text",value:f[key]||"",onChange:e=>set(key,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})
+  );
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:600,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},f.id?"Edit package":"New package"),
+      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Under "+project.project_name),
+      f.linked_reference_number && h("div",{style:{background:"#eaf9f4",border:"1px solid #8fd0bf",borderRadius:6,padding:"8px 10px",marginBottom:10,fontSize:11.5,color:"#085041"}},
+        "Linked to Quote# "+f.linked_reference_number
+      ),
+      field("Package name *","package_name"),
+      h("div",{style:{height:8}}),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"OEM status"),
+          h("select",{value:f.oem_status,onChange:e=>set("oem_status",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+            statuses.map(s=>h("option",{key:s,value:s},s))
+          )
+        ),
+        field("Confirmed OEM","confirmed_oem")
+      ),
+      h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,margin:"8px 0 6px"}},"STRAINER REQUIREMENT"),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, field("Product type","product_type"), field("Size","size")),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, field("Rating","rating"), field("Material","material")),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, field("Quantity","quantity"), field("Service","service")),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, field("Estimated value","estimated_value","number"), field("RFQ expected date","rfq_expected_date","date")),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}}, field("Competitor","competitor"), field("Vendor list status","vendor_list_status")),
+      h("div",{style:{marginBottom:8}},
+        h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Technical specification"),
+        h("textarea",{value:f.technical_spec||"",onChange:e=>set("technical_spec",e.target.value),rows:2,style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%",resize:"vertical"}})
+      ),
+      h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,margin:"8px 0 6px"}},"OWNERSHIP & FOLLOW-UP"),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Sales rep (inherits from project, reassignable)"),
+          h("select",{value:f.sales_rep||"",onChange:e=>set("sales_rep",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+            h("option",{value:""},"—"),
+            employees.map(name=>h("option",{key:name,value:name},name))
+          )
+        ),
+        field("Next follow-up date","next_followup_date","date")
+      ),
+      h("div",{style:{marginBottom:8}}, field("Next action","next_action")),
+      h("div",{style:{marginBottom:8}},
+        h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Notes"),
+        h("textarea",{value:f.notes||"",onChange:e=>set("notes",e.target.value),rows:2,style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%",resize:"vertical"}})
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
+        h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save package")
+      )
+    )
+  );
+}
+
 function CrmFunnelKanban({ user }){
   const [statuses,setStatuses] = useState([]);
   const [cards,setCards] = useState([]); // [{id, reference_number, item_sl_no, customer_name, description, quote_status, totalValue, status_changed_by, status_changed_at}]
@@ -19321,6 +19690,7 @@ function App() {
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
     tab==="bolting_calc"?h("div",null,h(BoltingCalculator,{user}),h(BoltingCalcHistoryViewer,{user})):
     tab==="flange_chart"?h(FlangeChart,{user}):
+    tab==="major_projects"?h(MajorProjectsScreen,{user}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
