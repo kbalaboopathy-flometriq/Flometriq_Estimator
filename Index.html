@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T01:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T03:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -17748,13 +17748,15 @@ function DashboardsScreen({ user }){
       viewBtn("owners","Owner leaderboard"),
       viewBtn("health","Quote health"),
       isAdminUser && viewBtn("security","Admin and security"),
-      viewBtn("rules","Rules coverage")
+      viewBtn("rules","Rules coverage"),
+      viewBtn("major_projects","Major Projects")
     ),
     view==="pipeline" && h(PipelineDashboard,{user}),
     view==="owners" && h(OwnerLeaderboardDashboard,{user}),
     view==="health" && h(QuoteHealthDashboard,{user}),
     view==="security" && isAdminUser && h(SecurityDashboard,{user}),
-    view==="rules" && h(RulesCoverageDashboard,{user})
+    view==="rules" && h(RulesCoverageDashboard,{user}),
+    view==="major_projects" && h(MajorProjectsDashboard,{user,isAdminUser})
   );
 }
 
@@ -17936,6 +17938,109 @@ function RulesCoverageDashboard({ user }){
     dashBar("Items with Datasheet MOC Rules set",mocCovered,items),
     dashBar("Items with a Description rule set",descCovered,items),
     h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:6}},items+" item(s) total in the Item master. Easy to forget to populate either rule set for a new item — this is just a coverage check, not a report.")
+  );
+}
+
+// Major Projects Phase 5 — Manager Dashboard + My Projects, folded into one
+// tab alongside the existing 5 (same dashMetric/dashBar helpers, same
+// load-on-mount/loading-state shape). "My Projects" (personal, scoped to
+// the logged-in employee) is visible to any linked employee. The portfolio-
+// wide Manager Dashboard section below it is admin/super_admin only, same
+// gating pattern as the existing Security dashboard.
+function MajorProjectsDashboard({ user, isAdminUser }){
+  const [loading,setLoading]=useState(true);
+  const [employee,setEmployee]=useState(null);
+  const [projects,setProjects]=useState([]);
+  const [packages,setPackages]=useState([]);
+  const [myPackages,setMyPackages]=useState([]);
+  useEffect(()=>{ (async()=>{
+    setLoading(true);
+    let emp = null;
+    if(user?.id){
+      const { data } = await sb.from("employee_tbl").select("employee_name").eq("app_user_id",user.id).limit(1).maybeSingle();
+      emp = data||null;
+      setEmployee(emp);
+    }
+    // "My Projects" — always loaded for a linked employee, scoped to just
+    // their own packages, regardless of admin status.
+    if(emp){
+      const { data: mine } = await sb.from("major_project_package_tbl").select("id,oem_status,estimated_value,next_followup_date").eq("sales_rep",emp.employee_name);
+      setMyPackages(mine||[]);
+    }
+    // Portfolio-wide (Manager Dashboard) data — admin/super_admin only, per
+    // the same gating pattern as the existing Security dashboard. Skipped
+    // entirely for a non-admin so their load doesn't pull every package.
+    if(isAdminUser){
+      const { data: projRows } = await sb.from("major_project_tbl").select("id,project_name,primary_sales_rep,estimated_value");
+      setProjects(projRows||[]);
+      const { data: pkgRows } = await sb.from("major_project_package_tbl").select("id,oem_status,sales_rep,estimated_value,next_followup_date,project_id");
+      setPackages(pkgRows||[]);
+    }
+    setLoading(false);
+  })(); },[user?.id,isAdminUser]);
+
+  if(loading) return h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…");
+
+  const today = new Date().toISOString().slice(0,10);
+  const myValue = myPackages.reduce((s,p)=>s+(Number(p.estimated_value)||0),0);
+  const myOverdue = myPackages.filter(p=>p.next_followup_date && p.next_followup_date<today).length;
+
+  const totalValue = packages.reduce((s,p)=>s+(Number(p.estimated_value)||0),0);
+  const overdueCount = packages.filter(p=>p.next_followup_date && p.next_followup_date<today).length;
+
+  const byStatus = {};
+  packages.forEach(p=>{ const s=p.oem_status||"Unknown"; byStatus[s]=(byStatus[s]||0)+1; });
+  const statuses = Object.keys(byStatus);
+  const maxStatus = Math.max(1,...Object.values(byStatus));
+
+  const byRep = new Map();
+  packages.forEach(p=>{
+    const rep = p.sales_rep||"Unassigned";
+    if(!byRep.has(rep)) byRep.set(rep,{rep,count:0,value:0,overdue:0});
+    const row = byRep.get(rep);
+    row.count++;
+    row.value += Number(p.estimated_value)||0;
+    if(p.next_followup_date && p.next_followup_date<today) row.overdue++;
+  });
+  const repRows = Array.from(byRep.values()).sort((a,b)=>b.value-a.value);
+  const maxRepValue = Math.max(1,...repRows.map(r=>r.value));
+
+  return h("div",null,
+    employee ? h(React.Fragment,null,
+      h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:10}},"My Projects — "+employee.employee_name),
+      h("div",{style:{display:"flex",gap:12,marginBottom:20}},
+        dashMetric("My packages",myPackages.length),
+        dashMetric("My pipeline value",fmt(myValue)),
+        dashMetric("My overdue follow-ups",myOverdue)
+      )
+    ) : h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:20}},"Your login isn't linked to an Employee record yet — ask HR to link it under Master Data → HR → Employees to see your own packages here."),
+
+    !isAdminUser && h("div",{style:{fontSize:11.5,color:colors.mutedLight}},"The portfolio-wide Manager Dashboard below is visible to admin/super_admin only."),
+
+    isAdminUser && h(React.Fragment,null,
+      h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:10}},"Portfolio — all projects"),
+      h("div",{style:{display:"flex",gap:12,marginBottom:20}},
+        dashMetric("Projects",projects.length),
+        dashMetric("Packages",packages.length),
+        dashMetric("Est. pipeline value",fmt(totalValue)),
+        dashMetric("Overdue follow-ups",overdueCount)
+      ),
+      h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:10}},"Packages by OEM status"),
+      statuses.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:20}},"No packages yet.") :
+      h("div",{style:{marginBottom:20}},statuses.map(s=>dashBar(s,byStatus[s],maxStatus,s==="RFQ Received"?"#1c8c56":colors.dark))),
+      h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:10}},"Packages by sales rep (by est. value)"),
+      repRows.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"No packages assigned yet.") :
+      repRows.map(r=>h("div",{key:r.rep,style:{marginBottom:14}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",fontSize:12.5,marginBottom:3}},
+          h("span",{style:{fontWeight:600}},r.rep),
+          h("span",{style:{color:colors.mutedLight}},r.count+" package(s) · "+fmt(r.value)+(r.overdue?(" · "+r.overdue+" overdue"):""))
+        ),
+        h("div",{style:{background:"#eceae0",borderRadius:5,height:10,overflow:"hidden"}},
+          h("div",{style:{background:r.overdue?colors.danger:colors.dark,height:"100%",width:((r.value/maxRepValue)*100)+"%"}})
+        )
+      )),
+      h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:6}},"Values are the Package's own Estimated value field — line-level BOM pricing doesn't exist yet at this stage (most packages predate any Quote#).")
+    )
   );
 }
 
