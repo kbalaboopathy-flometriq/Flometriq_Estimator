@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T03:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T04:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -3734,6 +3734,10 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const [orderQtyGate,setOrderQtyGate]=useState(null); // {cartOverride} while the gate is open, else null
   const [orderQtyGateInput,setOrderQtyGateInput]=useState("");
   const [orderQtyGateSaving,setOrderQtyGateSaving]=useState(false);
+  // Datasheet Yes/No — same gate, only shown when the cart being saved
+  // contains a Direct Price line (a real catalog Sl No never gets asked
+  // this; the requirement stays hard for those). null = unanswered.
+  const [datasheetChoice,setDatasheetChoice]=useState(null); // null | "yes" | "no"
   // The cart is this screen's "unsaved work" — feed it into the app-wide
   // guard so both browser-level navigation and the Close/New buttons below
   // know there's something to lose.
@@ -4604,6 +4608,13 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     if(!holdingNewSlNo) return;
     const { reference_number, item_sl_no } = holdingNewSlNo;
     setHoldingNewSlNo(null);
+    // Already answered permanently at the Order Qty gate (Custom/Direct
+    // Price line, "No — skip it") — don't ask again here.
+    const { data: estRow } = await sb.from("estimates").select("datasheet_not_required").eq("reference_number",reference_number).eq("item_sl_no",item_sl_no).maybeSingle();
+    if(estRow && estRow.datasheet_not_required===true){
+      if(onOpenQuote) onOpenQuote(reference_number, item_sl_no, false);
+      return;
+    }
     const { data } = await sb.from("datasheets").select("id").eq("reference_number",reference_number).eq("item_sl_no",item_sl_no).limit(1);
     const hasDatasheet = data && data.length>0;
     if(hasDatasheet){ if(onOpenQuote) onOpenQuote(reference_number, item_sl_no, false); return; }
@@ -4676,7 +4687,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setRefNumber(""); setQuoteDecision(null);
   };
 
-  const saveReference = async(cartOverride, orderQty)=>{
+  const saveReference = async(cartOverride, orderQty, skipDatasheet)=>{
     const effectiveCart = cartOverride || cart;
     setSaveMsg("");
     const fail = (m)=>{ setSaveMsg(m); if(!showSave) alert(m); };
@@ -4740,6 +4751,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         setSavingRef(false);
         setOrderQtyGate({cartOverride: effectiveCart});
         setOrderQtyGateInput("");
+        setDatasheetChoice(null);
         return false;
       }
       if(existing&&existing.length>0){
@@ -4747,7 +4759,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         await sb.from("estimates").update(headerPayload).eq("id",estimateId);
         await sb.from("estimate_lines").delete().eq("reference_number",ref).eq("item_sl_no",slNo);
       } else {
-        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,order_qty:Number(orderQty),quote_status:resolvedQuoteStatus,company_id:resolvedCompanyId,created_by:user.username}).select().single();
+        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,order_qty:Number(orderQty),quote_status:resolvedQuoteStatus,company_id:resolvedCompanyId,created_by:user.username,datasheet_not_required:skipDatasheet===true}).select().single();
         if(err) throw err;
         estimateId=created.id; createdNewHeader=true;
         promoteCompanyToLead(resolvedCompanyId, headerPayload.customer_name);
@@ -4779,10 +4791,12 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const confirmOrderQtyGate = async()=>{
     if(!orderQtyGate) return;
     setOrderQtyGateSaving(true);
-    const ok = await saveReference(orderQtyGate.cartOverride, Number(orderQtyGateInput));
+    const gateCart = orderQtyGate.cartOverride||[];
+    const hasDirectPrice = gateCart.some(l=>l.is_direct_price===true);
+    const ok = await saveReference(orderQtyGate.cartOverride, Number(orderQtyGateInput), hasDirectPrice && datasheetChoice==="no");
     setOrderQtyGateSaving(false);
     if(ok){
-      setOrderQtyGate(null); setOrderQtyGateInput("");
+      setOrderQtyGate(null); setOrderQtyGateInput(""); setDatasheetChoice(null);
       setShowSave(false); setSaveMaximised(true);
       if(holdingNewSlNo) await afterNewSlNoSave();
     }
@@ -5522,29 +5536,156 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       )
     ),
     // Order Qty gate — no Cancel/close button by design (see saveReference).
-    orderQtyGate && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.65)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+    orderQtyGate && (()=>{
+      const gateCart = orderQtyGate.cartOverride||[];
+      const hasDirectPrice = gateCart.some(l=>l.is_direct_price===true);
+      const qtyOk = Number(orderQtyGateInput)>=1;
+      const dsOk = !hasDirectPrice || datasheetChoice!==null;
+      return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.65)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,width:340,maxWidth:"92vw",padding:"20px 22px"}},
         h("div",{style:{fontSize:14,fontWeight:700,marginBottom:6}},"Order Quantity"),
         h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14}},"Enter the order quantity before saving."),
         h("input",{type:"number",min:1,step:1,value:orderQtyGateInput,autoFocus:true,
           onChange:e=>setOrderQtyGateInput(e.target.value),
-          onKeyDown:e=>{ if(e.key==="Enter" && Number(orderQtyGateInput)>=1 && !orderQtyGateSaving) confirmOrderQtyGate(); },
+          onKeyDown:e=>{ if(e.key==="Enter" && qtyOk && dsOk && !orderQtyGateSaving) confirmOrderQtyGate(); },
           placeholder:"units", style:{...inputStyle,width:"100%",fontSize:15,padding:"9px 10px",marginBottom:6}}),
-        !(Number(orderQtyGateInput)>=1) && orderQtyGateInput!=="" && h("div",{style:{fontSize:11,color:colors.danger,marginBottom:6}},"Must be 1 or more."),
-        h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginBottom:14}},"Required — must be 1 or more."),
+        !qtyOk && orderQtyGateInput!=="" && h("div",{style:{fontSize:11,color:colors.danger,marginBottom:6}},"Must be 1 or more."),
+        h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginBottom:hasDirectPrice?14:14}},"Required — must be 1 or more."),
+        hasDirectPrice && h("div",{style:{marginBottom:14,paddingTop:10,borderTop:"1px solid "+colors.border}},
+          h("div",{style:{fontSize:12.5,fontWeight:600,marginBottom:8}},"Does this line need a Datasheet?"),
+          h("div",{style:{display:"flex",gap:8}},
+            h("button",{onClick:()=>setDatasheetChoice("yes"),style:{...btnSmall,flex:1,background:datasheetChoice==="yes"?colors.dark:"#fff",color:datasheetChoice==="yes"?"#fff":colors.text}},"Yes"),
+            h("button",{onClick:()=>setDatasheetChoice("no"),style:{...btnSmall,flex:1,background:datasheetChoice==="no"?colors.dark:"#fff",color:datasheetChoice==="no"?"#fff":colors.text}},"No — skip it")
+          ),
+          datasheetChoice==="no" && h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:6}},"This Sl No won't block quote generation over a missing Datasheet.")
+        ),
         h("button",{
           onClick:confirmOrderQtyGate,
-          disabled:!(Number(orderQtyGateInput)>=1)||orderQtyGateSaving,
-          style:{...btnPrimary,width:"100%",padding:"10px",opacity:(!(Number(orderQtyGateInput)>=1)||orderQtyGateSaving)?0.55:1}
+          disabled:!qtyOk||!dsOk||orderQtyGateSaving,
+          style:{...btnPrimary,width:"100%",padding:"10px",opacity:(!qtyOk||!dsOk||orderQtyGateSaving)?0.55:1}
         },orderQtyGateSaving?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Confirm & Save")
       )
-    )
+      );
+    })()
     ) // close main layout div
   ); // close Fragment
 }
 
 /* ---- SAVED ESTIMATES ---- */
 /* ---- DATASHEET GENERATOR (popup, driven by DATASHEET_TEMPLATES) ---- */
+// Datasheet capture for a Custom/Direct Price line whose item has no
+// Datasheet Master template (custom items never do — templates are built
+// per real catalog Item). Two modes: upload an Excel (reuses the existing
+// direct-price-excels bucket/policy — no new bucket needed), or fill a
+// free-form Label/Value grid. Either satisfies the readiness check the same
+// way a real templated datasheet does — a row just needs to exist in
+// `datasheets` keyed by (reference_number, item_sl_no, template_key).
+function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
+  const [loading,setLoading] = useState(true);
+  const [mode,setMode] = useState(null); // "excel" | "grid"
+  const [fields,setFields] = useState([{label:"",value:""}]);
+  const [fileName,setFileName] = useState("");
+  const [filePath,setFilePath] = useState("");
+  const [uploading,setUploading] = useState(false);
+  const [saving,setSaving] = useState(false);
+  const templateKey = normalizeItemName(itemName);
+
+  useEffect(()=>{
+    let cancelled=false;
+    (async()=>{
+      const { data } = await sb.from("datasheets").select("*")
+        .eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no)
+        .eq("template_key",templateKey).maybeSingle();
+      if(cancelled) return;
+      if(data && data.is_custom_datasheet){
+        if(data.custom_excel_file_name){ setMode("excel"); setFileName(data.custom_excel_file_name); setFilePath(data.custom_excel_file_path||""); }
+        else if(data.custom_free_fields && data.custom_free_fields.length){ setMode("grid"); setFields(data.custom_free_fields); }
+      }
+      setLoading(false);
+    })();
+    return ()=>{ cancelled=true; };
+  },[openRef.reference_number, openRef.item_sl_no, templateKey]);
+
+  const uploadExcel = async(file)=>{
+    if(!file) return;
+    setUploading(true);
+    try{
+      const path = "custom_ds_"+openRef.reference_number+"_"+openRef.item_sl_no+"_"+Date.now()+"_"+file.name.replace(/[^a-zA-Z0-9._-]/g,"_");
+      const { error:err } = await sb.storage.from("direct-price-excels").upload(path, file);
+      if(err) throw err;
+      setFileName(file.name); setFilePath(path);
+    } catch(e){ alert("Upload failed: "+e.message); }
+    finally { setUploading(false); }
+  };
+  const downloadExcel = async()=>{
+    const { data } = await sb.storage.from("direct-price-excels").createSignedUrl(filePath, 60);
+    if(data?.signedUrl) window.open(data.signedUrl,"_blank");
+  };
+
+  const setFieldRow = (i,key,val)=>setFields(fs=>fs.map((f,idx)=>idx===i?{...f,[key]:val}:f));
+  const addFieldRow = ()=>setFields(fs=>[...fs,{label:"",value:""}]);
+  const removeFieldRow = (i)=>setFields(fs=>fs.filter((_,idx)=>idx!==i));
+
+  const save = async()=>{
+    if(mode==="excel" && !fileName){ alert("Attach an Excel file first."); return; }
+    if(mode==="grid" && fields.every(f=>!f.label.trim())){ alert("Add at least one row with a label."); return; }
+    setSaving(true);
+    try{
+      const payload = {
+        reference_number: openRef.reference_number, item_sl_no: openRef.item_sl_no, template_key: templateKey,
+        is_custom_datasheet: true,
+        custom_excel_file_name: mode==="excel" ? fileName : null,
+        custom_excel_file_path: mode==="excel" ? filePath : null,
+        custom_free_fields: mode==="grid" ? fields.filter(f=>f.label.trim()) : null,
+        field_values: {}, overrides: {},
+        updated_by: user.username, updated_at: new Date().toISOString()
+      };
+      const { error } = await sb.from("datasheets").upsert(payload,{onConflict:"reference_number,item_sl_no,template_key"});
+      if(error) throw error;
+      await sb.from("estimates").update({datasheet_skipped:false}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
+      await logAudit("SAVE","datasheets",openRef.reference_number+"-"+openRef.item_sl_no,"Custom datasheet ("+mode+") for "+itemName+", "+openRef.reference_number+" Sl No "+openRef.item_sl_no,user.username,null,payload);
+      onSaved();
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally { setSaving(false); }
+  };
+
+  if(loading){
+    return h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:80}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:24,fontSize:13,color:colors.mutedLight}},"Loading…")
+    );
+  }
+
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:80,padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:480,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:2}},"Datasheet — "+itemName),
+      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Sl No "+openRef.item_sl_no+" — this item has no Datasheet Master template. As a Custom/Direct Price line, attach an Excel or fill in a free-form list instead."),
+      h("div",{style:{display:"flex",gap:8,marginBottom:16}},
+        h("button",{onClick:()=>setMode("excel"),style:{...btnSmall,flex:1,background:mode==="excel"?colors.dark:"#fff",color:mode==="excel"?"#fff":colors.text}},"Upload Excel"),
+        h("button",{onClick:()=>setMode("grid"),style:{...btnSmall,flex:1,background:mode==="grid"?colors.dark:"#fff",color:mode==="grid"?"#fff":colors.text}},"Free-form grid")
+      ),
+      mode==="excel" && h("div",{style:{marginBottom:16}},
+        fileName
+          ? h("div",{style:{fontSize:12.5,color:"#0f6e3f",marginBottom:8}},"✓ "+fileName+" ",h("button",{onClick:downloadExcel,style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Download"))
+          : null,
+        h("input",{type:"file",accept:".xlsx,.xls,.csv",disabled:uploading,onChange:e=>{ const f=e.target.files[0]; if(f) uploadExcel(f); },style:{fontSize:12}}),
+        uploading && h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"Uploading…")
+      ),
+      mode==="grid" && h("div",{style:{marginBottom:16}},
+        fields.map((f,i)=>h("div",{key:i,style:{display:"flex",gap:6,marginBottom:6,alignItems:"center"}},
+          h("input",{value:f.label,onChange:e=>setFieldRow(i,"label",e.target.value),placeholder:"Label",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12}}),
+          h("input",{value:f.value,onChange:e=>setFieldRow(i,"value",e.target.value),placeholder:"Value",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12}}),
+          fields.length>1 && h("button",{onClick:()=>removeFieldRow(i),style:{...btnSmall,fontSize:10,padding:"3px 7px"}},"✕")
+        )),
+        h("button",{onClick:addFieldRow,style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"+ Add row")
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:onClose,style:btnSecondary},"Close"),
+        h("button",{onClick:save,disabled:saving||!mode,style:{...btnPrimary,opacity:(saving||!mode)?0.6:1}},saving?"Saving…":"Save")
+      )
+    )
+  );
+}
+
 function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose }) {
   const itemName = (modelItemMap&&model&&modelItemMap.get(model)) || (openLines && openLines[0] && openLines[0].item) || "";
   const [template,setTemplate] = useState(undefined); // undefined=loading, null=none found
@@ -5690,6 +5831,10 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   }
 
   if(!template){
+    const isCustomLine = (openLines||[]).some(l=>l.is_direct_price===true);
+    if(isCustomLine){
+      return h(CustomDatasheetCapture,{openRef, itemName, user, onClose, onSaved:onClose});
+    }
     return h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:80}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:24,maxWidth:420}},
         h("div",{style:{fontWeight:700,marginBottom:8}},"No datasheet template for this item"),
@@ -7219,6 +7364,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     // carry over.
     setBomSkipConfirmed(new Set());
     setBomSkipCodeTarget(null); setBomSkipCodeInput(""); setBomSkipCodeError("");
+    setValidatedLines(new Set());
+    setPendingValidateCodeTarget(null); setPendingValidateCodeInput(""); setPendingValidateCodeError("");
   });
   const resolveDraftConfirm = (proceed)=>{
     setDraftConfirm(null);
@@ -7273,6 +7420,61 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       setJustGenBomSkipCode(code);
     } catch(e){ setGenBomSkipCodeMsg("Couldn't generate: "+e.message); }
     finally { setGenBomSkipCodeBusy(false); }
+  };
+  // Pending-validation lines, resolvable right from this same blocking
+  // modal instead of a dead end pointing at a separate screen. Admin/super
+  // admin: instant if an Excel is already attached to the line; otherwise
+  // routes to the full Pending Validation screen (that's where the Excel
+  // gets attached). Regular user: one-time code, same gated_action_pin_tbl
+  // mechanism as skip_incomplete_bom_line above — the code itself IS the
+  // authorization, so it validates immediately once entered correctly,
+  // regardless of Excel status.
+  const [validatedLines,setValidatedLines]=useState(new Set()); // Set of estimate_lines.id
+  const [pendingValidateBusy,setPendingValidateBusy]=useState(null); // line id in flight
+  const [pendingValidateCodeTarget,setPendingValidateCodeTarget]=useState(null); // line id whose code entry is open
+  const [pendingValidateCodeInput,setPendingValidateCodeInput]=useState("");
+  const [pendingValidateCodeError,setPendingValidateCodeError]=useState("");
+  const doMarkLineValidated = async(line)=>{
+    setPendingValidateBusy(line.id);
+    try{
+      await sb.from("estimate_lines").update({validation_status:"Validated",validated_by:user?.username||"unknown",validated_at:new Date().toISOString()}).eq("id",line.id);
+      await logAudit("UPDATE","estimate_lines",refFilter+"-"+line.item_sl_no,"Marked Direct Price line \""+(line.component||"")+"\" as Validated (from quote readiness check)",user?.username||"unknown",{validation_status:"Pending"},{validation_status:"Validated"});
+      setValidatedLines(s=>new Set([...s,line.id]));
+      refreshReadiness(refFilter);
+    } finally { setPendingValidateBusy(null); }
+  };
+  const handleValidateClick = (line)=>{
+    if(line.excel_file_name){ doMarkLineValidated(line); return; }
+    // No Excel on file yet — that's attached from the full screen, not here.
+    resolveDraftConfirm(false);
+    if(onGoToTab) onGoToTab("reports_pending_validation");
+  };
+  const openValidateCodeEntry = (line)=>{ setPendingValidateCodeTarget(line.id); setPendingValidateCodeInput(""); setPendingValidateCodeError(""); };
+  const submitValidateCode = async(line)=>{
+    setPendingValidateBusy(line.id); setPendingValidateCodeError("");
+    const res = await verifyAndConsumeGatedPin("validate_pending_line", pendingValidateCodeInput, user?.username||"unknown", "estimate_lines", refFilter+"-"+line.item_sl_no, "Validated Direct Price line \""+(line.component||"")+"\" via one-time code");
+    if(!res.ok){ setPendingValidateCodeError(res.message||"That code didn't work."); setPendingValidateBusy(null); return; }
+    await sb.from("estimate_lines").update({validation_status:"Validated",validated_by:user?.username||"unknown",validated_at:new Date().toISOString()}).eq("id",line.id);
+    await logAudit("UPDATE","estimate_lines",refFilter+"-"+line.item_sl_no,"Marked Direct Price line \""+(line.component||"")+"\" as Validated via one-time code (from quote readiness check)",user?.username||"unknown",{validation_status:"Pending"},{validation_status:"Validated"});
+    setValidatedLines(s=>new Set([...s,line.id]));
+    setPendingValidateCodeTarget(null); setPendingValidateCodeInput("");
+    refreshReadiness(refFilter);
+    setPendingValidateBusy(null);
+  };
+  const [genValidateCodeBusy,setGenValidateCodeBusy]=useState(false);
+  const [genValidateCodeMsg,setGenValidateCodeMsg]=useState("");
+  const [justGenValidateCode,setJustGenValidateCode]=useState("");
+  const generateValidateCode = async()=>{
+    setGenValidateCodeBusy(true); setGenValidateCodeMsg(""); setJustGenValidateCode("");
+    try{
+      const code = String(Math.floor(100000+Math.random()*900000));
+      const { data:existing } = await sb.from("gated_action_pin_tbl").select("id").eq("action_type","validate_pending_line").maybeSingle();
+      if(existing) await sb.from("gated_action_pin_tbl").update({pin:code,is_used:false}).eq("id",existing.id);
+      else await sb.from("gated_action_pin_tbl").insert({action_type:"validate_pending_line",pin:code,is_used:false});
+      await logAudit("UPDATE","gated_action_pin_tbl","validate_pending_line","Generated a one-time code to mark a Pending Direct Price line as Validated",user?.username||"unknown",null,null);
+      setJustGenValidateCode(code);
+    } catch(e){ setGenValidateCodeMsg("Couldn't generate: "+e.message); }
+    finally { setGenValidateCodeBusy(false); }
   };
   // Incomplete-quote-PDF gate — Customer, Signatory, and Signatory
   // Designation are required for a real (non-draft) quote PDF. Missing any
@@ -8211,7 +8413,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const dsBySl = new Set(datasheetsRows.map(d=>d.item_sl_no));
     estimatesRows.forEach(est=>{
       slCount++;
-      if(dsBySl.has(est.item_sl_no)) dsDoneCount++;
+      if(dsBySl.has(est.item_sl_no) || est.datasheet_not_required===true) dsDoneCount++;
       else missing.push({section:"Sl No "+est.item_sl_no, items:["Datasheet not created"]});
       if(String(est.description||"").trim()) descDoneCount++;
       else missing.push({section:"Sl No "+est.item_sl_no, items:["Description not entered"]});
@@ -8221,11 +8423,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     // and lumping them together hid that difference before.
     const datasheetsState = slCount===0 ? "none" : dsDoneCount===0 ? "none" : dsDoneCount===slCount ? "all" : "some";
     const descriptionsState = slCount===0 ? "none" : descDoneCount===0 ? "none" : descDoneCount===slCount ? "all" : "some";
-    const { data: pendingLines } = await sb.from("estimate_lines").select("item_sl_no,component").eq("reference_number",refNumber).eq("validation_status","Pending");
+    const { data: pendingLines } = await sb.from("estimate_lines").select("id,item_sl_no,component,excel_file_name").eq("reference_number",refNumber).eq("validation_status","Pending");
     if(pendingLines && pendingLines.length){
       const bySl = new Map();
-      pendingLines.forEach(l=>{ if(!bySl.has(l.item_sl_no)) bySl.set(l.item_sl_no,[]); bySl.get(l.item_sl_no).push(l.component||"line"); });
-      bySl.forEach((items,sl)=>missing.push({section:"Sl No "+sl, items:["Pending validation: "+items.join(", ")]}));
+      pendingLines.forEach(l=>{ if(!bySl.has(l.item_sl_no)) bySl.set(l.item_sl_no,[]); bySl.get(l.item_sl_no).push(l); });
+      bySl.forEach((lines,sl)=>missing.push({section:"Sl No "+sl, items:["Pending validation: "+lines.map(l=>l.component||"line").join(", ")], type:"validation", slNo:sl, pendingLines:lines}));
       validationDone = false;
     }
     // BOM completeness — an item's MOC Rule (if one exists) is a MINIMUM
@@ -9573,8 +9775,25 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     for(const est of estimatesRows){
       const itemName = modelItemMap.get(est.model) || est.model || "Unknown item";
       const template = await loadDatasheetMaster(itemName);
-      if(!template) continue;
       const ds = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.template_key===normalizeItemName(itemName));
+      if(!template){
+        // No template — a real catalog item just gets skipped from the
+        // annexure as before. A Custom/Direct Price line that filled in a
+        // custom datasheet (Excel or free-form grid) gets its own simple
+        // section instead of vanishing from the PDF entirely.
+        if(ds && ds.is_custom_datasheet){
+          const totalSalesValue = await computeSlNoFoldedSalesTotal(est.reference_number, est.item_sl_no, est.order_qty);
+          const customSections = [];
+          if(ds.custom_excel_file_name){
+            customSections.push({ title:"Datasheet", rows:[{key:"custom-excel",label:"Reference",value:"See attached Excel — "+ds.custom_excel_file_name}] });
+          } else if(ds.custom_free_fields && ds.custom_free_fields.length){
+            customSections.push({ title:"Datasheet", rows: ds.custom_free_fields.map((f,i)=>({key:"custom-"+i,label:f.label,value:f.value})) });
+          }
+          customSections.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
+          list.push({ slNo: est.item_sl_no, model: est.model||"", itemName, sectionsRows: customSections });
+        }
+        continue;
+      }
       const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
       if(!mocRuleCache.has(itemName)){
         const { data:ruleRow } = await sb.from("item_moc_rules").select("*").eq("item",itemName).maybeSingle();
@@ -10746,7 +10965,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               genPdfCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genPdfCodeMsg),
               h("button",{onClick:generateBomSkipCode,disabled:genBomSkipCodeBusy,style:{...btnSecondary,padding:"4px 10px",fontSize:11,marginTop:8}},genBomSkipCodeBusy?"Generating…":"Generate skip-BOM-line code"),
               justGenBomSkipCode && h("div",{style:{fontSize:12,marginTop:6}},"Code: ",h("strong",null,justGenBomSkipCode)," — give this to whoever needs to skip an Incomplete BOM line (one line, or Select all, per code)."),
-              genBomSkipCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genBomSkipCodeMsg)
+              genBomSkipCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genBomSkipCodeMsg),
+              h("button",{onClick:generateValidateCode,disabled:genValidateCodeBusy,style:{...btnSecondary,padding:"4px 10px",fontSize:11,marginTop:8}},genValidateCodeBusy?"Generating…":"Generate validate-pending-line code"),
+              justGenValidateCode && h("div",{style:{fontSize:12,marginTop:6}},"Code: ",h("strong",null,justGenValidateCode)," — give this to whoever needs to mark a Pending Direct Price line as Validated."),
+              genValidateCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genValidateCodeMsg)
             )
           )
         ),
@@ -11514,16 +11736,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     ),
     draftConfirm && (()=>{
       const bomMissing = draftConfirm.missing.filter(m=>m.type==="bom");
-      const otherMissing = draftConfirm.missing.filter(m=>m.type!=="bom");
+      const validationMissing = draftConfirm.missing.filter(m=>m.type==="validation");
+      const otherMissing = draftConfirm.missing.filter(m=>m.type!=="bom" && m.type!=="validation");
       const allSlNos = bomMissing.map(m=>m.slNo);
       const allBomSkipped = bomMissing.every(m=>bomSkipConfirmed.has(m.slNo));
-      const canGenerate = allBomSkipped && otherMissing.length===0;
+      const allValidationDone = validationMissing.every(m=>m.pendingLines.every(l=>validatedLines.has(l.id)));
+      const canGenerate = allBomSkipped && allValidationDone && otherMissing.length===0;
       return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 20px",width:440,maxWidth:"100%",maxHeight:"85vh",display:"flex",flexDirection:"column"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"This quote isn't fully ready"),
         h("div",{style:{fontSize:12,color:colors.muted,marginBottom:12,lineHeight:1.5}},
-          bomMissing.length
-            ? "Tick each Incomplete BOM line to skip it — skipping is final and can't be undone here. Generate unlocks once every line below is ticked or fixed."
+          (bomMissing.length||validationMissing.length)
+            ? [bomMissing.length&&"Tick each Incomplete BOM line to skip it — skipping is final and can't be undone here.",validationMissing.length&&"Validate each Pending line below."].filter(Boolean).join(" ")+" Generate unlocks once everything below is resolved."
             : "Go back and fill in what's missing."
         ),
         h("div",{style:{background:colors.bg,borderRadius:6,padding:"10px 12px",overflowY:"auto",flex:1,marginBottom:14,fontSize:11.5,lineHeight:1.6}},
@@ -11543,7 +11767,31 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               );
             })
           ),
-          otherMissing.length>0 && h("div",{style:{marginTop:bomMissing.length?10:0,paddingTop:bomMissing.length?8:0,borderTop:bomMissing.length?"1px solid "+colors.border:"none"}},
+          validationMissing.length>0 && h("div",{style:{marginTop:bomMissing.length?10:0,paddingTop:bomMissing.length?8:0,borderTop:bomMissing.length?"1px solid "+colors.border:"none",marginBottom:validationMissing.length?6:0}},
+            h("div",{style:{fontWeight:700,padding:"4px 0 8px",borderBottom:"1px solid "+colors.border,marginBottom:6}},"Pending validation"),
+            validationMissing.map((m,mi)=>m.pendingLines.map((line,li)=>{
+              const done = validatedLines.has(line.id);
+              const codeOpen = pendingValidateCodeTarget===line.id;
+              return h("div",{key:"val-"+mi+"-"+li,style:{padding:"6px 0",borderBottom:"1px solid #f0efe8",opacity:done?0.55:1}},
+                h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}},
+                  h("div",null,
+                    h("span",{style:{fontWeight:700}},m.section),done&&h("i",{className:"ti ti-lock",style:{marginLeft:6,fontSize:11,color:colors.mutedLight}}),h("br"),
+                    h("span",{style:{color:colors.mutedLight}},(line.component||"line")+(line.excel_file_name?(" — "+line.excel_file_name):" — no Excel attached"))
+                  ),
+                  !done && (isAdminOrAbove
+                    ? h("button",{onClick:()=>handleValidateClick(line),disabled:pendingValidateBusy===line.id,style:{...btnSmall,fontSize:10,padding:"3px 8px",whiteSpace:"nowrap"}},pendingValidateBusy===line.id?"…":(line.excel_file_name?"✓ Mark validated":"Open Pending Validation"))
+                    : h("button",{onClick:()=>openValidateCodeEntry(line),style:{...btnSmall,fontSize:10,padding:"3px 8px",whiteSpace:"nowrap"}},"Enter code")
+                  )
+                ),
+                !done && !isAdminOrAbove && codeOpen && h("div",{style:{display:"flex",gap:6,alignItems:"center",marginTop:6,flexWrap:"wrap"}},
+                  h("input",{type:"text",value:pendingValidateCodeInput,onChange:e=>setPendingValidateCodeInput(e.target.value),placeholder:"Code",style:{width:80,padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}}),
+                  h("button",{onClick:()=>submitValidateCode(line),disabled:pendingValidateBusy===line.id||!pendingValidateCodeInput.trim(),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},pendingValidateBusy===line.id?"…":"Confirm"),
+                  pendingValidateCodeError && h("span",{style:{fontSize:10.5,color:colors.danger}},pendingValidateCodeError)
+                )
+              );
+            }))
+          ),
+          otherMissing.length>0 && h("div",{style:{marginTop:(bomMissing.length||validationMissing.length)?10:0,paddingTop:(bomMissing.length||validationMissing.length)?8:0,borderTop:(bomMissing.length||validationMissing.length)?"1px solid "+colors.border:"none"}},
             otherMissing.map((m,i)=>h("div",{key:"other-"+i,style:{marginBottom:6}},
               h("span",{style:{fontWeight:700}},m.section),h("br"),
               h("span",{style:{color:colors.mutedLight}},m.items.join(", "))
@@ -11559,8 +11807,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("input",{type:"text",value:bomSkipCodeInput,onChange:e=>setBomSkipCodeInput(e.target.value),placeholder:"Code",style:{width:80,padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}}),
           h("button",{onClick:()=>submitBomSkipCode(allSlNos),disabled:bomSkipBusy||!bomSkipCodeInput.trim(),style:{...btnSecondary,padding:"5px 10px",fontSize:11}},bomSkipBusy?"…":"Confirm")
         ),
-        canGenerate && bomMissing.length>0 && h("div",{style:{display:"flex",alignItems:"center",gap:6,color:"#0f6e56",fontSize:11.5,marginBottom:10}},
-          h("i",{className:"ti ti-check"}),"All lines skipped. Generate fires immediately — no further draft confirmation."
+        canGenerate && (bomMissing.length>0||validationMissing.length>0) && h("div",{style:{display:"flex",alignItems:"center",gap:6,color:"#0f6e56",fontSize:11.5,marginBottom:10}},
+          h("i",{className:"ti ti-check"}),"Everything above is resolved. Generate fires immediately — no further draft confirmation."
         ),
         h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
           h("button",{onClick:()=>resolveDraftConfirm(false),style:btnSecondary},"Go back and fix"),
@@ -17109,7 +17357,7 @@ function OverdueCallsReport(){
 }
 
 
-function PendingValidationScreen({ user }){
+function PendingValidationScreen({ user, onOpenQuote }){
   const [rows,setRows] = useState([]);
   const [loading,setLoading] = useState(true);
   const [busyId,setBusyId] = useState(null);
@@ -17175,6 +17423,7 @@ function PendingValidationScreen({ user }){
               uploadingId===row.id && h("span",{style:{fontSize:11,color:colors.mutedLight}},"Uploading…")
             ),
         isAdminOrAbove && h("button",{onClick:()=>markValidated(row),disabled:busyId===row.id,style:{...btnSmall,fontSize:11,background:"#1c8c56",color:"#fff"}},busyId===row.id?"Working…":"✓ Mark validated"),
+        onOpenQuote && h("button",{onClick:()=>onOpenQuote(row.reference_number,row.item_sl_no),style:{...btnSmall,fontSize:11,marginLeft:8}},"Open Quote#"),
         !isAdminOrAbove && h("div",{style:{fontSize:11,color:colors.mutedLight}},"Only an Admin or Super Admin can mark this validated.")
       ))
     )
@@ -20243,7 +20492,7 @@ function App() {
     tab==="reports_won_by_owner"?h(WonByOwnerReport,null):
     tab==="reports_overdue_calls"?h(OverdueCallsReport,null):
     tab==="reports_missed_entries"?h(MissedEntriesReport,{user}):
-    tab==="reports_pending_validation"?h(PendingValidationScreen,{user}):
+    tab==="reports_pending_validation"?h(PendingValidationScreen,{user,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}}):
     tab==="reports_status_history"?h(StatusChangeHistoryReport,null):
     tab==="reports_po_register"?h(PoRegisterReport,null):
     tab==="reports_grn_status"?h(GrnStatusReport,null):
