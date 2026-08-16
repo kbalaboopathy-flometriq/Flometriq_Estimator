@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-15T04:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T00:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -11763,7 +11763,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           const loggedLate = a.activity_date && a.activity_date!==(a.created_at||"").slice(0,10);
           return h("div",{key:a.id,style:{borderLeft:"2px solid "+colors.border,paddingLeft:10,marginBottom:10}},
             h("div",{style:{fontSize:12}},
-              h("span",{style:{fontWeight:600}},a.activity_type)," · "+(a.activity_date?new Date(a.activity_date).toLocaleDateString():"—")+" · "+(a.logged_by||"—"),
+              h("span",{style:{fontWeight:600}},a.activity_type)," · "+(a.company_name||"—")+" · "+(a.activity_date?new Date(a.activity_date).toLocaleDateString():"—")+" · "+(a.logged_by||"—"),
               loggedLate && h("span",{style:{fontSize:10,color:"#854f0b",marginLeft:6}},"(logged "+new Date(a.created_at).toLocaleDateString()+")")
             ),
             a.notes && h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},a.notes)
@@ -12754,12 +12754,14 @@ function MyWorklistScreen({ user }){
   const [myCompanies,setMyCompanies] = useState([]);
   const [activities,setActivities] = useState([]);
   const [openQuotesByCompany,setOpenQuotesByCompany] = useState(new Map());
+  const [myPackages,setMyPackages] = useState([]);
   const [loading,setLoading] = useState(true);
-  const [view,setView] = useState("date"); // "date" | "customer" | "all"
+  const [view,setView] = useState("date"); // "date" | "customer" | "all" | "packages"
   const [selectedCompany,setSelectedCompany] = useState("");
   const [page,setPage] = useState(0);
   const pageSize = 25;
   const [logFor,setLogFor] = useState(null); // company_name being logged against, or null
+  const [logForPackage,setLogForPackage] = useState(null); // package row being logged against, or null
   const [logDraft,setLogDraft] = useState({activity_type:"Call",outcome:"",notes:"",next_followup_date:""});
   const [saving,setSaving] = useState(false);
 
@@ -12776,6 +12778,8 @@ function MyWorklistScreen({ user }){
       ? await sb.from("activity_log_tbl").select("*").in("company_name",names).order("created_at",{ascending:false})
       : { data: [] };
     setActivities(acts||[]);
+    const { data: pkgs } = await sb.from("major_project_package_tbl").select("*, major_project_tbl(project_name,main_epc_company_name,end_user_company_name)").eq("sales_rep",emp.employee_name).order("next_followup_date",{ascending:true});
+    setMyPackages(pkgs||[]);
     if(emp.crm_role==="FSE" && names.length){
       const { data: ests } = await sb.from("estimates").select("reference_number,customer_name,quote_status,company_id,order_qty").in("company_id",(cos||[]).map(c=>c.id));
       const refNums = Array.from(new Set((ests||[]).map(e=>e.reference_number)));
@@ -12805,19 +12809,31 @@ function MyWorklistScreen({ user }){
     .filter(a=>a.next_followup_date && a.next_followup_date<=today)
     .sort((a,b)=>(a.next_followup_date||"").localeCompare(b.next_followup_date||""));
 
-  const openLog = (companyName)=>{ setLogFor(companyName); setLogDraft({activity_type:"Call",outcome:"",notes:"",activity_date:new Date().toISOString().slice(0,10),next_followup_date:""}); };
+  const openLog = (companyName)=>{ setLogForPackage(null); setLogFor(companyName); setLogDraft({activity_type:"Call",outcome:"",notes:"",activity_date:new Date().toISOString().slice(0,10),next_followup_date:""}); };
+  const openPackageLog = (pkg)=>{ setLogFor(null); setLogForPackage(pkg); setLogDraft({activity_type:"Call",outcome:"",notes:"",activity_date:new Date().toISOString().slice(0,10),next_followup_date:""}); };
   const saveLog = async()=>{
     if(!logDraft.activity_date){ alert("Enter the date this actually happened."); return; }
     setSaving(true);
     try{
-      const relevant = activities.filter(a=>a.company_name===logFor && a.next_followup_date);
-      const lastFollowUp = relevant.length ? relevant[0] : null;
-      await sb.from("activity_log_tbl").insert({
-        company_name:logFor, activity_type:logDraft.activity_type, outcome:logDraft.outcome||"",
-        notes:logDraft.notes||"", activity_date:logDraft.activity_date, next_followup_date:logDraft.next_followup_date||null,
-        is_followup_of: lastFollowUp?lastFollowUp.id:null, logged_by:user?.username||"unknown"
-      });
-      setLogFor(null);
+      if(logForPackage){
+        const proj = logForPackage.major_project_tbl;
+        await sb.from("activity_log_tbl").insert({
+          package_id:logForPackage.id, company_name:(proj&&(proj.main_epc_company_name||proj.end_user_company_name))||null,
+          activity_type:logDraft.activity_type, outcome:logDraft.outcome||"",
+          notes:logDraft.notes||"", activity_date:logDraft.activity_date, next_followup_date:logDraft.next_followup_date||null,
+          logged_by:user?.username||"unknown"
+        });
+        setLogForPackage(null);
+      } else {
+        const relevant = activities.filter(a=>a.company_name===logFor && a.next_followup_date);
+        const lastFollowUp = relevant.length ? relevant[0] : null;
+        await sb.from("activity_log_tbl").insert({
+          company_name:logFor, activity_type:logDraft.activity_type, outcome:logDraft.outcome||"",
+          notes:logDraft.notes||"", activity_date:logDraft.activity_date, next_followup_date:logDraft.next_followup_date||null,
+          is_followup_of: lastFollowUp?lastFollowUp.id:null, logged_by:user?.username||"unknown"
+        });
+        setLogFor(null);
+      }
       await load();
     } finally{ setSaving(false); }
   };
@@ -12847,6 +12863,21 @@ function MyWorklistScreen({ user }){
     )
   );
 
+  const packageLogPanel = (pkg)=> logForPackage===pkg && h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px",margin:"8px 0",background:"#faf9f4"}},
+    h("div",{style:{display:"flex",gap:8,marginBottom:8}},
+      h("select",{value:logDraft.activity_type,onChange:e=>setLogDraft(d=>({...d,activity_type:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:110}},
+        h("option",{value:"Call"},"Call"),h("option",{value:"Visit"},"Visit"),h("option",{value:"Email"},"Email")
+      ),
+      h("input",{type:"date",value:logDraft.activity_date,onChange:e=>setLogDraft(d=>({...d,activity_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:130},title:"Date this actually happened"}),
+      h("input",{type:"date",value:logDraft.next_followup_date,onChange:e=>setLogDraft(d=>({...d,next_followup_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:150},title:"Next follow-up date"})
+    ),
+    h("textarea",{value:logDraft.notes,onChange:e=>setLogDraft(d=>({...d,notes:e.target.value})),placeholder:"What was discussed…",style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%",minHeight:44,marginBottom:8}}),
+    h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+      h("button",{onClick:()=>setLogForPackage(null),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Cancel"),
+      h("button",{onClick:saveLog,disabled:saving,style:{...btnSmall,fontSize:10,padding:"3px 8px"}},saving?"Saving…":"Save")
+    )
+  );
+
   const viewBtn = (key,label)=>h("button",{onClick:()=>setView(key),style:{...btnSmall,marginRight:6,background:view===key?colors.dark:"#fff",color:view===key?"#fff":colors.text}},label);
 
   return h("div",{style:{padding:"20px 24px",maxWidth:900}},
@@ -12854,7 +12885,7 @@ function MyWorklistScreen({ user }){
       h("div",{style:{fontWeight:700,fontSize:16}},"My Worklist — "+employee.employee_name+" ("+(employee.crm_role||"—")+")")
     ),
     h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Scoped to the "+myCompanies.length+" account(s) you currently own."),
-    h("div",{style:{marginBottom:14}},viewBtn("date","By date"),viewBtn("customer","By customer"),viewBtn("all","All")),
+    h("div",{style:{marginBottom:14}},viewBtn("date","By date"),viewBtn("customer","By customer"),viewBtn("all","All"),viewBtn("packages","Packages")),
 
     view==="date" && h(React.Fragment,null,
       h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:10}},dueActivities.length+" due (including overdue)."),
@@ -12918,6 +12949,34 @@ function MyWorklistScreen({ user }){
           h("button",{onClick:()=>setPage(p=>((p+1)*pageSize<activities.length)?p+1:p),disabled:(page+1)*pageSize>=activities.length,style:btnSmall},"Next")
         )
       )
+    ),
+
+    view==="packages" && h(React.Fragment,null,
+      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:10}},myPackages.length+" package(s) you're the sales rep on."),
+      myPackages.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"No Major Projects packages assigned to you yet."),
+      myPackages.map(pkg=>{
+        const proj = pkg.major_project_tbl;
+        const overdue = pkg.next_followup_date && pkg.next_followup_date<today;
+        return h("div",{key:pkg.id},
+          h("div",{style:{border:"1px solid "+(overdue?colors.danger:colors.border),borderRadius:6,padding:"10px 12px",marginBottom:8,background:overdue?"#fdeeee":"#fff"}},
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:8}},
+              h("div",null,
+                h("div",{style:{fontWeight:700,fontSize:13}},pkg.package_name),
+                h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},(proj?proj.project_name+" · ":"")+(proj?proj.main_epc_company_name:"")),
+                h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},
+                  pkg.next_followup_date ? ((overdue?"Overdue — was due ":"Due ")+pkg.next_followup_date) : "No follow-up date set",
+                  pkg.next_action?(" — "+pkg.next_action):""
+                )
+              ),
+              h("div",{style:{display:"flex",alignItems:"center",gap:8}},
+                h("span",{style:{fontSize:10.5,fontWeight:700,padding:"3px 9px",borderRadius:20,background:"#eaf2fb",color:"#0c447c"}},pkg.oem_status),
+                h("button",{onClick:()=>openPackageLog(pkg),style:{...btnSmall,fontSize:10,padding:"4px 10px"}},"Log now")
+              )
+            )
+          ),
+          packageLogPanel(pkg)
+        );
+      })
     )
   );
 }
@@ -15720,7 +15779,7 @@ function StatusChangeHistoryReport(){
 // ============================================================
 
 function MajorProjectsScreen({ user }){
-  const [view,setView] = useState("list"); // "list" | "detail"
+  const [view,setView] = useState("list"); // "list" | "detail" | "package_detail"
   const [projects,setProjects] = useState([]);
   const [loading,setLoading] = useState(true);
   const [search,setSearch] = useState("");
@@ -15731,6 +15790,7 @@ function MajorProjectsScreen({ user }){
   const [editingProject,setEditingProject] = useState(null);
   const [showPackageForm,setShowPackageForm] = useState(false);
   const [editingPackage,setEditingPackage] = useState(null);
+  const [selectedPackage,setSelectedPackage] = useState(null); // package row currently drilled into
 
   const loadProjects = useCallback(async()=>{
     setLoading(true);
@@ -15749,6 +15809,8 @@ function MajorProjectsScreen({ user }){
 
   const openProject = (p)=>{ setSelectedProject(p); setView("detail"); loadPackages(p.id); };
   const backToList = ()=>{ setView("list"); setSelectedProject(null); setPackages([]); loadProjects(); };
+  const openPackageDetail = (pkg)=>{ setSelectedPackage(pkg); setView("package_detail"); };
+  const backToPackageList = ()=>{ setView("detail"); setSelectedPackage(null); loadPackages(selectedProject.id); };
 
   const filtered = projects.filter(p=>{
     const q = search.trim().toLowerCase();
@@ -15757,6 +15819,21 @@ function MajorProjectsScreen({ user }){
       || (p.end_user_company_name||"").toLowerCase().includes(q)
       || (p.main_epc_company_name||"").toLowerCase().includes(q);
   });
+
+  if(view==="package_detail" && selectedProject && selectedPackage){
+    return h(React.Fragment,null,
+      h(MajorProjectPackageDetail,{
+        pkg:selectedPackage, project:selectedProject, user,
+        onBack:backToPackageList,
+        onEdit:()=>{setEditingPackage(selectedPackage);setShowPackageForm(true);}
+      }),
+      showPackageForm && h(MajorProjectPackageFormModal,{
+        project:selectedProject, initial:editingPackage, user,
+        onCancel:()=>{setShowPackageForm(false);setEditingPackage(null);},
+        onSaved:(saved)=>{ setShowPackageForm(false); setEditingPackage(null); setSelectedPackage(saved); }
+      })
+    );
+  }
 
   if(view==="detail" && selectedProject){
     return h(React.Fragment,null,
@@ -15796,7 +15873,7 @@ function MajorProjectsScreen({ user }){
         loadingPackages ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
         packages.length===0 ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"No packages yet — add the first one.") :
         h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
-          packages.map(pkg=>h("div",{key:pkg.id,onClick:()=>{setEditingPackage(pkg);setShowPackageForm(true);},style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"12px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
+          packages.map(pkg=>h("div",{key:pkg.id,onClick:()=>openPackageDetail(pkg),style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"12px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
             h("div",null,
               h("div",{style:{fontWeight:700,fontSize:13}},pkg.package_name),
               h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},
@@ -16010,11 +16087,13 @@ function MajorProjectPackageFormModal({ project, initial, onCancel, onSaved, use
       if(f.id){
         const {id,linked_reference_number,...rest} = payload;
         await sb.from("major_project_package_tbl").update({...rest,updated_at:new Date().toISOString()}).eq("id",id);
+        onSaved({...f});
       } else {
         const {linked_reference_number,...rest} = payload;
-        await sb.from("major_project_package_tbl").insert({...rest, project_id:project.id, created_by:user?.username||"unknown"});
+        const { data, error } = await sb.from("major_project_package_tbl").insert({...rest, project_id:project.id, created_by:user?.username||"unknown"}).select().single();
+        if(error) throw error;
+        onSaved(data);
       }
-      onSaved();
     } catch(e){ alert("Save failed: "+e.message); }
     finally{ setSaving(false); }
   };
@@ -16073,6 +16152,301 @@ function MajorProjectPackageFormModal({ project, initial, onCancel, onSaved, use
         h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save package")
       )
     )
+  );
+}
+
+// Major Projects Phase 4 — Package detail screen: header stats, a Contacts
+// section (package_contact_tbl links existing company contacts, tagged with
+// Type/Qualification for this package specifically), and an Activity Log
+// section (same shared activity_log_tbl as everywhere else in CRM — writes
+// BOTH package_id (canonical, what's queried/filtered on) AND company_name
+// (Main EPC, for readability in the log itself and so this activity also
+// surfaces naturally on that company's own Activity history in Customers).
+function MajorProjectPackageDetail({ pkg, project, user, onBack, onEdit }){
+  return h("div",{style:{padding:"20px 24px",maxWidth:900}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16,flexWrap:"wrap",gap:10}},
+      h("div",null,
+        h("button",{onClick:onBack,style:{...btnSmall,marginBottom:8}},"← "+project.project_name),
+        h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},pkg.package_name),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginTop:4}},
+          project.end_user_company_name+" · EPC: "+project.main_epc_company_name
+        )
+      ),
+      h("button",{onClick:onEdit,style:btnSecondary},"Edit package")
+    ),
+    h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:20}},
+      h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
+        h("div",{style:{fontSize:10,color:colors.mutedLight}},"OEM status"),
+        h("div",{style:{fontSize:13,fontWeight:700}},pkg.oem_status||"—")
+      ),
+      h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
+        h("div",{style:{fontSize:10,color:colors.mutedLight}},"Confirmed OEM"),
+        h("div",{style:{fontSize:13,fontWeight:700}},pkg.confirmed_oem||"—")
+      ),
+      h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
+        h("div",{style:{fontSize:10,color:colors.mutedLight}},"Sales rep"),
+        h("div",{style:{fontSize:13,fontWeight:700}},pkg.sales_rep||"—")
+      ),
+      h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
+        h("div",{style:{fontSize:10,color:colors.mutedLight}},"Next follow-up"),
+        h("div",{style:{fontSize:13,fontWeight:700}},pkg.next_followup_date||"—")
+      )
+    ),
+    h(PackageContactsSection,{pkg,project,user}),
+    h(PackageActivitySection,{pkg,project,user})
+  );
+}
+
+// Contacts scoped to this package. Reuses the existing `contacts` table —
+// pick a contact already on file for either the End User or the Main EPC
+// company, tag it with Type/Qualification for THIS package via
+// package_contact_tbl (a linking table, not a duplicate contact store).
+function PackageContactsSection({ pkg, project, user }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [showPicker,setShowPicker] = useState(false);
+  const [retagging,setRetagging] = useState(null); // row currently being re-tagged, or null
+  const [types,setTypes] = useState([]);
+  const [quals,setQuals] = useState([]);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("package_contact_tbl").select("*, contacts(*)").eq("package_id",pkg.id).order("created_at",{ascending:false});
+    setRows(data||[]);
+    setLoading(false);
+  },[pkg.id]);
+  useEffect(()=>{ load(); },[load]);
+  useEffect(()=>{
+    sb.from("contact_type_tbl").select("type").order("sort_order").then(({data})=>setTypes((data||[]).map(r=>r.type)));
+    sb.from("contact_qualification_tbl").select("qualification").order("sort_order").then(({data})=>setQuals((data||[]).map(r=>r.qualification)));
+  },[]);
+
+  const removeRow = async(row)=>{
+    if(!confirm("Remove "+(row.contacts?row.contacts.contact_name:"this contact")+" from this package?")) return;
+    await sb.from("package_contact_tbl").delete().eq("id",row.id);
+    await logAudit("DELETE","package_contact_tbl",pkg.id,"Removed contact from package "+pkg.package_name,user?.username||"unknown",null,null);
+    load();
+  };
+
+  const saveRetag = async(row,contact_type,qualification_status)=>{
+    await sb.from("package_contact_tbl").update({contact_type,qualification_status,updated_at:new Date().toISOString()}).eq("id",row.id);
+    setRetagging(null);
+    load();
+  };
+
+  return h("div",{style:{marginBottom:24}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
+      h("h3",{style:{margin:0,fontSize:14,fontWeight:700}},"Contacts"),
+      h("button",{onClick:()=>setShowPicker(true),style:btnPrimary},"+ Add contact")
+    ),
+    loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
+    rows.length===0 ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"14px 0"}},"No contacts tagged for this package yet.") :
+    h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+      rows.map(row=>{
+        const ct = row.contacts;
+        return h("div",{key:row.id,style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"10px 14px"}},
+          h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:8}},
+            h("div",null,
+              h("div",{style:{fontWeight:700,fontSize:13}},ct?ct.contact_name:"(contact removed)"),
+              ct && h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},ct.company_name+(ct.designation?(" · "+ct.designation):""))
+            ),
+            h("div",{style:{display:"flex",alignItems:"center",gap:8}},
+              row.contact_type && h("span",{style:{fontSize:10.5,fontWeight:700,padding:"3px 9px",borderRadius:20,background:"#eaf2fb",color:"#0c447c"}},row.contact_type),
+              row.qualification_status && h("span",{style:{fontSize:10.5,fontWeight:700,padding:"3px 9px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},row.qualification_status),
+              h("button",{onClick:()=>setRetagging(retagging&&retagging.id===row.id?null:row),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Edit"),
+              h("button",{onClick:()=>removeRow(row),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Remove")
+            )
+          ),
+          retagging && retagging.id===row.id && h("div",{style:{display:"flex",gap:8,marginTop:8,paddingTop:8,borderTop:"1px solid "+colors.border,flexWrap:"wrap",alignItems:"center"}},
+            h("select",{defaultValue:row.contact_type||"",onChange:e=>{retagging._type=e.target.value;},style:{...inputStyle,padding:"6px 8px",fontSize:12,width:150}},
+              h("option",{value:""},"Type…"),types.map(t=>h("option",{key:t,value:t},t))
+            ),
+            h("select",{defaultValue:row.qualification_status||"",onChange:e=>{retagging._qual=e.target.value;},style:{...inputStyle,padding:"6px 8px",fontSize:12,width:170}},
+              h("option",{value:""},"Qualification…"),quals.map(q=>h("option",{key:q,value:q},q))
+            ),
+            h("button",{onClick:()=>saveRetag(row,retagging._type!==undefined?retagging._type:row.contact_type,retagging._qual!==undefined?retagging._qual:row.qualification_status),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Save"),
+            h("button",{onClick:()=>setRetagging(null),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Cancel")
+          )
+        );
+      })
+    ),
+    showPicker && h(PackageContactPickerModal,{
+      pkg, project, user,
+      onCancel:()=>setShowPicker(false),
+      onSaved:()=>{ setShowPicker(false); load(); }
+    })
+  );
+}
+
+// Picker: search existing contacts under this package's End User/Main EPC
+// companies (debounced, same search-as-you-type pattern as CustomerSelect —
+// no unbounded loads), or add a brand-new contact under one of those two
+// companies via the existing CustomerContactForm. Either way, ends on a
+// Type/Qualification tagging step before writing to package_contact_tbl.
+function PackageContactPickerModal({ pkg, project, user, onCancel, onSaved }){
+  const [step,setStep] = useState("search"); // "search" | "tag" | "new_contact"
+  const [q,setQ] = useState("");
+  const [matches,setMatches] = useState([]);
+  const [picked,setPicked] = useState(null); // contact row
+  const [newContactCompany,setNewContactCompany] = useState(""); // which company "+ New contact" is under
+  const [contactType,setContactType] = useState("");
+  const [qualification,setQualification] = useState("");
+  const [types,setTypes] = useState([]);
+  const [quals,setQuals] = useState([]);
+  const [saving,setSaving] = useState(false);
+
+  const companies = Array.from(new Set([project.end_user_company_name,project.main_epc_company_name].filter(Boolean)));
+
+  useEffect(()=>{
+    sb.from("contact_type_tbl").select("type").order("sort_order").then(({data})=>setTypes((data||[]).map(r=>r.type)));
+    sb.from("contact_qualification_tbl").select("qualification").order("sort_order").then(({data})=>setQuals((data||[]).map(r=>r.qualification)));
+  },[]);
+
+  useEffect(()=>{
+    if(step!=="search" || !companies.length) return;
+    let cancelled=false;
+    const t = setTimeout(async()=>{
+      let query = sb.from("contacts").select("*").in("company_name",companies).order("contact_name").limit(25);
+      if(q.trim().length>=1) query = query.ilike("contact_name","%"+q.trim()+"%");
+      const { data } = await query;
+      if(!cancelled) setMatches(data||[]);
+    },300);
+    return ()=>{ cancelled=true; clearTimeout(t); };
+  },[q,step]); // eslint-disable-line
+
+  const pickContact = (ct)=>{ setPicked(ct); setContactType(""); setQualification(""); setStep("tag"); };
+
+  const afterNewContact = async()=>{
+    // CustomerContactForm's onSaved carries no payload — re-fetch the just-
+    // created row for this company (newest first) to get its id.
+    const { data } = await sb.from("contacts").select("*").eq("company_name",newContactCompany).order("created_at",{ascending:false}).limit(1);
+    if(data && data[0]) pickContact(data[0]);
+    else setStep("search");
+  };
+
+  const save = async()=>{
+    if(!contactType){ alert("Pick a Type."); return; }
+    if(!qualification){ alert("Pick a Qualification status."); return; }
+    setSaving(true);
+    try{
+      await sb.from("package_contact_tbl").insert({
+        package_id:pkg.id, contact_id:picked.id, contact_type:contactType, qualification_status:qualification,
+        created_by:user?.username||"unknown"
+      });
+      await logAudit("INSERT","package_contact_tbl",pkg.id,"Tagged "+picked.contact_name+" ("+contactType+") on package "+pkg.package_name,user?.username||"unknown",null,null);
+      onSaved();
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally{ setSaving(false); }
+  };
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:460,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+
+      step==="search" && h(React.Fragment,null,
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Add contact"),
+        h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:12}},"Searching contacts under "+companies.join(" / ")),
+        h("input",{value:q,onChange:e=>setQ(e.target.value),placeholder:"Type a contact name…",style:{...inputStyle,width:"100%",marginBottom:10}}),
+        h("div",{style:{display:"flex",gap:8,marginBottom:12}},
+          companies.map(c=>h("button",{key:c,onClick:()=>{setNewContactCompany(c);setStep("new_contact");},style:{...btnSmall,fontSize:10.5}},"+ New contact under "+c))
+        ),
+        matches.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight,padding:"8px 0"}},"No matching contacts — add a new one above.") :
+        h("div",{style:{display:"flex",flexDirection:"column",gap:6,maxHeight:260,overflow:"auto"}},
+          matches.map(ct=>h("div",{key:ct.id,onClick:()=>pickContact(ct),style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",cursor:"pointer"}},
+            h("div",{style:{fontWeight:600,fontSize:12.5}},ct.contact_name),
+            h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},ct.company_name+(ct.designation?(" · "+ct.designation):""))
+          ))
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:14}},
+          h("button",{onClick:onCancel,style:btnSecondary},"Cancel")
+        )
+      ),
+
+      step==="new_contact" && h(CustomerContactForm,{
+        companyName:newContactCompany, user,
+        onCancel:()=>setStep("search"),
+        onSaved:afterNewContact
+      }),
+
+      step==="tag" && picked && h(React.Fragment,null,
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Tag contact for this package"),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},picked.contact_name+" · "+picked.company_name),
+        h("div",{style:{marginBottom:10}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Type"),
+          h("select",{value:contactType,onChange:e=>setContactType(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%"}},
+            h("option",{value:""},"Select…"),types.map(t=>h("option",{key:t,value:t},t))
+          )
+        ),
+        h("div",{style:{marginBottom:14}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Qualification status"),
+          h("select",{value:qualification,onChange:e=>setQualification(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%"}},
+            h("option",{value:""},"Select…"),quals.map(q2=>h("option",{key:q2,value:q2},q2))
+          )
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setStep("search"),style:btnSecondary},"Back"),
+          h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save")
+        )
+      )
+    )
+  );
+}
+
+// Activity Log for a package — same shared activity_log_tbl pattern as the
+// Quote follow-up panel (see QuoteScreen), just scoped to package_id.
+// Writes company_name too (Main EPC) purely for readability in the log and
+// so it surfaces on that company's own Activity history automatically.
+function PackageActivitySection({ pkg, project, user }){
+  const [activities,setActivities] = useState([]);
+  const [draft,setDraft] = useState({activity_type:"Call",notes:"",activity_date:new Date().toISOString().slice(0,10),next_followup_date:""});
+  const [saving,setSaving] = useState(false);
+
+  const load = useCallback(async()=>{
+    const { data } = await sb.from("activity_log_tbl").select("*").eq("package_id",pkg.id).order("created_at",{ascending:false});
+    setActivities(data||[]);
+  },[pkg.id]);
+  useEffect(()=>{ load(); },[load]);
+
+  const save = async()=>{
+    if(!draft.notes.trim()){ alert("Add a note before saving."); return; }
+    if(!draft.activity_date){ alert("Enter the date this actually happened."); return; }
+    setSaving(true);
+    try{
+      await sb.from("activity_log_tbl").insert({
+        package_id:pkg.id, company_name:project.main_epc_company_name||project.end_user_company_name||null,
+        activity_type:draft.activity_type, notes:draft.notes.trim(),
+        activity_date:draft.activity_date, next_followup_date:draft.next_followup_date||null,
+        logged_by:user?.username||"unknown"
+      });
+      await logAudit("INSERT","activity_log_tbl",pkg.id,"Logged "+draft.activity_type+" follow-up on package "+pkg.package_name,user?.username||"unknown",null,null);
+      setDraft({activity_type:"Call",notes:"",activity_date:new Date().toISOString().slice(0,10),next_followup_date:""});
+      await load();
+    } finally{ setSaving(false); }
+  };
+
+  return h("div",null,
+    h("h3",{style:{margin:"0 0 10px",fontSize:14,fontWeight:700}},"Activity log"),
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"12px 14px",marginBottom:14}},
+      h("div",{style:{display:"flex",gap:8,marginBottom:8}},
+        h("select",{value:draft.activity_type,onChange:e=>setDraft(d=>({...d,activity_type:e.target.value})),style:{...inputStyle,width:100}},
+          h("option",{value:"Call"},"Call"),h("option",{value:"Visit"},"Visit"),h("option",{value:"Email"},"Email")
+        ),
+        h("input",{type:"date",value:draft.activity_date,onChange:e=>setDraft(d=>({...d,activity_date:e.target.value})),style:{...inputStyle,width:130},title:"Date this actually happened"}),
+        h("input",{type:"date",value:draft.next_followup_date,onChange:e=>setDraft(d=>({...d,next_followup_date:e.target.value})),style:{...inputStyle,width:150},title:"Next follow-up date"})
+      ),
+      h("textarea",{value:draft.notes,onChange:e=>setDraft(d=>({...d,notes:e.target.value})),placeholder:"What was discussed…",style:{...inputStyle,width:"100%",minHeight:60,marginBottom:8}}),
+      h("button",{onClick:save,disabled:saving,style:{...btnPrimary,width:"100%",opacity:saving?0.6:1}},saving?"Saving…":"Log follow-up")
+    ),
+    activities.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"Nothing logged yet for this package."),
+    activities.map(a=>{
+      const loggedLate = a.activity_date && a.activity_date!==(a.created_at||"").slice(0,10);
+      return h("div",{key:a.id,style:{borderLeft:"2px solid "+colors.border,paddingLeft:10,marginBottom:10}},
+        h("div",{style:{fontSize:12}},
+          h("span",{style:{fontWeight:600}},a.activity_type)," · "+(a.company_name||"—")+" · "+(a.activity_date?new Date(a.activity_date).toLocaleDateString():"—")+" · "+(a.logged_by||"—"),
+          loggedLate && h("span",{style:{fontSize:10,color:"#854f0b",marginLeft:6}},"(logged "+new Date(a.created_at).toLocaleDateString()+")")
+        ),
+        a.notes && h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},a.notes)
+      );
+    })
   );
 }
 
