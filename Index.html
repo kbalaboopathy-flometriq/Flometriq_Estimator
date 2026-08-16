@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-15T03:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-15T04:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1195,6 +1195,7 @@ function MenuTabs({ user, active, onChange }) {
     { label:"CRM", subgroups:[
       { label:"Major Projects", tabs:[
         {key:"major_projects",label:"Projects"},
+        {key:"major_projects_kanban",label:"Package Board"},
       ]},
       { label:"Funnel", tabs:[
         {key:"crm_funnel",label:"Funnel"},
@@ -16075,6 +16076,91 @@ function MajorProjectPackageFormModal({ project, initial, onCancel, onSaved, use
   );
 }
 
+// Package/OEM Kanban — Tender / EPC Awarded / RFQ Received. Deliberately
+// separate from CrmFunnelKanban (the existing Quote-status board) — a card
+// here usually has no Quote# yet. Same visual/drag pattern as
+// CrmFunnelKanban, portfolio-wide (every project's packages together, not
+// scoped to one project) so a manager can see the whole pipeline at once.
+function MajorProjectPackageKanban({ user }){
+  const [cards,setCards] = useState([]);
+  const [columnOf,setColumnOf] = useState({}); // oem_status -> kanban_column
+  const [firstStatusOfColumn,setFirstStatusOfColumn] = useState({}); // kanban_column -> oem_status (lowest sort_order)
+  const [loading,setLoading] = useState(true);
+  const [dragCard,setDragCard] = useState(null);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const [{data:pkgRows},{data:colRows},{data:statusRows}] = await Promise.all([
+      sb.from("major_project_package_tbl").select("*, major_project_tbl(project_name,main_epc_company_name,end_user_company_name)").order("created_at",{ascending:false}),
+      sb.from("major_project_kanban_column_tbl").select("oem_status,kanban_column"),
+      sb.from("major_project_oem_status_tbl").select("status,sort_order").order("sort_order"),
+    ]);
+    const colMap = {};
+    (colRows||[]).forEach(r=>{ colMap[r.oem_status] = r.kanban_column; });
+    setColumnOf(colMap);
+    // First (lowest sort_order) detailed status per Kanban column — what a
+    // card becomes when dropped into that column from a different one.
+    const firstMap = {};
+    (statusRows||[]).forEach(r=>{
+      const col = colMap[r.status];
+      if(col && !(col in firstMap)) firstMap[col] = r.status;
+    });
+    setFirstStatusOfColumn(firstMap);
+    setCards(pkgRows||[]);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const moveCard = async(card,targetColumn)=>{
+    const currentColumn = columnOf[card.oem_status];
+    if(currentColumn===targetColumn) return;
+    const newStatus = firstStatusOfColumn[targetColumn];
+    if(!newStatus) return;
+    setCards(cs=>cs.map(c=>c.id===card.id?{...c,oem_status:newStatus}:c));
+    await sb.from("major_project_package_tbl").update({oem_status:newStatus,updated_at:new Date().toISOString()}).eq("id",card.id);
+  };
+
+  const columns = ["Tender","EPC Awarded","RFQ Received"];
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("h2",{style:{margin:"0 0 14px",fontSize:18,fontWeight:700}},"Package / OEM board"),
+    loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
+    h("div",{style:{display:"flex",gap:12,overflowX:"auto",paddingBottom:10}},
+      columns.map(col=>{
+        const colCards = cards.filter(c=>columnOf[c.oem_status]===col);
+        const totalValue = colCards.reduce((s,c)=>s+(Number(c.estimated_value)||0),0);
+        return h("div",{
+          key:col,
+          onDragOver:e=>e.preventDefault(),
+          onDrop:()=>{ if(dragCard) moveCard(dragCard,col); setDragCard(null); },
+          style:{flex:"0 0 260px",background:"#f4f2ea",borderRadius:10,padding:10,display:"flex",flexDirection:"column",gap:8,minHeight:160}
+        },
+          h("div",{style:{padding:"2px 4px 6px",borderBottom:"1px solid "+colors.border}},
+            h("div",{style:{fontSize:12.5,fontWeight:700}},col+" ("+colCards.length+")"),
+            h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},fmt(totalValue)+" est.")
+          ),
+          colCards.map(c=>h("div",{
+            key:c.id, draggable:true,
+            onDragStart:()=>setDragCard(c),
+            onDragEnd:()=>setDragCard(null),
+            style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"9px 11px",cursor:"grab"}
+          },
+            h("div",{style:{fontWeight:600,fontSize:12.5}},c.package_name),
+            h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},(c.major_project_tbl&&c.major_project_tbl.project_name)||"—"),
+            h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:2}},(c.major_project_tbl&&c.major_project_tbl.main_epc_company_name)||"—"),
+            c.confirmed_oem && h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},"OEM: "+c.confirmed_oem),
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:6,paddingTop:5,borderTop:"1px solid #f0efe8"}},
+              h("span",{style:{fontSize:10.5,color:colors.mutedLight}},c.sales_rep||"—"),
+              c.next_followup_date && h("span",{style:{fontSize:10.5,color:colors.mutedLight}},c.next_followup_date)
+            )
+          )),
+          colCards.length===0 && h("div",{style:{fontSize:11,color:colors.mutedLight,padding:6}},"No packages.")
+        );
+      })
+    )
+  );
+}
+
 function CrmFunnelKanban({ user }){
   const [statuses,setStatuses] = useState([]);
   const [cards,setCards] = useState([]); // [{id, reference_number, item_sl_no, customer_name, description, quote_status, totalValue, status_changed_by, status_changed_at}]
@@ -19691,6 +19777,7 @@ function App() {
     tab==="bolting_calc"?h("div",null,h(BoltingCalculator,{user}),h(BoltingCalcHistoryViewer,{user})):
     tab==="flange_chart"?h(FlangeChart,{user}):
     tab==="major_projects"?h(MajorProjectsScreen,{user}):
+    tab==="major_projects_kanban"?h(MajorProjectPackageKanban,{user}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
