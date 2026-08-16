@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T12:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T13:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -9329,13 +9329,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   };
 
   const [orderQty,setOrderQty]=useState(1);
+  // Same gap fixed twice already elsewhere (Annexure II, Datasheet Price
+  // Data) — a Direct Price line has no rate/sf, its real contribution is
+  // qty × its own cost/sales_price instead.
   const totalCost=useMemo(()=>openLines.reduce((s,l)=>{
     const qty=(Number(getLineVal(l,"qty_required"))||0)*(orderQty||1);
+    if(getLineVal(l,"is_direct_price")) return s+qty*(Number(getLineVal(l,"cost"))||0);
     const rate=Number(getLineVal(l,"rate"))||0;
     return s+qty*rate;
   },0),[openLines,lineEdits,orderQty]);
   const totalSales=useMemo(()=>openLines.reduce((s,l)=>{
     const qty=(Number(getLineVal(l,"qty_required"))||0)*(orderQty||1);
+    if(getLineVal(l,"is_direct_price")) return s+qty*(Number(getLineVal(l,"sales_price"))||0);
     const rate=Number(getLineVal(l,"rate"))||0;
     const sf=Number(getLineVal(l,"sf"))||3.1;
     return s+qty*rate*sf;
@@ -17657,14 +17662,35 @@ function PricingDescriptionPanel({ openRef, openLines, user, itemOptions, onSave
     finally { setSaving(s=>({...s,[line.id]:false})); }
   };
 
+  // Common case: exactly one Direct Price line under this Sl No — its
+  // BOM/Excel reference sits alongside the Datasheet banner, one row, same
+  // treatment. Rare multi-line case (several Direct Price lines added onto
+  // one Sl No) keeps each line's own BOM/Excel section in its own card
+  // instead, since one shared banner wouldn't clearly map to either line.
+  const singleDp = dpLines.length===1 ? dpLines[0] : null;
+  const singleFile = singleDp ? (fileState[singleDp.id]||{name:singleDp.excel_file_name||"",path:singleDp.excel_file_path||""}) : null;
+
   return h("div",{style:{padding:"14px 0",maxWidth:640}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
       h("div",{style:{fontSize:13,fontWeight:700}},"Pricing & Description — "+openRef.reference_number+" · Sl No "+openRef.item_sl_no),
       hasRealBom && h("button",{onClick:onViewBom,style:btnSecondary},"View / Edit BOM lines")
     ),
-    h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"10px 14px",marginBottom:14,background: hasDatasheet?"#eaf9f4":"#fff4d6",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
-      h("div",{style:{fontSize:12.5,fontWeight:600,color: hasDatasheet?"#085041":"#854f0b"}}, hasDatasheet===null?"Checking Datasheet…":hasDatasheet?"✓ Datasheet on file":"No Datasheet yet for this Sl No"),
-      hasDatasheet!==null && h("button",{onClick:()=>setShowDatasheet(true),style:btnSecondary}, hasDatasheet?"Open / Edit Datasheet":"Add Datasheet")
+    h("div",{style:{display:"grid",gridTemplateColumns:singleDp?"1fr 1fr":"1fr",gap:10,marginBottom:14}},
+      h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"10px 14px",background: hasDatasheet?"#eaf9f4":"#fff4d6",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
+        h("div",{style:{fontSize:12.5,fontWeight:600,color: hasDatasheet?"#085041":"#854f0b"}}, hasDatasheet===null?"Checking Datasheet…":hasDatasheet?"✓ Datasheet on file":"No Datasheet yet for this Sl No"),
+        hasDatasheet!==null && h("button",{onClick:()=>setShowDatasheet(true),style:btnSecondary}, hasDatasheet?"Open / Edit Datasheet":"Add Datasheet")
+      ),
+      singleDp && h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"10px 14px",background: singleFile.name?"#eaf9f4":"#fff4d6",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
+        singleFile.name
+          ? h("div",{style:{fontSize:12.5,fontWeight:600,color:"#085041"}},"✓ "+singleFile.name)
+          : h("div",{style:{fontSize:12.5,fontWeight:600,color:"#854f0b"}}, uploading[singleDp.id]?"Uploading…":"No BOM/Excel attached"),
+        singleFile.name
+          ? h("button",{onClick:()=>downloadExcelFor(singleDp),style:btnSecondary},"Open")
+          : h("label",{style:{...btnSecondary,cursor:"pointer",display:"inline-flex",alignItems:"center"}},
+              "Attach",
+              h("input",{type:"file",accept:".xlsx,.xls,.csv",disabled:uploading[singleDp.id],onChange:e=>{ const f=e.target.files[0]; if(f) uploadExcelFor(singleDp,f); },style:{display:"none"}})
+            )
+      )
     ),
     dpLines.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"No Direct Price lines here."),
     dpLines.map(line=>{
@@ -17690,7 +17716,7 @@ function PricingDescriptionPanel({ openRef, openLines, user, itemOptions, onSave
           h("div",{style:{flex:1,minWidth:120}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Cost price (INR) *"),h("input",{type:"number",value:draft.cost_price,onChange:e=>setDraft(line.id,"cost_price",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
           h("div",{style:{flex:1,minWidth:120}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Sales price (INR) *"),h("input",{type:"number",value:draft.sales_price,onChange:e=>setDraft(line.id,"sales_price",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
         ),
-        h("div",{style:{marginBottom:10}},
+        !singleDp && h("div",{style:{marginBottom:10}},
           h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"BOM / Excel reference"),
           h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
             file.name
