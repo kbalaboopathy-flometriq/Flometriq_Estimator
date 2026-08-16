@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T08:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T11:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -4544,13 +4544,13 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       setIsCustomModel(false); setDirectPriceLine(null);
       setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
       setCurrency(head.currency||"INR"); setConversionRate(String(head.conversion_rate||1));
-      setCustomerName(head.customer_name||""); setCustomerAddress(head.customer_address||"");
+      setCustomerName(head.customer_name||pendingNewSlNo.prefillCustomerName||""); setCustomerAddress(head.customer_address||"");
       setContactName(head.contact_name||""); setContactDesignation(head.contact_designation||"");
       setSignatoryName(head.signatory_name||""); setSignatoryDesignation(head.signatory_designation||"");
       setRefNumber(ref); setItemSlNo(String(pendingNewSlNo.item_sl_no)); setRefDesc("");
       setGatewayConfirmedNewSlNo(true);
-      setCustomerCountry(await fetchCustomerCountry(head.customer_name));
-      setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no, isNewQuote});
+      setCustomerCountry(await fetchCustomerCountry(head.customer_name||pendingNewSlNo.prefillCustomerName));
+      setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no, isNewQuote, linked_package_id:pendingNewSlNo.linked_package_id||null});
       // Existing quote: header already carries over, and Description will
       // auto-fill once a model's BOM loads — no separate popup needed here.
       // Just land on the model picker (the banner above shows what's
@@ -4763,10 +4763,16 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         await sb.from("estimates").update(headerPayload).eq("id",estimateId);
         await sb.from("estimate_lines").delete().eq("reference_number",ref).eq("item_sl_no",slNo);
       } else {
-        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,order_qty:Number(orderQty),quote_status:resolvedQuoteStatus,company_id:resolvedCompanyId,created_by:user.username,datasheet_not_required:skipDatasheet===true}).select().single();
+        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,order_qty:Number(orderQty),quote_status:resolvedQuoteStatus,company_id:resolvedCompanyId,created_by:user.username,datasheet_not_required:skipDatasheet===true,linked_package_id:(holdingNewSlNo&&holdingNewSlNo.linked_package_id)||null}).select().single();
         if(err) throw err;
         estimateId=created.id; createdNewHeader=true;
         promoteCompanyToLead(resolvedCompanyId, headerPayload.customer_name);
+        // Traceability, other direction — the Package's own detail screen
+        // shows "already quoted" from this column without a join, per the
+        // Phase 1 schema note this column was added ahead of time for.
+        if(holdingNewSlNo && holdingNewSlNo.linked_package_id){
+          await sb.from("major_project_package_tbl").update({linked_reference_number:ref,updated_at:new Date().toISOString()}).eq("id",holdingNewSlNo.linked_package_id);
+        }
       }
       const rows=effectiveCart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||"",is_direct_price:l.is_direct_price===true,validation_status:l.validation_status||null,excel_file_name:l.excel_file_name||null,excel_file_path:l.excel_file_path||null,no_excel_code_used:l.no_excel_code_used||null,added_by:l.added_by||null,custom_item:l.custom_item||null,custom_model_recorded:l.custom_model_recorded||null}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
@@ -8860,6 +8866,19 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // Detail table on demand instead of losing access to it entirely. Reset
   // to false every time a different Sl No is opened.
   const [showBomOverride,setShowBomOverride]=useState(false);
+  // Traceability, Quote side — when this Sl No was created via a Major
+  // Projects Package's "Create Quote" action, show which Project/Package
+  // it came from.
+  const [linkedPackageInfo,setLinkedPackageInfo]=useState(null); // {projectName, packageName} | null
+  useEffect(()=>{
+    let cancelled=false;
+    if(!openRef || !openRef.linked_package_id){ setLinkedPackageInfo(null); return; }
+    sb.from("major_project_package_tbl").select("package_name, major_project_tbl(project_name)").eq("id",openRef.linked_package_id).maybeSingle().then(({data})=>{
+      if(cancelled || !data) return;
+      setLinkedPackageInfo({ packageName:data.package_name, projectName:(data.major_project_tbl&&data.major_project_tbl.project_name)||"" });
+    });
+    return ()=>{ cancelled=true; };
+  },[openRef&&openRef.linked_package_id]);
   const [dpFileName,setDpFileName]=useState(""); const [dpFilePath,setDpFilePath]=useState("");
   const [dpUploading,setDpUploading]=useState(false);
   const [dpCodeInput,setDpCodeInput]=useState(""); const [dpCodeVerifying,setDpCodeVerifying]=useState(false);
@@ -8978,10 +8997,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   },[refs,refFilter]);
 
   const openEstimate=async(ref)=>{
+    const isDifferentSlNo = !openRef || openRef.reference_number!==ref.reference_number || openRef.item_sl_no!==ref.item_sl_no;
     setOpenRef(ref); setLoadingLines(true); setOrderQty(ref.order_qty||1); setLineEdits({}); setSavingLine({});
     setEditingDescSlNo(false);
     setUnsavedGuard(false);
-    setShowBomOverride(false);
+    if(isDifferentSlNo) setShowBomOverride(false);
     const{data}=await sb.from("estimate_lines").select("*").eq("reference_number",ref.reference_number).eq("item_sl_no",ref.item_sl_no).order("sl_no");
     setOpenLines(data||[]); setLoadingLines(false);
     // Header Model: the estimates row is the authoritative "main form" value.
@@ -9659,8 +9679,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const customer = (estimatesRows[0]&&estimatesRows[0].customer_name)||"";
       const wb = XLSX.utils.book_new();
       estimatesRows.forEach(est=>{
-        const itemName = modelItemMap.get(est.model) || "";
         const lines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
+        const dpLine = lines.find(l=>l.is_direct_price===true);
+        const itemName = dpLine ? (dpLine.item||"Custom") : (modelItemMap.get(est.model) || "");
         const rows=[];
         rows.push(["BOM WITH ESTIMATE"]);
         rows.push([]);
@@ -9795,7 +9816,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       estimatesRows.forEach((est,idx)=>{
         if(idx>0) doc.addPage();
         ensureLetterhead();
-        const itemName = modelItemMap.get(est.model) || "";
+        const dpLineForItem = linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.is_direct_price===true);
+        const itemName = dpLineForItem ? (dpLineForItem.item||"Custom") : (modelItemMap.get(est.model) || "");
         let y = drawDocHeaderBlock(doc,"BOM WITH ESTIMATE",{slNo:est.item_sl_no,client:customer,quoteDate:est.quote_date,item:itemName,quoteNo:est.reference_number,model:est.model,qtyByOrder:est.order_qty||1});
         doc.setFont(undefined,"italic"); doc.setFontSize(7); doc.setTextColor(120,120,120);
         doc.text("(Qty By Order x Reqd Qty)", 14, y);
@@ -9842,9 +9864,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const list = [];
     const mocRuleCache = new Map(); // itemName -> {parameters:[...]} — avoids refetching per Sl No when several share an item
     for(const est of estimatesRows){
-      const itemName = modelItemMap.get(est.model) || est.model || "Unknown item";
-      const template = await loadDatasheetMaster(itemName);
-      const ds = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.template_key===normalizeItemName(itemName));
+      const itemNameForTemplate = modelItemMap.get(est.model) || est.model || "Unknown item";
+      const template = await loadDatasheetMaster(itemNameForTemplate);
+      const ds = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.template_key===normalizeItemName(itemNameForTemplate));
       if(!template){
         // No template — a real catalog item just gets skipped from the
         // annexure as before. A Custom/Direct Price line that filled in a
@@ -9859,21 +9881,27 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             customSections.push({ title:"Datasheet", rows: ds.custom_free_fields.map((f,i)=>({key:"custom-"+i,label:f.label,value:f.value})) });
           }
           customSections.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
-          list.push({ slNo: est.item_sl_no, model: est.model||"", itemName, sectionsRows: customSections });
+          // Display label prefers the real typed Item off the Direct Price
+          // line itself — itemNameForTemplate above stays model-based on
+          // purpose, so the template lookup (and its "no template" fallback
+          // into this custom branch) isn't disturbed by this display fix.
+          const dpLine = linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.is_direct_price===true);
+          const displayItemName = dpLine ? (dpLine.item||itemNameForTemplate) : itemNameForTemplate;
+          list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: displayItemName, sectionsRows: customSections });
         }
         continue;
       }
       const slLines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
-      if(!mocRuleCache.has(itemName)){
-        const { data:ruleRow } = await sb.from("item_moc_rules").select("*").eq("item",itemName).maybeSingle();
-        mocRuleCache.set(itemName, ruleRow||{parameters:[]});
+      if(!mocRuleCache.has(itemNameForTemplate)){
+        const { data:ruleRow } = await sb.from("item_moc_rules").select("*").eq("item",itemNameForTemplate).maybeSingle();
+        mocRuleCache.set(itemNameForTemplate, ruleRow||{parameters:[]});
       }
-      const mocRow = mocRuleCache.get(itemName);
+      const mocRow = mocRuleCache.get(itemNameForTemplate);
       const allSections = buildDatasheetSectionRows(template, (ds&&ds.field_values)||{}, mocRow, slLines, est.model, est.item_sl_no);
       const sectionsRows = allSections.filter(sec=>sec.rows.some(r=>r.value!==undefined && r.value!==null && String(r.value).trim()!==""));
       const totalSalesValue = await computeSlNoFoldedSalesTotal(est.reference_number, est.item_sl_no, est.order_qty);
       sectionsRows.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
-      list.push({ slNo: est.item_sl_no, model: est.model||"", itemName, sectionsRows });
+      list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: itemNameForTemplate, sectionsRows });
     }
     list.sort((a,b)=>a.slNo-b.slNo);
     return list;
@@ -10315,7 +10343,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const totalInr = slNoFoldedTotalInr(est);
         const totalDisplay = quoteIsInr ? totalInr : (quoteFx>0 ? totalInr/quoteFx : 0);
         const { unit, total } = roundedUnitTotal(totalDisplay, qty);
-        return [est.item_sl_no, modelItemMap.get(est.model)||est.model||"—", est.description||"—",
+        // A Direct Price line's real Item lives on the line itself, typed
+        // by the user — est.model is "Custom" (or a typed model label),
+        // never the Item. Real BOM Sl Nos are unaffected (no dpLine found).
+        const dpLine = linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.is_direct_price===true);
+        const itemDisplay = dpLine ? (dpLine.item||"Custom") : (modelItemMap.get(est.model)||est.model||"—");
+        return [est.item_sl_no, itemDisplay, est.description||"—",
           fmt(unit), qty, fmt(total)];
       });
       // grandTotalInr, extraPriceTotal, testingSeparateTotal already computed
@@ -11259,7 +11292,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 h("div",{style:{display:"flex",flexWrap:"wrap",gap:12,marginTop:4}},
                   h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry#: "+(openRef.enquiry_number||"—")),
                   h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry date: "+(openRef.enquiry_date||"—")),
-                  h("span",{style:{fontSize:12,color:colors.muted}},"Quote date: "+(openRef.quote_date||"—"))
+                  h("span",{style:{fontSize:12,color:colors.muted}},"Quote date: "+(openRef.quote_date||"—")),
+                  linkedPackageInfo && h("span",{style:{fontSize:12,fontWeight:600,padding:"2px 9px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Major Project: "+linkedPackageInfo.projectName+" · "+linkedPackageInfo.packageName)
                 ),
                 h("div",{style:{display:"flex",alignItems:"center",gap:8,marginTop:4}},
                   h("span",{style:{fontSize:12,color:colors.muted}},"Model: "+(headerModel||"—")+(headerModel&&modelItemMap.get(headerModel)?"  ("+modelItemMap.get(headerModel)+")":"")),                  !openRef.model && headerModel && h("button",{onClick:fixHeaderModel,disabled:fixingModel,style:{...btnSmall,color:"#b8472f",borderColor:"#e3b9b9"}},fixingModel?"Fixing…":"Fix — save Model to this estimate")
@@ -16133,7 +16167,7 @@ function StatusChangeHistoryReport(){
 // SABIC, HPCL, DEWA, or any future account.
 // ============================================================
 
-function MajorProjectsScreen({ user }){
+function MajorProjectsScreen({ user, onCreateQuoteFromPackage, onOpenQuote }){
   const [view,setView] = useState("list"); // "list" | "detail" | "package_detail"
   const [projects,setProjects] = useState([]);
   const [loading,setLoading] = useState(true);
@@ -16180,7 +16214,8 @@ function MajorProjectsScreen({ user }){
       h(MajorProjectPackageDetail,{
         pkg:selectedPackage, project:selectedProject, user,
         onBack:backToPackageList,
-        onEdit:()=>{setEditingPackage(selectedPackage);setShowPackageForm(true);}
+        onEdit:()=>{setEditingPackage(selectedPackage);setShowPackageForm(true);},
+        onCreateQuoteFromPackage, onOpenQuote
       }),
       showPackageForm && h(MajorProjectPackageFormModal,{
         project:selectedProject, initial:editingPackage, user,
@@ -16517,7 +16552,25 @@ function MajorProjectPackageFormModal({ project, initial, onCancel, onSaved, use
 // BOTH package_id (canonical, what's queried/filtered on) AND company_name
 // (Main EPC, for readability in the log itself and so this activity also
 // surfaces naturally on that company's own Activity history in Customers).
-function MajorProjectPackageDetail({ pkg, project, user, onBack, onEdit }){
+function MajorProjectPackageDetail({ pkg, project, user, onBack, onEdit, onCreateQuoteFromPackage, onOpenQuote }){
+  const [showCreateQuote,setShowCreateQuote] = useState(false);
+  const [createQuoteRef,setCreateQuoteRef] = useState("");
+  const [createQuoteMsg,setCreateQuoteMsg] = useState("");
+  const [creatingQuote,setCreatingQuote] = useState(false);
+
+  const submitCreateQuote = async()=>{
+    const val = createQuoteRef.trim();
+    if(!val){ setCreateQuoteMsg("Enter a Quote# first."); return; }
+    setCreatingQuote(true); setCreateQuoteMsg("");
+    try{
+      const { data:existing } = await sb.from("estimates").select("reference_number").eq("reference_number",val).limit(1);
+      if(existing && existing.length>0){ setCreateQuoteMsg("Quote# \""+val+"\" already exists — pick a different number."); setCreatingQuote(false); return; }
+      setShowCreateQuote(false); setCreateQuoteRef("");
+      onCreateQuoteFromPackage(val, pkg.id, project.main_epc_company_name);
+    } catch(e){ setCreateQuoteMsg("Couldn't check: "+e.message); }
+    finally { setCreatingQuote(false); }
+  };
+
   return h("div",{style:{padding:"20px 24px",maxWidth:900}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16,flexWrap:"wrap",gap:10}},
       h("div",null,
@@ -16527,8 +16580,17 @@ function MajorProjectPackageDetail({ pkg, project, user, onBack, onEdit }){
           project.end_user_company_name+" · EPC: "+project.main_epc_company_name
         )
       ),
-      h("button",{onClick:onEdit,style:btnSecondary},"Edit package")
+      h("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
+        pkg.linked_reference_number
+          ? h(React.Fragment,null,
+              h("span",{style:{fontSize:11.5,fontWeight:700,padding:"6px 12px",borderRadius:20,background:"#eaf9f4",color:"#085041",alignSelf:"center"}},"Linked to Quote# "+pkg.linked_reference_number),
+              onOpenQuote && h("button",{onClick:()=>onOpenQuote(pkg.linked_reference_number,1),style:btnSecondary},"Open Quote#")
+            )
+          : onCreateQuoteFromPackage && h("button",{onClick:()=>{setShowCreateQuote(true);setCreateQuoteRef("");setCreateQuoteMsg("");},style:btnPrimary},"Create Quote"),
+        h("button",{onClick:onEdit,style:btnSecondary},"Edit package")
+      )
     ),
+    !pkg.linked_reference_number && pkg.oem_status!=="RFQ Received" && h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:12,marginTop:-8}},"Quotes are typically created once OEM status reaches RFQ Received — Create Quote is still available earlier if needed."),
     h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:20}},
       h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
         h("div",{style:{fontSize:10,color:colors.mutedLight}},"OEM status"),
@@ -16548,7 +16610,19 @@ function MajorProjectPackageDetail({ pkg, project, user, onBack, onEdit }){
       )
     ),
     h(PackageContactsSection,{pkg,project,user}),
-    h(PackageActivitySection,{pkg,project,user})
+    h(PackageActivitySection,{pkg,project,user}),
+    showCreateQuote && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Create Quote"),
+        h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"From package \""+pkg.package_name+"\" — customer will be pre-filled as "+project.main_epc_company_name+"."),
+        h("input",{value:createQuoteRef,onChange:e=>setCreateQuoteRef(e.target.value),placeholder:"New Quote# (e.g. FEX260601)",style:{...inputStyle,width:"100%",marginBottom:8}}),
+        createQuoteMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},createQuoteMsg),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setShowCreateQuote(false),style:btnSecondary},"Cancel"),
+          h("button",{onClick:submitCreateQuote,disabled:creatingQuote,style:{...btnPrimary,opacity:creatingQuote?0.6:1}},creatingQuote?"Checking…":"Continue to Estimator")
+        )
+      )
+    )
   );
 }
 
@@ -17484,6 +17558,17 @@ function PricingDescriptionPanel({ openRef, openLines, user, itemOptions, onSave
   },[openLines]);
   const [saving,setSaving] = useState({});
   const [uploading,setUploading] = useState({});
+  // Datasheet — one per Sl No (not per Direct Price line), same table every
+  // other Datasheet entry point in this app reads. Checked on mount and
+  // re-checked whenever the Datasheet modal closes.
+  const [hasDatasheet,setHasDatasheet] = useState(null); // null=loading, else boolean
+  const [showDatasheet,setShowDatasheet] = useState(false);
+  const checkDatasheet = useCallback(()=>{
+    sb.from("datasheets").select("id").eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no).limit(1).then(({data})=>{
+      setHasDatasheet((data||[]).length>0);
+    });
+  },[openRef.reference_number, openRef.item_sl_no]);
+  useEffect(()=>{ checkDatasheet(); },[checkDatasheet]);
 
   const setDraft = (id,key,val)=> setDrafts(d=>({...d,[id]:{...d[id],[key]:val}}));
 
@@ -17494,7 +17579,8 @@ function PricingDescriptionPanel({ openRef, openLines, user, itemOptions, onSave
       const path = "quote_"+openRef.reference_number+"_"+Date.now()+"_"+file.name.replace(/[^a-zA-Z0-9._-]/g,"_");
       const { error:err } = await sb.storage.from("direct-price-excels").upload(path,file);
       if(err) throw err;
-      await sb.from("estimate_lines").update({excel_file_name:file.name,excel_file_path:path}).eq("id",line.id);
+      const { error:updErr } = await sb.from("estimate_lines").update({excel_file_name:file.name,excel_file_path:path}).eq("id",line.id);
+      if(updErr) throw updErr;
       setFileState(f=>({...f,[line.id]:{name:file.name,path}}));
       onSaved();
     } catch(e){ alert("Upload failed: "+e.message); }
@@ -17516,17 +17602,20 @@ function PricingDescriptionPanel({ openRef, openLines, user, itemOptions, onSave
     setSaving(s=>({...s,[line.id]:true}));
     try{
       const newSalesPrice = Number(draft.sales_price)||0;
+      const newCostPrice = Number(draft.cost_price)||0;
       const payload = {
         item: draft.item.trim(), component: draft.description.trim(),
         qty_required: Number(draft.qty)||1, uom: draft.uom||"Nos",
-        cost: Number(draft.cost_price)||0, sales_price: newSalesPrice
+        cost: newCostPrice, sales_price: newSalesPrice
       };
       if(line.validation_status==="Validated" && Number(line.sales_price)!==newSalesPrice){
         payload.validation_status="Pending"; payload.validated_by=null; payload.validated_at=null;
       }
-      await sb.from("estimate_lines").update(payload).eq("id",line.id);
+      const { error } = await sb.from("estimate_lines").update(payload).eq("id",line.id);
+      if(error) throw error;
       await logAudit("UPDATE","estimate_lines",openRef.reference_number+"-"+openRef.item_sl_no,"Updated Direct Price line \""+draft.description.trim()+"\"",user?.username||"unknown",null,payload);
       onSaved();
+      alert("Saved — "+draft.item.trim()+" (\""+draft.description.trim()+"\"): Cost ₹"+newCostPrice.toFixed(2)+" · Sales ₹"+newSalesPrice.toFixed(2)+".");
     } catch(e){ alert("Save failed: "+e.message); }
     finally { setSaving(s=>({...s,[line.id]:false})); }
   };
@@ -17535,6 +17624,10 @@ function PricingDescriptionPanel({ openRef, openLines, user, itemOptions, onSave
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
       h("div",{style:{fontSize:13,fontWeight:700}},"Pricing & Description — "+openRef.reference_number+" · Sl No "+openRef.item_sl_no),
       hasRealBom && h("button",{onClick:onViewBom,style:btnSecondary},"View / Edit BOM lines")
+    ),
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"10px 14px",marginBottom:14,background: hasDatasheet?"#eaf9f4":"#fff4d6",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
+      h("div",{style:{fontSize:12.5,fontWeight:600,color: hasDatasheet?"#085041":"#854f0b"}}, hasDatasheet===null?"Checking Datasheet…":hasDatasheet?"✓ Datasheet on file":"No Datasheet yet for this Sl No"),
+      hasDatasheet!==null && h("button",{onClick:()=>setShowDatasheet(true),style:btnSecondary}, hasDatasheet?"Open / Edit Datasheet":"Add Datasheet")
     ),
     dpLines.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"No Direct Price lines here."),
     dpLines.map(line=>{
@@ -17560,16 +17653,24 @@ function PricingDescriptionPanel({ openRef, openLines, user, itemOptions, onSave
           h("div",{style:{flex:1,minWidth:120}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Cost price (INR) *"),h("input",{type:"number",value:draft.cost_price,onChange:e=>setDraft(line.id,"cost_price",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
           h("div",{style:{flex:1,minWidth:120}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Sales price (INR) *"),h("input",{type:"number",value:draft.sales_price,onChange:e=>setDraft(line.id,"sales_price",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
         ),
-        h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:10,flexWrap:"wrap"}},
-          file.name
-            ? h("div",{style:{fontSize:12,color:"#0f6e3f"}},"✓ "+file.name+" ",h("button",{onClick:()=>downloadExcelFor(line),style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Download"))
-            : h(React.Fragment,null,
-                h("input",{type:"file",accept:".xlsx,.xls,.csv",disabled:uploading[line.id],onChange:e=>{ const f=e.target.files[0]; if(f) uploadExcelFor(line,f); },style:{fontSize:11}}),
-                uploading[line.id] && h("span",{style:{fontSize:11,color:colors.mutedLight}},"Uploading…")
-              )
+        h("div",{style:{marginBottom:10}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"BOM / Excel reference"),
+          h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
+            file.name
+              ? h("div",{style:{fontSize:12,color:"#0f6e3f"}},"✓ "+file.name+" ",h("button",{onClick:()=>downloadExcelFor(line),style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Open"))
+              : h(React.Fragment,null,
+                  h("span",{style:{fontSize:11.5,color:"#854f0b"}},"No BOM/Excel attached — "),
+                  h("input",{type:"file",accept:".xlsx,.xls,.csv",disabled:uploading[line.id],onChange:e=>{ const f=e.target.files[0]; if(f) uploadExcelFor(line,f); },style:{fontSize:11}}),
+                  uploading[line.id] && h("span",{style:{fontSize:11,color:colors.mutedLight}},"Uploading…")
+                )
+          )
         ),
         h("button",{onClick:()=>save(line),disabled:saving[line.id],style:{...btnPrimary,opacity:saving[line.id]?0.6:1}},saving[line.id]?"Saving…":"Save")
       );
+    }),
+    showDatasheet && h(DatasheetModal,{
+      openRef, openLines, model:(openLines[0]&&openLines[0].model)||"", user,
+      onClose:()=>{ setShowDatasheet(false); checkDatasheet(); onSaved(); }
     })
   );
 }
@@ -20721,7 +20822,10 @@ function App() {
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
     tab==="bolting_calc"?h("div",null,h(BoltingCalculator,{user}),h(BoltingCalcHistoryViewer,{user})):
     tab==="flange_chart"?h(FlangeChart,{user}):
-    tab==="major_projects"?h(MajorProjectsScreen,{user}):
+    tab==="major_projects"?h(MajorProjectsScreen,{user,
+      onCreateQuoteFromPackage:(ref,pkgId,prefillCustomerName)=>{ setPendingNewSlNo({reference_number:ref,item_sl_no:1,linked_package_id:pkgId,prefillCustomerName}); setTab("estimator"); },
+      onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}
+    }):
     tab==="major_projects_kanban"?h(MajorProjectPackageKanban,{user}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
