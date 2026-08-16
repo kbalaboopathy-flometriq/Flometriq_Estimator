@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T06:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T08:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -488,12 +488,15 @@ async function computeSlNoFoldedSalesTotal(referenceNumber, itemSlNo, orderQty){
     sb.from("quote_sl_extra_price_tbl").select("price").eq("reference_number",referenceNumber).eq("item_sl_no",itemSlNo),
     sb.from("quote_sl_testing_tbl").select("price").eq("reference_number",referenceNumber).eq("item_sl_no",itemSlNo),
     sb.from("estimates").select("item_sl_no,order_qty").eq("reference_number",referenceNumber),
-    sb.from("estimate_lines").select("item_sl_no,qty_required,rate,sf").eq("reference_number",referenceNumber),
+    sb.from("estimate_lines").select("item_sl_no,qty_required,rate,sf,is_direct_price,sales_price").eq("reference_number",referenceNumber),
     sb.from("quote_global_testing_tbl").select("test_name,rate").eq("reference_number",referenceNumber)
   ]);
-  // Same formula the BOM footer itself uses — live, never stale.
+  // Same formula the BOM footer itself uses — live, never stale. A Direct
+  // Price line has no rate/sf (it's hand-priced, not BOM-costed) — its real
+  // contribution is qty_required × orderQty × its own sales_price instead.
   const liveGrandTotal = (slNo, qtyForSl)=> (allLines||[]).filter(l=>l.item_sl_no===slNo).reduce((s,l)=>{
     const q = (Number(l.qty_required)||0) * (qtyForSl||1);
+    if(l.is_direct_price) return s + q*(Number(l.sales_price)||0);
     const rate = Number(l.rate)||0;
     const sf = Number(l.sf)||3.1;
     return s + q*rate*sf;
@@ -3866,7 +3869,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     if(customModelName && m===customModelName){
       setIsCustomModel(true);
       setLines([]); setLoadingLines(false);
-      setDirectPriceLine({item:"",description:"",qty:"1",uom:"Nos",sales_price:"",recordAs:"custom",customModelText:"",excel_file_name:"",excel_file_path:""});
+      setDirectPriceLine({item:"",description:"",qty:"1",uom:"Nos",cost_price:"",sales_price:"",recordAs:"custom",customModelText:"",excel_file_name:"",excel_file_path:""});
       setDpFile(null); setDpCodeInput("");
       return;
     }
@@ -3945,6 +3948,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     const dp = directPriceLine;
     if(!dp.item){ alert("Pick an Item first."); return; }
     if(!dp.description.trim()){ alert("Enter a description."); return; }
+    if(!dp.cost_price || Number(dp.cost_price)<=0){ alert("Enter a cost price greater than 0."); return; }
     if(!dp.sales_price || Number(dp.sales_price)<=0){ alert("Enter a sales price."); return; }
     const isAdminOrAbove = user.role==="admin"||user.role==="super_admin";
     if(!dp.excel_file_path && !dpAuthorizedCode && !isAdminOrAbove){ alert("Attach an Excel reference, or enter a no-Excel authorization code from an Admin or Super Admin first."); return; }
@@ -3953,7 +3957,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       model:recordedModel, item:dp.item, size:"", sub_assembly:"", component:dp.description.trim(),
       material_shape:"", material_spec:"", grade:"",
       qty_required:Number(dp.qty)||1, uom:dp.uom||"Nos",
-      rate:0, cost:0, sf:0, sales_price:Number(dp.sales_price)||0,
+      rate:0, cost:Number(dp.cost_price)||0, sf:0, sales_price:Number(dp.sales_price)||0,
       cutting_plan_layout_size:"", cutting_plan_qty:0, cutting_plan_uom:"",
       is_direct_price:true, validation_status:"Pending",
       excel_file_name:dp.excel_file_name||"", excel_file_path:dp.excel_file_path||"",
@@ -3966,7 +3970,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     // runs — without this, saving falsely demands a description the user
     // already gave, just on the line instead of the quote header.
     if(!refDesc.trim()) setRefDesc(dp.description.trim());
-    setDirectPriceLine({item:"",description:"",qty:"1",uom:"Nos",sales_price:"",recordAs:"custom",customModelText:"",excel_file_name:"",excel_file_path:""});
+    setDirectPriceLine({item:"",description:"",qty:"1",uom:"Nos",cost_price:"",sales_price:"",recordAs:"custom",customModelText:"",excel_file_name:"",excel_file_path:""});
     setDpFile(null);
   };
 
@@ -5003,13 +5007,14 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#eaf2fb",color:"#0c447c"}},"Direct price line")
         ),
         h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Item *"),
-        h(MasterSelect,{value:directPriceLine.item,onChange:v=>setDirectPriceLine(d=>({...d,item:v})),options:(itemOptions||[]).slice(),table:"item_tbl",valueCol:"item",fieldLabel:"Item",placeholder:"Select item…",style:{padding:"8px 10px",fontSize:13,marginBottom:10},refreshOptions:onRefresh}),
+        h(LimitToListCombo,{value:directPriceLine.item,onChange:v=>setDirectPriceLine(d=>({...d,item:v})),options:(itemOptions||[]).slice(),limitToList:false,placeholder:"Type or pick an item…",style:{...inputStyle,padding:"8px 10px",fontSize:13,marginBottom:10}}),
         h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Description"),
         h("input",{value:directPriceLine.description,onChange:e=>setDirectPriceLine(d=>({...d,description:e.target.value})),placeholder:"As per attached workup…",style:{...inputStyle,padding:"8px 10px",fontSize:13,marginBottom:10,width:"100%"}}),
         h("div",{style:{display:"flex",gap:8,marginBottom:10}},
           h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Qty"),h("input",{type:"number",value:directPriceLine.qty,onChange:e=>setDirectPriceLine(d=>({...d,qty:e.target.value})),style:{...inputStyle,padding:"8px 10px",fontSize:13}})),
           h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"UOM"),h(MasterSelect,{value:directPriceLine.uom,onChange:v=>setDirectPriceLine(d=>({...d,uom:v})),options:(uoms||[]).slice(),table:"uom_tbl",valueCol:"uom",fieldLabel:"UOM",placeholder:"Select…",style:{padding:"8px 10px",fontSize:13},refreshOptions:onRefresh})),
-          h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Sales price"),h("input",{type:"number",value:directPriceLine.sales_price,onChange:e=>setDirectPriceLine(d=>({...d,sales_price:e.target.value})),placeholder:"0.00",style:{...inputStyle,padding:"8px 10px",fontSize:13}}))
+          h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Cost price (enter in INR) *"),h("input",{type:"number",value:directPriceLine.cost_price||"",onChange:e=>setDirectPriceLine(d=>({...d,cost_price:e.target.value})),placeholder:"0.00",style:{...inputStyle,padding:"8px 10px",fontSize:13}})),
+          h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Sales price (enter in INR — converted for display on non-INR quotes)"),h("input",{type:"number",value:directPriceLine.sales_price,onChange:e=>setDirectPriceLine(d=>({...d,sales_price:e.target.value})),placeholder:"0.00",style:{...inputStyle,padding:"8px 10px",fontSize:13}}))
         ),
         h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px",marginBottom:10}},
           h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:6}},"Record model as"),
@@ -8845,6 +8850,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [addLineMode,setAddLineMode]=useState("costed"); // "costed" | "direct_price"
   const [dpDescription,setDpDescription]=useState(""); const [dpQty,setDpQty]=useState("1");
   const [dpUom,setDpUom]=useState("Nos"); const [dpSalesPrice,setDpSalesPrice]=useState("");
+  const [dpCostPrice,setDpCostPrice]=useState("");
+  const [dpItem,setDpItem]=useState("");
+  const [dpItemOptions,setDpItemOptions]=useState([]);
+  // "View/Edit BOM lines" override — when a Sl No has any Direct Price
+  // line, its banner click lands on the Pricing & Description panel
+  // instead of the Detail/BOM table. If real BOM lines ALSO exist under
+  // that same Sl No (a mixed line), this lets the user reveal the normal
+  // Detail table on demand instead of losing access to it entirely. Reset
+  // to false every time a different Sl No is opened.
+  const [showBomOverride,setShowBomOverride]=useState(false);
   const [dpFileName,setDpFileName]=useState(""); const [dpFilePath,setDpFilePath]=useState("");
   const [dpUploading,setDpUploading]=useState(false);
   const [dpCodeInput,setDpCodeInput]=useState(""); const [dpCodeVerifying,setDpCodeVerifying]=useState(false);
@@ -8913,6 +8928,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       setGradesBySpec(g); setRateBySpecGrade(r);
     });
     fetchAll("uom_tbl","uom").then(rows=>setUoms(rows.map(r=>r.uom).filter(Boolean)));
+    fetchAll("item_tbl","item").then(rows=>setDpItemOptions(rows.map(r=>r.item).filter(Boolean)));
     fetchAll("material_spec","material_spec").then(rows=>setAllSpecs(Array.from(new Set(rows.map(r=>r.material_spec).filter(Boolean))).sort()));
   },[]);
 
@@ -8965,6 +8981,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     setOpenRef(ref); setLoadingLines(true); setOrderQty(ref.order_qty||1); setLineEdits({}); setSavingLine({});
     setEditingDescSlNo(false);
     setUnsavedGuard(false);
+    setShowBomOverride(false);
     const{data}=await sb.from("estimate_lines").select("*").eq("reference_number",ref.reference_number).eq("item_sl_no",ref.item_sl_no).order("sl_no");
     setOpenLines(data||[]); setLoadingLines(false);
     // Header Model: the estimates row is the authoritative "main form" value.
@@ -9040,7 +9057,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   };
   const saveDirectPriceAddLine = async()=>{
     if(!openRef) return;
+    if(!dpItem.trim()){ alert("Enter an Item first."); return; }
     if(!dpDescription.trim()){ alert("Enter a description."); return; }
+    if(!dpCostPrice || Number(dpCostPrice)<=0){ alert("Enter a cost price greater than 0."); return; }
     if(!dpSalesPrice || Number(dpSalesPrice)<=0){ alert("Enter a sales price."); return; }
     const isAdminOrAbove = user.role==="admin"||user.role==="super_admin";
     if(!dpFilePath && !dpAuthorizedCode && !isAdminOrAbove){ alert("Attach an Excel reference, or enter a no-Excel authorization code from an Admin or Super Admin first."); return; }
@@ -9049,10 +9068,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const nextSl=(openLines.length>0?Math.max(...openLines.map(l=>l.sl_no)):0)+1;
       const payload={
         reference_number:openRef.reference_number, item_sl_no:openRef.item_sl_no, sl_no:nextSl, estimate_id:openRef.id,
-        model:addModel, sub_assembly:"", component:dpDescription.trim(), material_shape:"",
+        model:addModel, item:dpItem.trim(), sub_assembly:"", component:dpDescription.trim(), material_shape:"",
         cutting_plan_layout_size:"", cutting_plan_qty:0, cutting_plan_uom:"",
         material_spec:"", grade:"", qty_required:Number(dpQty)||1, uom:dpUom||"Nos",
-        rate:0, cost:0, sf:0, sales_price:Number(dpSalesPrice)||0,
+        rate:0, cost:Number(dpCostPrice)||0, sf:0, sales_price:Number(dpSalesPrice)||0,
         is_direct_price:true, validation_status:"Pending",
         excel_file_name:dpFileName||null, excel_file_path:dpFilePath||null,
         no_excel_code_used: dpFilePath?null:(dpAuthorizedCode||(isAdminOrAbove?"self-authorized ("+user.username+")":"")),
@@ -9064,7 +9083,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         await logRevisionChange(openRef.reference_number,"bom","Direct price line added",null,dpDescription.trim());
       }
       setOpenLines(l=>[...l,data]);
-      setDpDescription(""); setDpQty("1"); setDpUom("Nos"); setDpSalesPrice(""); setDpFileName(""); setDpFilePath(""); setDpAuthorizedCode(""); setDpCodeInput("");
+      setDpDescription(""); setDpQty("1"); setDpUom("Nos"); setDpSalesPrice(""); setDpCostPrice(""); setDpItem(""); setDpFileName(""); setDpFilePath(""); setDpAuthorizedCode(""); setDpCodeInput("");
       setAddMsg("Added — Pending validation.");
       if(openRef) refreshReadiness && refreshReadiness(openRef.reference_number);
     } catch(e){ setAddMsg("Failed: "+e.message); }
@@ -9940,6 +9959,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const q = est.order_qty||1;
         return slLines.reduce((s,l)=>{
           const qr=(Number(l.qty_required)||0)*q;
+          if(l.is_direct_price) return s+qr*(Number(l.sales_price)||0);
           const rate=Number(l.rate)||0;
           const sf=Number(l.sf)||3.1;
           return s+qr*rate*sf;
@@ -10751,6 +10771,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     );
   };
 
+  // A Sl No with any Direct Price line lands on the Pricing & Description
+  // panel instead of the Detail/BOM table when opened. A mixed Sl No (real
+  // BOM lines alongside a Direct Price one) keeps the Detail table
+  // reachable via "View/Edit BOM lines" — showBomOverride flips it back on.
+  const openLinesHaveDirectPrice = openLines.some(l=>l.is_direct_price===true);
+  const openLinesHaveRealBom = openLines.some(l=>l.is_direct_price!==true);
+  const showDetailPanel = !showSummarySaved && !showCuttingPlan && (!openLinesHaveDirectPrice || showBomOverride);
+  const showPricingPanel = !showSummarySaved && !showCuttingPlan && openLinesHaveDirectPrice && !showBomOverride;
+
   return h(React.Fragment,null,
     h("div",{style:{position:"sticky",top:appHeaderHeight,zIndex:55,background:colors.bg,padding:"20px 24px 14px",borderBottom:"1px solid "+colors.border}},
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}},
@@ -11237,7 +11266,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 )
             )
             ),
-            !showSummarySaved&&!showCuttingPlan&&h("div",{style:fullScreenBOM?{position:"fixed",inset:0,zIndex:1000,background:"#f4f2ea",padding:20,overflowY:"auto"}:{}},
+            showPricingPanel && h(PricingDescriptionPanel,{ openRef, openLines, user, itemOptions:dpItemOptions, onSaved:()=>{ openEstimate(openRef); refreshReadiness(openRef.reference_number); }, onViewBom:()=>setShowBomOverride(true), hasRealBom:openLinesHaveRealBom }),
+            showDetailPanel&&h("div",{style:fullScreenBOM?{position:"fixed",inset:0,zIndex:1000,background:"#f4f2ea",padding:20,overflowY:"auto"}:{}},
               h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
                 h("div",{style:{fontSize:13,fontWeight:700}}, fullScreenBOM?("BOM — "+(openRef?openRef.reference_number+" · Sl No "+openRef.item_sl_no:"")):""),
                 h("div",{style:{display:"flex",gap:8}},
@@ -11354,7 +11384,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               )
             )
             ),
-            !showSummarySaved&&!showCuttingPlan&&h("div",{style:{marginTop:10}},
+            showDetailPanel&&h("div",{style:{marginTop:10}},
               h("button",{onClick:openAddLine,style:btnPrimary},"+ Add line")
             ),
             showSummarySaved&&h("div",{style:fullScreenSummary?{position:"fixed",inset:0,zIndex:1000,background:colors.bg,padding:20,overflowY:"auto"}:{marginTop:10}},
@@ -11533,13 +11563,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           ),
           addLineMode==="direct_price" ? h(React.Fragment,null,
             h("div",{style:{marginBottom:10}},
+              h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Item"),
+              h(LimitToListCombo,{value:dpItem,onChange:v=>setDpItem(v),options:(dpItemOptions||[]).slice(),limitToList:false,placeholder:"Type or pick an item…",style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%"}})
+            ),
+            h("div",{style:{marginBottom:10}},
               h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Description"),
               h("input",{value:dpDescription,onChange:e=>setDpDescription(e.target.value),placeholder:"As per attached workup…",style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%"}})
             ),
             h("div",{style:{display:"flex",gap:10,marginBottom:10}},
               h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Qty"),h("input",{type:"number",value:dpQty,onChange:e=>setDpQty(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
               h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"UOM"),h(MasterSelect,{value:dpUom,onChange:v=>setDpUom(v),options:[...uoms],table:"uom_tbl",valueCol:"uom",fieldLabel:"UOM",placeholder:"Select…",style:{padding:"7px 9px",fontSize:12}})),
-              h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Sales price"),h("input",{type:"number",value:dpSalesPrice,onChange:e=>setDpSalesPrice(e.target.value),placeholder:"0.00",style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
+              h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Cost price (INR) *"),h("input",{type:"number",value:dpCostPrice,onChange:e=>setDpCostPrice(e.target.value),placeholder:"0.00",style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+              h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Sales price (enter in INR)"),h("input",{type:"number",value:dpSalesPrice,onChange:e=>setDpSalesPrice(e.target.value),placeholder:"0.00",style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
             ),
             h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px",marginBottom:10}},
               h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:8}},"Reference for this price"),
@@ -17428,6 +17463,116 @@ function OverdueCallsReport(){
   );
 }
 
+
+// Replaces the Detail/BOM table when a Sl No has any Direct Price line.
+// One editable card per Direct Price line under this Sl No (usually just
+// one). Cost price is mandatory and >0 here too — it's what makes Material
+// % mean anything for a hand-priced line. Excel attach/download reuses the
+// same direct-price-excels bucket/policy as everywhere else. Editing a
+// Validated line's sales price reverts it to Pending, matching the same
+// guard already used elsewhere in this app when a validated price changes.
+function PricingDescriptionPanel({ openRef, openLines, user, itemOptions, onSaved, onViewBom, hasRealBom }){
+  const dpLines = openLines.filter(l=>l.is_direct_price===true);
+  const draftFor = (l)=>({ item:l.item||"", description:l.component||"", qty:String(l.qty_required||1), uom:l.uom||"Nos", cost_price:l.cost?String(l.cost):"", sales_price:l.sales_price?String(l.sales_price):"" });
+  const [drafts,setDrafts] = useState(()=>{ const d={}; dpLines.forEach(l=>{ d[l.id]=draftFor(l); }); return d; });
+  const [fileState,setFileState] = useState(()=>{ const f={}; dpLines.forEach(l=>{ f[l.id]={name:l.excel_file_name||"",path:l.excel_file_path||""}; }); return f; });
+  useEffect(()=>{
+    const d={}, f={};
+    dpLines.forEach(l=>{ d[l.id]=draftFor(l); f[l.id]={name:l.excel_file_name||"",path:l.excel_file_path||""}; });
+    setDrafts(d); setFileState(f);
+    // eslint-disable-next-line
+  },[openLines]);
+  const [saving,setSaving] = useState({});
+  const [uploading,setUploading] = useState({});
+
+  const setDraft = (id,key,val)=> setDrafts(d=>({...d,[id]:{...d[id],[key]:val}}));
+
+  const uploadExcelFor = async(line,file)=>{
+    if(!file) return;
+    setUploading(u=>({...u,[line.id]:true}));
+    try{
+      const path = "quote_"+openRef.reference_number+"_"+Date.now()+"_"+file.name.replace(/[^a-zA-Z0-9._-]/g,"_");
+      const { error:err } = await sb.storage.from("direct-price-excels").upload(path,file);
+      if(err) throw err;
+      await sb.from("estimate_lines").update({excel_file_name:file.name,excel_file_path:path}).eq("id",line.id);
+      setFileState(f=>({...f,[line.id]:{name:file.name,path}}));
+      onSaved();
+    } catch(e){ alert("Upload failed: "+e.message); }
+    finally { setUploading(u=>({...u,[line.id]:false})); }
+  };
+  const downloadExcelFor = async(line)=>{
+    const path = (fileState[line.id]&&fileState[line.id].path)||line.excel_file_path;
+    if(!path) return;
+    const { data } = await sb.storage.from("direct-price-excels").createSignedUrl(path,60);
+    if(data?.signedUrl) window.open(data.signedUrl,"_blank");
+  };
+
+  const save = async(line)=>{
+    const draft = drafts[line.id]||{};
+    if(!draft.item.trim()){ alert("Enter an Item."); return; }
+    if(!draft.description.trim()){ alert("Enter a description."); return; }
+    if(!draft.cost_price || Number(draft.cost_price)<=0){ alert("Enter a cost price greater than 0."); return; }
+    if(!draft.sales_price || Number(draft.sales_price)<=0){ alert("Enter a sales price greater than 0."); return; }
+    setSaving(s=>({...s,[line.id]:true}));
+    try{
+      const newSalesPrice = Number(draft.sales_price)||0;
+      const payload = {
+        item: draft.item.trim(), component: draft.description.trim(),
+        qty_required: Number(draft.qty)||1, uom: draft.uom||"Nos",
+        cost: Number(draft.cost_price)||0, sales_price: newSalesPrice
+      };
+      if(line.validation_status==="Validated" && Number(line.sales_price)!==newSalesPrice){
+        payload.validation_status="Pending"; payload.validated_by=null; payload.validated_at=null;
+      }
+      await sb.from("estimate_lines").update(payload).eq("id",line.id);
+      await logAudit("UPDATE","estimate_lines",openRef.reference_number+"-"+openRef.item_sl_no,"Updated Direct Price line \""+draft.description.trim()+"\"",user?.username||"unknown",null,payload);
+      onSaved();
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally { setSaving(s=>({...s,[line.id]:false})); }
+  };
+
+  return h("div",{style:{padding:"14px 0",maxWidth:640}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
+      h("div",{style:{fontSize:13,fontWeight:700}},"Pricing & Description — "+openRef.reference_number+" · Sl No "+openRef.item_sl_no),
+      hasRealBom && h("button",{onClick:onViewBom,style:btnSecondary},"View / Edit BOM lines")
+    ),
+    dpLines.length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight}},"No Direct Price lines here."),
+    dpLines.map(line=>{
+      const draft = drafts[line.id]||draftFor(line);
+      const file = fileState[line.id]||{name:line.excel_file_name||"",path:line.excel_file_path||""};
+      return h("div",{key:line.id,style:{border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px",marginBottom:12,background:"#fff"}},
+        h("div",{style:{marginBottom:10}},
+          h("span",{style:{fontSize:11,fontWeight:700,padding:"3px 9px",borderRadius:20,background:line.validation_status==="Validated"?"#eaf9f4":"#fff4d6",color:line.validation_status==="Validated"?"#085041":"#854f0b"}},line.validation_status==="Validated"?"● Validated":"● Pending validation")
+        ),
+        h("div",{style:{marginBottom:8}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Item"),
+          h(LimitToListCombo,{value:draft.item,onChange:v=>setDraft(line.id,"item",v),options:itemOptions||[],limitToList:false,placeholder:"Type or pick an item…",style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%"}})
+        ),
+        h("div",{style:{marginBottom:8}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Description"),
+          h("input",{value:draft.description,onChange:e=>setDraft(line.id,"description",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%"}})
+        ),
+        h("div",{style:{display:"flex",gap:10,marginBottom:8,flexWrap:"wrap"}},
+          h("div",{style:{flex:1,minWidth:80}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Qty"),h("input",{type:"number",value:draft.qty,onChange:e=>setDraft(line.id,"qty",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+          h("div",{style:{flex:1,minWidth:80}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"UOM"),h("input",{value:draft.uom,onChange:e=>setDraft(line.id,"uom",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
+        ),
+        h("div",{style:{display:"flex",gap:10,marginBottom:10,flexWrap:"wrap"}},
+          h("div",{style:{flex:1,minWidth:120}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Cost price (INR) *"),h("input",{type:"number",value:draft.cost_price,onChange:e=>setDraft(line.id,"cost_price",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+          h("div",{style:{flex:1,minWidth:120}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Sales price (INR) *"),h("input",{type:"number",value:draft.sales_price,onChange:e=>setDraft(line.id,"sales_price",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}}))
+        ),
+        h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:10,flexWrap:"wrap"}},
+          file.name
+            ? h("div",{style:{fontSize:12,color:"#0f6e3f"}},"✓ "+file.name+" ",h("button",{onClick:()=>downloadExcelFor(line),style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Download"))
+            : h(React.Fragment,null,
+                h("input",{type:"file",accept:".xlsx,.xls,.csv",disabled:uploading[line.id],onChange:e=>{ const f=e.target.files[0]; if(f) uploadExcelFor(line,f); },style:{fontSize:11}}),
+                uploading[line.id] && h("span",{style:{fontSize:11,color:colors.mutedLight}},"Uploading…")
+              )
+        ),
+        h("button",{onClick:()=>save(line),disabled:saving[line.id],style:{...btnPrimary,opacity:saving[line.id]?0.6:1}},saving[line.id]?"Saving…":"Save")
+      );
+    })
+  );
+}
 
 function PendingValidationScreen({ user, onOpenQuote }){
   const [rows,setRows] = useState([]);
