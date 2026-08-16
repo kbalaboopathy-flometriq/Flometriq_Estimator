@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T16:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T17:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -3777,6 +3777,12 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const [descMasterBuilderItem,setDescMasterBuilderItem]=useState(null); // item name while the inline builder modal is open
   const [descMasterDismissedItems,setDescMasterDismissedItems]=useState(new Set()); // don't re-prompt for the same item twice in one session
   const [customerName,setCustomerName]=useState(""); const [customerAddress,setCustomerAddress]=useState("");
+  // Optional, skippable — set once at genuine quote creation, loose tag
+  // only (estimates.linked_project_id). The precise link is
+  // linked_allocation_id, set separately via a Package's own Create Quote
+  // / Link existing Quote# actions.
+  const [linkedProjectId,setLinkedProjectId]=useState(null);
+  const [linkedProjectName,setLinkedProjectName]=useState("");
   const [customerCountry,setCustomerCountry]=useState(""); // drives the currency default and the missing-country PDF-generation gate
   const [contactName,setContactName]=useState(""); const [contactDesignation,setContactDesignation]=useState("");
   const [signatoryName,setSignatoryName]=useState(""); const [signatoryDesignation,setSignatoryDesignation]=useState("");
@@ -4537,7 +4543,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       "Clear all",
       ()=>{
         logAudit("UPDATE","estimate_cart","clear-cart",cart.length+" unsaved cart item(s) and header cleared before saving"+(refNumber?" (Quote# "+refNumber+")":""),user?.username||"unknown",null,null);
-        setSelectedModel(null);setLines([]);setOverrides({});setMocDeletedExceptions([]);setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setCurrency("INR");setConversionRate("1");setCustomerName("");setCustomerAddress("");setContactName("");setContactDesignation("");setSignatoryName("");setSignatoryDesignation("");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg("");
+        setSelectedModel(null);setLines([]);setOverrides({});setMocDeletedExceptions([]);setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setCurrency("INR");setConversionRate("1");setCustomerName("");setCustomerAddress("");setContactName("");setContactDesignation("");setSignatoryName("");setSignatoryDesignation("");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg("");setLinkedProjectId(null);setLinkedProjectName("");
       }
     );
   };
@@ -4557,6 +4563,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setConversionRate("1");
     setCustomerName(""); setCustomerAddress(""); setContactName(""); setContactDesignation("");
     setSignatoryName(""); setSignatoryDesignation(""); setRefDesc("");
+    setLinkedProjectId(null); setLinkedProjectName("");
     setShowAddGateway(false); setShowSave(true);
   };
   const gatewayViewExisting = ()=>{
@@ -4624,7 +4631,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       setRefNumber(ref); setItemSlNo(String(pendingNewSlNo.item_sl_no)); setRefDesc("");
       setGatewayConfirmedNewSlNo(true);
       setCustomerCountry(await fetchCustomerCountry(head.customer_name||pendingNewSlNo.prefillCustomerName));
-      setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no, isNewQuote, linked_package_id:pendingNewSlNo.linked_package_id||null});
+      setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no, isNewQuote, linked_allocation_id:pendingNewSlNo.linked_allocation_id||null});
       // Existing quote: header already carries over, and Description will
       // auto-fill once a model's BOM loads — no separate popup needed here.
       // Just land on the model picker (the banner above shows what's
@@ -4837,15 +4844,15 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         await sb.from("estimates").update(headerPayload).eq("id",estimateId);
         await sb.from("estimate_lines").delete().eq("reference_number",ref).eq("item_sl_no",slNo);
       } else {
-        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,order_qty:Number(orderQty),quote_status:resolvedQuoteStatus,company_id:resolvedCompanyId,created_by:user.username,datasheet_not_required:skipDatasheet===true,linked_package_id:(holdingNewSlNo&&holdingNewSlNo.linked_package_id)||null}).select().single();
+        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,order_qty:Number(orderQty),quote_status:resolvedQuoteStatus,company_id:resolvedCompanyId,created_by:user.username,datasheet_not_required:skipDatasheet===true,linked_allocation_id:(holdingNewSlNo&&holdingNewSlNo.linked_allocation_id)||null,linked_project_id:linkedProjectId||null}).select().single();
         if(err) throw err;
         estimateId=created.id; createdNewHeader=true;
         promoteCompanyToLead(resolvedCompanyId, headerPayload.customer_name);
-        // Traceability, other direction — the Package's own detail screen
-        // shows "already quoted" from this column without a join, per the
-        // Phase 1 schema note this column was added ahead of time for.
-        if(holdingNewSlNo && holdingNewSlNo.linked_package_id){
-          await sb.from("major_project_package_tbl").update({linked_reference_number:ref,updated_at:new Date().toISOString()}).eq("id",holdingNewSlNo.linked_package_id);
+        // Traceability, other direction — the Allocation's own row shows
+        // "already quoted" from this column without a join, same reasoning
+        // as major_project_package_tbl.linked_reference_number in Phase 1.
+        if(holdingNewSlNo && holdingNewSlNo.linked_allocation_id){
+          await sb.from("package_customer_allocation_tbl").update({linked_reference_number:ref,updated_at:new Date().toISOString()}).eq("id",holdingNewSlNo.linked_allocation_id);
         }
       }
       const rows=effectiveCart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||"",is_direct_price:l.is_direct_price===true,validation_status:l.validation_status||null,excel_file_name:l.excel_file_name||null,excel_file_path:l.excel_file_path||null,no_excel_code_used:l.no_excel_code_used||null,added_by:l.added_by||null,custom_item:l.custom_item||null,custom_model_recorded:l.custom_model_recorded||null}));
@@ -4862,7 +4869,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       }
       const successMsg = "Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).";
       setSaveMsg(successMsg); if(!showSave) alert(successMsg);
-      setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setConversionRate("1"); setCustomerName(""); setCustomerAddress(""); setContactName(""); setContactDesignation(""); setSignatoryName(""); setSignatoryDesignation(""); setExistingQuoteHeader(null); setShowSave(false);
+      setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setConversionRate("1"); setCustomerName(""); setCustomerAddress(""); setContactName(""); setContactDesignation(""); setSignatoryName(""); setSignatoryDesignation(""); setExistingQuoteHeader(null); setShowSave(false); setLinkedProjectId(null); setLinkedProjectName("");
       return true;
     } catch(e){
       // If the lines insert is what failed, don't leave a header behind with
@@ -5543,6 +5550,10 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           h("div",{style:{flex:1,minWidth:220}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Customer"),
             h(CustomerSelect,{value:customerName,disabled:!!existingQuoteHeader,user,onSelect:(p)=>{ setCustomerName(p.company_name); setCustomerAddress(p.address); if(p.contact_name) setContactName(p.contact_name); if(p.contact_designation) setContactDesignation(p.contact_designation); setCustomerCountry(p.billing_country||""); const isIndia=(p.billing_country||"").trim().toLowerCase()==="india"; setCurrency(isIndia?"INR":"USD"); if(isIndia) setConversionRate("1"); }})
+          ),
+          h("div",{style:{flex:1,minWidth:200}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Major project (optional)"),
+            h(MajorProjectSelect,{value:linkedProjectName,disabled:!!existingQuoteHeader,onSelect:(p)=>{ setLinkedProjectId(p?p.id:null); setLinkedProjectName(p?p.project_name:""); }})
           ),
           h("div",{style:{flex:1,minWidth:180}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Address"),
@@ -7183,6 +7194,42 @@ function MasterSelect({ value, onChange, options, table, valueCol, fieldLabel, p
 // order. The old code also loaded ALL of `contacts` unconditionally on every
 // mount — same unbounded-load pattern, fixed here too by only fetching
 // contacts for the companies actually matched by the current search.
+// Optional, skippable project tag at quote creation — loose, project-only
+// (see standing note on estimates.linked_project_id). Debounced search
+// against major_project_tbl, same shape as CustomerSelect but simpler
+// since it only needs to return {id, project_name}.
+function MajorProjectSelect({ value, onSelect, disabled }){
+  const [queryText,setQueryText] = useState(value||"");
+  const [matches,setMatches] = useState([]);
+  const listId = useMemo(()=>"proj-dl-"+Math.random().toString(36).slice(2,9),[]);
+
+  useEffect(()=>{ setQueryText(value||""); },[value]);
+
+  useEffect(()=>{
+    const q = queryText.trim();
+    if(q.length<2){ setMatches([]); return; }
+    let cancelled=false;
+    const t = setTimeout(async()=>{
+      const { data } = await sb.from("major_project_tbl").select("id,project_name").ilike("project_name","%"+q+"%").order("project_name").limit(15);
+      if(!cancelled) setMatches(data||[]);
+    },300);
+    return ()=>{ cancelled=true; clearTimeout(t); };
+  },[queryText]);
+
+  return h("div",null,
+    h("input",{
+      list:listId, value:queryText, disabled,
+      onChange:e=>{
+        const v = e.target.value; setQueryText(v);
+        const hit = matches.find(m=>m.project_name===v);
+        if(hit) onSelect(hit); else if(!v) onSelect(null);
+      },
+      placeholder:"Type to search projects…", style:{...inputStyle,width:"100%"}
+    }),
+    h("datalist",{id:listId}, matches.map(m=>h("option",{key:m.id,value:m.project_name})))
+  );
+}
+
 function CustomerSelect({ value, onSelect, disabled, user }){
   const [queryText,setQueryText] = useState(value||"");
   const [matches,setMatches] = useState([]); // [{company_name,billing_*,contacts:[...]}]
@@ -8972,19 +9019,30 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // Detail table on demand instead of losing access to it entirely. Reset
   // to false every time a different Sl No is opened.
   const [showBomOverride,setShowBomOverride]=useState(false);
-  // Traceability, Quote side — when this Sl No was created via a Major
-  // Projects Package's "Create Quote" action, show which Project/Package
-  // it came from.
-  const [linkedPackageInfo,setLinkedPackageInfo]=useState(null); // {projectName, packageName} | null
+  // Traceability, Quote side — two tiers. linked_allocation_id is precise
+  // (created from, or later linked to, one specific customer allocation
+  // under a package). linked_project_id is loose (the optional, skippable
+  // tag at quote creation — set even when nothing precise is known yet).
+  const [linkedPackageInfo,setLinkedPackageInfo]=useState(null); // {projectName, packageName, companyName} | null
+  const [linkedProjectTag,setLinkedProjectTag]=useState(null); // project_name | null
   useEffect(()=>{
     let cancelled=false;
-    if(!openRef || !openRef.linked_package_id){ setLinkedPackageInfo(null); return; }
-    sb.from("major_project_package_tbl").select("package_name, major_project_tbl(project_name)").eq("id",openRef.linked_package_id).maybeSingle().then(({data})=>{
+    if(!openRef || !openRef.linked_allocation_id){ setLinkedPackageInfo(null); return; }
+    sb.from("package_customer_allocation_tbl").select("company_name, major_project_package_tbl(package_name, major_project_tbl(project_name))").eq("id",openRef.linked_allocation_id).maybeSingle().then(({data})=>{
       if(cancelled || !data) return;
-      setLinkedPackageInfo({ packageName:data.package_name, projectName:(data.major_project_tbl&&data.major_project_tbl.project_name)||"" });
+      const pkgRow = data.major_project_package_tbl;
+      setLinkedPackageInfo({ companyName:data.company_name, packageName:pkgRow&&pkgRow.package_name, projectName:(pkgRow&&pkgRow.major_project_tbl&&pkgRow.major_project_tbl.project_name)||"" });
     });
     return ()=>{ cancelled=true; };
-  },[openRef&&openRef.linked_package_id]);
+  },[openRef&&openRef.linked_allocation_id]);
+  useEffect(()=>{
+    let cancelled=false;
+    if(!openRef || !openRef.linked_project_id || openRef.linked_allocation_id){ setLinkedProjectTag(null); return; }
+    sb.from("major_project_tbl").select("project_name").eq("id",openRef.linked_project_id).maybeSingle().then(({data})=>{
+      if(!cancelled) setLinkedProjectTag(data?data.project_name:null);
+    });
+    return ()=>{ cancelled=true; };
+  },[openRef&&openRef.linked_project_id, openRef&&openRef.linked_allocation_id]);
   // BOM line exceptions — lines removed from an ambiguous MOC group via
   // the Estimator's Select MOC wizard, only ever possible while the quote
   // was still Draft. Purely informational here; nothing to action.
@@ -11416,7 +11474,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry#: "+(openRef.enquiry_number||"—")),
                   h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry date: "+(openRef.enquiry_date||"—")),
                   h("span",{style:{fontSize:12,color:colors.muted}},"Quote date: "+(openRef.quote_date||"—")),
-                  linkedPackageInfo && h("span",{style:{fontSize:12,fontWeight:600,padding:"2px 9px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Major Project: "+linkedPackageInfo.projectName+" · "+linkedPackageInfo.packageName),
+                  linkedPackageInfo && h("span",{style:{fontSize:12,fontWeight:600,padding:"2px 9px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Major Project: "+linkedPackageInfo.projectName+" · "+linkedPackageInfo.packageName+" · "+linkedPackageInfo.companyName),
+                  !linkedPackageInfo && linkedProjectTag && h("span",{style:{fontSize:12,fontWeight:600,padding:"2px 9px",borderRadius:20,background:"#f0efe8",color:colors.muted}},"Major Project: "+linkedProjectTag+" (not linked to a specific package)"),
                   bomExceptions.length>0 && h("span",{
                     style:{fontSize:12,fontWeight:600,padding:"2px 9px",borderRadius:20,background:"#fff4d6",color:"#854f0b",cursor:"pointer"},
                     title:bomExceptions.map(ex=>(ex.shape||ex.component||"line")+" ("+(ex.grade||"no grade")+") — removed by "+(ex.deleted_by||"unknown")+" "+new Date(ex.deleted_at).toLocaleDateString()).join("\n")
@@ -16331,7 +16390,7 @@ function StatusChangeHistoryReport(){
 // SABIC, HPCL, DEWA, or any future account.
 // ============================================================
 
-function MajorProjectsScreen({ user, onCreateQuoteFromPackage, onOpenQuote }){
+function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote }){
   const [view,setView] = useState("list"); // "list" | "detail" | "package_detail"
   const [projects,setProjects] = useState([]);
   const [loading,setLoading] = useState(true);
@@ -16379,7 +16438,7 @@ function MajorProjectsScreen({ user, onCreateQuoteFromPackage, onOpenQuote }){
         pkg:selectedPackage, project:selectedProject, user,
         onBack:backToPackageList,
         onEdit:()=>{setEditingPackage(selectedPackage);setShowPackageForm(true);},
-        onCreateQuoteFromPackage, onOpenQuote
+        onCreateQuoteFromAllocation, onOpenQuote
       }),
       showPackageForm && h(MajorProjectPackageFormModal,{
         project:selectedProject, initial:editingPackage, user,
@@ -16485,6 +16544,74 @@ function MajorProjectsScreen({ user, onCreateQuoteFromPackage, onOpenQuote }){
       onCancel:()=>{setShowProjectForm(false);setEditingProject(null);},
       onSaved:()=>{ setShowProjectForm(false); setEditingProject(null); loadProjects(); }
     })
+  );
+}
+
+// MS-Access-style subform — Packages for this Project, editable inline as
+// a grid instead of the modal-per-package flow. That flow still exists
+// unchanged on the Project detail page (per "keep this interface") — this
+// is purely a faster add-on, shown once the project is being edited (a
+// package needs a real project_id, so it can't appear before the first
+// save on a brand-new project).
+function ProjectPackagesSubform({ project, user }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [statuses,setStatuses] = useState([]);
+  const [packageNameOptions,setPackageNameOptions] = useState([]);
+  const [allocByPackage,setAllocByPackage] = useState({});
+  const [addAllocFor,setAddAllocFor] = useState(null);
+
+  const refreshPackageNames = ()=> sb.from("package_name_tbl").select("value").order("value").then(({data})=>setPackageNameOptions((data||[]).map(r=>r.value)));
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("major_project_package_tbl").select("*").eq("project_id",project.id).order("created_at");
+    setRows(data||[]);
+    if(data && data.length){
+      const { data: allocs } = await sb.from("package_customer_allocation_tbl").select("package_id,company_name").in("package_id",data.map(r=>r.id));
+      const grouped = {};
+      (allocs||[]).forEach(a=>{ if(!grouped[a.package_id]) grouped[a.package_id]=[]; grouped[a.package_id].push(a.company_name); });
+      setAllocByPackage(grouped);
+    } else setAllocByPackage({});
+    setLoading(false);
+  },[project.id]);
+  useEffect(()=>{ load(); },[load]);
+  useEffect(()=>{
+    sb.from("major_project_oem_status_tbl").select("status").order("sort_order").then(({data})=>setStatuses((data||[]).map(r=>r.status)));
+    refreshPackageNames();
+  },[]);
+
+  const updateRow = async(row,patch)=>{
+    setRows(rs=>rs.map(r=>r.id===row.id?{...r,...patch}:r));
+    await sb.from("major_project_package_tbl").update({...patch,updated_at:new Date().toISOString()}).eq("id",row.id);
+  };
+
+  const addRow = async()=>{
+    const { data, error } = await sb.from("major_project_package_tbl").insert({project_id:project.id, package_name:"", oem_status:"Unknown", sales_rep:project.primary_sales_rep||"", created_by:user?.username||"unknown"}).select().single();
+    if(error){ alert("Couldn't add row: "+error.message); return; }
+    setRows(rs=>[...rs,data]);
+  };
+
+  return h("div",{style:{marginBottom:14,borderTop:"1px solid "+colors.border,paddingTop:12}},
+    h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,marginBottom:6}},"PACKAGES"),
+    loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+      h("div",{style:{display:"grid",gridTemplateColumns:"1.3fr 2fr 1fr",background:"#faf9f4",fontSize:10.5,color:colors.muted,padding:"6px 8px"}},
+        h("div",null,"Package name"), h("div",null,"Customers allocated"), h("div",null,"OEM status")
+      ),
+      rows.map(row=>h("div",{key:row.id,style:{display:"grid",gridTemplateColumns:"1.3fr 2fr 1fr",padding:"6px 8px",borderTop:"1px solid "+colors.border,alignItems:"center",gap:6}},
+        h(MasterSelect,{value:row.package_name,onChange:v=>updateRow(row,{package_name:v}),options:packageNameOptions,table:"package_name_tbl",valueCol:"value",fieldLabel:"Package name",placeholder:"Select or add…",style:{padding:"5px 7px",fontSize:11.5},refreshOptions:refreshPackageNames}),
+        h("div",{onClick:()=>row.package_name?setAddAllocFor(row):alert("Pick a Package name first."),style:{cursor:"pointer",display:"flex",gap:4,flexWrap:"wrap",alignItems:"center",minHeight:20}},
+          (allocByPackage[row.id]||[]).map(name=>h("span",{key:name,style:{fontSize:10.5,background:"#e6f1fb",color:"#0c447c",padding:"2px 7px",borderRadius:10}},name)),
+          h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"+ add")
+        ),
+        h("select",{value:row.oem_status,onChange:e=>updateRow(row,{oem_status:e.target.value}),style:{padding:"5px 7px",fontSize:11.5,border:"1px solid "+colors.border,borderRadius:5}},
+          statuses.map(s=>h("option",{key:s,value:s},s))
+        )
+      )),
+      h("div",{onClick:addRow,style:{padding:"6px 8px",borderTop:"1px solid "+colors.border,cursor:"pointer",fontSize:11.5,color:colors.mutedLight}},"+ add package row")
+    ),
+    addAllocFor && h(AddAllocationModal,{pkg:addAllocFor, project, user, onCancel:()=>setAddAllocFor(null), onSaved:()=>{ setAddAllocFor(null); load(); }})
   );
 }
 
@@ -16608,6 +16735,7 @@ function MajorProjectFormModal({ initial, onCancel, onSaved, user }){
         h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Notes"),
         h("textarea",{value:f.notes||"",onChange:e=>set("notes",e.target.value),rows:2,style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%",resize:"vertical"}})
       ),
+      f.id && h(ProjectPackagesSubform,{project:f, user}),
       h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14}},
         h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
         h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save project")
@@ -16722,25 +16850,187 @@ function MajorProjectPackageFormModal({ project, initial, onCancel, onSaved, use
 // BOTH package_id (canonical, what's queried/filtered on) AND company_name
 // (Main EPC, for readability in the log itself and so this activity also
 // surfaces naturally on that company's own Activity history in Customers).
-function MajorProjectPackageDetail({ pkg, project, user, onBack, onEdit, onCreateQuoteFromPackage, onOpenQuote }){
-  const [showCreateQuote,setShowCreateQuote] = useState(false);
-  const [createQuoteRef,setCreateQuoteRef] = useState("");
-  const [createQuoteMsg,setCreateQuoteMsg] = useState("");
-  const [creatingQuote,setCreatingQuote] = useState(false);
+// Customer Allocations — a Package can go to MULTIPLE customers at once
+// (OEM X, OEM Y, Skid Manu Z under one package), each with its own status
+// and its own quote. Adding one prompts to tag that customer with this
+// package's name as a Customer Type if it isn't already — the type list
+// grows from real assignments, never pre-seeded.
+function PackageAllocationsSection({ pkg, project, user, onCreateQuoteFromAllocation, onOpenQuote }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [showAdd,setShowAdd] = useState(false);
+  const [linkFor,setLinkFor] = useState(null);
 
-  const submitCreateQuote = async()=>{
-    const val = createQuoteRef.trim();
-    if(!val){ setCreateQuoteMsg("Enter a Quote# first."); return; }
-    setCreatingQuote(true); setCreateQuoteMsg("");
-    try{
-      const { data:existing } = await sb.from("estimates").select("reference_number").eq("reference_number",val).limit(1);
-      if(existing && existing.length>0){ setCreateQuoteMsg("Quote# \""+val+"\" already exists — pick a different number."); setCreatingQuote(false); return; }
-      setShowCreateQuote(false); setCreateQuoteRef("");
-      onCreateQuoteFromPackage(val, pkg.id, project.main_epc_company_name);
-    } catch(e){ setCreateQuoteMsg("Couldn't check: "+e.message); }
-    finally { setCreatingQuote(false); }
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("package_customer_allocation_tbl").select("*").eq("package_id",pkg.id).order("created_at");
+    setRows(data||[]);
+    setLoading(false);
+  },[pkg.id]);
+  useEffect(()=>{ load(); },[load]);
+
+  const createQuoteFor = (row)=>{
+    const ref = prompt("New Quote# for "+row.company_name+" (e.g. FEX260601):");
+    if(!ref || !ref.trim()) return;
+    (async()=>{
+      const { data:existing } = await sb.from("estimates").select("reference_number").eq("reference_number",ref.trim()).limit(1);
+      if(existing && existing.length>0){ alert("Quote# \""+ref.trim()+"\" already exists — pick a different number."); return; }
+      onCreateQuoteFromAllocation(ref.trim(), row.id, row.company_name);
+    })();
   };
 
+  return h("div",{style:{marginBottom:16}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}},
+      h("div",{style:{fontWeight:700,fontSize:13}},"Customer allocations ("+rows.length+")"),
+      h("button",{onClick:()=>setShowAdd(true),style:btnSmall},"+ Add customer allocation")
+    ),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    rows.length===0?h("div",{style:{fontSize:12,color:colors.mutedLight,padding:"10px 0"}},"No customers allocated to this package yet."):
+    h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+      rows.map(row=>h("div",{key:row.id,style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,background:"#fff"}},
+        h("div",null,
+          h("div",{style:{fontWeight:600,fontSize:13}},row.company_name),
+          h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},row.oem_status)
+        ),
+        row.linked_reference_number
+          ? h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+              h("span",{style:{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Linked to Quote# "+row.linked_reference_number),
+              onOpenQuote && h("button",{onClick:()=>onOpenQuote(row.linked_reference_number,1),style:btnSmall},"Open Quote#")
+            )
+          : h("div",{style:{display:"flex",gap:8}},
+              h("button",{onClick:()=>createQuoteFor(row),style:btnSmall},"Create quote"),
+              h("button",{onClick:()=>setLinkFor(row),style:btnSmall},"Link existing Quote#")
+            )
+      ))
+    ),
+    showAdd && h(AddAllocationModal,{pkg,project,user,onCancel:()=>setShowAdd(false),onSaved:()=>{setShowAdd(false);load();}}),
+    linkFor && h(LinkExistingQuoteModal,{allocation:linkFor,onCancel:()=>setLinkFor(null),onSaved:()=>{setLinkFor(null);load();}})
+  );
+}
+
+// Search an existing company, allocate it to this package, and — if it
+// doesn't already carry this package's name as a Customer Type — offer to
+// tag it right there. The type vocabulary grows from real assignments.
+function AddAllocationModal({ pkg, project, user, onCancel, onSaved }){
+  const [q,setQ] = useState("");
+  const [matches,setMatches] = useState([]);
+  const [picked,setPicked] = useState(null);
+  const [needsTypePrompt,setNeedsTypePrompt] = useState(false);
+  const [saving,setSaving] = useState(false);
+
+  useEffect(()=>{
+    const t = q.trim();
+    if(t.length<2){ setMatches([]); return; }
+    let cancelled=false;
+    const timer = setTimeout(async()=>{
+      const { data } = await sb.from("companies").select("company_name").ilike("company_name","%"+t+"%").order("company_name").limit(15);
+      if(!cancelled) setMatches((data||[]).map(c=>c.company_name));
+    },300);
+    return ()=>{ cancelled=true; clearTimeout(timer); };
+  },[q]);
+
+  const pick = async(companyName)=>{
+    setPicked(companyName);
+    const { data } = await sb.from("company_customer_type_tbl").select("id").eq("company_name",companyName).eq("customer_type",pkg.package_name).maybeSingle();
+    setNeedsTypePrompt(!data);
+  };
+
+  const finish = async(addType)=>{
+    setSaving(true);
+    try{
+      const { error } = await sb.from("package_customer_allocation_tbl").insert({package_id:pkg.id, company_name:picked, oem_status:"Unknown", created_by:user?.username||"unknown"});
+      if(error) throw error;
+      if(addType){
+        try{ await sb.from("customer_type_tbl").insert({value:pkg.package_name}); } catch(ignoreDup){}
+        try{ await sb.from("company_customer_type_tbl").insert({company_name:picked, customer_type:pkg.package_name, created_by:user?.username||"unknown"}); } catch(ignoreDup){}
+      }
+      await logAudit("INSERT","package_customer_allocation_tbl",String(pkg.id),"Allocated "+picked+" to package "+pkg.package_name,user?.username||"unknown",null,{company_name:picked});
+      onSaved();
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally { setSaving(false); }
+  };
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:400,maxWidth:"100%"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:12}},"Add customer allocation"),
+      !picked ? h(React.Fragment,null,
+        h("input",{value:q,onChange:e=>setQ(e.target.value),placeholder:"Type to search customers…",style:{...inputStyle,width:"100%",marginBottom:8}}),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:6,maxHeight:220,overflow:"auto"}},
+          matches.map(m=>h("div",{key:m,onClick:()=>pick(m),style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",cursor:"pointer",fontSize:12.5}},m))
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:14}},
+          h("button",{onClick:onCancel,style:btnSecondary},"Cancel")
+        )
+      ) : h(React.Fragment,null,
+        h("div",{style:{fontSize:12.5,marginBottom:12}},"Allocate ",h("strong",null,picked)," to this package?"),
+        needsTypePrompt && h("div",{style:{background:"#fff4d6",borderRadius:6,padding:"10px 12px",fontSize:12,color:"#854f0b",marginBottom:12}},
+          picked+" doesn't have the type \""+pkg.package_name+"\" yet — add it?",
+          h("div",{style:{display:"flex",gap:8,marginTop:8}},
+            h("button",{onClick:()=>finish(true),disabled:saving,style:btnSmall},"Yes, add type"),
+            h("button",{onClick:()=>finish(false),disabled:saving,style:btnSmall},"No")
+          )
+        ),
+        !needsTypePrompt && h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setPicked(null),style:btnSecondary},"Back"),
+          h("button",{onClick:()=>finish(false),disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Add allocation")
+        )
+      )
+    )
+  );
+}
+
+// Attach a quote that already exists (built independently of this
+// allocation) rather than creating a new one — the reverse of Create Quote.
+function LinkExistingQuoteModal({ allocation, onCancel, onSaved }){
+  const [q,setQ] = useState("");
+  const [matches,setMatches] = useState([]);
+  const [saving,setSaving] = useState(false);
+
+  useEffect(()=>{
+    const t = q.trim();
+    if(t.length<2){ setMatches([]); return; }
+    let cancelled=false;
+    const timer = setTimeout(async()=>{
+      const { data } = await sb.from("estimates").select("reference_number,customer_name").ilike("reference_number","%"+t+"%").is("linked_allocation_id",null).order("reference_number").limit(15);
+      if(!cancelled){
+        const seen = new Set(); const uniq=[];
+        (data||[]).forEach(r=>{ if(!seen.has(r.reference_number)){ seen.add(r.reference_number); uniq.push(r); } });
+        setMatches(uniq);
+      }
+    },300);
+    return ()=>{ cancelled=true; clearTimeout(timer); };
+  },[q]);
+
+  const link = async(ref)=>{
+    setSaving(true);
+    try{
+      const { error } = await sb.from("estimates").update({linked_allocation_id:allocation.id}).eq("reference_number",ref);
+      if(error) throw error;
+      await sb.from("package_customer_allocation_tbl").update({linked_reference_number:ref,updated_at:new Date().toISOString()}).eq("id",allocation.id);
+      onSaved();
+    } catch(e){ alert("Link failed: "+e.message); }
+    finally { setSaving(false); }
+  };
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:400,maxWidth:"100%"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Link existing Quote#"),
+      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:12}},"For "+allocation.company_name),
+      h("input",{value:q,onChange:e=>setQ(e.target.value),placeholder:"Type a Quote#…",style:{...inputStyle,width:"100%",marginBottom:8}}),
+      h("div",{style:{display:"flex",flexDirection:"column",gap:6,maxHeight:220,overflow:"auto"}},
+        matches.map(m=>h("div",{key:m.reference_number,onClick:()=>!saving&&link(m.reference_number),style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",cursor:"pointer",fontSize:12.5}},
+          h("div",{style:{fontWeight:600}},m.reference_number),
+          h("div",{style:{fontSize:11,color:colors.muted}},m.customer_name)
+        ))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:14}},
+        h("button",{onClick:onCancel,style:btnSecondary},"Cancel")
+      )
+    )
+  );
+}
+
+function MajorProjectPackageDetail({ pkg, project, user, onBack, onEdit, onCreateQuoteFromAllocation, onOpenQuote }){
   return h("div",{style:{padding:"20px 24px",maxWidth:900}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16,flexWrap:"wrap",gap:10}},
       h("div",null,
@@ -16750,25 +17040,12 @@ function MajorProjectPackageDetail({ pkg, project, user, onBack, onEdit, onCreat
           project.end_user_company_name+" · EPC: "+project.main_epc_company_name
         )
       ),
-      h("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
-        pkg.linked_reference_number
-          ? h(React.Fragment,null,
-              h("span",{style:{fontSize:11.5,fontWeight:700,padding:"6px 12px",borderRadius:20,background:"#eaf9f4",color:"#085041",alignSelf:"center"}},"Linked to Quote# "+pkg.linked_reference_number),
-              onOpenQuote && h("button",{onClick:()=>onOpenQuote(pkg.linked_reference_number,1),style:btnSecondary},"Open Quote#")
-            )
-          : onCreateQuoteFromPackage && h("button",{onClick:()=>{setShowCreateQuote(true);setCreateQuoteRef("");setCreateQuoteMsg("");},style:btnPrimary},"Create Quote"),
-        h("button",{onClick:onEdit,style:btnSecondary},"Edit package")
-      )
+      h("button",{onClick:onEdit,style:btnSecondary},"Edit package")
     ),
-    !pkg.linked_reference_number && pkg.oem_status!=="RFQ Received" && h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:12,marginTop:-8}},"Quotes are typically created once OEM status reaches RFQ Received — Create Quote is still available earlier if needed."),
     h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:20}},
       h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
         h("div",{style:{fontSize:10,color:colors.mutedLight}},"OEM status"),
         h("div",{style:{fontSize:13,fontWeight:700}},pkg.oem_status||"—")
-      ),
-      h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
-        h("div",{style:{fontSize:10,color:colors.mutedLight}},"Confirmed OEM"),
-        h("div",{style:{fontSize:13,fontWeight:700}},pkg.confirmed_oem||"—")
       ),
       h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
         h("div",{style:{fontSize:10,color:colors.mutedLight}},"Sales rep"),
@@ -16779,20 +17056,9 @@ function MajorProjectPackageDetail({ pkg, project, user, onBack, onEdit, onCreat
         h("div",{style:{fontSize:13,fontWeight:700}},pkg.next_followup_date||"—")
       )
     ),
+    h(PackageAllocationsSection,{pkg,project,user,onCreateQuoteFromAllocation,onOpenQuote}),
     h(PackageContactsSection,{pkg,project,user}),
-    h(PackageActivitySection,{pkg,project,user}),
-    showCreateQuote && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
-      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
-        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Create Quote"),
-        h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"From package \""+pkg.package_name+"\" — customer will be pre-filled as "+project.main_epc_company_name+"."),
-        h("input",{value:createQuoteRef,onChange:e=>setCreateQuoteRef(e.target.value),placeholder:"New Quote# (e.g. FEX260601)",style:{...inputStyle,width:"100%",marginBottom:8}}),
-        createQuoteMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},createQuoteMsg),
-        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
-          h("button",{onClick:()=>setShowCreateQuote(false),style:btnSecondary},"Cancel"),
-          h("button",{onClick:submitCreateQuote,disabled:creatingQuote,style:{...btnPrimary,opacity:creatingQuote?0.6:1}},creatingQuote?"Checking…":"Continue to Estimator")
-        )
-      )
-    )
+    h(PackageActivitySection,{pkg,project,user})
   );
 }
 
@@ -21014,7 +21280,7 @@ function App() {
     tab==="bolting_calc"?h("div",null,h(BoltingCalculator,{user}),h(BoltingCalcHistoryViewer,{user})):
     tab==="flange_chart"?h(FlangeChart,{user}):
     tab==="major_projects"?h(MajorProjectsScreen,{user,
-      onCreateQuoteFromPackage:(ref,pkgId,prefillCustomerName)=>{ setPendingNewSlNo({reference_number:ref,item_sl_no:1,linked_package_id:pkgId,prefillCustomerName}); setTab("estimator"); },
+      onCreateQuoteFromAllocation:(ref,allocationId,prefillCustomerName)=>{ setPendingNewSlNo({reference_number:ref,item_sl_no:1,linked_allocation_id:allocationId,prefillCustomerName}); setTab("estimator"); },
       onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}
     }):
     tab==="major_projects_kanban"?h(MajorProjectPackageKanban,{user}):
