@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T14:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T15:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -3799,6 +3799,20 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const [showMOC,setShowMOC]=useState(false);
   const [mocLines,setMocLines]=useState([]);
   const [mocSelections,setMocSelections]=useState({});
+  // Exploded-row state — only relevant for a shape group whose lines
+  // already carry more than one distinct grade (genuine divergence, not
+  // just "multiple grade options exist"). mocLineSelections/mocLineLabels
+  // are keyed per line id instead of per shape. Labels are a UI forcing
+  // function only (never persisted) — required on an ambiguous line (same
+  // component/sub_assembly as another line in the group) before Apply;
+  // not shown at all on a line whose component/sub_assembly already tells
+  // it apart ("set by rule").
+  const [mocLineSelections,setMocLineSelections]=useState({});
+  const [mocLineLabels,setMocLineLabels]=useState({});
+  // Lines deleted from an ambiguous group via the MOC wizard — held here
+  // until the cart is actually saved (see saveReference), then committed
+  // to bom_line_exceptions with the real reference_number/item_sl_no.
+  const [mocDeletedExceptions,setMocDeletedExceptions]=useState([]);
   const [mocMode,setMocMode]=useState("shape"); // "shape" or "freetext"
   const [freeText,setFreeText]=useState("");
   const [parsedMatches,setParsedMatches]=useState(null); // null = not yet parsed
@@ -4009,17 +4023,47 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       specs.forEach(spec=>{ (gradesBySpec.get(spec)||[]).forEach(g=>grades.add(g.grade)); });
       val.gradeOptions = Array.from(grades).sort();
       val.specs = specs;
+      // Explode only when the group's OWN lines already carry more than
+      // one distinct grade — real divergence, not just "this shape has
+      // several grade options available" (true of almost every shape).
+      const distinctGrades = new Set(val.lines.map(l=>l.grade).filter(Boolean));
+      val.needsExplode = distinctGrades.size>1;
+      if(val.needsExplode){
+        const idCounts = new Map();
+        val.lines.forEach(l=>{
+          const idKey = (l.component||"")+"|"+(l.sub_assembly||"");
+          idCounts.set(idKey,(idCounts.get(idKey)||0)+1);
+        });
+        val.lines.forEach(l=>{
+          const idKey = (l.component||"")+"|"+(l.sub_assembly||"");
+          l._ambiguous = idCounts.get(idKey)>1;
+          l._idLabel = l.component||l.sub_assembly||"";
+        });
+      }
     });
     return Array.from(map.values()).sort((a,b)=>b.lines.length-a.lines.length);
   },[mocLines, gradesBySpec]);
 
   const applyMOC = ()=>{
+    // Every ambiguous line in an exploded group needs a label before Apply
+    // — the label itself is never stored, it's just a forcing function so
+    // nobody applies a grade to the wrong line by mistake.
+    for(const sg of shapeGroups){
+      if(!sg.needsExplode) continue;
+      for(const l of sg.lines){
+        if(l._ambiguous && !(mocLineLabels[l.id]||"").trim()){
+          alert("Add a label for the highlighted "+sg.shape+" line(s) before applying.");
+          return;
+        }
+      }
+    }
     // For each line, find its shape group, get the selected grade, look up rate
     const newOverrides = {};
     mocLines.forEach(l=>{
       const key = l.material_shape || l.material_spec || "";
-      const selGrade = mocSelections[key];
-      if(!selGrade) return; // skip unselected shapes
+      const sg = shapeGroups.find(g=>g.shape===key);
+      const selGrade = (sg && sg.needsExplode) ? mocLineSelections[l.id] : mocSelections[key];
+      if(!selGrade) return; // skip unselected shapes/lines
       const spec = l.material_spec||"";
       const hit = spec ? rateBySpecGrade.get(spec+"||"+selGrade) : null;
       newOverrides[l.id] = { grade: selGrade, rate: hit ? hit.rate : 0 };
@@ -4028,14 +4072,31 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setShowMOC(false);
   };
 
+  // A brand-new, not-yet-saved quote has no existingQuoteHeader at all —
+  // treated as Draft (nothing's been sent to a customer yet). Once a real
+  // quote_status is known and isn't Draft, delete is blocked outright — no
+  // admin bypass, no code. Draft deletion is unrestricted but still logged
+  // and flagged.
+  const isDraftQuote = !existingQuoteHeader || existingQuoteHeader.quoteStatus==="Draft";
+  const deleteMocLine = (line)=>{
+    if(!isDraftQuote){ alert("Can't delete a BOM line once the quote has left Draft."); return; }
+    setMocLines(ml=>ml.filter(x=>x.id!==line.id));
+    setLines(l=>l.filter(x=>x.id!==line.id));
+    setOverrides(o=>{ const n={...o}; delete n[line.id]; return n; });
+    setMocLineSelections(s=>{ const n={...s}; delete n[line.id]; return n; });
+    setMocLineLabels(s=>{ const n={...s}; delete n[line.id]; return n; });
+    setMocDeletedExceptions(ex=>[...ex,{shape:line.material_shape||"",component:line.component||"",sub_assembly:line.sub_assembly||"",grade:line.grade||"",material_spec:line.material_spec||""}]);
+    logAudit("DELETE","estimate_lines",(refNumber||"(unsaved)")+"-"+(itemSlNo||"?"),"Removed ambiguous BOM line (\""+(line.component||line.material_shape||"line")+"\") via MOC wizard — flagged as exception",user?.username||"unknown",line,null);
+  };
+
   const cancelMOC = ()=>{ setShowMOC(false); setMocMode("shape"); setFreeText(""); setParsedMatches(null); };
   // Distinct from cancelMOC above: that one deliberately keeps the model
   // selected and drops you into manual per-line grading. This one fully
   // abandons the model pick and returns to "no model selected" — Escape
   // always does this; the popup also gets an explicit close button for it.
   const abandonModelSelection = ()=>{
-    setShowMOC(false); setSelectedModel(null); setLines([]); setOverrides({});
-    setMocSelections({}); setMocLines([]); setMocMode("shape"); setFreeText(""); setParsedMatches(null);
+    setShowMOC(false); setSelectedModel(null); setLines([]); setOverrides({}); setMocDeletedExceptions([]);
+    setMocSelections({}); setMocLines([]); setMocLineSelections({}); setMocLineLabels({}); setMocMode("shape"); setFreeText(""); setParsedMatches(null);
   };
   useEffect(()=>{
     if(!showMOC) return;
@@ -4476,7 +4537,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       "Clear all",
       ()=>{
         logAudit("UPDATE","estimate_cart","clear-cart",cart.length+" unsaved cart item(s) and header cleared before saving"+(refNumber?" (Quote# "+refNumber+")":""),user?.username||"unknown",null,null);
-        setSelectedModel(null);setLines([]);setOverrides({});setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setCurrency("INR");setConversionRate("1");setCustomerName("");setCustomerAddress("");setContactName("");setContactDesignation("");setSignatoryName("");setSignatoryDesignation("");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg("");
+        setSelectedModel(null);setLines([]);setOverrides({});setMocDeletedExceptions([]);setCart([]);setRefNumber("");setRefDesc("");setItemSlNo("");setEnquiryNumber("");setEnquiryDate("");setQuoteDate("");setCurrency("INR");setConversionRate("1");setCustomerName("");setCustomerAddress("");setContactName("");setContactDesignation("");setSignatoryName("");setSignatoryDesignation("");setExistingQuoteHeader(null);setQuoteDecision(null);setSlNoPickerValue("");setShowSave(false);setSaveMsg("");
       }
     );
   };
@@ -4522,7 +4583,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     if(gatewaySiblings.some(r=>r.item_sl_no===slNo)){ setGatewaySlNoWarn(true); return; }
     setGatewayBusy(true);
     const ref = gatewayRef.trim();
-    const { data } = await sb.from("estimates").select("enquiry_number,enquiry_date,quote_date,currency,conversion_rate,customer_name,customer_address,contact_name,contact_designation,signatory_name,signatory_designation").eq("reference_number",ref).order("item_sl_no").limit(1);
+    const { data } = await sb.from("estimates").select("enquiry_number,enquiry_date,quote_date,currency,conversion_rate,customer_name,customer_address,contact_name,contact_designation,signatory_name,signatory_designation,quote_status").eq("reference_number",ref).order("item_sl_no").limit(1);
     setGatewayBusy(false);
     const head = (data&&data[0])||{};
     setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
@@ -4531,7 +4592,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setContactName(head.contact_name||""); setContactDesignation(head.contact_designation||"");
     setSignatoryName(head.signatory_name||""); setSignatoryDesignation(head.signatory_designation||"");
     setRefNumber(ref); setItemSlNo(String(slNo)); setRefDesc("");
-    setExistingQuoteHeader({ usedSlNos: gatewaySiblings.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
+    setExistingQuoteHeader({ usedSlNos: gatewaySiblings.map(r=>r.item_sl_no).sort((a,b)=>a-b), quoteStatus: head.quote_status||"Draft" });
     setGatewayConfirmedNewSlNo(true);
     setShowAddGateway(false);
     setCustomerCountry(await fetchCustomerCountry(head.customer_name));
@@ -4551,8 +4612,8 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       // data from an unrelated earlier model silently rides along into the
       // save — this was a real bug (reported as "random model data" landing
       // in a new Sl No), not intentional carry-over.
-      setCart([]); setSelectedModel(null); setLines([]); setOverrides({});
-      setShowMOC(false); setMocSelections({}); setMocLines([]); setMocMode("shape");
+      setCart([]); setSelectedModel(null); setLines([]); setOverrides({}); setMocDeletedExceptions([]);
+      setShowMOC(false); setMocSelections({}); setMocLines([]); setMocLineSelections({}); setMocLineLabels({}); setMocMode("shape");
       setFreeText(""); setParsedMatches(null); setModelFilter("");
       setIsCustomModel(false); setDirectPriceLine(null);
       setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
@@ -4578,8 +4639,8 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   // automatically. Both funnel through the same unsaved-cart check; the
   // only difference is where they land afterward.
   const resetCart = ()=>{
-    setCart([]); setSelectedModel(null); setLines([]); setOverrides({});
-    setShowMOC(false); setMocSelections({}); setMocLines([]); setMocMode("shape");
+    setCart([]); setSelectedModel(null); setLines([]); setOverrides({}); setMocDeletedExceptions([]);
+    setShowMOC(false); setMocSelections({}); setMocLines([]); setMocLineSelections({}); setMocLineLabels({}); setMocMode("shape");
     setFreeText(""); setParsedMatches(null); setModelFilter("");
     setIsCustomModel(false); setDirectPriceLine(null); setHoldingNewSlNo(null);
     setUnsavedGuard(false);
@@ -4669,7 +4730,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const lookupQuoteHeader = async()=>{
     const ref = refNumber.trim();
     if(!ref){ setExistingQuoteHeader(null); return; }
-    const { data } = await sb.from("estimates").select("item_sl_no,model,enquiry_number,enquiry_date,quote_date,description,currency,conversion_rate,customer_name,customer_address,contact_name,contact_designation,signatory_name,signatory_designation").eq("reference_number",ref).order("item_sl_no");
+    const { data } = await sb.from("estimates").select("item_sl_no,model,enquiry_number,enquiry_date,quote_date,description,currency,conversion_rate,customer_name,customer_address,contact_name,contact_designation,signatory_name,signatory_designation,quote_status").eq("reference_number",ref).order("item_sl_no");
     if(data && data.length>0){
       setQuoteDecision({ ref, rows: data });
       setSlNoPickerValue(String(data[0].item_sl_no));
@@ -4686,7 +4747,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setContactName(head.contact_name||""); setContactDesignation(head.contact_designation||"");
     setSignatoryName(head.signatory_name||""); setSignatoryDesignation(head.signatory_designation||"");
     if(!refDesc) setRefDesc(head.description||"");
-    setExistingQuoteHeader({ usedSlNos: quoteDecision.rows.map(r=>r.item_sl_no).sort((a,b)=>a-b) });
+    setExistingQuoteHeader({ usedSlNos: quoteDecision.rows.map(r=>r.item_sl_no).sort((a,b)=>a-b), quoteStatus: quoteDecision.rows[0].quote_status||"Draft" });
     setItemSlNo("");
     setQuoteDecision(null);
     setCustomerCountry(await fetchCustomerCountry(head.customer_name));
@@ -4789,6 +4850,16 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       }
       const rows=effectiveCart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||"",is_direct_price:l.is_direct_price===true,validation_status:l.validation_status||null,excel_file_name:l.excel_file_name||null,excel_file_path:l.excel_file_path||null,no_excel_code_used:l.no_excel_code_used||null,added_by:l.added_by||null,custom_item:l.custom_item||null,custom_model_recorded:l.custom_model_recorded||null}));
       const{error:insErr}=await sb.from("estimate_lines").insert(rows); if(insErr)throw insErr;
+      if(mocDeletedExceptions.length>0){
+        try{
+          await sb.from("bom_line_exceptions").insert(mocDeletedExceptions.map(ex=>({
+            reference_number:ref, item_sl_no:slNo, shape:ex.shape, component:ex.component,
+            sub_assembly:ex.sub_assembly, grade:ex.grade, material_spec:ex.material_spec,
+            deleted_by:user.username
+          })));
+        } catch(exErr){ /* non-fatal — the quote itself saved fine; the exception record is best-effort */ }
+        setMocDeletedExceptions([]);
+      }
       const successMsg = "Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).";
       setSaveMsg(successMsg); if(!showSave) alert(successMsg);
       setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setConversionRate("1"); setCustomerName(""); setCustomerAddress(""); setContactName(""); setContactDesignation(""); setSignatoryName(""); setSignatoryDesignation(""); setExistingQuoteHeader(null); setShowSave(false);
@@ -4913,17 +4984,39 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         mocMode==="shape" && h("div", {style:{padding:"16px 20px"}},
           h("div", {style:{fontSize:11,color:"#8a8f7e",marginBottom:10,letterSpacing:"0.04em"}}, "MATERIAL SHAPES IN THIS MODEL ("+shapeGroups.length+")"),
           shapeGroups.length===0 ? h("div", {style:{color:"#8a8f7e",fontSize:13,padding:"12px 0"}},"No material shapes found — grades can be selected per line in the table.") :
-          shapeGroups.map(sg=>h("div", {key:sg.shape, style:{display:"flex",alignItems:"center",padding:"10px 12px",borderRadius:8,border:"0.5px solid #d8d4c5",marginBottom:8,background:"#faf9f4",gap:12}},
-            h("div", {style:{minWidth:130}},
-              h("div", {style:{fontSize:13,fontWeight:600,color:"#1c1f1a"}}, sg.shape||"(no shape)"),
-              h("div", {style:{fontSize:11,color:"#8a8f7e"}}, sg.lines.length+" line"+(sg.lines.length!==1?"s":""))
-            ),
-            h("select", {value:mocSelections[sg.shape]||"", onChange:e=>setMocSelections(s=>({...s,[sg.shape]:e.target.value})), style:{flex:1,padding:"8px 10px",border:"0.5px solid #d8d4c5",borderRadius:6,fontSize:13,background:"#fff",color:"#1c1f1a",fontFamily:"inherit"}},
-              h("option",{value:""},"Select grade…"),
-              sg.gradeOptions.length>0 ? sg.gradeOptions.map(g=>h("option",{key:g,value:g},g)) : h("option",{disabled:true,value:""},"No rates found — set manually")
-            ),
-            mocSelections[sg.shape]&&h("span",{style:{background:"#e1f5ee",color:"#0f6e56",fontSize:11,padding:"3px 8px",borderRadius:10,whiteSpace:"nowrap",marginLeft:4}},"✓")
-          ))
+          shapeGroups.map(sg=>
+            !sg.needsExplode
+            ? h("div", {key:sg.shape, style:{display:"flex",alignItems:"center",padding:"10px 12px",borderRadius:8,border:"0.5px solid #d8d4c5",marginBottom:8,background:"#faf9f4",gap:12}},
+                h("div", {style:{minWidth:130}},
+                  h("div", {style:{fontSize:13,fontWeight:600,color:"#1c1f1a"}}, sg.shape||"(no shape)"),
+                  h("div", {style:{fontSize:11,color:"#8a8f7e"}}, sg.lines.length+" line"+(sg.lines.length!==1?"s":""))
+                ),
+                h("select", {value:mocSelections[sg.shape]||"", onChange:e=>setMocSelections(s=>({...s,[sg.shape]:e.target.value})), style:{flex:1,padding:"8px 10px",border:"0.5px solid #d8d4c5",borderRadius:6,fontSize:13,background:"#fff",color:"#1c1f1a",fontFamily:"inherit"}},
+                  h("option",{value:""},"Select grade…"),
+                  sg.gradeOptions.length>0 ? sg.gradeOptions.map(g=>h("option",{key:g,value:g},g)) : h("option",{disabled:true,value:""},"No rates found — set manually")
+                ),
+                mocSelections[sg.shape]&&h("span",{style:{background:"#e1f5ee",color:"#0f6e56",fontSize:11,padding:"3px 8px",borderRadius:10,whiteSpace:"nowrap",marginLeft:4}},"✓")
+              )
+            : h("div",{key:sg.shape, style:{marginBottom:10}},
+                sg.lines.map(l=>h("div",{key:l.id, style:{display:"flex",flexDirection:"column",padding:"10px 12px",borderRadius:8,border:"0.5px solid "+(l._ambiguous?"#e8c165":"#d8d4c5"),marginBottom:6,background:l._ambiguous?"#fff8e1":"#faf9f4"}},
+                  h("div",{style:{display:"flex",alignItems:"center",gap:10}},
+                    h("div",{style:{minWidth:80,fontSize:13,fontWeight:600,color:"#1c1f1a"}}, sg.shape||"(no shape)"),
+                    h("select",{value:mocLineSelections[l.id]||"", onChange:e=>setMocLineSelections(s=>({...s,[l.id]:e.target.value})), style:{flex:1,padding:"7px 9px",border:"0.5px solid #d8d4c5",borderRadius:6,fontSize:13,background:"#fff",color:"#1c1f1a",fontFamily:"inherit"}},
+                      h("option",{value:""},"Select grade…"),
+                      sg.gradeOptions.length>0 ? sg.gradeOptions.map(g=>h("option",{key:g,value:g},g)) : h("option",{disabled:true,value:""},"No rates found — set manually")
+                    ),
+                    l._ambiguous && h("input",{type:"text",value:mocLineLabels[l.id]||"",onChange:e=>setMocLineLabels(s=>({...s,[l.id]:e.target.value})),placeholder:"Label (required)",style:{flex:1,padding:"7px 9px",border:"0.5px solid "+(mocLineLabels[l.id]?"#d8d4c5":"#e8c165"),borderRadius:6,fontSize:13,fontFamily:"inherit"}}),
+                    mocLineSelections[l.id]&&h("span",{style:{background:"#e1f5ee",color:"#0f6e56",fontSize:11,padding:"3px 8px",borderRadius:10,whiteSpace:"nowrap"}},"✓"),
+                    h("button",{onClick:()=>deleteMocLine(l),title:isDraftQuote?"Delete this line — flagged as an exception":"Can't delete once the quote has left Draft",disabled:!isDraftQuote,style:{border:"0.5px solid "+(isDraftQuote?"#d85a4a":"#d8d4c5"),color:isDraftQuote?"#a32d2d":"#b4b2a9",background:"#fff",borderRadius:6,padding:"6px 9px",cursor:isDraftQuote?"pointer":"not-allowed",fontSize:13}},h("i",{className:"ti ti-trash","aria-hidden":"true"}))
+                  ),
+                  h("div",{style:{fontSize:10.5,color:l._ambiguous?"#7a5000":"#8a8f7e",marginTop:5,marginLeft:90}},
+                    l._ambiguous
+                      ? "ambiguous — same component as another line, needs a label"
+                      : (l._idLabel ? (l._idLabel+" — set by rule") : "")+((l.material_spec&&mocLineSelections[l.id])?((l._idLabel?" · ":"")+l.material_spec+", "+mocLineSelections[l.id]):"")
+                  )
+                ))
+              )
+          )
         ),
 
         // FREE TEXT MODE body
@@ -5314,7 +5407,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         h("div",{style:{marginTop:14,display:"flex",gap:8,flexWrap:"wrap"}},
           h("button",{onClick:()=>{
             if(!confirm("Clear all "+lines.length+" line item(s) from this draft? This cannot be undone.")) return;
-            requestCodeConfirm("Confirm clearing the lines","This removes all "+lines.length+" line item(s) from the current draft BOM. This can't be undone.","Clear all lines",()=>{ setLines([]); setOverrides({}); });
+            requestCodeConfirm("Confirm clearing the lines","This removes all "+lines.length+" line item(s) from the current draft BOM. This can't be undone.","Clear all lines",()=>{ setLines([]); setOverrides({}); setMocDeletedExceptions([]); });
           },disabled:lines.length===0,style:{...btnSecondary,color:colors.danger,borderColor:"#f0b8b8",opacity:lines.length===0?0.5:1}},"Clear all lines"),
           h("button",{onClick:saveEstimateFromBom,disabled:simpleSaving,style:{...btnPrimary,marginLeft:"auto",opacity:simpleSaving?0.6:1}},simpleSaving?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Save estimate")
         )
@@ -8892,6 +8985,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     });
     return ()=>{ cancelled=true; };
   },[openRef&&openRef.linked_package_id]);
+  // BOM line exceptions — lines removed from an ambiguous MOC group via
+  // the Estimator's Select MOC wizard, only ever possible while the quote
+  // was still Draft. Purely informational here; nothing to action.
+  const [bomExceptions,setBomExceptions]=useState([]);
+  useEffect(()=>{
+    let cancelled=false;
+    if(!openRef){ setBomExceptions([]); return; }
+    sb.from("bom_line_exceptions").select("*").eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no).order("deleted_at",{ascending:false}).then(({data})=>{
+      if(!cancelled) setBomExceptions(data||[]);
+    });
+    return ()=>{ cancelled=true; };
+  },[openRef&&openRef.reference_number, openRef&&openRef.item_sl_no]);
   const [dpFileName,setDpFileName]=useState(""); const [dpFilePath,setDpFilePath]=useState("");
   const [dpUploading,setDpUploading]=useState(false);
   const [dpCodeInput,setDpCodeInput]=useState(""); const [dpCodeVerifying,setDpCodeVerifying]=useState(false);
@@ -11311,7 +11416,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry#: "+(openRef.enquiry_number||"—")),
                   h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry date: "+(openRef.enquiry_date||"—")),
                   h("span",{style:{fontSize:12,color:colors.muted}},"Quote date: "+(openRef.quote_date||"—")),
-                  linkedPackageInfo && h("span",{style:{fontSize:12,fontWeight:600,padding:"2px 9px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Major Project: "+linkedPackageInfo.projectName+" · "+linkedPackageInfo.packageName)
+                  linkedPackageInfo && h("span",{style:{fontSize:12,fontWeight:600,padding:"2px 9px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Major Project: "+linkedPackageInfo.projectName+" · "+linkedPackageInfo.packageName),
+                  bomExceptions.length>0 && h("span",{
+                    style:{fontSize:12,fontWeight:600,padding:"2px 9px",borderRadius:20,background:"#fff4d6",color:"#854f0b",cursor:"pointer"},
+                    title:bomExceptions.map(ex=>(ex.shape||ex.component||"line")+" ("+(ex.grade||"no grade")+") — removed by "+(ex.deleted_by||"unknown")+" "+new Date(ex.deleted_at).toLocaleDateString()).join("\n")
+                  },"⚠ "+bomExceptions.length+" BOM exception"+(bomExceptions.length>1?"s":""))
                 ),
                 h("div",{style:{display:"flex",alignItems:"center",gap:8,marginTop:4}},
                   h("span",{style:{fontSize:12,color:colors.muted}},"Model: "+(headerModel||"—")+(headerModel&&modelItemMap.get(headerModel)?"  ("+modelItemMap.get(headerModel)+")":"")),                  !openRef.model && headerModel && h("button",{onClick:fixHeaderModel,disabled:fixingModel,style:{...btnSmall,color:"#b8472f",borderColor:"#e3b9b9"}},fixingModel?"Fixing…":"Fix — save Model to this estimate")
