@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T04:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T06:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -554,7 +554,7 @@ function isSlNoLabel(label){
 // mocLines must be the ticked ("Show in MOC") lines for that one Sl No only.
 function buildDatasheetSectionRows(template, fieldValues, mocRow, slLines, model, slNo){
   const values = fieldValues || {};
-  const materialDataRows = buildMocMaterialDataRows(mocRow, slLines||[]);
+  const materialDataRows = buildMocMaterialDataRows(mocRow, slLines||[], values.__mocChoices);
   return template.sections.map(section=>{
     const deleted = new Set((values.__deletedKeys && values.__deletedKeys[section.no]) || []);
     let base;
@@ -5686,6 +5686,50 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
   );
 }
 
+// Inline resolver for a Material Data row with genuinely ambiguous grades —
+// two paths: pick one grade for the whole row, or split into one row per
+// grade with a user-typed label each (pre-filled from the matched BOM
+// line's own Sub Assembly/Component name — whichever field the rule ISN'T
+// matching on, so the pre-fill is actually informative). Local state only;
+// the parent writes the final choice into values.__mocChoices once made.
+function MocGradeRow({ row, onPickSingle, onPickSplit }){
+  const [mode,setMode] = useState(null); // null | "single" | "split"
+  const [singleVal,setSingleVal] = useState("");
+  const [splitLabels,setSplitLabels] = useState(()=> row.options.map(g=>(row.sourceLabelByGrade&&row.sourceLabelByGrade[g])||""));
+
+  if(mode===null){
+    return h("div",{style:{flex:1,display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
+      h("span",{style:{fontSize:11,color:colors.mutedLight}},"Multiple grades: "+row.options.join(", ")+" — showing: "+row.value),
+      h("button",{onClick:()=>setMode("single"),style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Pick just one grade"),
+      h("button",{onClick:()=>setMode("split"),style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Plug in all "+row.options.length)
+    );
+  }
+  if(mode==="single"){
+    return h("div",{style:{flex:1,display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
+      h("select",{value:singleVal,onChange:e=>setSingleVal(e.target.value),style:{...inputStyle,padding:"4px 7px",fontSize:12,width:160}},
+        h("option",{value:""},"Select grade…"),
+        row.options.map(o=>h("option",{key:o,value:o},o))
+      ),
+      h("button",{onClick:()=>{ if(singleVal) onPickSingle(singleVal); },disabled:!singleVal,style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Save"),
+      h("button",{onClick:()=>setMode(null),style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Back")
+    );
+  }
+  // mode==="split"
+  return h("div",{style:{flex:1}},
+    row.options.map((g,i)=>h("div",{key:g,style:{display:"flex",alignItems:"center",gap:8,marginBottom:4}},
+      h("span",{style:{fontSize:11,color:colors.muted,width:70,flexShrink:0}},g),
+      h("input",{value:splitLabels[i],spellCheck:true,onChange:e=>setSplitLabels(ls=>ls.map((l,idx)=>idx===i?e.target.value:l)),placeholder:"Label for "+g,style:{...inputStyle,padding:"4px 7px",fontSize:12,flex:1}})
+    )),
+    h("div",{style:{display:"flex",gap:8,marginTop:4}},
+      h("button",{onClick:()=>{
+        if(splitLabels.some(l=>!l.trim())){ alert("Every grade needs a label."); return; }
+        onPickSplit(row.options.map((g,i)=>({grade:g,label:splitLabels[i].trim()})));
+      },style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Save labels"),
+      h("button",{onClick:()=>setMode(null),style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Back")
+    )
+  );
+}
+
 function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose }) {
   const itemName = (modelItemMap&&model&&modelItemMap.get(model)) || (openLines && openLines[0] && openLines[0].item) || "";
   const [template,setTemplate] = useState(undefined); // undefined=loading, null=none found
@@ -5789,7 +5833,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   // Material Data is always rebuilt straight from Item MOC Rules matched
   // against the real BOM/estimate lines — whatever field list the
   // uploaded Excel defined for this section is ignored.
-  const materialDataRows = useMemo(()=> buildMocMaterialDataRows(mocRow, openLines||[]), [mocRow, openLines]);
+  const materialDataRows = useMemo(()=> buildMocMaterialDataRows(mocRow, openLines||[], values.__mocChoices), [mocRow, openLines, values.__mocChoices]);
   // Per-section "add line" draft inputs, keyed by section number: {label, value}
   const [addDraft,setAddDraft] = useState({});
   const [addLineSaving,setAddLineSaving] = useState({}); // {sectionNo: true} while the auto-save round-trip is in flight
@@ -5868,7 +5912,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
     const deleted = new Set(getDeletedKeys(section.no));
     let base;
     if(section.bomSection){
-      base = materialDataRows.map(r=>({ key:r.key, label:r.label, value:r.value }));
+      base = materialDataRows.map(r=>({ key:r.key, label:r.label, value:r.value, needsChoice:r.needsChoice, options:r.options, sourceLabelByGrade:r.sourceLabelByGrade }));
     } else {
       base = section.fields.map(f=>({ key:f.key, label:f.label, value:getDisplayValue(f), field:f }));
     }
@@ -6099,7 +6143,13 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
               ? h("div",{style:{padding:"10px 14px",fontSize:12,color:colors.mutedLight}},section.bomSection?"No lines ticked \"Show in MOC\" yet.":"No fields in this section.")
               : rows.map(row=>h("div",{key:row.key,style:{display:"flex",alignItems:"center",gap:8,padding:"6px 14px",fontSize:12.5,borderTop:"1px solid #f0efe8"}},
                   h("div",{style:{width:220,color:colors.muted,flexShrink:0}},row.label),
-                  h("div",{style:{flex:1,color:row.value?colors.text:colors.mutedLight}}, row.value||"— not filled —"),
+                  row.needsChoice
+                    ? h(MocGradeRow,{
+                        row,
+                        onPickSingle:(val)=>setField("__mocChoices",{...(values.__mocChoices||{}),[row.label]:{mode:"single",value:val}}),
+                        onPickSplit:(entries)=>setField("__mocChoices",{...(values.__mocChoices||{}),[row.label]:{mode:"split",entries}})
+                      })
+                    : h("div",{style:{flex:1,color:row.value?colors.text:colors.mutedLight}}, row.value||"— not filled —"),
                   h("button",{onClick:()=>deleteRow(section.no,row),title:"Delete this line",
                     style:{border:"none",background:"none",color:colors.danger,cursor:"pointer",fontSize:14,padding:"2px 6px",flexShrink:0}},"✕")
                 )),
@@ -15152,16 +15202,38 @@ function buildAutoDescription(masterRow, lines, itemName, sizeText){
 // returns structured {key,label,value} rows for Material Data instead of
 // a joined description string. One row per parameter that actually found
 // a match; multiple matching lines combine their values with " / ".
-function buildMocMaterialDataRows(mocRow, lines){
+function buildMocMaterialDataRows(mocRow, lines, mocChoices){
   if(!mocRow || !lines || lines.length===0) return [];
-  return (mocRow.parameters||[]).map((p,idx)=>{
-    const matches = lines.filter(l=> (p.match_field==="sub_assembly" ? l.sub_assembly : l.component) === p.match_value);
-    if(matches.length===0) return null;
-    const vals = matches.map(l=> p.value_source==="spec" ? (l.material_spec||"") : (l.grade||l.selGrade||"")).filter(Boolean);
-    if(vals.length===0) return null;
+  return (mocRow.parameters||[]).flatMap((p,idx)=>{
+    const matchVals = mocParamValues(p);
+    const matches = lines.filter(l=> matchVals.includes(p.match_field==="sub_assembly" ? l.sub_assembly : l.component));
+    if(matches.length===0) return [];
+    const gradeOf = l=> p.value_source==="spec" ? (l.material_spec||"") : (l.grade||l.selGrade||"");
+    const vals = matches.map(gradeOf).filter(Boolean);
+    if(vals.length===0) return [];
     const uniqueVals = Array.from(new Set(vals));
-    return { key:"moc-"+idx+"-"+(p.label||""), label:p.label||"(unlabeled)", value:uniqueVals.join(" / ") };
-  }).filter(Boolean);
+    const label = p.label||"(unlabeled)";
+    const baseKey = "moc-"+idx+"-"+label;
+    if(uniqueVals.length<=1) return [{ key:baseKey, label, value: uniqueVals[0]||"" }];
+    // Genuinely different grades/specs across the matched lines.
+    const choice = mocChoices && mocChoices[label];
+    if(choice && choice.mode==="single" && uniqueVals.includes(choice.value)){
+      return [{ key:baseKey, label, value: choice.value }];
+    }
+    if(choice && choice.mode==="split" && Array.isArray(choice.entries) && choice.entries.length===uniqueVals.length && choice.entries.every(e=>uniqueVals.includes(e.grade))){
+      return choice.entries.map((e,i)=>({ key:baseKey+"-"+i, label: e.label||label, value: e.grade }));
+    }
+    // Ambiguous, unresolved (or a stale split whose grade set has since
+    // changed — re-prompts from scratch rather than trying to reconcile).
+    // sourceLabelByGrade gives the split-form a sensible pre-fill per grade,
+    // pulled from whichever BOM field ISN'T what this rule matched on.
+    const sourceLabelByGrade = {};
+    uniqueVals.forEach(g=>{
+      const line = matches.find(l=>gradeOf(l)===g);
+      sourceLabelByGrade[g] = line ? ((p.match_field==="sub_assembly" ? line.component : line.sub_assembly) || line.component || line.sub_assembly || "") : "";
+    });
+    return [{ key:baseKey, label, value: uniqueVals.join(" / "), needsChoice:true, options: uniqueVals, sourceLabelByGrade }];
+  });
 }
 
 function UserManualScreen(){
