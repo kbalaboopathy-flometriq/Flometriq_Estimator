@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T18:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T19:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -13534,6 +13534,64 @@ function MyWorklistScreen({ user }){
   );
 }
 
+// Directly tag a customer with a Package it handles, plus an optional
+// sub-category — the same information the AddAllocationModal prompt
+// offers indirectly when allocating this company under a Project, but
+// reachable straight from the Customer record too.
+function AddPackageHandledModal({ companyName, user, onCancel, onSaved }){
+  const [packageOptions,setPackageOptions] = useState([]);
+  const [packageName,setPackageName] = useState("");
+  const [subcatOptions,setSubcatOptions] = useState([]);
+  const [subcategory,setSubcategory] = useState("");
+  const [newSubcat,setNewSubcat] = useState("");
+  const [saving,setSaving] = useState(false);
+
+  useEffect(()=>{
+    sb.from("package_name_tbl").select("value").order("value").then(({data})=>setPackageOptions((data||[]).map(r=>r.value)));
+  },[]);
+  useEffect(()=>{
+    if(!packageName){ setSubcatOptions([]); return; }
+    sb.from("package_subcategory_tbl").select("subcategory").eq("package_name",packageName).order("subcategory").then(({data})=>setSubcatOptions((data||[]).map(r=>r.subcategory)));
+  },[packageName]);
+
+  const save = async()=>{
+    if(!packageName){ alert("Pick a Package first."); return; }
+    setSaving(true);
+    try{
+      const finalSubcat = newSubcat.trim() || subcategory || null;
+      const { error } = await sb.from("company_package_tbl").insert({company_name:companyName, package_name:packageName, subcategory:finalSubcat, created_by:user?.username||"unknown"});
+      if(error) throw error;
+      if(newSubcat.trim()){
+        try{ await sb.from("package_subcategory_tbl").insert({package_name:packageName, subcategory:newSubcat.trim()}); } catch(ignoreDup){}
+      }
+      onSaved();
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally { setSaving(false); }
+  };
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:12}},"Add package handled"),
+      h("div",{style:{marginBottom:10}},
+        h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Package"),
+        h(MasterSelect,{value:packageName,onChange:v=>{setPackageName(v);setSubcategory("");setNewSubcat("");},options:packageOptions,table:"package_name_tbl",valueCol:"value",fieldLabel:"Package",placeholder:"Select or add…",style:{padding:"7px 9px",fontSize:12},refreshOptions:()=>sb.from("package_name_tbl").select("value").order("value").then(({data})=>setPackageOptions((data||[]).map(r=>r.value)))})
+      ),
+      h("div",{style:{marginBottom:14}},
+        h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Sub-category (optional)"),
+        subcatOptions.length>0 && h("select",{value:subcategory,onChange:e=>{setSubcategory(e.target.value); setNewSubcat("");},style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%",marginBottom:6}},
+          h("option",{value:""},"Skip / not specified"),
+          subcatOptions.map(s=>h("option",{key:s,value:s},s))
+        ),
+        h("input",{value:newSubcat,onChange:e=>{setNewSubcat(e.target.value); setSubcategory("");},placeholder:"Or type a new sub-category…",style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%"}})
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Add")
+      )
+    )
+  );
+}
+
 function CustomersScreen({ user }){
   const [companies,setCompanies] = useState([]);
   const [loading,setLoading] = useState(true);
@@ -13614,6 +13672,33 @@ function CustomersScreen({ user }){
     setLoadingLinkedProjects(false);
   },[]);
   useEffect(()=>{ if(selected) loadLinkedProjects(selected.company_name); },[selected,loadLinkedProjects]);
+
+  // Deeper back-link — this company traced through package allocations,
+  // not just the two fixed Project-level fields above. "One customer
+  // could be traced to multiple EPCs and multiple Main Projects."
+  const [linkedAllocations,setLinkedAllocations] = useState([]);
+  const loadLinkedAllocations = useCallback(async(companyName)=>{
+    if(!companyName){ setLinkedAllocations([]); return; }
+    const { data } = await sb.from("package_customer_allocation_tbl").select("*, major_project_package_tbl(package_name,major_project_tbl(project_name,main_epc_company_name))").eq("company_name",companyName);
+    setLinkedAllocations(data||[]);
+  },[]);
+  useEffect(()=>{ if(selected) loadLinkedAllocations(selected.company_name); },[selected,loadLinkedAllocations]);
+
+  // Packages handled — one-to-many, like Contacts. Each entry optionally
+  // carries a sub-category (Pump Manufacturer under OEM, etc).
+  const [packagesHandled,setPackagesHandled] = useState([]);
+  const [showAddPackage,setShowAddPackage] = useState(false);
+  const loadPackagesHandled = useCallback(async(companyName)=>{
+    if(!companyName){ setPackagesHandled([]); return; }
+    const { data } = await sb.from("company_package_tbl").select("*").eq("company_name",companyName).order("created_at");
+    setPackagesHandled(data||[]);
+  },[]);
+  useEffect(()=>{ if(selected) loadPackagesHandled(selected.company_name); },[selected,loadPackagesHandled]);
+  const removePackageHandled = async(row)=>{
+    if(!confirm("Remove \""+row.package_name+(row.subcategory?(" — "+row.subcategory):"")+"\" from Packages handled?")) return;
+    await sb.from("company_package_tbl").delete().eq("id",row.id);
+    loadPackagesHandled(selected.company_name);
+  };
   const saveNewActivity = async()=>{
     if(!newActivity.activity_type){ alert("Pick an activity type."); return; }
     if(!newActivity.activity_date){ alert("Enter the date this actually happened."); return; }
@@ -13866,6 +13951,38 @@ function CustomersScreen({ user }){
             p.estimated_value && h("div",{style:{fontSize:11.5,color:colors.mutedLight}},fmt(p.estimated_value))
           ))
         )
+      ),
+      linkedAllocations.length>0 && h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px",background:"#fff",marginBottom:16}},
+        h("div",{style:{fontWeight:700,fontSize:13,marginBottom:8}},"Allocated as customer ("+linkedAllocations.length+")"),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+          linkedAllocations.map(a=>{
+            const pkgRow = a.major_project_package_tbl;
+            const projRow = pkgRow && pkgRow.major_project_tbl;
+            return h("div",{key:a.id,style:{border:"1px solid "+colors.border,borderRadius:6,padding:"9px 12px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
+              h("div",null,
+                h("div",{style:{fontWeight:600,fontSize:12.5}},(projRow&&projRow.project_name)||"—"),
+                h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},
+                  "EPC: "+((projRow&&projRow.main_epc_company_name)||"—")+" · Package: "+((pkgRow&&pkgRow.package_name)||"—")+(a.subcategory?(" — "+a.subcategory):"")
+                )
+              ),
+              h("span",{style:{fontSize:10.5,fontWeight:700,padding:"3px 9px",borderRadius:20,background:"#eaf2fb",color:"#0c447c"}},a.allocation_status)
+            );
+          })
+        )
+      ),
+      h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px",background:"#fff",marginBottom:16}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}},
+          h("div",{style:{fontWeight:700,fontSize:13}},"Packages handled ("+packagesHandled.length+")"),
+          h("button",{onClick:()=>setShowAddPackage(true),style:btnSmall},"+ Add")
+        ),
+        packagesHandled.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"None recorded yet.") :
+        h("div",{style:{display:"flex",flexWrap:"wrap",gap:6}},
+          packagesHandled.map(row=>h("span",{key:row.id,style:{fontSize:11.5,background:"#e6f1fb",color:"#0c447c",padding:"4px 10px",borderRadius:14,display:"flex",alignItems:"center",gap:6}},
+            row.package_name+(row.subcategory?(" — "+row.subcategory):""),
+            h("span",{onClick:()=>removePackageHandled(row),style:{cursor:"pointer",color:"#0c447c",fontWeight:700}},"✕")
+          ))
+        ),
+        showAddPackage && h(AddPackageHandledModal,{companyName:selected.company_name,user,onCancel:()=>setShowAddPackage(false),onSaved:()=>{setShowAddPackage(false);loadPackagesHandled(selected.company_name);}})
       ),
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}},
         h("div",{style:{fontWeight:700,fontSize:13}},"Contacts ("+contacts.length+")"),
@@ -16886,7 +17003,7 @@ function PackageAllocationsSection({ pkg, project, user, onCreateQuoteFromAlloca
       rows.map(row=>h("div",{key:row.id,style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,background:"#fff"}},
         h("div",null,
           h("div",{style:{fontWeight:600,fontSize:13}},row.company_name),
-          h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},row.allocation_status)
+          h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},row.allocation_status+(row.subcategory?(" · "+row.subcategory):""))
         ),
         row.linked_reference_number
           ? h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
@@ -16908,10 +17025,15 @@ function PackageAllocationsSection({ pkg, project, user, onCreateQuoteFromAlloca
 // doesn't already carry this package's name as a Customer Type — offer to
 // tag it right there. The type vocabulary grows from real assignments.
 function AddAllocationModal({ pkg, project, user, onCancel, onSaved }){
+  const [step,setStep] = useState("search"); // "search" | "confirm"
   const [q,setQ] = useState("");
   const [matches,setMatches] = useState([]);
   const [picked,setPicked] = useState(null);
   const [needsTypePrompt,setNeedsTypePrompt] = useState(false);
+  const [addType,setAddType] = useState(false);
+  const [subcatOptions,setSubcatOptions] = useState([]);
+  const [subcategory,setSubcategory] = useState("");
+  const [newSubcat,setNewSubcat] = useState("");
   const [saving,setSaving] = useState(false);
 
   useEffect(()=>{
@@ -16927,20 +17049,27 @@ function AddAllocationModal({ pkg, project, user, onCancel, onSaved }){
 
   const pick = async(companyName)=>{
     setPicked(companyName);
-    const { data } = await sb.from("company_customer_type_tbl").select("id").eq("company_name",companyName).eq("customer_type",pkg.package_name).maybeSingle();
+    const { data } = await sb.from("company_package_tbl").select("id").eq("company_name",companyName).eq("package_name",pkg.package_name).maybeSingle();
     setNeedsTypePrompt(!data);
+    setAddType(!data);
+    const { data: subs } = await sb.from("package_subcategory_tbl").select("subcategory").eq("package_name",pkg.package_name).order("subcategory");
+    setSubcatOptions((subs||[]).map(s=>s.subcategory));
+    setStep("confirm");
   };
 
-  const finish = async(addType)=>{
+  const finish = async()=>{
     setSaving(true);
     try{
-      const { error } = await sb.from("package_customer_allocation_tbl").insert({package_id:pkg.id, company_name:picked, allocation_status:"Unknown", created_by:user?.username||"unknown"});
+      const finalSubcat = newSubcat.trim() || subcategory || null;
+      const { error } = await sb.from("package_customer_allocation_tbl").insert({package_id:pkg.id, company_name:picked, allocation_status:"Unknown", subcategory:finalSubcat, created_by:user?.username||"unknown"});
       if(error) throw error;
       if(addType){
-        try{ await sb.from("customer_type_tbl").insert({value:pkg.package_name}); } catch(ignoreDup){}
-        try{ await sb.from("company_customer_type_tbl").insert({company_name:picked, customer_type:pkg.package_name, created_by:user?.username||"unknown"}); } catch(ignoreDup){}
+        try{ await sb.from("company_package_tbl").insert({company_name:picked, package_name:pkg.package_name, subcategory:finalSubcat, created_by:user?.username||"unknown"}); } catch(ignoreDup){}
       }
-      await logAudit("INSERT","package_customer_allocation_tbl",String(pkg.id),"Allocated "+picked+" to package "+pkg.package_name,user?.username||"unknown",null,{company_name:picked});
+      if(newSubcat.trim()){
+        try{ await sb.from("package_subcategory_tbl").insert({package_name:pkg.package_name, subcategory:newSubcat.trim()}); } catch(ignoreDup){}
+      }
+      await logAudit("INSERT","package_customer_allocation_tbl",String(pkg.id),"Allocated "+picked+" to package "+pkg.package_name+(finalSubcat?(" ("+finalSubcat+")"):""),user?.username||"unknown",null,{company_name:picked});
       onSaved();
     } catch(e){ alert("Save failed: "+e.message); }
     finally { setSaving(false); }
@@ -16949,7 +17078,7 @@ function AddAllocationModal({ pkg, project, user, onCancel, onSaved }){
   return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:400,maxWidth:"100%"}},
       h("div",{style:{fontWeight:700,fontSize:14,marginBottom:12}},"Add customer allocation"),
-      !picked ? h(React.Fragment,null,
+      step==="search" ? h(React.Fragment,null,
         h("input",{value:q,onChange:e=>setQ(e.target.value),placeholder:"Type to search customers…",style:{...inputStyle,width:"100%",marginBottom:8}}),
         h("div",{style:{display:"flex",flexDirection:"column",gap:6,maxHeight:220,overflow:"auto"}},
           matches.map(m=>h("div",{key:m,onClick:()=>pick(m),style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",cursor:"pointer",fontSize:12.5}},m))
@@ -16958,17 +17087,25 @@ function AddAllocationModal({ pkg, project, user, onCancel, onSaved }){
           h("button",{onClick:onCancel,style:btnSecondary},"Cancel")
         )
       ) : h(React.Fragment,null,
-        h("div",{style:{fontSize:12.5,marginBottom:12}},"Allocate ",h("strong",null,picked)," to this package?"),
+        h("div",{style:{fontSize:12.5,marginBottom:12}},"Allocate ",h("strong",null,picked)," to ",h("strong",null,pkg.package_name),"?"),
         needsTypePrompt && h("div",{style:{background:"#fff4d6",borderRadius:6,padding:"10px 12px",fontSize:12,color:"#854f0b",marginBottom:12}},
-          picked+" doesn't have the type \""+pkg.package_name+"\" yet — add it?",
+          picked+" doesn't have \""+pkg.package_name+"\" under Packages handled yet — add it?",
           h("div",{style:{display:"flex",gap:8,marginTop:8}},
-            h("button",{onClick:()=>finish(true),disabled:saving,style:btnSmall},"Yes, add type"),
-            h("button",{onClick:()=>finish(false),disabled:saving,style:btnSmall},"No")
+            h("button",{onClick:()=>setAddType(true),style:{...btnSmall,background:addType?colors.dark:"#fff",color:addType?"#fff":colors.text}},"Yes"),
+            h("button",{onClick:()=>setAddType(false),style:{...btnSmall,background:!addType?colors.dark:"#fff",color:!addType?"#fff":colors.text}},"No")
           )
         ),
-        !needsTypePrompt && h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
-          h("button",{onClick:()=>setPicked(null),style:btnSecondary},"Back"),
-          h("button",{onClick:()=>finish(false),disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Add allocation")
+        h("div",{style:{marginBottom:14}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Sub-category (optional)"),
+          subcatOptions.length>0 && h("select",{value:subcategory,onChange:e=>{setSubcategory(e.target.value); setNewSubcat("");},style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%",marginBottom:6}},
+            h("option",{value:""},"Skip / not specified"),
+            subcatOptions.map(s=>h("option",{key:s,value:s},s))
+          ),
+          h("input",{value:newSubcat,onChange:e=>{setNewSubcat(e.target.value); setSubcategory("");},placeholder:"Or type a new sub-category…",style:{...inputStyle,padding:"7px 9px",fontSize:12,width:"100%"}})
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>{setStep("search"); setPicked(null);},style:btnSecondary},"Back"),
+          h("button",{onClick:finish,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Add allocation")
         )
       )
     )
