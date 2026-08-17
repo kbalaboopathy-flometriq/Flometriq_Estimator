@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T19:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-16T21:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1243,6 +1243,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Engineering", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"}] },
       { label:"Company", tabs:[{key:"company_master",label:"Company Master"}] },
       { label:"HR", tabs: byKeys(["employee_tbl","department_tbl","crm_role_tbl","employee_status_tbl","designation_tbl"]) },
+      { label:"Major Projects", tabs:[{key:"crm_helper_masters",label:"Package & Type Masters"}] },
     ]});
     groups.push({ label:"Rules", subgroups:[
       { label:"Rules", tabs:[{key:"item_moc_rules",label:"Datasheet MOC"},{key:"description_master",label:"Description"}] }
@@ -1680,10 +1681,11 @@ function BomEntryForm({ onGoToTab, user }) {
   const setEditField = (field,value)=>{
     setEditRowDraft(d=>{
       const next={...d,[field]:value};
-      // Shape must follow spec — left stale otherwise (root cause of the
-      // 2026-08-11 shape-drift data fix). Re-derive from the same
-      // spec→shape map the cutting-plan shortcut already uses.
-      if(field==="material_spec"){ delete next.grade; next.material_shape = specShapeLookup.get(value)||""; }
+      // Shape now drives Spec — changing Shape clears Spec since the old
+      // value may not belong to the new Shape, forcing a fresh pick from
+      // the correctly-scoped options rather than silently keeping a
+      // mismatched combination.
+      if(field==="material_shape"){ next.material_spec=""; delete next.grade; }
       if(field==="component") delete next.sub_assembly;
       return next;
     });
@@ -1692,14 +1694,29 @@ function BomEntryForm({ onGoToTab, user }) {
     if(!masterData) return [];
     return Array.from(new Set(masterData.ciTbl.map(r=>r.component).filter(Boolean))).sort();
   },[masterData]);
+  // Shape now drives Spec (not the other way around) — matches this app's
+  // own standing rule (Shape → Spec → Grade) and the Material Rates
+  // screen, which already worked this way. Spec's options are always
+  // scoped to whichever Shape is currently picked; empty until Shape has
+  // a value, forcing Shape to be chosen first.
+  const specsByShapeMap = useMemo(()=>{
+    const m = new Map();
+    (masterData?.specs||[]).forEach(r=>{
+      if(!r.material_shape || !r.material_spec) return;
+      if(!m.has(r.material_shape)) m.set(r.material_shape,[]);
+      m.get(r.material_shape).push(r.material_spec);
+    });
+    m.forEach((v,k)=>m.set(k,Array.from(new Set(v)).sort()));
+    return m;
+  },[masterData]);
+  const specOptionsFor = (shape)=> shape ? (specsByShapeMap.get(shape)||[]) : [];
+  const shapeOptions = useMemo(()=> (masterData?.shapes||[]).map(r=>r.shape).filter(Boolean).sort(), [masterData]);
+  const refreshShapeOptions = ()=> fetchAll("materials_shape","shape").then(shapes=>setMasterData(md=>md?{...md,shapes}:md));
   const editSubAssemblyOptions = useMemo(()=>{
     if(!masterData||!editRowDraft.component) return [];
     return Array.from(new Set(masterData.saTbl.filter(r=>r.component===editRowDraft.component).map(r=>r.sub_assembly).filter(Boolean))).sort();
   },[masterData, editRowDraft.component]);
-  const editSpecOptions = useMemo(()=>{
-    if(!masterData) return [];
-    return Array.from(new Set(masterData.specs.map(r=>r.material_spec).filter(Boolean))).sort();
-  },[masterData]);
+  const editSpecOptions = useMemo(()=> specOptionsFor(editRowDraft.material_shape), [specsByShapeMap, editRowDraft.material_shape]);
 
   // Universal edit — flip every line of the loaded model into the same
   // cascading dropdowns at once, instead of one row at a time.
@@ -1730,8 +1747,8 @@ function BomEntryForm({ onGoToTab, user }) {
   const setEditAllField = (id,field,value)=>{
     setEditAllDrafts(d=>{
       const row={...(d[id]||{}),[field]:value};
-      // Same shape resync as the single-row editor above.
-      if(field==="material_spec"){ delete row.grade; row.material_shape = specShapeLookup.get(value)||""; }
+      // Same Shape-drives-Spec fix as the single-row editor above.
+      if(field==="material_shape"){ row.material_spec=""; delete row.grade; }
       if(field==="component") delete row.sub_assembly;
       return {...d,[id]:row};
     });
@@ -1825,18 +1842,13 @@ function BomEntryForm({ onGoToTab, user }) {
   const setDraft = (field,value)=>{
     setNewRowDraft(d=>{
       const next={...d,[field]:value};
-      if(field==="material_spec") { delete next.grade; next.material_shape = specShapeLookup.get(value)||""; }
+      if(field==="material_shape"){ next.material_spec=""; delete next.grade; }
       return next;
     });
     setUnsavedGuard(true,"You have an unsaved new BOM line. Leave anyway?");
   };
 
-  const specOptions = useMemo(()=>{
-    if(!masterData) return [];
-    const all = Array.from(new Set(masterData.specs.map(r=>r.material_spec).filter(Boolean))).sort();
-    if(!newRowDraft.material_shape) return all;
-    return Array.from(new Set(masterData.specs.filter(r=>r.material_shape===newRowDraft.material_shape).map(r=>r.material_spec).filter(Boolean))).sort();
-  },[masterData, newRowDraft.material_shape]);
+  const specOptions = useMemo(()=> specOptionsFor(newRowDraft.material_shape), [specsByShapeMap, newRowDraft.material_shape]);
 
   const gradeOptions = useMemo(()=>{
     if(!masterData||!newRowDraft.material_spec) return [];
@@ -1926,9 +1938,9 @@ function BomEntryForm({ onGoToTab, user }) {
     ? h("tr",{key:r.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
         h("td",{style:{padding:"6px 8px",color:colors.mutedLight,position:"sticky",left:0,zIndex:1,background:"#eef6f3"}},idx+1),
         h("td",{style:{padding:"4px 6px",position:"sticky",left:30,zIndex:1,background:"#eef6f3"}},sel(editRowDraft.component,v=>setEditField("component",v),editComponentOptions,"Component…")),
-        h("td",{style:{padding:"6px 8px",fontSize:11.5,color:colors.mutedLight,whiteSpace:"nowrap"}},editRowDraft.material_shape||"—"),
+        h("td",{style:{padding:"4px 6px"}},h(MasterSelect,{value:editRowDraft.material_shape,onChange:v=>setEditField("material_shape",v),options:shapeOptions,table:"materials_shape",valueCol:"shape",fieldLabel:"Shape",placeholder:"Shape…",style:{...iStyle},refreshOptions:refreshShapeOptions})),
         h("td",{style:{padding:"4px 6px"}},sel(editRowDraft.sub_assembly,v=>setEditField("sub_assembly",v),editSubAssemblyOptions,editRowDraft.component?"Sub assembly…":"Pick component first")),
-        h("td",{style:{padding:"4px 6px"}},sel(editRowDraft.material_spec,v=>setEditField("material_spec",v),editSpecOptions,"Material spec…")),
+        h("td",{style:{padding:"4px 6px"}},sel(editRowDraft.material_spec,v=>setEditField("material_spec",v),editSpecOptions,editRowDraft.material_shape?"Material spec…":"Pick shape first")),
         h("td",{style:{padding:"4px 6px"}},h("input",{value:editRowDraft.cutting_plan_layout_size||"",onChange:e=>setEditField("cutting_plan_layout_size",e.target.value),onDoubleClick:()=>handleCuttingPlanDoubleClick(editRowDraft,setEditField),style:{...iStyle}})),
         h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:editRowDraft.cutting_plan_qty||"",onChange:e=>setEditField("cutting_plan_qty",e.target.value),style:{...iStyle,textAlign:"right"}})),
         h("td",{style:{padding:"4px 6px"}},sel(editRowDraft.cutting_plan_uom,v=>setEditField("cutting_plan_uom",v),masterData.uoms.map(u=>u.uom),"Cutting UOM")),
@@ -1966,9 +1978,9 @@ function BomEntryForm({ onGoToTab, user }) {
     return h("tr",{key:r.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
       h("td",{style:{padding:"6px 8px",color:colors.mutedLight,position:"sticky",left:0,zIndex:1,background:"#eef6f3"}},idx+1),
       h("td",{style:{padding:"4px 6px",position:"sticky",left:30,zIndex:1,background:"#eef6f3"}},sel(draft.component,v=>setEditAllField(r.id,"component",v),editComponentOptions,"Component…")),
-      h("td",{style:{padding:"6px 8px",fontSize:11.5,color:colors.mutedLight,whiteSpace:"nowrap"}},draft.material_shape||"—"),
+      h("td",{style:{padding:"4px 6px"}},h(MasterSelect,{value:draft.material_shape,onChange:v=>setEditAllField(r.id,"material_shape",v),options:shapeOptions,table:"materials_shape",valueCol:"shape",fieldLabel:"Shape",placeholder:"Shape…",style:{...iStyle},refreshOptions:refreshShapeOptions})),
       h("td",{style:{padding:"4px 6px"}},sel(draft.sub_assembly,v=>setEditAllField(r.id,"sub_assembly",v),subOpts,draft.component?"Sub assembly…":"Pick component first")),
-      h("td",{style:{padding:"4px 6px"}},sel(draft.material_spec,v=>setEditAllField(r.id,"material_spec",v),editSpecOptions,"Material spec…")),
+      h("td",{style:{padding:"4px 6px"}},sel(draft.material_spec,v=>setEditAllField(r.id,"material_spec",v),specOptionsFor(draft.material_shape),draft.material_shape?"Material spec…":"Pick shape first")),
       h("td",{style:{padding:"4px 6px"}},h("input",{value:draft.cutting_plan_layout_size||"",onChange:e=>setEditAllField(r.id,"cutting_plan_layout_size",e.target.value),onDoubleClick:()=>handleCuttingPlanDoubleClick(draft,(field,val)=>setEditAllField(r.id,field,val)),style:{...iStyle}})),
       h("td",{style:{padding:"4px 6px"}},h("input",{type:"number",value:draft.cutting_plan_qty||"",onChange:e=>setEditAllField(r.id,"cutting_plan_qty",e.target.value),style:{...iStyle,textAlign:"right"}})),
       h("td",{style:{padding:"4px 6px"}},sel(draft.cutting_plan_uom,v=>setEditAllField(r.id,"cutting_plan_uom",v),masterData.uoms.map(u=>u.uom),"UOM")),
@@ -2098,10 +2110,10 @@ function BomEntryForm({ onGoToTab, user }) {
             h("tr",{style:{background:"#fbf6e8",borderTop:"2px solid "+colors.border}},
               h("td",{style:{padding:"6px 8px",color:colors.mutedLight,fontSize:11,position:"sticky",left:0,zIndex:1,background:"#fbf6e8"}},"new"),
               h("td",{style:{padding:"4px 6px",position:"sticky",left:30,zIndex:1,background:"#fbf6e8"}},h("input",{list:"ci-list",value:newRowDraft.component||"",onChange:e=>setDraft("component",e.target.value),style:{...iStyle},placeholder:"Component"})),
-              h("td",{style:{padding:"6px 8px",fontSize:11.5,color:colors.mutedLight,whiteSpace:"nowrap"}},newRowDraft.material_shape||"—"),
+              h("td",{style:{padding:"4px 6px"}},h(MasterSelect,{value:newRowDraft.material_shape,onChange:v=>setDraft("material_shape",v),options:shapeOptions,table:"materials_shape",valueCol:"shape",fieldLabel:"Shape",placeholder:"Shape…",style:{...iStyle},refreshOptions:refreshShapeOptions})),
               h("td",{style:{padding:"4px 6px"}},h("input",{list:"sa-list",value:newRowDraft.sub_assembly||"",onChange:e=>setDraft("sub_assembly",e.target.value),style:{...iStyle},placeholder:"Sub Assembly"})),
               h("td",{style:{padding:"4px 6px"}},
-                h("input",{list:"spec-list-form",value:newRowDraft.material_spec||"",onChange:e=>setDraft("material_spec",e.target.value),style:{...iStyle},placeholder:"Material Spec"}),
+                h("input",{list:"spec-list-form",value:newRowDraft.material_spec||"",disabled:!newRowDraft.material_shape,onChange:e=>setDraft("material_spec",e.target.value),style:{...iStyle,background:newRowDraft.material_shape?"#fff":"#f4f2ea"},placeholder:newRowDraft.material_shape?"Material Spec":"Pick shape first"}),
                 h("datalist",{id:"spec-list-form"},specOptions.map(s=>h("option",{key:s,value:s})))
               ),
               h("td",{style:{padding:"4px 6px"}},h("input",{value:newRowDraft.cutting_plan_layout_size||"",onChange:e=>setDraft("cutting_plan_layout_size",e.target.value),onDoubleClick:()=>handleCuttingPlanDoubleClick(newRowDraft,setDraft),style:{...iStyle},placeholder:"Cutting Plan"})),
@@ -21422,6 +21434,7 @@ function App() {
     tab==="customers"?h(CustomersScreen,{user}):
     tab==="vendors"?h(VendorsScreen,{user}):
     tab==="test_types"?h(TestTypesScreen,null):
+    tab==="crm_helper_masters"?h(CrmHelperMastersScreen,{user}):
     tab==="user_manual"?h(UserManualScreen,null):
     tab==="tour"?h(TourScreen,null):
     tab==="faq"?h(FaqScreen,null):
@@ -22655,6 +22668,159 @@ function GrnStatusReport(){
     section("Draft", grouped.Draft, "#8a4b1f"),
     section("Open", grouped.Open, "#1c4a8a"),
     section("Cleared", grouped.Cleared, "#2b6b2b")
+  );
+}
+
+// Simple add/delete for a flat one-column (or one-column + sort_order)
+// lookup table — no usage checks yet ("we'll dig into these logics when
+// time comes"); the DB's own foreign keys still protect against orphaning
+// real data, a delete that's actually in use will just surface as an
+// error via the normal alert.
+function SimpleValueMaster({ tableName, column, label, hasSortOrder }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [newVal,setNewVal] = useState("");
+  const [adding,setAdding] = useState(false);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    let q = sb.from(tableName).select("*");
+    q = hasSortOrder ? q.order("sort_order") : q.order(column);
+    const { data } = await q;
+    setRows(data||[]);
+    setLoading(false);
+  },[tableName,column,hasSortOrder]);
+  useEffect(()=>{ load(); },[load]);
+
+  const add = async()=>{
+    if(!newVal.trim()) return;
+    setAdding(true);
+    try{
+      const payload = { [column]: newVal.trim() };
+      if(hasSortOrder) payload.sort_order = (rows.length ? Math.max(...rows.map(r=>r.sort_order||0)) : 0) + 1;
+      const { error } = await sb.from(tableName).insert(payload);
+      if(error) throw error;
+      setNewVal("");
+      load();
+    } catch(e){ alert("Add failed: "+e.message); }
+    finally { setAdding(false); }
+  };
+  const remove = async(row)=>{
+    if(!confirm("Delete \""+row[column]+"\"?")) return;
+    try{
+      const { error } = await sb.from(tableName).delete().eq("id",row.id);
+      if(error) throw error;
+      load();
+    } catch(e){ alert("Delete failed: "+e.message+" — it's probably still in use somewhere."); }
+  };
+
+  return h("div",{style:{maxWidth:480}},
+    h("h3",{style:{fontSize:15,fontWeight:700,marginBottom:10}},label),
+    h("div",{style:{display:"flex",gap:8,marginBottom:14}},
+      h("input",{value:newVal,onChange:e=>setNewVal(e.target.value),placeholder:"New value…",style:{...inputStyle,flex:1}}),
+      h("button",{onClick:add,disabled:adding,style:{...btnPrimary,opacity:adding?0.6:1}},adding?"Adding…":"+ Add")
+    ),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    rows.length===0?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Nothing yet."):
+    h("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+      rows.map(row=>h("div",{key:row.id,style:{display:"flex",justifyContent:"space-between",alignItems:"center",border:"1px solid "+colors.border,borderRadius:6,padding:"7px 12px"}},
+        h("span",{style:{fontSize:13}},row[column]),
+        h("button",{onClick:()=>remove(row),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Delete")
+      ))
+    )
+  );
+}
+
+// Package Sub-categories are scoped to a specific Package, so this one
+// needs a picker first, then the flat add/delete list underneath.
+function PackageSubcategoryMaster(){
+  const [packages,setPackages] = useState([]);
+  const [selectedPackage,setSelectedPackage] = useState("");
+  const [subcats,setSubcats] = useState([]);
+  const [loading,setLoading] = useState(false);
+  const [newVal,setNewVal] = useState("");
+  const [adding,setAdding] = useState(false);
+
+  useEffect(()=>{
+    sb.from("package_name_tbl").select("value").order("value").then(({data})=>setPackages((data||[]).map(r=>r.value)));
+  },[]);
+
+  const load = useCallback(async()=>{
+    if(!selectedPackage){ setSubcats([]); return; }
+    setLoading(true);
+    const { data } = await sb.from("package_subcategory_tbl").select("*").eq("package_name",selectedPackage).order("subcategory");
+    setSubcats(data||[]);
+    setLoading(false);
+  },[selectedPackage]);
+  useEffect(()=>{ load(); },[load]);
+
+  const add = async()=>{
+    if(!selectedPackage){ alert("Pick a Package first."); return; }
+    if(!newVal.trim()) return;
+    setAdding(true);
+    try{
+      const { error } = await sb.from("package_subcategory_tbl").insert({package_name:selectedPackage, subcategory:newVal.trim()});
+      if(error) throw error;
+      setNewVal("");
+      load();
+    } catch(e){ alert("Add failed: "+e.message); }
+    finally { setAdding(false); }
+  };
+  const remove = async(row)=>{
+    if(!confirm("Delete \""+row.subcategory+"\"?")) return;
+    try{
+      const { error } = await sb.from("package_subcategory_tbl").delete().eq("id",row.id);
+      if(error) throw error;
+      load();
+    } catch(e){ alert("Delete failed: "+e.message); }
+  };
+
+  return h("div",{style:{maxWidth:480}},
+    h("h3",{style:{fontSize:15,fontWeight:700,marginBottom:10}},"Package sub-categories"),
+    h("div",{style:{marginBottom:12}},
+      h("div",{style:{fontSize:10,color:colors.muted,marginBottom:3}},"Package"),
+      h("select",{value:selectedPackage,onChange:e=>setSelectedPackage(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:13,width:"100%"}},
+        h("option",{value:""},"Select a Package…"),
+        packages.map(p=>h("option",{key:p,value:p},p))
+      )
+    ),
+    selectedPackage && h(React.Fragment,null,
+      h("div",{style:{display:"flex",gap:8,marginBottom:14}},
+        h("input",{value:newVal,onChange:e=>setNewVal(e.target.value),placeholder:"New sub-category…",style:{...inputStyle,flex:1}}),
+        h("button",{onClick:add,disabled:adding,style:{...btnPrimary,opacity:adding?0.6:1}},adding?"Adding…":"+ Add")
+      ),
+      loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+      subcats.length===0?h("div",{style:{fontSize:12,color:colors.mutedLight}},"No sub-categories yet for "+selectedPackage+"."):
+      h("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+        subcats.map(row=>h("div",{key:row.id,style:{display:"flex",justifyContent:"space-between",alignItems:"center",border:"1px solid "+colors.border,borderRadius:6,padding:"7px 12px"}},
+          h("span",{style:{fontSize:13}},row.subcategory),
+          h("button",{onClick:()=>remove(row),style:{...btnSmall,fontSize:10,padding:"3px 8px"}},"Delete")
+        ))
+      )
+    )
+  );
+}
+
+function CrmHelperMastersScreen({ user }){
+  const [tab,setTab] = useState("package");
+  const tabs = [
+    {key:"package",label:"Package"},
+    {key:"subcategory",label:"Sub-categories"},
+    {key:"status",label:"Package status"},
+    {key:"contact_type",label:"Contact type"},
+    {key:"contact_qual",label:"Contact qualification"},
+  ];
+  return h("div",{style:{padding:"20px 24px"}},
+    h("h2",{style:{margin:"0 0 4px",fontSize:18,fontWeight:700}},"Package & Type Masters"),
+    h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:16}},"Simple add/delete for the lookup lists used across Major Projects. No usage checks yet — a delete that's still referenced somewhere will surface as an error rather than being silently blocked or silently allowed."),
+    h("div",{style:{display:"flex",gap:6,marginBottom:20,flexWrap:"wrap"}},
+      tabs.map(t=>h("button",{key:t.key,onClick:()=>setTab(t.key),style:{...btnSmall,background:tab===t.key?colors.dark:"#fff",color:tab===t.key?"#fff":colors.text}},t.label))
+    ),
+    tab==="package" && h(SimpleValueMaster,{tableName:"package_name_tbl",column:"value",label:"Package",hasSortOrder:false}),
+    tab==="subcategory" && h(PackageSubcategoryMaster,null),
+    tab==="status" && h(SimpleValueMaster,{tableName:"major_project_package_status_tbl",column:"status",label:"Package status",hasSortOrder:true}),
+    tab==="contact_type" && h(SimpleValueMaster,{tableName:"contact_type_tbl",column:"value",label:"Contact type",hasSortOrder:false}),
+    tab==="contact_qual" && h(SimpleValueMaster,{tableName:"contact_qualification_tbl",column:"value",label:"Contact qualification",hasSortOrder:true})
   );
 }
 
