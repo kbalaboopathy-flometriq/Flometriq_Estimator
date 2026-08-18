@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-17T00:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-17T01:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1482,9 +1482,19 @@ function BomEntryForm({ onGoToTab, user }) {
   };
 
   const handleModelSelect = (val)=>{
+    const trimmed = val.trim();
+    // Only the moment of an actual switch to a different, valid model
+    // needs the dirty check — this fires on every keystroke as an onChange,
+    // so checking unconditionally would pop a confirm() on every character
+    // typed while searching.
+    const isRealSwitch = trimmed && trimmed!==modelInput.trim() && allModels.includes(trimmed);
+    if(isRealSwitch){
+      if(!confirmLeaveIfDirty()) return;
+      setUnsavedGuard(false); setEditingRowId(null); setEditRowDraft({}); setEditAllMode(false); setEditAllDrafts({});
+    }
     setModelInput(val); setMsg(""); setModelNotFoundPrompt(false);
-    if(!val.trim()) { setSubRows([]); setBomStatus(null); return; }
-    if(allModels.includes(val.trim())) { loadSubForm(val.trim()); } else { setBomStatus(null); }
+    if(!trimmed) { setSubRows([]); setBomStatus(null); return; }
+    if(allModels.includes(trimmed)) { loadSubForm(trimmed); } else { setBomStatus(null); }
   };
 
   const handleModelBlur = ()=>{
@@ -2040,7 +2050,7 @@ function BomEntryForm({ onGoToTab, user }) {
               style:{...inputStyle,flex:1,background:sizeFilter?"#fff":colors.bg}, placeholder:sizeFilter?"Type or pick a model…":"Select size first"
             }),
             modelInput&&allModels.includes(modelInput.trim())&&h("button",{
-              onClick:()=>loadSubForm(modelInput.trim()),
+              onClick:()=>{ if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false); setEditingRowId(null); setEditRowDraft({}); setEditAllMode(false); setEditAllDrafts({}); loadSubForm(modelInput.trim()); },
               style:btnSecondary
             },"Reload")
           ),
@@ -21260,8 +21270,12 @@ function MaterialRatesReport({ user }){
     if(!draft || !draft.newRate) return;
     const newRate = Number(draft.newRate);
     if(isNaN(newRate)){ alert("Enter a valid number."); return; }
+    const oldRate = Number(row.rate)||0;
     const { error:err } = await sb.from("material_rates").update({ rate:newRate, created_at:new Date().toISOString(), created_by:user.username }).eq("id",row.id);
     if(err){ alert("Update failed: "+err.message); return; }
+    if(newRate!==oldRate){
+      await sb.from("rate_history").insert({material_spec:row.material_spec, material_grade:row.material_grade, old_rate:oldRate, new_rate:newRate, changed_by:user?.username||"unknown"});
+    }
     await logAudit("UPDATE","material_rates",row.id,row.material_spec+" — "+row.material_grade,user.username,{rate:row.rate},{rate:newRate});
     setEditing(e=>{ const n={...e}; delete n[row.id]; return n; });
     load();
