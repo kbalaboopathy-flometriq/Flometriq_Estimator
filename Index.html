@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-16T21:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-17T00:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1199,6 +1199,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Major Projects", tabs:[
         {key:"major_projects",label:"Projects"},
         {key:"major_projects_kanban",label:"Package Board"},
+        {key:"major_projects_bulk_import",label:"Bulk Import"},
       ]},
       { label:"Funnel", tabs:[
         {key:"crm_funnel",label:"Funnel"},
@@ -1758,19 +1759,24 @@ function BomEntryForm({ onGoToTab, user }) {
     if(!confirm("Save changes to all "+subRows.length+" line(s) of \""+m+"\"?")) return;
     setSavingAll(true);
     try{
-      const updates=[];
+      const updates=[]; const failures=[];
       for(const r of subRows){
         const draft = editAllDrafts[r.id] || r;
         const payload = {
           component:draft.component||"", sub_assembly:draft.sub_assembly||"",
+          material_shape:draft.material_shape||"",
           material_spec:draft.material_spec||"",
           cutting_plan_layout_size:draft.cutting_plan_layout_size||"",
           cutting_plan_qty:Number(draft.cutting_plan_qty)||0,
           cutting_plan_uom:draft.cutting_plan_uom||"",
           qty_required:Number(draft.qty_required)||0, uom:draft.uom||"",
         };
-        await sb.from("bom").update(payload).eq("id",r.id);
+        const { error } = await sb.from("bom").update(payload).eq("id",r.id);
+        if(error){ failures.push((draft.component||"line")+": "+error.message); continue; }
         updates.push({id:r.id, ...payload});
+      }
+      if(failures.length>0){
+        alert(failures.length+" line(s) failed to save:\n"+failures.join("\n"));
       }
       await logAudit("UPDATE","bom",m,"Bulk edit via \"Edit all lines\": "+updates.length+" line(s) updated for model \""+m+"\"",user?.username||"unknown",null,{lineCount:updates.length});
       setSubRows(rs=>rs.map(r=>{ const u=updates.find(x=>x.id===r.id); return u?{...r,...u}:r; }));
@@ -1781,6 +1787,7 @@ function BomEntryForm({ onGoToTab, user }) {
   const saveEditRow = async()=>{
     const payload = {
       component:editRowDraft.component||"", sub_assembly:editRowDraft.sub_assembly||"",
+      material_shape:editRowDraft.material_shape||"",
       material_spec:editRowDraft.material_spec||"",
       cutting_plan_layout_size:editRowDraft.cutting_plan_layout_size||"",
       cutting_plan_qty:Number(editRowDraft.cutting_plan_qty)||0,
@@ -1880,7 +1887,7 @@ function BomEntryForm({ onGoToTab, user }) {
       if(err) throw err;
       setSubRows(r=>[...r,data]);
       setNewRowDraft({model:newRowDraft.model, item:newRowDraft.item});
-      if(!allModels.includes(newRowDraft.model)) setAllModels(m=>[...m,newRowDraft.model].sort());
+      if(!allModels.includes(newRowDraft.model)) setAllModels(m=>[...m,newRowDraft.model].sort(naturalCompare));
       setMsg("Row saved.");
       setUnsavedGuard(false);
     } catch(e) { setMsg("Save failed: "+e.message); } finally { setSavingNew(false); }
@@ -2084,9 +2091,9 @@ function BomEntryForm({ onGoToTab, user }) {
         h("div",{style:{height:1,width:bomEntryMeasuredWidth||1205}})
       ),
       h("div",{ref:bomEntryBottomScrollRef,onScroll:syncBomEntryScrollFromBottom,style:{overflow:"auto",maxHeight:fullScreenBomEntry?"calc(100vh - 220px)":"65vh",border:"1px solid "+colors.border,borderRadius:6,marginTop:2}},
-        h("table",{style:{fontSize:12,width:"100%",minWidth:1205,tableLayout:"fixed",borderCollapse:"separate",borderSpacing:0}},
+        h("table",{style:{fontSize:12,width:"100%",minWidth:1285,tableLayout:"fixed",borderCollapse:"separate",borderSpacing:0}},
           h("colgroup",null,
-            h("col",{style:{width:30}}), h("col",{style:{width:120}}), h("col",{style:{width:90}}), h("col",{style:{width:150}}), h("col",{style:{width:170}}),
+            h("col",{style:{width:30}}), h("col",{style:{width:120}}), h("col",{style:{width:170}}), h("col",{style:{width:150}}), h("col",{style:{width:170}}),
             h("col",{style:{width:260}}), h("col",{style:{width:80}}), h("col",{style:{width:60}}), h("col",{style:{width:55}}), h("col",{style:{width:55}}), h("col",{style:{width:135}})
           ),
           h("thead",null,
@@ -2732,8 +2739,8 @@ function MasterEditor({ tableKey, user }) {
       }
       await logAudit("UPDATE","model_tbl",newName,"Renamed model \""+renameOld+"\" to \""+newName+"\" (Models + BOM + "+(draftEstimates?.length||0)+" Draft quote(s), headers and lines)",user?.username||"unknown",{model:renameOld},{model:newName});
       setRenameMsg("Renamed. "+(draftEstimates?.length||0)+" Draft quote(s) updated (headers and lines); non-Draft quotes kept \""+renameOld+"\".");
-      setAllModelNamesForRename(names=>names.map(n=>n===renameOld?newName:n).sort());
-      setAllModels(m=>m.map(n=>n===renameOld?newName:n).sort());
+      setAllModelNamesForRename(names=>names.map(n=>n===renameOld?newName:n).sort(naturalCompare));
+      setAllModels(m=>m.map(n=>n===renameOld?newName:n).sort(naturalCompare));
       setRenameOld(""); setRenameNew("");
       load();
     } catch(e){ setRenameMsg("Failed: "+e.message); } finally { setRenameBusy(false); }
@@ -2893,7 +2900,7 @@ function MasterEditor({ tableKey, user }) {
       const { error:err } = await sb.from("bom").insert(newRows);
       if(err) throw err;
       setDupMsg("Created \""+dupTarget.trim()+"\" with "+newRows.length+" rows.");
-      setAllModels(m=>[...m,dupTarget.trim()].sort()); setDupTarget(""); load();
+      setAllModels(m=>[...m,dupTarget.trim()].sort(naturalCompare)); setDupTarget(""); load();
     } catch(e) { setDupMsg("Failed: "+e.message); } finally { setDupBusy(false); }
   };
 
@@ -17465,6 +17472,217 @@ function PackageActivitySection({ pkg, project, user }){
 // here usually has no Quote# yet. Same visual/drag pattern as
 // CrmFunnelKanban, portfolio-wide (every project's packages together, not
 // scoped to one project) so a manager can see the whole pipeline at once.
+// Bulk import: one flat sheet, one row per allocation — Project, End User,
+// EPC, Package, Company, Sub-category (optional). Same analyze-then-commit
+// shape as Customer Bulk Upload, for the same reason that feature works
+// that way now: a past incident here (~2,200 orphaned rows from an
+// uncaught insert failure) taught this app to always show what's about to
+// happen before writing anything, and to check {error} on every single
+// insert rather than trusting a silent "it probably worked."
+//
+// Per explicit instruction, everything auto-creates on commit — new
+// Projects, new Companies (End User/EPC/allocated), new Package types, new
+// Sub-categories, new Package lines, new Allocations. Existing rows are
+// matched and reused, never duplicated. Also tags the allocated company's
+// own "Packages handled" list, same as the interactive Add Allocation flow
+// already does, for consistency.
+function MajorProjectsBulkImport({ user }){
+  const [file,setFile] = useState(null);
+  const [analyzing,setAnalyzing] = useState(false);
+  const [result,setResult] = useState(null);
+  const [committing,setCommitting] = useState(false);
+  const [committed,setCommitted] = useState(null);
+  const norm = s => (s||"").toString().trim().toLowerCase();
+
+  const analyze = async()=>{
+    if(!file) return;
+    setAnalyzing(true); setResult(null); setCommitted(null);
+    try{
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf,{type:"array"});
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet,{defval:""});
+
+      const [{data:companies},{data:projects},{data:packageNames},{data:subcats}] = await Promise.all([
+        sb.from("companies").select("company_name"),
+        sb.from("major_project_tbl").select("id,project_name"),
+        sb.from("package_name_tbl").select("value"),
+        sb.from("package_subcategory_tbl").select("package_name,subcategory"),
+      ]);
+      const existingCoSet = new Set((companies||[]).map(c=>norm(c.company_name)));
+      const existingProjSet = new Set((projects||[]).map(p=>norm(p.project_name)));
+      const existingPkgNameSet = new Set((packageNames||[]).map(p=>norm(p.value)));
+      const existingSubcatSet = new Set((subcats||[]).map(s=>norm(s.package_name)+"|||"+norm(s.subcategory)));
+
+      const newCompanies = new Map(), newProjects = new Map(), newPackageNames = new Set(), newSubcats = new Map();
+      const planRows = [];
+
+      rows.forEach((row,idx)=>{
+        const projectName = (row.Project||row["Project Name"]||"").toString().trim();
+        const endUser = (row["End User"]||row["End User Name"]||"").toString().trim();
+        const epc = (row.EPC||row["EPC Contractor"]||row["Main EPC"]||"").toString().trim();
+        const packageName = (row.Package||row["Package Name"]||row["Package Type"]||"").toString().trim();
+        const companyName = (row.Company||row["Allocated Company"]||row.Customer||"").toString().trim();
+        const subcategory = (row["Sub-category"]||row.Subcategory||row["Sub Category"]||"").toString().trim();
+
+        if(!projectName||!endUser||!epc||!packageName||!companyName){
+          planRows.push({idx,error:"Missing required field(s) — Project, End User, EPC, Package, and Company are all required."});
+          return;
+        }
+        [endUser,epc,companyName].forEach(name=>{
+          const key = norm(name);
+          if(!existingCoSet.has(key) && !newCompanies.has(key)) newCompanies.set(key,name);
+        });
+        const projKey = norm(projectName);
+        if(!existingProjSet.has(projKey) && !newProjects.has(projKey)) newProjects.set(projKey,projectName);
+        const pkgKey = norm(packageName);
+        if(!existingPkgNameSet.has(pkgKey)) newPackageNames.add(packageName);
+        if(subcategory){
+          const subKey = pkgKey+"|||"+norm(subcategory);
+          if(!existingSubcatSet.has(subKey) && !newSubcats.has(subKey)) newSubcats.set(subKey,packageName+" — "+subcategory);
+        }
+        planRows.push({idx,projectName,endUser,epc,packageName,companyName,subcategory});
+      });
+
+      setResult({
+        planRows, totalRows:rows.length, validRows:planRows.filter(r=>!r.error).length,
+        newCompanies:Array.from(newCompanies.values()), newProjects:Array.from(newProjects.values()),
+        newPackageNames:Array.from(newPackageNames), newSubcats:Array.from(newSubcats.values())
+      });
+    } catch(e){ alert("Could not read that file: "+e.message); }
+    finally { setAnalyzing(false); }
+  };
+
+  const commit = async()=>{
+    if(!result) return;
+    setCommitting(true);
+    const companyCache = new Map(), projectCache = new Map(), packageNameCache = new Set(), packageLineCache = new Map(), subcatCache = new Set();
+    const errors = [];
+    const created = { companies:0, projects:0, packageNames:0, packageLines:0, subcats:0, allocations:0, skippedAllocations:0 };
+
+    for(const row of result.planRows){
+      if(row.error) continue;
+      try{
+        for(const name of [row.endUser,row.epc,row.companyName]){
+          const key = norm(name);
+          if(companyCache.has(key)) continue;
+          const { data:existing } = await sb.from("companies").select("company_name").eq("company_name",name).maybeSingle();
+          if(existing){ companyCache.set(key,true); continue; }
+          const { error } = await sb.from("companies").insert({company_name:name, created_by:user?.username||"bulk_import"});
+          if(error){ errors.push(name+" (company): "+error.message); continue; }
+          companyCache.set(key,true); created.companies++;
+        }
+
+        const projKey = norm(row.projectName);
+        let proj = projectCache.get(projKey);
+        if(!proj){
+          const { data:existingProj } = await sb.from("major_project_tbl").select("id").eq("project_name",row.projectName).maybeSingle();
+          if(existingProj) proj = { id: existingProj.id };
+          else{
+            const { data:newProj, error } = await sb.from("major_project_tbl").insert({project_name:row.projectName, end_user_company_name:row.endUser, main_epc_company_name:row.epc, created_by:user?.username||"bulk_import"}).select().single();
+            if(error){ errors.push(row.projectName+" (project): "+error.message); continue; }
+            proj = { id: newProj.id }; created.projects++;
+          }
+          projectCache.set(projKey,proj);
+        }
+
+        const pkgNameKey = norm(row.packageName);
+        if(!packageNameCache.has(pkgNameKey)){
+          const { data:existingPkgName } = await sb.from("package_name_tbl").select("value").eq("value",row.packageName).maybeSingle();
+          if(!existingPkgName){
+            const { error } = await sb.from("package_name_tbl").insert({value:row.packageName});
+            if(error){ if(!String(error.message).toLowerCase().includes("duplicate")) errors.push(row.packageName+" (package type): "+error.message); }
+            else created.packageNames++;
+          }
+          packageNameCache.add(pkgNameKey);
+        }
+
+        const pkgLineKey = proj.id+"|||"+pkgNameKey;
+        let pkgLineId = packageLineCache.get(pkgLineKey);
+        if(!pkgLineId){
+          const { data:existingLine } = await sb.from("major_project_package_tbl").select("id").eq("project_id",proj.id).eq("package_name",row.packageName).maybeSingle();
+          if(existingLine) pkgLineId = existingLine.id;
+          else{
+            const { data:newLine, error } = await sb.from("major_project_package_tbl").insert({project_id:proj.id, package_name:row.packageName, package_status:"Unknown", created_by:user?.username||"bulk_import"}).select().single();
+            if(error){ errors.push(row.projectName+" / "+row.packageName+" (package line): "+error.message); continue; }
+            pkgLineId = newLine.id; created.packageLines++;
+          }
+          packageLineCache.set(pkgLineKey,pkgLineId);
+        }
+
+        if(row.subcategory){
+          const subKey = pkgNameKey+"|||"+norm(row.subcategory);
+          if(!subcatCache.has(subKey)){
+            const { data:existingSub } = await sb.from("package_subcategory_tbl").select("id").eq("package_name",row.packageName).eq("subcategory",row.subcategory).maybeSingle();
+            if(!existingSub){
+              const { error } = await sb.from("package_subcategory_tbl").insert({package_name:row.packageName, subcategory:row.subcategory});
+              if(error){ if(!String(error.message).toLowerCase().includes("duplicate")) errors.push(row.subcategory+" (sub-category): "+error.message); }
+              else created.subcats++;
+            }
+            subcatCache.add(subKey);
+          }
+        }
+
+        const { data:existingAlloc } = await sb.from("package_customer_allocation_tbl").select("id").eq("package_id",pkgLineId).eq("company_name",row.companyName).maybeSingle();
+        if(existingAlloc){ created.skippedAllocations++; }
+        else{
+          const { error } = await sb.from("package_customer_allocation_tbl").insert({package_id:pkgLineId, company_name:row.companyName, allocation_status:"Unknown", subcategory:row.subcategory||null, created_by:user?.username||"bulk_import"});
+          if(error){ errors.push(row.companyName+" → "+row.packageName+" (allocation): "+error.message); continue; }
+          created.allocations++;
+        }
+
+        try{
+          const { data:existingTag } = await sb.from("company_package_tbl").select("id").eq("company_name",row.companyName).eq("package_name",row.packageName).maybeSingle();
+          if(!existingTag){
+            await sb.from("company_package_tbl").insert({company_name:row.companyName, package_name:row.packageName, subcategory:row.subcategory||null, created_by:user?.username||"bulk_import"});
+          }
+        } catch(ignoreTagFail){}
+      } catch(e){ errors.push("Row "+(row.idx+1)+": "+e.message); }
+    }
+
+    setCommitted({ created, errors });
+    setCommitting(false);
+  };
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:720}},
+    h("h2",{style:{margin:"0 0 6px",fontSize:19,fontWeight:700}},"Major Projects — Bulk Import"),
+    h("div",{style:{fontSize:12.5,color:colors.mutedLight,marginBottom:16}},
+      "One flat sheet, one row per allocation. Columns: Project, End User, EPC, Package, Company, Sub-category (optional). Everything missing — Projects, Companies, Package types, Sub-categories — gets created automatically; existing rows are matched and reused, never duplicated."
+    ),
+    h("input",{type:"file",accept:".xlsx,.xls",onChange:e=>setFile(e.target.files[0]),style:{marginBottom:10}}),
+    h("div",null,
+      h("button",{onClick:analyze,disabled:!file||analyzing,style:{...btnPrimary,opacity:(!file||analyzing)?0.6:1}},analyzing?"Analyzing…":"Analyze")
+    ),
+
+    result && h("div",{style:{marginTop:20,border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px",background:"#fff"}},
+      h("div",{style:{fontWeight:700,fontSize:13,marginBottom:10}},result.validRows+" of "+result.totalRows+" rows are ready to import."+(result.totalRows>result.validRows?(" "+(result.totalRows-result.validRows)+" row(s) skipped — missing required fields."):"")),
+      h("div",{style:{display:"flex",flexWrap:"wrap",gap:16,fontSize:12.5,marginBottom:14}},
+        h("div",null,h("strong",null,result.newProjects.length)," new project(s)"),
+        h("div",null,h("strong",null,result.newCompanies.length)," new compan"+(result.newCompanies.length===1?"y":"ies")),
+        h("div",null,h("strong",null,result.newPackageNames.length)," new package type(s)"),
+        h("div",null,h("strong",null,result.newSubcats.length)," new sub-categor"+(result.newSubcats.length===1?"y":"ies"))
+      ),
+      result.newCompanies.length>0 && h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:10}},"New companies: "+result.newCompanies.join(", ")),
+      !committed && h("button",{onClick:commit,disabled:committing||result.validRows===0,style:{...btnPrimary,opacity:(committing||result.validRows===0)?0.6:1}},committing?"Importing…":"Import "+result.validRows+" row(s)"),
+      committed && h("div",{style:{marginTop:6}},
+        h("div",{style:{fontWeight:700,fontSize:13,marginBottom:8,color:"#0f6e56"}},"Import complete."),
+        h("div",{style:{fontSize:12.5,display:"flex",flexDirection:"column",gap:3,marginBottom:10}},
+          h("div",null,committed.created.companies+" compan"+(committed.created.companies===1?"y":"ies")+" created"),
+          h("div",null,committed.created.projects+" project(s) created"),
+          h("div",null,committed.created.packageNames+" package type(s) created"),
+          h("div",null,committed.created.subcats+" sub-categor"+(committed.created.subcats===1?"y":"ies")+" created"),
+          h("div",null,committed.created.packageLines+" package line(s) created"),
+          h("div",null,committed.created.allocations+" allocation(s) created"+(committed.created.skippedAllocations?(" ("+committed.created.skippedAllocations+" already existed, skipped)"):""))
+        ),
+        committed.errors.length>0 && h("div",{style:{background:"#fdeeee",borderRadius:6,padding:"10px 12px",fontSize:12,color:colors.danger}},
+          h("div",{style:{fontWeight:700,marginBottom:4}},committed.errors.length+" row(s) had errors:"),
+          committed.errors.map((e,i)=>h("div",{key:i},"• "+e))
+        )
+      )
+    )
+  );
+}
+
 function MajorProjectPackageKanban({ user }){
   const [cards,setCards] = useState([]);
   const [columnOf,setColumnOf] = useState({}); // package_status -> kanban_column
@@ -21428,6 +21646,7 @@ function App() {
       onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}
     }):
     tab==="major_projects_kanban"?h(MajorProjectPackageKanban,{user}):
+    tab==="major_projects_bulk_import"?h(MajorProjectsBulkImport,{user}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
