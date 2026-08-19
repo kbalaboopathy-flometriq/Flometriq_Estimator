@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-17T03:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-17T05:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -2264,6 +2264,443 @@ function BomEntryForm({ onGoToTab, user }) {
 }
 
 /* ---- GENERIC MASTER EDITOR ---- */
+// Bulk upload for Material Rates. Analyze-then-commit, same shape every
+// bulk import in this app now uses, for the same reason: a past incident
+// here taught this app to always show what's about to happen before
+// writing anything, and to check {error} on every insert.
+//
+// "Duplicate" has a precise meaning: a row that would change NOTHING —
+// either identical to another row in the same file, contradicts another
+// row in the same file for the same Shape/Spec/Grade, or already matches
+// the current database rate exactly. All three are pulled out, never
+// auto-processed, and handed back as a downloadable corrections file with
+// a reason column. A row whose rate genuinely differs from what's current
+// is the real, intended case — it updates normally, old rate pushed to
+// rate_history, the file's own Date preserved as the new rate's effective
+// date (not today's date).
+//
+// Creating a brand-new Shape/Spec/Grade master value needs a one-time
+// admin code — ONE code covers the whole upload, not one per item. Admins
+// bypass the code entirely, matching every other gated action in this app.
+function MaterialRatesBulkUpload({ user, onClose, onImported }){
+  const [file,setFile] = useState(null);
+  const [analyzing,setAnalyzing] = useState(false);
+  const [result,setResult] = useState(null);
+  const [committing,setCommitting] = useState(false);
+  const [committed,setCommitted] = useState(null);
+  const [codeInput,setCodeInput] = useState("");
+  const [codeVerified,setCodeVerified] = useState(false);
+  const [codeError,setCodeError] = useState("");
+  const [genCodeBusy,setGenCodeBusy] = useState(false);
+  const [justGenCode,setJustGenCode] = useState("");
+  const isAdminOrAbove = user.role==="admin"||user.role==="super_admin";
+  const norm = s => (s||"").toString().trim();
+
+  const analyze = async()=>{
+    if(!file) return;
+    setAnalyzing(true); setResult(null); setCommitted(null); setCodeVerified(false); setCodeInput(""); setCodeError("");
+    try{
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf,{type:"array"});
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rawRows = XLSX.utils.sheet_to_json(sheet,{defval:""});
+
+      const parseDate = (v)=>{
+        if(v instanceof Date) return v.toISOString().slice(0,10);
+        if(typeof v==="number"){ const d=XLSX.SSF.parse_date_code(v); return d?(d.y+"-"+String(d.m).padStart(2,"0")+"-"+String(d.d).padStart(2,"0")):""; }
+        return norm(v);
+      };
+      const parsed = rawRows.map((row,idx)=>({
+        idx, shape:norm(row.Shape), spec:norm(row.Spec||row["Material Spec"]),
+        grade:norm(row.Grade||row["Material Grade"]), rate:Number(row.Rate), dateStr:parseDate(row.Date)
+      }));
+
+      const flagged = [];
+      const invalid = parsed.filter(r=>!r.shape||!r.spec||!r.grade||isNaN(r.rate)||!r.dateStr);
+      invalid.forEach(r=>flagged.push({...r, reason:"Missing or invalid Shape/Spec/Grade/Rate/Date"}));
+      const valid = parsed.filter(r=>r.shape&&r.spec&&r.grade&&!isNaN(r.rate)&&r.dateStr);
+
+      // Within-file duplicate/conflict detection
+      const byKey = new Map();
+      valid.forEach(r=>{
+        const key = r.shape+"|||"+r.spec+"|||"+r.grade;
+        if(!byKey.has(key)) byKey.set(key,[]);
+        byKey.get(key).push(r);
+      });
+      const clean = [];
+      byKey.forEach(group=>{
+        if(group.length===1){ clean.push(group[0]); return; }
+        const uniqueSignatures = new Set(group.map(r=>r.rate+"|||"+r.dateStr));
+        if(uniqueSignatures.size===1){
+          clean.push(group[0]);
+          group.slice(1).forEach(r=>flagged.push({...r, reason:"Exact duplicate of another row in this file"}));
+        } else {
+          group.forEach(r=>flagged.push({...r, reason:"Conflicts with another row in this file for the same Shape/Spec/Grade — different Rate or Date"}));
+        }
+      });
+
+      const [{data:existingRates},{data:shapes},{data:specs},{data:grades}] = await Promise.all([
+        sb.from("material_rates").select("id,material_shape,material_spec,material_grade,rate"),
+        sb.from("materials_shape").select("shape"),
+        sb.from("material_spec").select("material_spec,material_shape"),
+        sb.from("grade_tbl").select("material_grade,material_shape"),
+      ]);
+      const rateMap = new Map((existingRates||[]).map(r=>[r.material_shape+"|||"+r.material_spec+"|||"+r.material_grade, r]));
+      const shapeSet = new Set((shapes||[]).map(s=>s.shape));
+      const specKeySet = new Set((specs||[]).map(s=>s.material_shape+"|||"+s.material_spec));
+      const gradeKeySet = new Set((grades||[]).map(g=>g.material_shape+"|||"+g.material_grade));
+
+      const newMasterNeeds = []; const seenNeeds = new Set();
+      const willUpdate = []; const willCreate = [];
+      clean.forEach(r=>{
+        if(!shapeSet.has(r.shape)){ const k="Shape|||"+r.shape; if(!seenNeeds.has(k)){ seenNeeds.add(k); newMasterNeeds.push({type:"Shape",shape:r.shape,value:r.shape}); } }
+        if(!specKeySet.has(r.shape+"|||"+r.spec)){ const k="Spec|||"+r.shape+"|||"+r.spec; if(!seenNeeds.has(k)){ seenNeeds.add(k); newMasterNeeds.push({type:"Spec",shape:r.shape,value:r.spec}); } }
+        if(!gradeKeySet.has(r.shape+"|||"+r.grade)){ const k="Grade|||"+r.shape+"|||"+r.grade; if(!seenNeeds.has(k)){ seenNeeds.add(k); newMasterNeeds.push({type:"Grade",shape:r.shape,value:r.grade}); } }
+
+        const existingRateRow = rateMap.get(r.shape+"|||"+r.spec+"|||"+r.grade);
+        if(existingRateRow){
+          if(Number(existingRateRow.rate)===r.rate){
+            flagged.push({...r, reason:"Already matches the current database rate ("+existingRateRow.rate+") — nothing to change"});
+          } else {
+            willUpdate.push({...r, existingRateRow});
+          }
+        } else {
+          willCreate.push(r);
+        }
+      });
+
+      setResult({ willUpdate, willCreate, flagged, newMasterNeeds, totalRows: rawRows.length });
+    } catch(e){ alert("Could not read that file: "+e.message); }
+    finally { setAnalyzing(false); }
+  };
+
+  const downloadCorrections = ()=>{
+    const rows = result.flagged.map(r=>({ Shape:r.shape, Spec:r.spec, Grade:r.grade, Rate:r.rate, Date:r.dateStr, Reason:r.reason }));
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wbOut = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wbOut, ws, "Needs correction");
+    XLSX.writeFile(wbOut, "material_rates_bulk_upload_corrections.xlsx");
+  };
+
+  const verifyCode = async()=>{
+    setCodeError("");
+    const res = await verifyAndConsumeGatedPin("bulk_upload_create_master", codeInput, user?.username||"unknown", "material_rates","bulk_upload","Verified one-time code to create "+result.newMasterNeeds.length+" new master value(s) during a Material Rates bulk upload");
+    if(!res.ok){ setCodeError(res.message||"That code didn't work."); return; }
+    setCodeVerified(true);
+  };
+
+  const generateCode = async()=>{
+    setGenCodeBusy(true); setJustGenCode("");
+    try{
+      const code = String(Math.floor(100000+Math.random()*900000));
+      const { data:existing } = await sb.from("gated_action_pin_tbl").select("id").eq("action_type","bulk_upload_create_master").maybeSingle();
+      if(existing) await sb.from("gated_action_pin_tbl").update({pin:code,is_used:false}).eq("id",existing.id);
+      else await sb.from("gated_action_pin_tbl").insert({action_type:"bulk_upload_create_master",pin:code,is_used:false});
+      await logAudit("UPDATE","gated_action_pin_tbl","bulk_upload_create_master","Generated a one-time code to create new master value(s) during a Material Rates bulk upload",user?.username||"unknown",null,null);
+      setJustGenCode(code);
+    } catch(e){ alert("Couldn't generate: "+e.message); }
+    finally { setGenCodeBusy(false); }
+  };
+
+  const commit = async()=>{
+    if(!result) return;
+    if(result.newMasterNeeds.length>0 && !isAdminOrAbove && !codeVerified){ setCodeError("Enter the one-time code from an Admin or Super Admin first."); return; }
+    setCommitting(true);
+    const created = { shapes:0, specs:0, grades:0, updated:0, inserted:0 };
+    const errors = [];
+    try{
+      for(const need of result.newMasterNeeds){
+        try{
+          let error;
+          if(need.type==="Shape") ({error} = await sb.from("materials_shape").insert({shape:need.value}));
+          if(need.type==="Spec") ({error} = await sb.from("material_spec").insert({material_spec:need.value, material_shape:need.shape}));
+          if(need.type==="Grade") ({error} = await sb.from("grade_tbl").insert({material_grade:need.value, material_shape:need.shape}));
+          if(error && !String(error.message||"").toLowerCase().includes("duplicate")) throw error;
+          if(need.type==="Shape") created.shapes++; else if(need.type==="Spec") created.specs++; else created.grades++;
+        } catch(e){ errors.push(need.type+" \""+need.value+"\": "+e.message); }
+      }
+
+      for(const r of result.willUpdate){
+        try{
+          const payload = { rate:r.rate, rate_effective_date:r.dateStr, material_shape:r.shape, material_spec:r.spec, material_grade:r.grade };
+          const { error } = await sb.from("material_rates").update(payload).eq("id",r.existingRateRow.id);
+          if(error) throw error;
+          const { error:histErr } = await sb.from("rate_history").insert({ material_spec:r.spec, material_grade:r.grade, old_rate:r.existingRateRow.rate, new_rate:r.rate, changed_by:user?.username||"unknown", rate_date:r.dateStr });
+          if(histErr) throw histErr;
+          created.updated++;
+        } catch(e){ errors.push(r.spec+" / "+r.grade+": "+e.message); }
+      }
+      for(const r of result.willCreate){
+        try{
+          const payload = { material_shape:r.shape, material_spec:r.spec, material_grade:r.grade, rate:r.rate, rate_effective_date:r.dateStr, spec_grade:(r.spec+" "+r.grade).trim(), created_by:user?.username||"unknown" };
+          const { error } = await sb.from("material_rates").insert(payload);
+          if(error) throw error;
+          created.inserted++;
+        } catch(e){ errors.push(r.spec+" / "+r.grade+": "+e.message); }
+      }
+      await logAudit("INSERT","material_rates","bulk upload","Bulk uploaded material rates: "+created.updated+" updated, "+created.inserted+" new, "+(created.shapes+created.specs+created.grades)+" new master value(s)",user?.username||"unknown",null,created);
+      setCommitted({ created, errors });
+      if(onImported) onImported();
+    } finally { setCommitting(false); }
+  };
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:640,maxWidth:"100%",maxHeight:"88vh",overflow:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:6}},"Bulk upload — Material rates"),
+      h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},"Columns: Shape, Spec, Grade, Rate, Date. A row whose rate genuinely differs from what's current updates normally — the old rate moves to history, dated as of today. A row that's an exact duplicate, conflicts with another row in this same file, or already matches the current rate is set aside, never applied."),
+      h("input",{type:"file",accept:".xlsx,.xls",onChange:e=>setFile(e.target.files[0]),style:{marginBottom:10}}),
+      h("div",null, h("button",{onClick:analyze,disabled:!file||analyzing,style:{...btnPrimary,opacity:(!file||analyzing)?0.6:1}},analyzing?"Analyzing…":"Analyze")),
+
+      result && h("div",{style:{marginTop:20,border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px",background:"#fff"}},
+        h("div",{style:{display:"flex",flexWrap:"wrap",gap:16,fontSize:12.5,marginBottom:10}},
+          h("div",null,h("strong",null,result.willUpdate.length)," rate(s) will update"),
+          h("div",null,h("strong",null,result.willCreate.length)," new"),
+          h("div",null,h("strong",null,result.flagged.length)," set aside — needs correction")
+        ),
+        result.flagged.length>0 && h("button",{onClick:downloadCorrections,style:{...btnSecondary,marginBottom:12}},"Download corrections file ("+result.flagged.length+" row(s))"),
+
+        result.newMasterNeeds.length>0 && h("div",{style:{background:"#fff4d6",borderRadius:6,padding:"10px 12px",marginBottom:12,fontSize:12,color:"#854f0b"}},
+          h("div",{style:{fontWeight:700,marginBottom:4}},result.newMasterNeeds.length+" new master value(s) needed:"),
+          result.newMasterNeeds.map((n,i)=>h("div",{key:i},"• "+n.type+": \""+n.value+"\""+(n.type!=="Shape"?(" (under "+n.shape+")"):""))),
+          !isAdminOrAbove && h("div",{style:{marginTop:8,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
+            codeVerified
+              ? h("span",{style:{color:"#0f6e56",fontWeight:600}},"✓ Code verified")
+              : h(React.Fragment,null,
+                  h("input",{value:codeInput,onChange:e=>setCodeInput(e.target.value),placeholder:"One-time code from Admin",style:{...inputStyle,width:160,padding:"6px 8px",fontSize:12}}),
+                  h("button",{onClick:verifyCode,style:{...btnSmall,fontSize:11}},"Verify code")
+                ),
+            codeError && h("span",{style:{color:colors.danger,fontSize:11.5}},codeError)
+          ),
+          isAdminOrAbove && h("div",{style:{marginTop:8,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
+            h("button",{onClick:generateCode,disabled:genCodeBusy,style:{...btnSmall,fontSize:11}},genCodeBusy?"Generating…":"Generate code for this upload"),
+            justGenCode && h("span",{style:{fontSize:11.5}},"Code: ",h("strong",null,justGenCode)," — give this to whoever is uploading, if not you.")
+          )
+        ),
+
+        !committed && h("button",{onClick:commit,disabled:committing||(result.willUpdate.length===0&&result.willCreate.length===0),style:{...btnPrimary,opacity:(committing||(result.willUpdate.length===0&&result.willCreate.length===0))?0.6:1}},committing?"Uploading…":"Upload "+(result.willUpdate.length+result.willCreate.length)+" row(s)"),
+
+        committed && h("div",{style:{marginTop:6}},
+          h("div",{style:{fontWeight:700,fontSize:13,marginBottom:8,color:"#0f6e56"}},"Upload complete."),
+          h("div",{style:{fontSize:12.5,display:"flex",flexDirection:"column",gap:3,marginBottom:10}},
+            h("div",null,committed.created.updated+" rate(s) updated"),
+            h("div",null,committed.created.inserted+" new rate(s) created"),
+            (committed.created.shapes+committed.created.specs+committed.created.grades)>0 && h("div",null,committed.created.shapes+" Shape, "+committed.created.specs+" Spec, "+committed.created.grades+" Grade master value(s) created")
+          ),
+          committed.errors.length>0 && h("div",{style:{background:"#fdeeee",borderRadius:6,padding:"10px 12px",fontSize:12,color:colors.danger}},
+            h("div",{style:{fontWeight:700,marginBottom:4}},committed.errors.length+" row(s) had errors:"),
+            committed.errors.map((e,i)=>h("div",{key:i},"• "+e))
+          )
+        )
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:16}},
+        h("button",{onClick:onClose,style:btnSecondary},"Close")
+      )
+    )
+  );
+}
+
+// Global Restore — restore every rate within chosen Shape(s) back to what it
+// provably was on or before a chosen date. Never touches a row we can't
+// prove existed by that date — only rate_history entries with a rate_date
+// on or before the target count as proof; a row with no qualifying history
+// is simply left alone, which sidesteps material_rates.created_at entirely
+// (it gets overwritten on every edit, so it's not a reliable "first
+// existed" signal — no new schema needed for this).
+//
+// Gated: Super Admin acts directly. Admin needs a one-time code generated
+// by a Super Admin from this same screen. A regular user never sees the
+// button that opens this at all (see MasterEditor's toolbar).
+function MaterialRatesGlobalRestore({ user, onClose, onRestored }){
+  const isSuperAdmin = user.role==="super_admin";
+  const isAdminOnly = user.role==="admin";
+  const [shapes,setShapes] = useState([]);
+  const [selectedShapes,setSelectedShapes] = useState(new Set());
+  const [restoreDate,setRestoreDate] = useState("");
+  const [previewing,setPreviewing] = useState(false);
+  const [preview,setPreview] = useState(null);
+  const [codeInput,setCodeInput] = useState("");
+  const [codeVerified,setCodeVerified] = useState(isSuperAdmin);
+  const [codeError,setCodeError] = useState("");
+  const [genCodeBusy,setGenCodeBusy] = useState(false);
+  const [justGenCode,setJustGenCode] = useState("");
+  const [restoring,setRestoring] = useState(false);
+  const [restored,setRestored] = useState(null);
+
+  useEffect(()=>{
+    sb.from("material_rates").select("material_shape").then(({data})=>{
+      setShapes(Array.from(new Set((data||[]).map(r=>r.material_shape).filter(Boolean))).sort());
+    });
+  },[]);
+
+  const toggleShape = (shape)=>{
+    setSelectedShapes(s=>{ const n=new Set(s); n.has(shape)?n.delete(shape):n.add(shape); return n; });
+  };
+
+  const runPreview = async()=>{
+    if(selectedShapes.size===0){ alert("Pick at least one Shape."); return; }
+    if(!restoreDate){ alert("Pick a restore-to date first."); return; }
+    setPreviewing(true); setPreview(null); setRestored(null);
+    try{
+      const shapeList = Array.from(selectedShapes);
+      const { data: rateRows } = await sb.from("material_rates").select("id,material_shape,material_spec,material_grade,rate").in("material_shape",shapeList);
+      const specGradePairs = Array.from(new Set((rateRows||[]).map(r=>r.material_spec+"|||"+r.material_grade)));
+      const { data: historyRows } = await sb.from("rate_history").select("*").in("material_spec",(rateRows||[]).map(r=>r.material_spec));
+      const historyByKey = new Map();
+      (historyRows||[]).forEach(h=>{
+        const key = h.material_spec+"|||"+h.material_grade;
+        if(!historyByKey.has(key)) historyByKey.set(key,[]);
+        historyByKey.get(key).push(h);
+      });
+
+      const candidates = [];
+      let leftAlone = 0, alreadyMatches = 0;
+      (rateRows||[]).forEach(row=>{
+        const key = row.material_spec+"|||"+row.material_grade;
+        const entries = (historyByKey.get(key)||[]).slice().sort((a,b)=>{
+          const da = a.rate_date||(a.changed_at||"").slice(0,10);
+          const db = b.rate_date||(b.changed_at||"").slice(0,10);
+          return da<db?-1:da>db?1:0;
+        });
+        const onOrBefore = entries.filter(h=>{
+          const d = h.rate_date||(h.changed_at||"").slice(0,10);
+          return d && d<=restoreDate;
+        });
+        if(onOrBefore.length===0){ leftAlone++; return; }
+        const latest = onOrBefore[onOrBefore.length-1];
+        const targetRate = Number(latest.new_rate)||0;
+        if(targetRate===Number(row.rate)){ alreadyMatches++; return; }
+        candidates.push({ row, targetRate, asOfEntry: latest });
+      });
+
+      setPreview({ candidates, leftAlone, alreadyMatches, totalChecked:(rateRows||[]).length });
+    } catch(e){ alert("Preview failed: "+e.message); }
+    finally { setPreviewing(false); }
+  };
+
+  const generateCode = async()=>{
+    setGenCodeBusy(true); setJustGenCode("");
+    try{
+      const code = String(Math.floor(100000+Math.random()*900000));
+      const { data:existing } = await sb.from("gated_action_pin_tbl").select("id").eq("action_type","global_rate_restore").maybeSingle();
+      if(existing) await sb.from("gated_action_pin_tbl").update({pin:code,is_used:false}).eq("id",existing.id);
+      else await sb.from("gated_action_pin_tbl").insert({action_type:"global_rate_restore",pin:code,is_used:false});
+      await logAudit("UPDATE","gated_action_pin_tbl","global_rate_restore","Generated a one-time code for a Material Rates global restore",user?.username||"unknown",null,null);
+      setJustGenCode(code);
+    } catch(e){ alert("Couldn't generate: "+e.message); }
+    finally { setGenCodeBusy(false); }
+  };
+
+  const verifyCode = async()=>{
+    setCodeError("");
+    const res = await verifyAndConsumeGatedPin("global_rate_restore", codeInput, user?.username||"unknown", "material_rates","global_restore","Verified one-time code for a Material Rates global restore ("+(preview?preview.candidates.length:0)+" row(s))");
+    if(!res.ok){ setCodeError(res.message||"That code didn't work."); return; }
+    setCodeVerified(true);
+  };
+
+  const commitRestore = async()=>{
+    if(!preview || preview.candidates.length===0) return;
+    if(!isSuperAdmin && !codeVerified){ setCodeError("Enter the one-time code from a Super Admin first."); return; }
+    setRestoring(true);
+    const today = new Date().toISOString().slice(0,10);
+    let ok=0; const errors=[];
+    for(const c of preview.candidates){
+      try{
+        const { error } = await sb.from("material_rates").update({ rate:c.targetRate, rate_effective_date:today }).eq("id",c.row.id);
+        if(error) throw error;
+        const dateLabel = new Date(c.asOfEntry.rate_date||c.asOfEntry.changed_at).toLocaleDateString();
+        const { error:histErr } = await sb.from("rate_history").insert({
+          material_spec:c.row.material_spec, material_grade:c.row.material_grade,
+          old_rate:c.row.rate, new_rate:c.targetRate, changed_by:user?.username||"unknown",
+          rate_date:today, note:"Restored to the rate effective "+dateLabel+" (global restore)"
+        });
+        if(histErr) throw histErr;
+        ok++;
+      } catch(e){ errors.push(c.row.material_spec+" / "+c.row.material_grade+": "+e.message); }
+    }
+    await logAudit("UPDATE","material_rates","global_restore","Global restore to "+restoreDate+" across "+Array.from(selectedShapes).join(", ")+" — "+ok+" row(s) restored",user?.username||"unknown",null,{ok, errors:errors.length});
+    setRestored({ ok, errors });
+    setRestoring(false);
+    if(onRestored) onRestored();
+  };
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:640,maxWidth:"100%",maxHeight:"88vh",overflow:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:6,color:"#a3312a"}},"Global restore — Material rates"),
+      h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},"Restores every rate within the Shape(s) you pick back to what it provably was on or before a chosen date. A rate with no history on or before that date is left untouched — never guessed at."),
+
+      h("div",{style:{marginBottom:12}},
+        h("div",{style:{fontSize:11,fontWeight:600,color:colors.muted,marginBottom:6}},"Shapes (pick one or more)"),
+        h("div",{style:{display:"flex",flexWrap:"wrap",gap:6,maxHeight:120,overflow:"auto",border:"1px solid "+colors.border,borderRadius:6,padding:8}},
+          shapes.length===0 ? h("span",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
+          shapes.map(s=>h("label",{key:s,style:{display:"flex",alignItems:"center",gap:4,fontSize:12,background:selectedShapes.has(s)?"#eaf2fb":"#f4f2ea",padding:"4px 8px",borderRadius:4,cursor:"pointer"}},
+            h("input",{type:"checkbox",checked:selectedShapes.has(s),onChange:()=>toggleShape(s)}), s
+          ))
+        )
+      ),
+      h("div",{style:{marginBottom:12}},
+        h("div",{style:{fontSize:11,fontWeight:600,color:colors.muted,marginBottom:4}},"Restore to rate as of"),
+        h("input",{type:"date",value:restoreDate,onChange:e=>setRestoreDate(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:13}})
+      ),
+      h("button",{onClick:runPreview,disabled:previewing,style:{...btnPrimary,opacity:previewing?0.6:1}},previewing?"Checking…":"Preview"),
+
+      preview && h("div",{style:{marginTop:18,border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px"}},
+        h("div",{style:{display:"flex",flexWrap:"wrap",gap:16,fontSize:12.5,marginBottom:10}},
+          h("div",null,h("strong",null,preview.candidates.length)," would change"),
+          h("div",null,h("strong",null,preview.alreadyMatches)," already match — skipped"),
+          h("div",null,h("strong",null,preview.leftAlone)," left alone — no proof they existed by that date")
+        ),
+        preview.candidates.length>0 && h("div",{style:{maxHeight:200,overflow:"auto",border:"1px solid "+colors.border,borderRadius:6,marginBottom:12}},
+          h("table",{style:{width:"100%",fontSize:12}},
+            h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},["Shape","Spec","Grade","Current","Restoring to"].map(c=>h("th",{key:c,style:{padding:"5px 8px"}},c)))),
+            h("tbody",null,preview.candidates.map((c,i)=>h("tr",{key:i,style:{borderTop:"1px solid #eceae0"}},
+              h("td",{style:{padding:"5px 8px"}},c.row.material_shape),
+              h("td",{style:{padding:"5px 8px"}},c.row.material_spec),
+              h("td",{style:{padding:"5px 8px"}},c.row.material_grade),
+              h("td",{style:{padding:"5px 8px"}},fmt(Number(c.row.rate)||0)),
+              h("td",{style:{padding:"5px 8px",fontWeight:700}},fmt(c.targetRate))
+            )))
+          )
+        ),
+
+        preview.candidates.length>0 && !isSuperAdmin && h("div",{style:{background:"#fff4d6",borderRadius:6,padding:"10px 12px",marginBottom:12,fontSize:12,color:"#854f0b"}},
+          isAdminOnly
+            ? (codeVerified
+                ? h("span",{style:{color:"#0f6e56",fontWeight:600}},"✓ Code verified")
+                : h(React.Fragment,null,
+                    h("div",{style:{marginBottom:6}},"This needs a one-time code from a Super Admin."),
+                    h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
+                      h("input",{value:codeInput,onChange:e=>setCodeInput(e.target.value),placeholder:"One-time code",style:{...inputStyle,width:160,padding:"6px 8px",fontSize:12}}),
+                      h("button",{onClick:verifyCode,style:{...btnSmall,fontSize:11}},"Verify code")
+                    ),
+                    codeError && h("div",{style:{color:colors.danger,fontSize:11.5,marginTop:4}},codeError)
+                  ))
+            : "You don't have permission to run a global restore."
+        ),
+        isSuperAdmin && preview.candidates.length>0 && h("div",{style:{marginBottom:12,fontSize:11.5,color:colors.mutedLight,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
+          h("button",{onClick:generateCode,disabled:genCodeBusy,style:{...btnSmall,fontSize:11}},genCodeBusy?"Generating…":"Generate code for an Admin"),
+          justGenCode && h("span",null,"Code: ",h("strong",null,justGenCode)," — give this to the Admin running the restore, if not you.")
+        ),
+
+        !restored && preview.candidates.length>0 && h("button",{
+          onClick:commitRestore, disabled:restoring||(!isSuperAdmin&&!codeVerified),
+          style:{...btnPrimary,background:"#a3312a",opacity:(restoring||(!isSuperAdmin&&!codeVerified))?0.6:1}
+        },restoring?"Restoring…":"Restore "+preview.candidates.length+" row(s)"),
+
+        restored && h("div",{style:{marginTop:6}},
+          h("div",{style:{fontWeight:700,fontSize:13,marginBottom:6,color:"#0f6e56"}},restored.ok+" row(s) restored."),
+          restored.errors.length>0 && h("div",{style:{background:"#fdeeee",borderRadius:6,padding:"10px 12px",fontSize:12,color:colors.danger}},
+            h("div",{style:{fontWeight:700,marginBottom:4}},restored.errors.length+" row(s) had errors:"),
+            restored.errors.map((e,i)=>h("div",{key:i},"• "+e))
+          )
+        )
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:16}},
+        h("button",{onClick:onClose,style:btnSecondary},"Close")
+      )
+    )
+  );
+}
+
 function MasterEditor({ tableKey, user }) {
   const tableDef = MASTER_TABLES.find(t=>t.key===tableKey);
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
@@ -2418,7 +2855,7 @@ function MasterEditor({ tableKey, user }) {
     const { error:err } = await sb.from("material_rates").update(payload).eq("id",mrEditingId);
     if(err){ setError(err.message); return; }
     if(newRate!==oldRate){
-      await sb.from("rate_history").insert({material_spec:payload.material_spec, material_grade:payload.material_grade, old_rate:oldRate, new_rate:newRate, changed_by:user?.username||"unknown"});
+      await sb.from("rate_history").insert({material_spec:payload.material_spec, material_grade:payload.material_grade, old_rate:oldRate, new_rate:newRate, changed_by:user?.username||"unknown", rate_date:new Date().toISOString().slice(0,10)});
     }
     await logAudit("UPDATE","material_rates",mrEditingId,payload.material_spec+" — "+payload.material_grade,user?.username||"unknown",null,payload);
     setRows(rs=>rs.map(r=>r.id===mrEditingId?{...r,...payload}:r));
@@ -2469,7 +2906,7 @@ function MasterEditor({ tableKey, user }) {
         };
         if(newRate!==oldRate){
           payload.rate_effective_date = new Date().toISOString().slice(0,10);
-          historyInserts.push({material_spec:payload.material_spec, material_grade:payload.material_grade, old_rate:oldRate, new_rate:newRate, changed_by:user?.username||"unknown"});
+          historyInserts.push({material_spec:payload.material_spec, material_grade:payload.material_grade, old_rate:oldRate, new_rate:newRate, changed_by:user?.username||"unknown", rate_date:new Date().toISOString().slice(0,10)});
         }
         await sb.from("material_rates").update(payload).eq("id",r.id);
         updates.push({id:r.id,...payload});
@@ -2544,7 +2981,7 @@ function MasterEditor({ tableKey, user }) {
     if(!val || val<=0){ alert("Enter a rate greater than 0."); return; }
     const payload = { rate: val, rate_effective_date: new Date().toISOString().slice(0,10) };
     await sb.from("material_rates").update(payload).eq("id",row.id);
-    await sb.from("rate_history").insert({material_spec:row.material_spec, material_grade:row.material_grade, old_rate:0, new_rate:val, changed_by:user?.username||"unknown"});
+    await sb.from("rate_history").insert({material_spec:row.material_spec, material_grade:row.material_grade, old_rate:0, new_rate:val, changed_by:user?.username||"unknown", rate_date:new Date().toISOString().slice(0,10)});
     await logAudit("UPDATE","material_rates",row.id,row.material_spec+" — "+row.material_grade+" (rate set from 0 to "+val+")",user?.username||"unknown",{rate:0},payload);
     setZeroRateRows(rs=>rs.filter(r=>r.id!==row.id));
     setZeroRateTotal(c=>Math.max(0,c-1));
@@ -2642,8 +3079,39 @@ function MasterEditor({ tableKey, user }) {
     const { data } = await sb.from("rate_history").select("*").eq("material_spec",row.material_spec).eq("material_grade",row.material_grade).order("changed_at",{ascending:false});
     setHistoryRows(data||[]); setHistoryFor(row);
   };
+  // Restoring an old rate makes it CURRENT again (so costing/quotes pick it
+  // up immediately) but never rewrites the timeline — it adds a new,
+  // clearly-annotated entry on top, same as the earlier "restore" design.
+  const [restoringId,setRestoringId]=useState(null);
+  const restoreRate = async(hrow)=>{
+    const oldDateLabel = new Date(hrow.rate_date||hrow.changed_at).toLocaleDateString();
+    if(!confirm("Restore rate to "+fmt(Number(hrow.new_rate)||0)+" (originally effective "+oldDateLabel+")? This becomes the current rate immediately.")) return;
+    setRestoringId(hrow.id);
+    try{
+      const currentRate = Number(historyFor.rate)||0;
+      const restoredRate = Number(hrow.new_rate)||0;
+      const today = new Date().toISOString().slice(0,10);
+      const payload = { rate: restoredRate, rate_effective_date: today };
+      const { error } = await sb.from("material_rates").update(payload).eq("id",historyFor.id);
+      if(error) throw error;
+      const { error:histErr } = await sb.from("rate_history").insert({
+        material_spec: historyFor.material_spec, material_grade: historyFor.material_grade,
+        old_rate: currentRate, new_rate: restoredRate, changed_by: user?.username||"unknown",
+        rate_date: today, note: "Restored to the rate effective "+oldDateLabel
+      });
+      if(histErr) throw histErr;
+      await logAudit("UPDATE","material_rates",historyFor.id,historyFor.material_spec+" — "+historyFor.material_grade+" (restored to "+restoredRate+", originally effective "+oldDateLabel+")",user?.username||"unknown",{rate:currentRate},payload);
+      setRows(rs=>rs.map(r=>r.id===historyFor.id?{...r,...payload}:r));
+      setHistoryFor(rr=>({...rr,...payload}));
+      const { data } = await sb.from("rate_history").select("*").eq("material_spec",historyFor.material_spec).eq("material_grade",historyFor.material_grade).order("changed_at",{ascending:false});
+      setHistoryRows(data||[]);
+    } catch(e){ alert("Restore failed: "+e.message); }
+    finally { setRestoringId(null); }
+  };
   const [mrFieldLockMsg,setMrFieldLockMsg]=useState("");
   const [mrZoomOpen,setMrZoomOpen]=useState(false);
+  const [showMrBulkUpload,setShowMrBulkUpload]=useState(false);
+  const [showMrGlobalRestore,setShowMrGlobalRestore]=useState(false);
   const mrGuardField = (e)=>{ setMrFieldLockMsg("Contact your Super Admin to change Spec, Grade, Shape, or UOM — Admins can only update Rate."); e.target.blur(); };
   const lockedFieldStyle = {...inputStyle,padding:"5px 7px",fontSize:12,background:"#f4f2ea",color:colors.mutedLight};
 
@@ -3124,6 +3592,8 @@ function MasterEditor({ tableKey, user }) {
         tableKey==="model_tbl"&&h("button",{onClick:()=>{setShowRename(v=>!v);setRenameMsg("");},style:btnSecondary},"Rename model"),
         tableKey==="bom"&&h("button",{onClick:downloadCleanupTracker,style:btnSecondary},"Download cleanup tracker"),
         tableKey==="material_rates"&&zeroRateCount>0&&h("button",{onClick:openZeroRateTable,style:{...btnDanger,fontWeight:600}},"⚠ Rate = 0 ("+zeroRateCount+")"),
+        tableKey==="material_rates"&&h("button",{onClick:()=>setShowMrBulkUpload(true),style:btnSecondary},"Bulk upload"),
+        tableKey==="material_rates"&&(user.role==="admin"||user.role==="super_admin")&&h("button",{onClick:()=>setShowMrGlobalRestore(true),style:{...btnSecondary,border:"1px solid #a3312a",color:"#a3312a"}},"Global restore"),
         tableKey==="material_rates"&&mrFilteredRows.length>0&&h("button",{onClick:()=>setMrZoomOpen(true),style:btnSecondary},"⤢ Zoom"),
         tableKey==="material_rates"&&h("button",{onClick:()=>openMrExportPreview("excel"),disabled:exportPreviewLoading,style:btnSecondary},"Export Excel"),
         tableKey==="material_rates"&&h("button",{onClick:()=>openMrExportPreview("pdf"),disabled:exportPreviewLoading,style:btnSecondary},"Export PDF"),
@@ -3456,13 +3926,19 @@ function MasterEditor({ tableKey, user }) {
           ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"14px 0"}},"No changes recorded yet — this rate hasn't been edited since rate history was added.")
           : h("table",{style:{width:"100%",fontSize:12.5,marginTop:10}},
               h("thead",null,h("tr",{style:{textAlign:"left",borderBottom:"2px solid "+colors.dark}},
-                ["Old rate","New rate","Date","By"].map(c=>h("th",{key:c,style:{padding:"6px 8px"}},c))
+                ["Old rate","New rate","Effective","By",""].map(c=>h("th",{key:c,style:{padding:"6px 8px"}},c))
               )),
               h("tbody",null,historyRows.map(hrow=>h("tr",{key:hrow.id,style:{borderBottom:"1px solid #eceae0"}},
                 h("td",{style:{padding:"6px 8px"}},fmt(Number(hrow.old_rate)||0)),
                 h("td",{style:{padding:"6px 8px",fontWeight:700}},fmt(Number(hrow.new_rate)||0)),
-                h("td",{style:{padding:"6px 8px",color:colors.muted}},new Date(hrow.changed_at).toLocaleDateString()),
-                h("td",{style:{padding:"6px 8px",color:colors.muted}},hrow.changed_by)
+                h("td",{style:{padding:"6px 8px",color:colors.muted}},
+                  new Date(hrow.rate_date||hrow.changed_at).toLocaleDateString(),
+                  hrow.note && h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:2}},hrow.note)
+                ),
+                h("td",{style:{padding:"6px 8px",color:colors.muted}},hrow.changed_by),
+                h("td",{style:{padding:"6px 8px"}},
+                  Number(hrow.new_rate)!==Number(historyFor.rate) && h("button",{onClick:()=>restoreRate(hrow),disabled:restoringId===hrow.id,style:{...btnSmall,fontSize:10,padding:"3px 8px"}},restoringId===hrow.id?"…":"Restore")
+                )
               )))
             )
       )
@@ -3471,7 +3947,9 @@ function MasterEditor({ tableKey, user }) {
       employee: employeeLoginRow, user,
       onClose: ()=>setEmployeeLoginRow(null),
       onLinked: (appUserId)=>{ setRows(rs=>rs.map(r=>r.id===employeeLoginRow.id?{...r,app_user_id:appUserId}:r)); setEmployeeLoginRow(null); }
-    })
+    }),
+    showMrBulkUpload && h(MaterialRatesBulkUpload,{ user, onClose:()=>setShowMrBulkUpload(false), onImported:load }),
+    showMrGlobalRestore && h(MaterialRatesGlobalRestore,{ user, onClose:()=>setShowMrGlobalRestore(false), onRestored:load })
   );
 }
 
@@ -5250,7 +5728,8 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
             h("h2",{style:{margin:0,fontSize:19,fontWeight:700}},selectedModel),
             h("div",{style:{display:"flex",alignItems:"center",gap:10,marginTop:4}},
               h("span",{style:{fontSize:12,color:colors.mutedLight}},computedLines.length+" line items · "+summaryRows.length+" groups"),
-              h("button",{onClick:()=>{setMocLines(lines);setMocSelections({});setShowMOC(true);},style:{...btnSecondary,fontSize:12,padding:"5px 12px"}},"Set MOC")
+              h("button",{onClick:()=>{setMocLines(lines);setMocSelections({});setShowMOC(true);},style:{...btnSecondary,fontSize:12,padding:"5px 12px"}},"Set MOC"),
+              h("button",{onClick:onRefresh,title:"Pull the latest Shapes, Specs, Grades and Rates — useful if you (or someone else, in another tab) just added or fixed one",style:{...btnSecondary,fontSize:12,padding:"5px 12px"}},"↻ Refresh rates")
             )
           ),
           h("div",{style:{display:"flex",gap:16,alignItems:"center",flexWrap:"wrap"}},
@@ -9234,7 +9713,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     });
   },[]);
 
-  useEffect(()=>{
+  const loadRatesAndGrades = ()=>{
     fetchAll("material_rates","material_spec,material_grade,rate,uom").then(rows=>{
       const g=new Map(), r=new Map();
       rows.forEach(row=>{
@@ -9245,6 +9724,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       });
       setGradesBySpec(g); setRateBySpecGrade(r);
     });
+  };
+  useEffect(()=>{
+    loadRatesAndGrades();
     fetchAll("uom_tbl","uom").then(rows=>setUoms(rows.map(r=>r.uom).filter(Boolean)));
     fetchAll("item_tbl","item").then(rows=>setDpItemOptions(rows.map(r=>r.item).filter(Boolean)));
     fetchAll("material_spec","material_spec").then(rows=>setAllSpecs(Array.from(new Set(rows.map(r=>r.material_spec).filter(Boolean))).sort()));
@@ -11623,6 +12105,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                       : {...btnSmall,border:"1px solid #0f6e56",color:"#0f6e56",opacity:refreshingPrice?0.6:1}
                   }, refreshingPrice?"Refreshing…":"Refresh price"),
                   h("button",{onClick:()=>setShowBomRefreshConfirm(true),style:{...btnSmall,border:"1px solid #a3312a",color:"#a3312a"}},"Refresh BOM from master"),
+                  h("button",{onClick:loadRatesAndGrades,title:"Pull the latest Shapes, Specs, Grades and Rates — useful if you (or someone else, in another tab) just added or fixed one",style:{...btnSmall,border:"1px solid "+colors.border,color:colors.text}},"↻ Refresh rates"),
                   isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No"),
                   h("button",{onClick:()=>setFullScreenBOM(f=>!f),style:{...btnSecondary,fontSize:11,padding:"4px 10px"}}, fullScreenBOM?"Esc · Close full screen":"⛶ Full screen BOM")
                 )
@@ -21368,7 +21851,7 @@ function MaterialRatesReport({ user }){
     const { error:err } = await sb.from("material_rates").update({ rate:newRate, created_at:new Date().toISOString(), created_by:user.username }).eq("id",row.id);
     if(err){ alert("Update failed: "+err.message); return; }
     if(newRate!==oldRate){
-      await sb.from("rate_history").insert({material_spec:row.material_spec, material_grade:row.material_grade, old_rate:oldRate, new_rate:newRate, changed_by:user?.username||"unknown"});
+      await sb.from("rate_history").insert({material_spec:row.material_spec, material_grade:row.material_grade, old_rate:oldRate, new_rate:newRate, changed_by:user?.username||"unknown", rate_date:new Date().toISOString().slice(0,10)});
     }
     await logAudit("UPDATE","material_rates",row.id,row.material_spec+" — "+row.material_grade,user.username,{rate:row.rate},{rate:newRate});
     setEditing(e=>{ const n={...e}; delete n[row.id]; return n; });
