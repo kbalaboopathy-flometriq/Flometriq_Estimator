@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-20T04:05:57Z";
+  var APP_BUILD_VERSION = "2026-08-20T06:04:41Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8779,6 +8779,50 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     }
   };
 
+  // Cart screen — Qty is the only field editable inline there (Item/Size/
+  // Model stay display-only, per the settled Phase 2 scope: changing those
+  // after a BOM exists is a heavier operation than this screen should
+  // silently trigger — that stays Goto BOM's job). Saves on blur/Enter,
+  // only when the value actually changed. Recomputes each non-direct-price
+  // line's cost/sales_price the same way updateOrderQty does for the
+  // "open" Sl No — deliberately excluding Direct Price Lines from that
+  // formula, same reasoning as Clone Sl No: their price is already a flat
+  // per-unit figure multiplied by qty only at total-computation time, and
+  // rate/sf are 0 on those lines, so applying the formula would zero them.
+  const [cartQtyDraft,setCartQtyDraft]=useState({}); // {refId: string} local text while editing
+  const [cartQtySaving,setCartQtySaving]=useState({}); // {refId: true} while in flight
+  const updateCartRowQty = async(ref, val)=>{
+    const n = Number(val);
+    if(!Number.isFinite(n) || n<=0){ alert("Enter a qty greater than 0."); setCartQtyDraft(d=>{ const c={...d}; delete c[ref.id]; return c; }); return; }
+    if(n===Number(ref.order_qty||1)){ setCartQtyDraft(d=>{ const c={...d}; delete c[ref.id]; return c; }); return; }
+    setCartQtySaving(s=>({...s,[ref.id]:true}));
+    try{
+      const { error } = await sb.from("estimates").update({order_qty:n}).eq("id",ref.id);
+      if(error) throw error;
+      setRefs(rs=>rs.map(r=>r.id===ref.id?{...r,order_qty:n}:r));
+      if(openRef && openRef.id===ref.id){ setOpenRef(r=>r?{...r,order_qty:n}:r); setOrderQty(n); }
+      const { data:lineRows } = await sb.from("estimate_lines").select("*").eq("reference_number",ref.reference_number).eq("item_sl_no",ref.item_sl_no);
+      let changed = 0;
+      for(const line of (lineRows||[])){
+        if(line.is_direct_price) continue;
+        const qty = Number(line.qty_required)||0;
+        const rate = Number(line.rate)||0;
+        const sf = Number(line.sf)||3.1;
+        const cost = Number((qty*n*rate).toFixed(4));
+        const sales_price = Number((cost*sf).toFixed(4));
+        if(Number(line.cost)===cost && Number(line.sales_price)===sales_price) continue;
+        await sb.from("estimate_lines").update({cost,sales_price}).eq("id",line.id);
+        if(openRef && openRef.id===ref.id) setOpenLines(ls=>ls.map(l=>l.id===line.id?{...l,cost,sales_price}:l));
+        changed++;
+      }
+      if(changed>0) await logAudit("UPDATE","estimate_lines",ref.reference_number+"-"+ref.item_sl_no,"Order Qty changed to "+n+" from Cart — recomputed cost/sales_price on "+changed+" line(s)",user?.username||"unknown",null,null);
+    } catch(e){ alert("Couldn't save the new quantity: "+e.message); }
+    finally {
+      setCartQtySaving(s=>({...s,[ref.id]:false}));
+      setCartQtyDraft(d=>{ const c={...d}; delete c[ref.id]; return c; });
+    }
+  };
+
   // "+ Add new" — prompts for a quote number, checks if it's taken, and
   // either offers to open the existing one or hands off to the Estimator
   // to create it, same as the search box's not-found flow.
@@ -9409,6 +9453,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // Commercial Terms field is filled in AND every Sl No under the quote has
   // a datasheet on file.
   const [modelItemMap,setModelItemMap]=useState(new Map());
+  const [modelSizeMap,setModelSizeMap]=useState(new Map()); // model -> size, for the Cart screen's display-only Size column
   const checkQuoteReadiness = useCallback(async(refNumber)=>{
     const missing = [];
     let termsDone = true, validationDone = true;
@@ -9903,10 +9948,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     refreshModelItemMap();
   },[]);
   const refreshModelItemMap = ()=>{
-    fetchAll("model_tbl","item,model").then(rows=>{
-      const m=new Map();
-      rows.forEach(row=>{ if(row.model) m.set(row.model, row.item||""); });
+    fetchAll("model_tbl","item,size,model").then(rows=>{
+      const m=new Map(); const s=new Map();
+      rows.forEach(row=>{ if(row.model){ m.set(row.model, row.item||""); s.set(row.model, row.size||""); } });
       setModelItemMap(m);
+      setModelSizeMap(s);
     });
   };
 
@@ -9976,7 +10022,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(refFilter) out = out.filter(r=>r.reference_number===refFilter);
     if(slNoFilter) out = out.filter(r=>String(r.item_sl_no)===String(slNoFilter));
     if(descSearch){ const s=descSearch.toLowerCase(); out = out.filter(r=>(r.description||"").toLowerCase().includes(s)); }
-    return out;
+    // Sl Nos within the same quote always show in numeric order — refs
+    // itself is created_at DESC (a sensible "most recent quote first" order
+    // when browsing across many quotes), but a freshly cloned or added Sl
+    // No has the newest timestamp of anything on its own quote, so left
+    // unsorted it jumps to wherever recency puts it instead of sitting
+    // where it belongs in the sequence. Cross-quote order (when no single
+    // quote is filtered) still follows recency, unchanged.
+    return [...out].sort((a,b)=> a.reference_number===b.reference_number
+      ? a.item_sl_no-b.item_sl_no
+      : (a.created_at<b.created_at?1:-1));
   },[refs,refFilter,slNoFilter,descSearch]);
 
   // Sl No options narrow to whichever Quote# is currently selected
@@ -10887,13 +10942,19 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         if(hasFields || hasAttachment){
           const totalSalesValue = await computeSlNoFoldedSalesTotal(est.reference_number, est.item_sl_no, est.order_qty);
           const dsRows = hasFields ? ds.custom_free_fields.map((f,i)=>({key:"custom-"+i,label:f.label,value:f.value})) : [];
+          // The "Reference — Attached" pointer row only makes sense for the
+          // Excel export (no merge concept there) — the PDF loops below
+          // check renderOwnPdfPage and skip drawing this section entirely
+          // for an attachment-only Sl No, since the real vendor pages that
+          // immediately follow make a pointer line redundant.
           if(hasAttachment) dsRows.push({key:"custom-pdf",label:"Reference",value:"Attached — see following page(s)"});
           const customSections = [ { title:"Datasheet", rows: dsRows } ];
           customSections.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
           // itemNameForTemplate is now already the real typed Item (see fix
           // above) — no separate display-name fallback needed here anymore.
           list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: itemNameForTemplate, sectionsRows: customSections,
-            attachedFilePath: hasAttachment ? ds.custom_excel_file_path : null, attachedFileName: hasAttachment ? ds.custom_excel_file_name : null });
+            attachedFilePath: hasAttachment ? ds.custom_excel_file_path : null, attachedFileName: hasAttachment ? ds.custom_excel_file_name : null,
+            renderOwnPdfPage: !!hasFields });
         }
         continue;
       }
@@ -10907,7 +10968,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const sectionsRows = allSections.filter(sec=>sec.rows.some(r=>r.value!==undefined && r.value!==null && String(r.value).trim()!==""));
       const totalSalesValue = await computeSlNoFoldedSalesTotal(est.reference_number, est.item_sl_no, est.order_qty);
       sectionsRows.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
-      list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: itemNameForTemplate, sectionsRows });
+      list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: itemNameForTemplate, sectionsRows, renderOwnPdfPage:true });
     }
     list.sort((a,b)=>a.slNo-b.slNo);
     return list;
@@ -11448,38 +11509,40 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       doc.addPage();
       const dsStartPage = doc.internal.getNumberOfPages();
       dsList.forEach((inst,idx)=>{
-        if(idx>0) doc.addPage();
-        letterhead("ANNEXURE III - TECHNICAL DATA SHEET");
-        let yy=34;
-        doc.setFontSize(9); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
-        doc.text("Sl No "+inst.slNo+" — "+inst.itemName,12,yy);
-        const body=[];
-        inst.sectionsRows.forEach(sec=>{
-          if(!sec.rows.length) return;
-          body.push([{content:sec.title,colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
-          sec.rows.forEach(r=>body.push([r.label, r.value]));
-        });
-        const slOptions = slExtraByItem.get(inst.slNo)||[];
-        if(slOptions.length){
-          body.push([{content:"Options",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
-          slOptions.forEach(o=>body.push([o.label, ""]));
+        if(inst.renderOwnPdfPage!==false){
+          if(idx>0) doc.addPage();
+          letterhead("ANNEXURE III - TECHNICAL DATA SHEET");
+          let yy=34;
+          doc.setFontSize(9); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+          doc.text("Sl No "+inst.slNo+" — "+inst.itemName,12,yy);
+          const body=[];
+          inst.sectionsRows.forEach(sec=>{
+            if(!sec.rows.length) return;
+            body.push([{content:sec.title,colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
+            sec.rows.forEach(r=>body.push([r.label, r.value]));
+          });
+          const slOptions = slExtraByItem.get(inst.slNo)||[];
+          if(slOptions.length){
+            body.push([{content:"Options",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
+            slOptions.forEach(o=>body.push([o.label, ""]));
+          }
+          const slTests = [...(slTestingByItem.get(inst.slNo)||[]), ...(globalTestingByItem.get(inst.slNo)||[]).map(g=>({test_name:g.test_name}))];
+          if(slTests.length){
+            body.push([{content:"Testing",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
+            slTests.forEach(t=>body.push([t.test_name+" — Included in scope", ""]));
+          }
+          doc.autoTable({
+            startY:yy+6, body, theme:"plain",
+            styles:{font:"helvetica",fontSize:8.5,textColor:dark,cellPadding:{top:1,right:5,bottom:1,left:5}},
+            columnStyles:{0:{cellWidth:60},1:{cellWidth:"auto"}},
+            margin:{top:32,left:12,right:12,bottom:16},
+            didDrawPage:()=>letterhead("ANNEXURE III - TECHNICAL DATA SHEET")
+          });
         }
-        const slTests = [...(slTestingByItem.get(inst.slNo)||[]), ...(globalTestingByItem.get(inst.slNo)||[]).map(g=>({test_name:g.test_name}))];
-        if(slTests.length){
-          body.push([{content:"Testing",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
-          slTests.forEach(t=>body.push([t.test_name+" — Included in scope", ""]));
-        }
-        doc.autoTable({
-          startY:yy+6, body, theme:"plain",
-          styles:{font:"helvetica",fontSize:8.5,textColor:dark,cellPadding:{top:1,right:5,bottom:1,left:5}},
-          columnStyles:{0:{cellWidth:60},1:{cellWidth:"auto"}},
-          margin:{top:32,left:12,right:12,bottom:16},
-          didDrawPage:()=>letterhead("ANNEXURE III - TECHNICAL DATA SHEET")
-        });
-        // This Sl No's own content (typed fields + price data) is done —
-        // if it also has an attached PDF, record where its pages get
-        // spliced in: right after the current last page, so they land
-        // immediately after this Sl No's section, before the next Sl No's.
+        // An attachment-only Sl No (renderOwnPdfPage===false) draws nothing
+        // of its own — no pointer page, no wasted page break. Its vendor
+        // pages just land wherever the previous entry left off, via the
+        // insertion recorded below.
         if(inst.attachedFilePath){
           pdfMergeInsertions.push({ afterPage: doc.internal.getNumberOfPages(), filePath: inst.attachedFilePath, fileName: inst.attachedFileName });
         }
@@ -11612,25 +11675,27 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         if(p !== letterheadPage){ drawQuoteLetterhead(doc,W,"DATA SHEET",quoteExportRef,customer); letterheadPage = p; }
       };
       list.forEach((inst,idx)=>{
-        if(idx>0) doc.addPage();
-        ensureLetterhead();
-        let y = drawDocHeaderBlock(doc,"DATA SHEET",{ slNo:inst.slNo, client:customer, item:inst.itemName, quoteNo, model:inst.model });
-        const body = [];
-        inst.sectionsRows.forEach((sec,si)=>{
-          // Blank rows are dropped from the PDF entirely (Excel keeps them,
-          // since that's meant to double as a fillable reference template).
-          const filledRows = sec.rows.filter(r=>r.value!==undefined && r.value!==null && String(r.value).trim()!=="" && r.value!=="—");
-          if(filledRows.length===0) return;
-          body.push([{content:sec.title, colSpan:2, styles:{fontStyle:"bold", font:"times", fontSize:11}}]);
-          filledRows.forEach(r=>body.push([r.label, r.value]));
-        });
-        doc.autoTable({
-          startY:y, body, theme:"plain", tableWidth:"wrap",
-          styles:{font:"helvetica", cellPadding:{top:1.2,right:6,bottom:1.2,left:6}, fontSize:10, textColor:dark},
-          columnStyles:{0:{cellWidth:60},1:{cellWidth:"auto"}},
-          margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
-          didDrawPage: ensureLetterhead
-        });
+        if(inst.renderOwnPdfPage!==false){
+          if(idx>0) doc.addPage();
+          ensureLetterhead();
+          let y = drawDocHeaderBlock(doc,"DATA SHEET",{ slNo:inst.slNo, client:customer, item:inst.itemName, quoteNo, model:inst.model });
+          const body = [];
+          inst.sectionsRows.forEach((sec,si)=>{
+            // Blank rows are dropped from the PDF entirely (Excel keeps them,
+            // since that's meant to double as a fillable reference template).
+            const filledRows = sec.rows.filter(r=>r.value!==undefined && r.value!==null && String(r.value).trim()!=="" && r.value!=="—");
+            if(filledRows.length===0) return;
+            body.push([{content:sec.title, colSpan:2, styles:{fontStyle:"bold", font:"times", fontSize:11}}]);
+            filledRows.forEach(r=>body.push([r.label, r.value]));
+          });
+          doc.autoTable({
+            startY:y, body, theme:"plain", tableWidth:"wrap",
+            styles:{font:"helvetica", cellPadding:{top:1.2,right:6,bottom:1.2,left:6}, fontSize:10, textColor:dark},
+            columnStyles:{0:{cellWidth:60},1:{cellWidth:"auto"}},
+            margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
+            didDrawPage: ensureLetterhead
+          });
+        }
         if(inst.attachedFilePath){
           pdfMergeInsertions.push({ afterPage: doc.internal.getNumberOfPages(), filePath: inst.attachedFilePath, fileName: inst.attachedFileName });
         }
@@ -12830,18 +12895,29 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,overflow:"hidden"}},
           h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:13}},
             h("thead",null,h("tr",{style:{background:"#faf9f4",borderBottom:"2px solid "+colors.dark,textAlign:"left"}},
-              h("th",{style:{padding:"8px 10px"}},"Sl No"),h("th",{style:{padding:"8px 10px"}},"Item"),h("th",{style:{padding:"8px 10px"}},"Model"),h("th",{style:{padding:"8px 10px"}},"Qty"),h("th",{style:{padding:"8px 10px"}},"")
+              h("th",{style:{padding:"8px 10px"}},"Sl No"),h("th",{style:{padding:"8px 10px"}},"Item"),h("th",{style:{padding:"8px 10px"}},"Size"),h("th",{style:{padding:"8px 10px"}},"Model"),h("th",{style:{padding:"8px 10px"}},"Qty"),h("th",{style:{padding:"8px 10px"}},"")
             )),
             h("tbody",null,
               refs.filter(r=>r.reference_number===refFilter).length===0
-                ? h("tr",null,h("td",{colSpan:5,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},"No Sl Nos on this quote yet."))
+                ? h("tr",null,h("td",{colSpan:6,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},"No Sl Nos on this quote yet."))
                 : refs.filter(r=>r.reference_number===refFilter).sort((a,b)=>a.item_sl_no-b.item_sl_no).map(r=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
                     h("td",{style:{padding:"8px 10px",fontWeight:700,color:"#0f6e56"}},r.item_sl_no),
-                    h("td",{style:{padding:"8px 10px"}},modelItemMap.get(r.model)||r.model||"—"),
-                    h("td",{style:{padding:"8px 10px"}},r.model||"—"),
-                    h("td",{style:{padding:"8px 10px"}},r.order_qty||1),
+                    h("td",{style:{padding:"8px 10px",color:colors.muted}},modelItemMap.get(r.model)||r.model||"—"),
+                    h("td",{style:{padding:"8px 10px",color:colors.muted}},modelSizeMap.get(r.model)||"—"),
+                    h("td",{style:{padding:"8px 10px",color:colors.muted}},r.model||"—"),
+                    h("td",{style:{padding:"8px 10px"}},
+                      h("input",{type:"number",min:1,
+                        value: cartQtyDraft[r.id]!==undefined ? cartQtyDraft[r.id] : (r.order_qty||1),
+                        disabled: !!cartQtySaving[r.id],
+                        onChange:e=>setCartQtyDraft(d=>({...d,[r.id]:e.target.value})),
+                        onBlur:e=>updateCartRowQty(r,e.target.value),
+                        onKeyDown:e=>{ if(e.key==="Enter") e.target.blur(); },
+                        style:{width:60,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4,opacity:cartQtySaving[r.id]?0.6:1}
+                      })
+                    ),
                     h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
                       h("button",{onClick:async()=>{ setShowCartScreen(false); await openEstimate(r); },style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Goto BOM"),
+                      h("button",{onClick:()=>{ setShowCartScreen(false); openEstimate(r); setShowDatasheet(true); },style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Datasheet"),
                       h("button",{onClick:()=>openCloneSlNo(r),style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6,borderColor:"#1c8c75",color:"#0f6e56"}},"Clone Sl No"),
                       isAdmin && h("button",{onClick:()=>deleteSlNo(r),disabled:deletingSlNo===r.id,style:{border:"none",background:"transparent",color:colors.danger,cursor:"pointer",fontSize:12}},deletingSlNo===r.id?"…":"Remove")
                     )
