@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-20T01:04:12Z";
+  var APP_BUILD_VERSION = "2026-08-20T02:30:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -10773,7 +10773,20 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const list = [];
     const mocRuleCache = new Map(); // itemName -> {parameters:[...]} — avoids refetching per Sl No when several share an item
     for(const est of estimatesRows){
-      const itemNameForTemplate = modelItemMap.get(est.model) || est.model || "Unknown item";
+      // Direct Price/Custom BOM lines store model as the literal string
+      // "Custom" (not a real catalog model) — modelItemMap.get("Custom")
+      // finds nothing, so this used to fall back to est.model itself
+      // ("Custom"), which was then used BOTH to look up a Datasheet Master
+      // template AND to match a saved custom datasheet's template_key.
+      // That silently failed whenever the custom datasheet was saved under
+      // the line's real typed Item (e.g. "Birds Screen" -> template_key
+      // "birds screen"), since "custom" never matches "birds screen" —
+      // ds came back undefined and the Sl No was dropped from Annexure III
+      // entirely with no error. Fixed: resolve the Direct Price line's own
+      // typed Item FIRST, same source DatasheetModal/CustomDatasheetCapture
+      // already use to open/save the datasheet in the first place.
+      const dpLineForTemplate = linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.is_direct_price===true);
+      const itemNameForTemplate = (dpLineForTemplate && dpLineForTemplate.item) || modelItemMap.get(est.model) || est.model || "Unknown item";
       const template = await loadDatasheetMaster(itemNameForTemplate);
       const ds = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.template_key===normalizeItemName(itemNameForTemplate));
       if(!template){
@@ -10790,13 +10803,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             customSections.push({ title:"Datasheet", rows: ds.custom_free_fields.map((f,i)=>({key:"custom-"+i,label:f.label,value:f.value})) });
           }
           customSections.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
-          // Display label prefers the real typed Item off the Direct Price
-          // line itself — itemNameForTemplate above stays model-based on
-          // purpose, so the template lookup (and its "no template" fallback
-          // into this custom branch) isn't disturbed by this display fix.
-          const dpLine = linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.is_direct_price===true);
-          const displayItemName = dpLine ? (dpLine.item||itemNameForTemplate) : itemNameForTemplate;
-          list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: displayItemName, sectionsRows: customSections });
+          // itemNameForTemplate is now already the real typed Item (see fix
+          // above) — no separate display-name fallback needed here anymore.
+          list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: itemNameForTemplate, sectionsRows: customSections });
         }
         continue;
       }
