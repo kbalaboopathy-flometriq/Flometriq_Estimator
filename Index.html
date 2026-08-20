@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-20T02:30:00Z";
+  var APP_BUILD_VERSION = "2026-08-20T03:19:09Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -6269,9 +6269,18 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
 // free-form Label/Value grid. Either satisfies the readiness check the same
 // way a real templated datasheet does — a row just needs to exist in
 // `datasheets` keyed by (reference_number, item_sl_no, template_key).
+// Custom/Direct Price lines have no Datasheet Master template (nothing to
+// match against a real catalog item), so this is the only way their
+// technical data gets captured. Confirmed 20 Aug: typed fields are the ONLY
+// thing that counts as "this Sl No has a datasheet" — Annexure III prints
+// them in full, in the same branded format every other Sl No gets. An
+// attached file is optional and purely a backup reference for internal use;
+// it is never substituted into the PDF (an arbitrary Excel/Word/PDF has no
+// fixed layout to reliably reformat from — see standing note). A Sl No with
+// neither typed fields nor an attachment simply doesn't get an Annexure III
+// page at all — the Price Summary description already covers it there.
 function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
   const [loading,setLoading] = useState(true);
-  const [mode,setMode] = useState(null); // "excel" | "grid"
   const [fields,setFields] = useState([{label:"",value:""}]);
   const [fileName,setFileName] = useState("");
   const [filePath,setFilePath] = useState("");
@@ -6287,8 +6296,8 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
         .eq("template_key",templateKey).maybeSingle();
       if(cancelled) return;
       if(data && data.is_custom_datasheet){
-        if(data.custom_excel_file_name){ setMode("excel"); setFileName(data.custom_excel_file_name); setFilePath(data.custom_excel_file_path||""); }
-        else if(data.custom_free_fields && data.custom_free_fields.length){ setMode("grid"); setFields(data.custom_free_fields); }
+        if(data.custom_free_fields && data.custom_free_fields.length) setFields(data.custom_free_fields);
+        if(data.custom_excel_file_name){ setFileName(data.custom_excel_file_name); setFilePath(data.custom_excel_file_path||""); }
       }
       setLoading(false);
     })();
@@ -6310,29 +6319,30 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
     const { data } = await sb.storage.from("direct-price-excels").createSignedUrl(filePath, 60);
     if(data?.signedUrl) window.open(data.signedUrl,"_blank");
   };
+  const removeAttachment = ()=>{ setFileName(""); setFilePath(""); };
 
   const setFieldRow = (i,key,val)=>setFields(fs=>fs.map((f,idx)=>idx===i?{...f,[key]:val}:f));
   const addFieldRow = ()=>setFields(fs=>[...fs,{label:"",value:""}]);
   const removeFieldRow = (i)=>setFields(fs=>fs.filter((_,idx)=>idx!==i));
 
   const save = async()=>{
-    if(mode==="excel" && !fileName){ alert("Attach an Excel file first."); return; }
-    if(mode==="grid" && fields.every(f=>!f.label.trim())){ alert("Add at least one row with a label."); return; }
+    const filled = fields.filter(f=>f.label.trim());
+    if(!filled.length){ alert("Add at least one row with a label — this is what prints on Annexure III. A reference file alone won't appear on the quote."); return; }
     setSaving(true);
     try{
       const payload = {
         reference_number: openRef.reference_number, item_sl_no: openRef.item_sl_no, template_key: templateKey,
         is_custom_datasheet: true,
-        custom_excel_file_name: mode==="excel" ? fileName : null,
-        custom_excel_file_path: mode==="excel" ? filePath : null,
-        custom_free_fields: mode==="grid" ? fields.filter(f=>f.label.trim()) : null,
+        custom_excel_file_name: fileName || null,
+        custom_excel_file_path: filePath || null,
+        custom_free_fields: filled,
         field_values: {}, overrides: {},
         updated_by: user.username, updated_at: new Date().toISOString()
       };
       const { error } = await sb.from("datasheets").upsert(payload,{onConflict:"reference_number,item_sl_no,template_key"});
       if(error) throw error;
       await sb.from("estimates").update({datasheet_skipped:false}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
-      await logAudit("SAVE","datasheets",openRef.reference_number+"-"+openRef.item_sl_no,"Custom datasheet ("+mode+") for "+itemName+", "+openRef.reference_number+" Sl No "+openRef.item_sl_no,user.username,null,payload);
+      await logAudit("SAVE","datasheets",openRef.reference_number+"-"+openRef.item_sl_no,"Custom datasheet for "+itemName+", "+openRef.reference_number+" Sl No "+openRef.item_sl_no+" ("+filled.length+" field(s)"+(fileName?", 1 reference file":"")+")",user.username,null,payload);
       onSaved();
     } catch(e){ alert("Save failed: "+e.message); }
     finally { setSaving(false); }
@@ -6347,19 +6357,8 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
   return h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:80,padding:20}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:480,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
       h("div",{style:{fontWeight:700,fontSize:15,marginBottom:2}},"Datasheet — "+itemName),
-      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Sl No "+openRef.item_sl_no+" — this item has no Datasheet Master template. As a Custom/Direct Price line, attach an Excel or fill in a free-form list instead."),
-      h("div",{style:{display:"flex",gap:8,marginBottom:16}},
-        h("button",{onClick:()=>setMode("excel"),style:{...btnSmall,flex:1,background:mode==="excel"?colors.dark:"#fff",color:mode==="excel"?"#fff":colors.text}},"Upload Excel"),
-        h("button",{onClick:()=>setMode("grid"),style:{...btnSmall,flex:1,background:mode==="grid"?colors.dark:"#fff",color:mode==="grid"?"#fff":colors.text}},"Free-form grid")
-      ),
-      mode==="excel" && h("div",{style:{marginBottom:16}},
-        fileName
-          ? h("div",{style:{fontSize:12.5,color:"#0f6e3f",marginBottom:8}},"✓ "+fileName+" ",h("button",{onClick:downloadExcel,style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Download"))
-          : null,
-        h("input",{type:"file",accept:".xlsx,.xls,.csv",disabled:uploading,onChange:e=>{ const f=e.target.files[0]; if(f) uploadExcel(f); },style:{fontSize:12}}),
-        uploading && h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"Uploading…")
-      ),
-      mode==="grid" && h("div",{style:{marginBottom:16}},
+      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Sl No "+openRef.item_sl_no+" — this item has no Datasheet Master template. Type the fields below; they print on Annexure III in full, same format as every other Sl No."),
+      h("div",{style:{marginBottom:14}},
         fields.map((f,i)=>h("div",{key:i,style:{display:"flex",gap:6,marginBottom:6,alignItems:"center"}},
           h("input",{value:f.label,onChange:e=>setFieldRow(i,"label",e.target.value),placeholder:"Label",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12}}),
           h("input",{value:f.value,onChange:e=>setFieldRow(i,"value",e.target.value),placeholder:"Value",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12}}),
@@ -6367,9 +6366,18 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
         )),
         h("button",{onClick:addFieldRow,style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"+ Add row")
       ),
+      h("div",{style:{borderTop:"1px solid "+colors.border,paddingTop:12,marginBottom:16}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:6}},"Reference file (optional — internal backup only, not printed on the quote)"),
+        fileName
+          ? h("div",{style:{fontSize:12.5,color:"#0f6e3f",marginBottom:6}},"✓ "+fileName+" ",
+              h("button",{onClick:downloadExcel,style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Download"),
+              h("button",{onClick:removeAttachment,style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Remove"))
+          : h("input",{type:"file",accept:".xlsx,.xls,.csv,.pdf,.doc,.docx",disabled:uploading,onChange:e=>{ const f=e.target.files[0]; if(f) uploadExcel(f); },style:{fontSize:12}}),
+        uploading && h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"Uploading…")
+      ),
       h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
         h("button",{onClick:onClose,style:btnSecondary},"Close"),
-        h("button",{onClick:save,disabled:saving||!mode,style:{...btnPrimary,opacity:(saving||!mode)?0.6:1}},saving?"Saving…":"Save")
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save")
       )
     )
   );
@@ -10794,14 +10802,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         // annexure as before. A Custom/Direct Price line that filled in a
         // custom datasheet (Excel or free-form grid) gets its own simple
         // section instead of vanishing from the PDF entirely.
-        if(ds && ds.is_custom_datasheet){
+        // A reference file alone (no typed fields) is not enough to earn an
+        // Annexure III page — there's no reliable way to reformat an
+        // arbitrary Excel/Word/PDF into this layout (see standing note in
+        // CustomDatasheetCapture). That Sl No is skipped here, same as
+        // before, and its Price Summary description covers it instead.
+        if(ds && ds.is_custom_datasheet && ds.custom_free_fields && ds.custom_free_fields.length){
           const totalSalesValue = await computeSlNoFoldedSalesTotal(est.reference_number, est.item_sl_no, est.order_qty);
-          const customSections = [];
-          if(ds.custom_excel_file_name){
-            customSections.push({ title:"Datasheet", rows:[{key:"custom-excel",label:"Reference",value:"See attached Excel — "+ds.custom_excel_file_name}] });
-          } else if(ds.custom_free_fields && ds.custom_free_fields.length){
-            customSections.push({ title:"Datasheet", rows: ds.custom_free_fields.map((f,i)=>({key:"custom-"+i,label:f.label,value:f.value})) });
-          }
+          const customSections = [
+            { title:"Datasheet", rows: ds.custom_free_fields.map((f,i)=>({key:"custom-"+i,label:f.label,value:f.value})) }
+          ];
           customSections.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
           // itemNameForTemplate is now already the real typed Item (see fix
           // above) — no separate display-name fallback needed here anymore.
@@ -12737,7 +12747,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{width:100,flexShrink:0,borderRight:"1px solid "+colors.border,paddingRight:12}},
           h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"EXISTING"),
           h("div",{style:{display:"flex",flexDirection:"column",gap:5}},
-            refs.filter(r=>r.reference_number===refFilter).map(r=>h("span",{key:r.item_sl_no,style:{fontSize:12,padding:"3px 7px",background:"#f4f2ea",borderRadius:5}},"Sl No "+r.item_sl_no))
+            refs.filter(r=>r.reference_number===refFilter).sort((a,b)=>a.item_sl_no-b.item_sl_no).map(r=>h("span",{key:r.item_sl_no,style:{fontSize:12,padding:"3px 7px",background:"#f4f2ea",borderRadius:5}},"Sl No "+r.item_sl_no))
           )
         ),
         h("div",{style:{flex:1}},
