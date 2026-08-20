@@ -10,6 +10,7 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tabler-icons/3.44.0/tabler-icons.min.css" />
 <style>
 * { box-sizing: border-box; }
@@ -43,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-20T03:19:09Z";
+  var APP_BUILD_VERSION = "2026-08-20T04:05:57Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -6271,14 +6272,15 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
 // `datasheets` keyed by (reference_number, item_sl_no, template_key).
 // Custom/Direct Price lines have no Datasheet Master template (nothing to
 // match against a real catalog item), so this is the only way their
-// technical data gets captured. Confirmed 20 Aug: typed fields are the ONLY
-// thing that counts as "this Sl No has a datasheet" — Annexure III prints
-// them in full, in the same branded format every other Sl No gets. An
-// attached file is optional and purely a backup reference for internal use;
-// it is never substituted into the PDF (an arbitrary Excel/Word/PDF has no
-// fixed layout to reliably reformat from — see standing note). A Sl No with
-// neither typed fields nor an attachment simply doesn't get an Annexure III
-// page at all — the Price Summary description already covers it there.
+// technical data gets captured. Confirmed 20 Aug (revised): an attached PDF
+// is now a first-class path, not just a backup reference — its actual pages
+// get merged straight into the generated quote PDF, right after this Sl
+// No's Price Data, via mergeAttachedPdfPages()/pdf-lib (see there for why
+// this only works reliably for PDF — no OCR/reformatting of Excel or Word).
+// Typed fields still exist for when there's no source PDF to attach. Either
+// one (or both) counts as "this Sl No has a datasheet"; a Sl No with
+// neither gets no Annexure III page at all — the Price Summary description
+// covers it instead.
 function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
   const [loading,setLoading] = useState(true);
   const [fields,setFields] = useState([{label:"",value:""}]);
@@ -6304,8 +6306,9 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
     return ()=>{ cancelled=true; };
   },[openRef.reference_number, openRef.item_sl_no, templateKey]);
 
-  const uploadExcel = async(file)=>{
+  const uploadPdf = async(file)=>{
     if(!file) return;
+    if(file.type!=="application/pdf" && !/\.pdf$/i.test(file.name)){ alert("Only PDF files can be attached — the pages get inserted directly into the quote PDF, and that only works reliably for real PDF pages. If you have a Word or Excel file, print/export it to PDF first, or use the typed fields instead."); return; }
     setUploading(true);
     try{
       const path = "custom_ds_"+openRef.reference_number+"_"+openRef.item_sl_no+"_"+Date.now()+"_"+file.name.replace(/[^a-zA-Z0-9._-]/g,"_");
@@ -6315,7 +6318,7 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
     } catch(e){ alert("Upload failed: "+e.message); }
     finally { setUploading(false); }
   };
-  const downloadExcel = async()=>{
+  const downloadAttachment = async()=>{
     const { data } = await sb.storage.from("direct-price-excels").createSignedUrl(filePath, 60);
     if(data?.signedUrl) window.open(data.signedUrl,"_blank");
   };
@@ -6327,7 +6330,7 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
 
   const save = async()=>{
     const filled = fields.filter(f=>f.label.trim());
-    if(!filled.length){ alert("Add at least one row with a label — this is what prints on Annexure III. A reference file alone won't appear on the quote."); return; }
+    if(!filled.length && !filePath){ alert("Either attach a PDF or type at least one field below — one of the two is needed for this Sl No to appear on Annexure III."); return; }
     setSaving(true);
     try{
       const payload = {
@@ -6342,7 +6345,7 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
       const { error } = await sb.from("datasheets").upsert(payload,{onConflict:"reference_number,item_sl_no,template_key"});
       if(error) throw error;
       await sb.from("estimates").update({datasheet_skipped:false}).eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
-      await logAudit("SAVE","datasheets",openRef.reference_number+"-"+openRef.item_sl_no,"Custom datasheet for "+itemName+", "+openRef.reference_number+" Sl No "+openRef.item_sl_no+" ("+filled.length+" field(s)"+(fileName?", 1 reference file":"")+")",user.username,null,payload);
+      await logAudit("SAVE","datasheets",openRef.reference_number+"-"+openRef.item_sl_no,"Custom datasheet for "+itemName+", "+openRef.reference_number+" Sl No "+openRef.item_sl_no+" ("+filled.length+" typed field(s)"+(fileName?", 1 attached PDF ("+fileName+")":"")+")",user.username,null,payload);
       onSaved();
     } catch(e){ alert("Save failed: "+e.message); }
     finally { setSaving(false); }
@@ -6357,8 +6360,18 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
   return h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:80,padding:20}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:480,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
       h("div",{style:{fontWeight:700,fontSize:15,marginBottom:2}},"Datasheet — "+itemName),
-      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Sl No "+openRef.item_sl_no+" — this item has no Datasheet Master template. Type the fields below; they print on Annexure III in full, same format as every other Sl No."),
-      h("div",{style:{marginBottom:14}},
+      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Sl No "+openRef.item_sl_no+" — this item has no Datasheet Master template. Attach the vendor's PDF (its pages go straight into the quote PDF, right after this Sl No's price data), or type fields by hand if there's no source PDF. Either — or both — works."),
+      h("div",{style:{marginBottom:16}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:6}},"Attached PDF (its pages print in full on the quote)"),
+        fileName
+          ? h("div",{style:{fontSize:12.5,color:"#0f6e3f",marginBottom:6}},"✓ "+fileName+" ",
+              h("button",{onClick:downloadAttachment,style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Download"),
+              h("button",{onClick:removeAttachment,style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Remove"))
+          : h("input",{type:"file",accept:"application/pdf,.pdf",disabled:uploading,onChange:e=>{ const f=e.target.files[0]; if(f) uploadPdf(f); },style:{fontSize:12}}),
+        uploading && h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"Uploading…")
+      ),
+      h("div",{style:{borderTop:"1px solid "+colors.border,paddingTop:12,marginBottom:14}},
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:6}},"Typed fields (used if there's no PDF to attach — also print in full)"),
         fields.map((f,i)=>h("div",{key:i,style:{display:"flex",gap:6,marginBottom:6,alignItems:"center"}},
           h("input",{value:f.label,onChange:e=>setFieldRow(i,"label",e.target.value),placeholder:"Label",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12}}),
           h("input",{value:f.value,onChange:e=>setFieldRow(i,"value",e.target.value),placeholder:"Value",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12}}),
@@ -6366,21 +6379,85 @@ function CustomDatasheetCapture({ openRef, itemName, user, onClose, onSaved }){
         )),
         h("button",{onClick:addFieldRow,style:{...btnSecondary,fontSize:11,padding:"4px 10px"}},"+ Add row")
       ),
-      h("div",{style:{borderTop:"1px solid "+colors.border,paddingTop:12,marginBottom:16}},
-        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:6}},"Reference file (optional — internal backup only, not printed on the quote)"),
-        fileName
-          ? h("div",{style:{fontSize:12.5,color:"#0f6e3f",marginBottom:6}},"✓ "+fileName+" ",
-              h("button",{onClick:downloadExcel,style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Download"),
-              h("button",{onClick:removeAttachment,style:{...btnSmall,fontSize:10,padding:"2px 8px",marginLeft:6}},"Remove"))
-          : h("input",{type:"file",accept:".xlsx,.xls,.csv,.pdf,.doc,.docx",disabled:uploading,onChange:e=>{ const f=e.target.files[0]; if(f) uploadExcel(f); },style:{fontSize:12}}),
-        uploading && h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"Uploading…")
-      ),
       h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
         h("button",{onClick:onClose,style:btnSecondary},"Close"),
         h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save")
       )
     )
   );
+}
+
+// Wraps raw PDF bytes (from a pdf-lib merge) in the same minimal interface
+// PdfPreviewModal already calls on a real jsPDF doc — .output("blob"/
+// "arraybuffer") for the iframe preview, .save(filename) for the Download
+// button — so a merged document is a drop-in replacement everywhere a
+// jsPDF doc was expected, with no changes needed to PdfPreviewModal itself.
+function wrapAsJsPdfLike(bytes){
+  const blob = new Blob([bytes], {type:"application/pdf"});
+  return {
+    output(type){ if(type==="arraybuffer") return bytes.buffer||bytes; return blob; },
+    save(filename){
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename||"document.pdf";
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(()=>URL.revokeObjectURL(url), 1500);
+    }
+  };
+}
+
+// Reads just the page count of an attached PDF from storage, without doing
+// a full merge — used to work out the true Annexure III end page for the
+// Index/Table of Contents BEFORE the actual pdf-lib splice happens (that
+// splice runs after the Index is already drawn, so the Index needs to know
+// the page counts in advance rather than discovering them afterward).
+async function getPdfPageCountFromStorage(filePath, storageBucket){
+  try{
+    const { data:signed } = await sb.storage.from(storageBucket).createSignedUrl(filePath, 300);
+    if(!signed?.signedUrl) return 0;
+    const resp = await fetch(signed.signedUrl);
+    const bytes = await resp.arrayBuffer();
+    const { PDFDocument } = window.PDFLib;
+    const pdf = await PDFDocument.load(bytes);
+    return pdf.getPageCount();
+  } catch(e){ console.error("Could not read attached PDF page count for "+filePath, e); return 0; }
+}
+
+// already-built jsPDF quote doc, at the exact page each insertion recorded
+// as "afterPage" (1-based count from doc.internal.getNumberOfPages() at the
+// moment that Sl No's own content finished drawing — see the Annexure III
+// loop in generateQuotePdf/exportQuoteDatasheetsPDF). Only pdf-lib can
+// splice in another PDF's real pages; jsPDF can only draw new content, not
+// embed existing pages. Processes insertions highest-afterPage-first so
+// each insertion point is still valid when its turn comes (an earlier
+// insertion doesn't shift the page count an already-recorded later
+// insertion is relying on). Falls back to the un-merged doc (with a clear
+// alert, not a silent drop) if fetching or merging any attachment fails —
+// a failed attachment merge should never block the rest of the quote from
+// generating.
+async function mergeAttachedPdfPages(doc, insertions, storageBucket){
+  if(!insertions || !insertions.length) return doc;
+  try{
+    const { PDFDocument } = window.PDFLib;
+    const jsPdfBytes = doc.output("arraybuffer");
+    const mergedPdf = await PDFDocument.load(jsPdfBytes);
+    const sorted = [...insertions].sort((a,b)=>b.afterPage-a.afterPage);
+    for(const ins of sorted){
+      const { data:signed } = await sb.storage.from(storageBucket).createSignedUrl(ins.filePath, 300);
+      if(!signed?.signedUrl) continue;
+      const resp = await fetch(signed.signedUrl);
+      const attachedBytes = await resp.arrayBuffer();
+      const attachedDoc = await PDFDocument.load(attachedBytes);
+      const copiedPages = await mergedPdf.copyPages(attachedDoc, attachedDoc.getPageIndices());
+      copiedPages.forEach((pg,i)=>mergedPdf.insertPage(ins.afterPage+i, pg));
+    }
+    const finalBytes = await mergedPdf.save();
+    return wrapAsJsPdfLike(finalBytes);
+  } catch(mergeErr){
+    console.error("Attached PDF merge failed — returning the quote PDF without merged attachments", mergeErr);
+    alert("The quote PDF generated, but one or more attached datasheets couldn't be merged in this time: "+mergeErr.message+"\n\nEverything else in the PDF is unaffected — you can try generating again, or check the attachment under Goto Datasheet for the affected Sl No.");
+    return doc;
+  }
 }
 
 // Inline resolver for a Material Data row with genuinely ambiguous grades —
@@ -10799,23 +10876,24 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const ds = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.template_key===normalizeItemName(itemNameForTemplate));
       if(!template){
         // No template — a real catalog item just gets skipped from the
-        // annexure as before. A Custom/Direct Price line that filled in a
-        // custom datasheet (Excel or free-form grid) gets its own simple
-        // section instead of vanishing from the PDF entirely.
-        // A reference file alone (no typed fields) is not enough to earn an
-        // Annexure III page — there's no reliable way to reformat an
-        // arbitrary Excel/Word/PDF into this layout (see standing note in
-        // CustomDatasheetCapture). That Sl No is skipped here, same as
-        // before, and its Price Summary description covers it instead.
-        if(ds && ds.is_custom_datasheet && ds.custom_free_fields && ds.custom_free_fields.length){
+        // annexure as before. A Custom/Direct Price line with either typed
+        // fields or an attached PDF (or both) gets its own section instead
+        // of vanishing from the PDF entirely. attachedFilePath/fileName
+        // are carried through so the caller can record a merge insertion —
+        // the actual page-splicing happens after the whole doc is built,
+        // in mergeAttachedPdfPages().
+        const hasFields = ds && ds.is_custom_datasheet && ds.custom_free_fields && ds.custom_free_fields.length;
+        const hasAttachment = ds && ds.is_custom_datasheet && ds.custom_excel_file_path;
+        if(hasFields || hasAttachment){
           const totalSalesValue = await computeSlNoFoldedSalesTotal(est.reference_number, est.item_sl_no, est.order_qty);
-          const customSections = [
-            { title:"Datasheet", rows: ds.custom_free_fields.map((f,i)=>({key:"custom-"+i,label:f.label,value:f.value})) }
-          ];
+          const dsRows = hasFields ? ds.custom_free_fields.map((f,i)=>({key:"custom-"+i,label:f.label,value:f.value})) : [];
+          if(hasAttachment) dsRows.push({key:"custom-pdf",label:"Reference",value:"Attached — see following page(s)"});
+          const customSections = [ { title:"Datasheet", rows: dsRows } ];
           customSections.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate));
           // itemNameForTemplate is now already the real typed Item (see fix
           // above) — no separate display-name fallback needed here anymore.
-          list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: itemNameForTemplate, sectionsRows: customSections });
+          list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: itemNameForTemplate, sectionsRows: customSections,
+            attachedFilePath: hasAttachment ? ds.custom_excel_file_path : null, attachedFileName: hasAttachment ? ds.custom_excel_file_name : null });
         }
         continue;
       }
@@ -11357,6 +11435,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
 
       // ---- Datasheets, one per Sl No ----
       const dsList = await buildQuoteDatasheetsBySlNo(estimatesRows, linesRows, datasheetsRows);
+      // Pre-read attached PDFs' page counts (metadata only, no merge yet) so
+      // the Index/Table of Contents below can print the TRUE Annexure III
+      // page range including the pages that get spliced in at the very end
+      // — the Index is drawn before that splice happens, so it can't
+      // discover this by just checking doc.internal.getNumberOfPages().
+      const attachedPageCounts = await Promise.all(
+        dsList.filter(i=>i.attachedFilePath).map(i=>getPdfPageCountFromStorage(i.attachedFilePath,"direct-price-excels"))
+      );
+      const totalAttachedPages = attachedPageCounts.reduce((s,n)=>s+n,0);
+      const pdfMergeInsertions = []; // {afterPage, filePath, fileName} — spliced in by mergeAttachedPdfPages() after the whole doc is built
       doc.addPage();
       const dsStartPage = doc.internal.getNumberOfPages();
       dsList.forEach((inst,idx)=>{
@@ -11388,6 +11476,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           margin:{top:32,left:12,right:12,bottom:16},
           didDrawPage:()=>letterhead("ANNEXURE III - TECHNICAL DATA SHEET")
         });
+        // This Sl No's own content (typed fields + price data) is done —
+        // if it also has an attached PDF, record where its pages get
+        // spliced in: right after the current last page, so they land
+        // immediately after this Sl No's section, before the next Sl No's.
+        if(inst.attachedFilePath){
+          pdfMergeInsertions.push({ afterPage: doc.internal.getNumberOfPages(), filePath: inst.attachedFilePath, fileName: inst.attachedFileName });
+        }
       });
       const dsEndPage = doc.internal.getNumberOfPages();
 
@@ -11402,7 +11497,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       indexRows.push([String(seq++),"Annexure-I","Commercial Terms", termsStartPage===termsEndPage?String(termsStartPage):termsStartPage+"-"+termsEndPage]);
       if(quoteNotes.length) indexRows.push([String(seq++),"Annexure-IB","Notes", notesStartPage===notesEndPage?String(notesStartPage):notesStartPage+"-"+notesEndPage]);
       indexRows.push([String(seq++),"Annexure-II","Price Summary", summaryStartPage===summaryEndPage?String(summaryStartPage):summaryStartPage+"-"+summaryEndPage]);
-      indexRows.push([String(seq++),"Annexure-III","Technical Data Sheet", dsStartPage===dsEndPage?String(dsStartPage):dsStartPage+"-"+dsEndPage]);
+      indexRows.push([String(seq++),"Annexure-III","Technical Data Sheet", (()=>{ const trueEnd=dsEndPage+totalAttachedPages; return dsStartPage===trueEnd?String(dsStartPage):dsStartPage+"-"+trueEnd; })()]);
       doc.autoTable({
         startY:38,
         head:[["S.No","Annexures","Description","Page Nos"]],
@@ -11429,7 +11524,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           doc.setTextColor(...dark); // restore for anything drawn after (safety, though this is the last step per page)
         }
       }
-      return doc;
+      // Note (known, disclosed limitation): footer "Page X of Y" numbers
+      // above were stamped by numberQuotePages() based on the page count
+      // BEFORE this splice. Any native page that physically follows an
+      // inserted attachment will still show its pre-splice number/total —
+      // the Index/TOC page ranges above ARE correct (computed with
+      // totalAttachedPages), but in-footer numbering past an insertion
+      // point can drift. Re-numbering after a pdf-lib byte-level merge
+      // would need footer text drawn via pdf-lib directly rather than
+      // jsPDF, which is a larger follow-on change, not done here.
+      return await mergeAttachedPdfPages(doc, pdfMergeInsertions, "direct-price-excels");
       }; // end buildDoc
 
       const doc = await buildDoc({});
@@ -11501,6 +11605,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
       const W = doc.internal.pageSize.getWidth();
       const dark=[28,31,26];
+      const pdfMergeInsertions = [];
       let letterheadPage = 0;
       const ensureLetterhead = ()=>{
         const p = doc.internal.getNumberOfPages();
@@ -11526,10 +11631,14 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
           didDrawPage: ensureLetterhead
         });
+        if(inst.attachedFilePath){
+          pdfMergeInsertions.push({ afterPage: doc.internal.getNumberOfPages(), filePath: inst.attachedFilePath, fileName: inst.attachedFileName });
+        }
       });
       if(list.length===0){ ensureLetterhead(); doc.setFontSize(10); doc.text("No datasheet masters found for any item in this quote.",12,40); }
       numberQuotePages(doc,W);
-      setPdfPreview({doc, filename:quoteExportRef.replace(/\s+/g,"_")+"_Datasheets.pdf"});
+      const finalDoc = await mergeAttachedPdfPages(doc, pdfMergeInsertions, "direct-price-excels");
+      setPdfPreview({doc:finalDoc, filename:quoteExportRef.replace(/\s+/g,"_")+"_Datasheets.pdf"});
     } catch(e){
       console.error("Export Datasheets PDF failed", e);
       alert("Could not generate the Datasheets PDF: "+e.message);
