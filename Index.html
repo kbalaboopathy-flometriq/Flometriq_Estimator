@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-20T06:04:41Z";
+  var APP_BUILD_VERSION = "2026-08-20T14:04:46Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8263,11 +8263,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // unreliable in-browser and could silently resolve as Cancel even on a
   // real OK click. An in-app modal with a real scroll area and buttons
   // that call real functions directly has no such length ceiling.
-  const [draftConfirm,setDraftConfirm]=useState(null); // {missing}
+  const [draftConfirm,setDraftConfirm]=useState(null); // {missing, incompleteBomDetails}
   const draftConfirmResolveRef = useRef(null);
-  const askDraftConfirm = (missing)=> new Promise(resolve=>{
+  const askDraftConfirm = (missing, incompleteBomDetails)=> new Promise(resolve=>{
     draftConfirmResolveRef.current = resolve;
-    setDraftConfirm({missing});
+    setDraftConfirm({missing, incompleteBomDetails: incompleteBomDetails||[]});
     // Fresh state every time this modal opens — a skip decision from a
     // previous Generate PDF attempt on this (or another) quote should never
     // carry over.
@@ -8275,10 +8275,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     setBomSkipCodeTarget(null); setBomSkipCodeInput(""); setBomSkipCodeError("");
     setValidatedLines(new Set());
     setPendingValidateCodeTarget(null); setPendingValidateCodeInput(""); setPendingValidateCodeError("");
+    setBomExceptionTarget(null); setBomExceptionReasonInput(""); setBomExceptionCodeInput(""); setBomExceptionCodeError("");
   });
-  const resolveDraftConfirm = (proceed)=>{
+  // outcome: "cancel" (Go back and fix), "draft" (proceed watermarked,
+  // regardless of what's still open), "clean" (proceed unwatermarked — only
+  // reachable once canGenerate is true, same as the old single-Generate
+  // button used to require).
+  const resolveDraftConfirm = (outcome)=>{
     setDraftConfirm(null);
-    if(draftConfirmResolveRef.current){ draftConfirmResolveRef.current(proceed); draftConfirmResolveRef.current=null; }
+    if(draftConfirmResolveRef.current){ draftConfirmResolveRef.current(outcome); draftConfirmResolveRef.current=null; }
   };
   // Per-line skip for Incomplete BOM entries only — every OTHER readiness
   // gap (Commercial Terms, Datasheet, Description, Pending validation)
@@ -8330,6 +8335,72 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     } catch(e){ setGenBomSkipCodeMsg("Couldn't generate: "+e.message); }
     finally { setGenBomSkipCodeBusy(false); }
   };
+
+  // Per-COMPONENT exception (distinct from the whole-Sl-No skip above) —
+  // e.g. a screwed cover legitimately needs no separate bolts/nuts. Marking
+  // one writes a real row to bom_line_exceptions (exception_type
+  // 'marked_missing') with a required reason, so it's excluded from
+  // checkQuoteReadiness permanently — survives reload, survives amendments —
+  // unlike bomSkipConfirmed above which only lasts one Generate attempt.
+  // Admin: instant. Regular user: same one-time-PIN pattern as the other
+  // gated actions here, own action_type so the audit trail can tell "skipped
+  // a whole line" apart from "excepted one component".
+  const [bomExceptionTarget,setBomExceptionTarget]=useState(null); // {slNo,itemName,paramLabel} mid-flow
+  const [bomExceptionReasonInput,setBomExceptionReasonInput]=useState("");
+  const [bomExceptionCodeInput,setBomExceptionCodeInput]=useState("");
+  const [bomExceptionCodeError,setBomExceptionCodeError]=useState("");
+  const [bomExceptionBusy,setBomExceptionBusy]=useState(false);
+  const openBomException = (slNo,itemName,paramLabel)=>{
+    setBomExceptionTarget({slNo,itemName,paramLabel});
+    setBomExceptionReasonInput(""); setBomExceptionCodeInput(""); setBomExceptionCodeError("");
+  };
+  const saveBomException = async(reason)=>{
+    if(!bomExceptionTarget) return;
+    const {slNo,itemName,paramLabel} = bomExceptionTarget;
+    setBomExceptionBusy(true);
+    try{
+      const { error } = await sb.from("bom_line_exceptions").insert({
+        reference_number:quoteExportRef, item_sl_no:slNo, exception_type:"marked_missing",
+        parameter_label:paramLabel, reason:reason.trim(), deleted_by:user?.username||"unknown"
+      });
+      if(error) throw error;
+      await logAudit("INSERT","bom_line_exceptions",quoteExportRef+"-"+slNo,"Marked \""+paramLabel+"\" as a BOM exception on Sl No "+slNo+" (\""+itemName+"\") — "+reason.trim(),user?.username||"unknown",null,null);
+      setBomExceptionTarget(null);
+      // Re-check readiness and refresh THIS modal's own snapshot (draftConfirm),
+      // not just the background readiness bar — otherwise the item we just
+      // excepted would keep showing in the open modal until it's reopened.
+      const fresh = await checkQuoteReadiness(quoteExportRef);
+      setDraftConfirm(dc=> dc ? {missing:fresh.missing, incompleteBomDetails:fresh.incompleteBomDetails} : dc);
+      refreshReadiness(quoteExportRef);
+    } catch(e){ alert("Couldn't save the exception: "+e.message); }
+    finally { setBomExceptionBusy(false); }
+  };
+  const confirmBomExceptionAdmin = ()=>{
+    if(!bomExceptionReasonInput.trim()){ alert("Enter a reason for this exception first."); return; }
+    saveBomException(bomExceptionReasonInput);
+  };
+  const submitBomExceptionCode = async()=>{
+    if(!bomExceptionReasonInput.trim()){ setBomExceptionCodeError("Enter a reason first."); return; }
+    setBomExceptionBusy(true); setBomExceptionCodeError("");
+    const res = await verifyAndConsumeGatedPin("bom_component_exception", bomExceptionCodeInput, user?.username||"unknown", "estimates", quoteExportRef, "Marked \""+bomExceptionTarget.paramLabel+"\" as a BOM exception on Sl No "+bomExceptionTarget.slNo+" — "+bomExceptionReasonInput.trim());
+    if(!res.ok){ setBomExceptionCodeError(res.message||"That code didn't work."); setBomExceptionBusy(false); return; }
+    await saveBomException(bomExceptionReasonInput);
+  };
+  const [genBomExceptionCodeBusy,setGenBomExceptionCodeBusy]=useState(false);
+  const [genBomExceptionCodeMsg,setGenBomExceptionCodeMsg]=useState("");
+  const [justGenBomExceptionCode,setJustGenBomExceptionCode]=useState("");
+  const generateBomExceptionCode = async()=>{
+    setGenBomExceptionCodeBusy(true); setGenBomExceptionCodeMsg(""); setJustGenBomExceptionCode("");
+    try{
+      const code = String(Math.floor(100000+Math.random()*900000));
+      const { data:existing } = await sb.from("gated_action_pin_tbl").select("id").eq("action_type","bom_component_exception").maybeSingle();
+      if(existing) await sb.from("gated_action_pin_tbl").update({pin:code,is_used:false}).eq("id",existing.id);
+      else await sb.from("gated_action_pin_tbl").insert({action_type:"bom_component_exception",pin:code,is_used:false});
+      await logAudit("UPDATE","gated_action_pin_tbl","bom_component_exception","Generated a one-time code to mark a missing BOM component as an exception",user?.username||"unknown",null,null);
+      setJustGenBomExceptionCode(code);
+    } catch(e){ setGenBomExceptionCodeMsg("Couldn't generate: "+e.message); }
+    finally { setGenBomExceptionCodeBusy(false); }
+  };
   // Pending-validation lines, resolvable right from this same blocking
   // modal instead of a dead end pointing at a separate screen. Admin/super
   // admin: instant if an Excel is already attached to the line; otherwise
@@ -8355,7 +8426,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const handleValidateClick = (line)=>{
     if(line.excel_file_name){ doMarkLineValidated(line); return; }
     // No Excel on file yet — that's attached from the full screen, not here.
-    resolveDraftConfirm(false);
+    resolveDraftConfirm("cancel");
     if(onGoToTab) onGoToTab("reports_pending_validation");
   };
   const openValidateCodeEntry = (line)=>{ setPendingValidateCodeTarget(line.id); setPendingValidateCodeInput(""); setPendingValidateCodeError(""); };
@@ -9490,7 +9561,19 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     // in that Sl No's BOM, the master BOM for that item is genuinely
     // missing a component (not just this one quote) — flag it. Items with
     // no MOC rule defined at all aren't checked (nothing to verify against).
+    // BOM completeness — an item's MOC Rule (if one exists) is a MINIMUM
+    // required set: if a rule parameter has zero matching lines anywhere
+    // in that Sl No's BOM, the master BOM for that item is genuinely
+    // missing a component (not just this one quote) — flag it. Items with
+    // no MOC rule defined at all aren't checked (nothing to verify against).
+    // A component can be marked as a genuine, permanent exception (e.g. a
+    // screwed cover legitimately has no separate bolts/nuts) — that record
+    // lives in bom_line_exceptions (exception_type='marked_missing') and is
+    // excluded here every time, not just for the one Generate attempt that
+    // created it (unlike bomSkipConfirmed, which is session-only).
     const { data: allLinesForBom } = await sb.from("estimate_lines").select("item_sl_no,component,sub_assembly").eq("reference_number",refNumber);
+    const { data: bomExceptionRows } = await sb.from("bom_line_exceptions").select("item_sl_no,parameter_label").eq("reference_number",refNumber).eq("exception_type","marked_missing");
+    const exceptedKeys = new Set((bomExceptionRows||[]).map(r=>r.item_sl_no+"::"+r.parameter_label));
     const itemsInPlay = Array.from(new Set(estimatesRows.map(est=>modelItemMap.get(est.model)||est.model).filter(Boolean)));
     const { data: mocRulesForBom } = itemsInPlay.length ? await sb.from("item_moc_rules").select("*").in("item",itemsInPlay) : {data:[]};
     const rulesByItem = new Map((mocRulesForBom||[]).map(r=>[r.item,r]));
@@ -9502,7 +9585,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       if(!rule || !rule.parameters || rule.parameters.length===0) return; // no rule defined — nothing to check
       bomCheckedCount++;
       const slLines = (allLinesForBom||[]).filter(l=>l.item_sl_no===est.item_sl_no);
-      const missingParams = rule.parameters.filter(p=> !slLines.some(l=> mocParamValues(p).includes(p.match_field==="sub_assembly"?l.sub_assembly:l.component)));
+      const missingParams = rule.parameters
+        .filter(p=> !slLines.some(l=> mocParamValues(p).includes(p.match_field==="sub_assembly"?l.sub_assembly:l.component)))
+        .filter(p=> !exceptedKeys.has(est.item_sl_no+"::"+(p.label||mocParamValues(p).join(" or "))));
       if(missingParams.length){
         missing.push({section:"Sl No "+est.item_sl_no, items:["Incomplete BOM (\""+itemName+"\") — missing: "+missingParams.map(p=>p.label||mocParamValues(p).join(" or ")).join(", ")], type:"bom", slNo:est.item_sl_no});
         incompleteBomDetails.push({slNo:est.item_sl_no, itemName, missingParams});
@@ -11022,9 +11107,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     setGeneratingQuotePdf(true);
     try {
       const readinessCheck = await checkQuoteReadiness(quoteExportRef);
-      if(!readinessCheck.ready){
-        const proceed = await askDraftConfirm(readinessCheck.missing);
-        if(!proceed){ setGeneratingQuotePdf(false); return; }
+      // Admin/super admin bypass this gate entirely — same standing rule as
+      // the missingHeaderFieldsForPdf gate above (isAdminOrAbove skips it
+      // there too): their PDF is always the clean, final one, dirty quote
+      // or not. Only a regular user sees this modal and has to choose.
+      if(!readinessCheck.ready && !isAdminOrAbove){
+        const outcome = await askDraftConfirm(readinessCheck.missing, readinessCheck.incompleteBomDetails);
+        if(outcome==="cancel"){ setGeneratingQuotePdf(false); return; }
+        if(outcome==="draft") watermark = true; // proceed regardless of what's still open
+        // "clean" only reachable once canGenerate is true (fully resolved) — watermark stays whatever it already was
       }
       const {estimatesRows, linesRows, datasheetsRows} = await fetchQuoteBundle(quoteExportRef);
       if(!estimatesRows.length){ alert("No Sl Nos found under "+quoteExportRef+"."); return; }
@@ -12180,6 +12271,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("button",{onClick:generateBomSkipCode,disabled:genBomSkipCodeBusy,style:{...btnSecondary,padding:"4px 10px",fontSize:11,marginTop:8}},genBomSkipCodeBusy?"Generating…":"Generate skip-BOM-line code"),
               justGenBomSkipCode && h("div",{style:{fontSize:12,marginTop:6}},"Code: ",h("strong",null,justGenBomSkipCode)," — give this to whoever needs to skip an Incomplete BOM line (one line, or Select all, per code)."),
               genBomSkipCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genBomSkipCodeMsg),
+              h("button",{onClick:generateBomExceptionCode,disabled:genBomExceptionCodeBusy,style:{...btnSecondary,padding:"4px 10px",fontSize:11,marginTop:8}},genBomExceptionCodeBusy?"Generating…":"Generate BOM-exception code"),
+              justGenBomExceptionCode && h("div",{style:{fontSize:12,marginTop:6}},"Code: ",h("strong",null,justGenBomExceptionCode)," — give this to whoever needs to mark one missing BOM component as an exception (not skip the whole line)."),
+              genBomExceptionCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genBomExceptionCodeMsg),
               h("button",{onClick:generateValidateCode,disabled:genValidateCodeBusy,style:{...btnSecondary,padding:"4px 10px",fontSize:11,marginTop:8}},genValidateCodeBusy?"Generating…":"Generate validate-pending-line code"),
               justGenValidateCode && h("div",{style:{fontSize:12,marginTop:6}},"Code: ",h("strong",null,justGenValidateCode)," — give this to whoever needs to mark a Pending Direct Price line as Validated."),
               genValidateCodeMsg && h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},genValidateCodeMsg)
@@ -13003,11 +13097,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const allValidationDone = validationMissing.every(m=>m.pendingLines.every(l=>validatedLines.has(l.id)));
       const canGenerate = allBomSkipped && allValidationDone && otherMissing.length===0;
       return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
-      h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 20px",width:440,maxWidth:"100%",maxHeight:"85vh",display:"flex",flexDirection:"column"}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 20px",width:480,maxWidth:"100%",maxHeight:"85vh",display:"flex",flexDirection:"column"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"This quote isn't fully ready"),
         h("div",{style:{fontSize:12,color:colors.muted,marginBottom:12,lineHeight:1.5}},
           (bomMissing.length||validationMissing.length)
-            ? [bomMissing.length&&"Tick each Incomplete BOM line to skip it — skipping is final and can't be undone here.",validationMissing.length&&"Validate each Pending line below."].filter(Boolean).join(" ")+" Generate unlocks once everything below is resolved."
+            ? [bomMissing.length&&"Mark a missing item as an exception, or tick a whole Sl No to skip it — skipping is final and can't be undone here.",validationMissing.length&&"Validate each Pending line below."].filter(Boolean).join(" ")+" Generate unlocks once everything below is resolved — or generate a watermarked draft now."
             : "Go back and fill in what's missing."
         ),
         h("div",{style:{background:colors.bg,borderRadius:6,padding:"10px 12px",overflowY:"auto",flex:1,marginBottom:14,fontSize:11.5,lineHeight:1.6}},
@@ -13016,16 +13110,41 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("input",{type:"checkbox",checked:allBomSkipped,disabled:allBomSkipped,onChange:()=>skipAllBomLines(allSlNos)}),
               "Select all Incomplete BOM lines"
             ),
-            bomMissing.map((m,i)=>{
-              const done = bomSkipConfirmed.has(m.slNo);
-              return h("label",{key:"bom-"+i,style:{display:"flex",alignItems:"flex-start",gap:8,padding:"6px 0",borderBottom:"1px solid #f0efe8",cursor:done?"default":"pointer"}},
-                h("input",{type:"checkbox",checked:done,disabled:done,onChange:()=>skipBomLine(m.slNo),style:{marginTop:2}}),
-                h("div",{style:{opacity:done?0.55:1}},
-                  h("span",{style:{fontWeight:700}},m.section,done&&h("i",{className:"ti ti-lock",style:{marginLeft:6,fontSize:11,color:colors.mutedLight}})),h("br"),
-                  h("span",{style:{color:colors.mutedLight}},m.items.join(", "))
+            draftConfirm.incompleteBomDetails.filter(d=>!bomSkipConfirmed.has(d.slNo)).map((d,di)=>
+              h("div",{key:"bomsl-"+di,style:{padding:"6px 0",borderBottom:"1px solid #f0efe8"}},
+                h("div",{style:{fontWeight:700,marginBottom:4}},"Sl No "+d.slNo+" — \""+d.itemName+"\""),
+                d.missingParams.map((p,pi)=>{
+                  const label = p.label||mocParamValues(p).join(" or ");
+                  const isTarget = bomExceptionTarget && bomExceptionTarget.slNo===d.slNo && bomExceptionTarget.paramLabel===label;
+                  return h("div",{key:"param-"+pi},
+                    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"3px 0 3px 10px"}},
+                      h("span",{style:{color:colors.mutedLight}},label),
+                      !isTarget && h("button",{onClick:()=>openBomException(d.slNo,d.itemName,label),style:{...btnSmall,fontSize:10,padding:"3px 8px",whiteSpace:"nowrap"}},"Mark as exception")
+                    ),
+                    isTarget && h("div",{style:{marginLeft:10,marginBottom:6,background:"#fffaf0",border:"1px solid #f0d9a8",borderRadius:6,padding:"8px 10px"}},
+                      h("input",{type:"text",value:bomExceptionReasonInput,onChange:e=>setBomExceptionReasonInput(e.target.value),placeholder:"Reason — e.g. screwed cover, no separate fasteners",style:{width:"100%",padding:"5px 7px",fontSize:11.5,border:"1px solid "+colors.border,borderRadius:4,marginBottom:6,boxSizing:"border-box"}}),
+                      isAdminOrAbove
+                        ? h("div",{style:{display:"flex",gap:6}},
+                            h("button",{onClick:confirmBomExceptionAdmin,disabled:bomExceptionBusy,style:{...btnSecondary,padding:"5px 10px",fontSize:11}},bomExceptionBusy?"…":"Save exception"),
+                            h("button",{onClick:()=>setBomExceptionTarget(null),disabled:bomExceptionBusy,style:{...btnSmall,padding:"5px 10px",fontSize:11}},"Cancel")
+                          )
+                        : h(React.Fragment,null,
+                            h("div",{style:{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}},
+                              h("input",{type:"text",value:bomExceptionCodeInput,onChange:e=>setBomExceptionCodeInput(e.target.value),placeholder:"Code",style:{width:80,padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}}),
+                              h("button",{onClick:submitBomExceptionCode,disabled:bomExceptionBusy||!bomExceptionCodeInput.trim(),style:{...btnSecondary,padding:"5px 10px",fontSize:11}},bomExceptionBusy?"…":"Confirm"),
+                              h("button",{onClick:()=>setBomExceptionTarget(null),disabled:bomExceptionBusy,style:{...btnSmall,padding:"5px 10px",fontSize:11}},"Cancel")
+                            ),
+                            bomExceptionCodeError && h("div",{style:{color:colors.danger,marginTop:4,fontSize:11}},bomExceptionCodeError)
+                          )
+                    )
+                  );
+                }),
+                h("label",{style:{display:"flex",alignItems:"center",gap:6,fontSize:11,color:colors.mutedLight,marginTop:6,paddingTop:6,borderTop:"1px solid #f0efe8",cursor:"pointer"}},
+                  h("input",{type:"checkbox",checked:false,onChange:()=>skipBomLine(d.slNo)}),
+                  "Skip this whole Sl No instead"
                 )
-              );
-            })
+              )
+            )
           ),
           validationMissing.length>0 && h("div",{style:{marginTop:bomMissing.length?10:0,paddingTop:bomMissing.length?8:0,borderTop:bomMissing.length?"1px solid "+colors.border:"none",marginBottom:validationMissing.length?6:0}},
             h("div",{style:{fontWeight:700,padding:"4px 0 8px",borderBottom:"1px solid "+colors.border,marginBottom:6}},"Pending validation"),
@@ -13070,9 +13189,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         canGenerate && (bomMissing.length>0||validationMissing.length>0) && h("div",{style:{display:"flex",alignItems:"center",gap:6,color:"#0f6e56",fontSize:11.5,marginBottom:10}},
           h("i",{className:"ti ti-check"}),"Everything above is resolved. Generate fires immediately — no further draft confirmation."
         ),
-        h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
-          h("button",{onClick:()=>resolveDraftConfirm(false),style:btnSecondary},"Go back and fix"),
-          h("button",{onClick:()=>resolveDraftConfirm(true),disabled:!canGenerate,style:{...btnDanger,opacity:canGenerate?1:0.5,cursor:canGenerate?"pointer":"not-allowed"}},"Generate")
+        h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap"}},
+          h("button",{onClick:()=>resolveDraftConfirm("cancel"),style:btnSecondary},"Go back and fix"),
+          !isAdminOrAbove && !canGenerate && h("button",{onClick:()=>resolveDraftConfirm("draft"),style:{...btnSecondary,borderColor:"#d4901f",color:"#8a5a10"}},"Generate draft (watermarked)"),
+          h("button",{onClick:()=>resolveDraftConfirm("clean"),disabled:!canGenerate,style:{...btnDanger,opacity:canGenerate?1:0.5,cursor:canGenerate?"pointer":"not-allowed"}},"Generate")
         )
       )
     );
