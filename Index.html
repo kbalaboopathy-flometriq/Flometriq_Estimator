@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-20T14:04:46Z";
+  var APP_BUILD_VERSION = "2026-08-20T14:12:20Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -5160,6 +5160,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     if(!pendingNewSlNo) return;
     (async()=>{
       const ref = pendingNewSlNo.reference_number;
+      const hf = pendingNewSlNo.headerFields || {}; // pre-filled from the new Header-first modal (Phase 2), empty object for every other path (existing quote, gateway) so the ||"" fallbacks below behave exactly as before
       const { data } = await sb.from("estimates").select("enquiry_number,enquiry_date,quote_date,currency,conversion_rate,customer_name,customer_address,contact_name,contact_designation,signatory_name,signatory_designation").eq("reference_number",ref).order("item_sl_no").limit(1);
       const head = (data&&data[0])||{};
       const isNewQuote = !(data&&data.length>0);
@@ -5174,14 +5175,15 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       setShowMOC(false); setMocSelections({}); setMocLines([]); setMocLineSelections({}); setMocLineLabels({}); setMocMode("shape");
       setFreeText(""); setParsedMatches(null); setModelFilter("");
       setIsCustomModel(false); setDirectPriceLine(null);
-      setEnquiryNumber(head.enquiry_number||""); setEnquiryDate(head.enquiry_date||""); setQuoteDate(head.quote_date||"");
-      setCurrency(head.currency||"INR"); setConversionRate(String(head.conversion_rate||1));
-      setCustomerName(head.customer_name||pendingNewSlNo.prefillCustomerName||""); setCustomerAddress(head.customer_address||"");
-      setContactName(head.contact_name||""); setContactDesignation(head.contact_designation||"");
-      setSignatoryName(head.signatory_name||""); setSignatoryDesignation(head.signatory_designation||"");
+      setEnquiryNumber(head.enquiry_number||hf.enquiryNumber||""); setEnquiryDate(head.enquiry_date||hf.enquiryDate||""); setQuoteDate(head.quote_date||hf.quoteDate||"");
+      setCurrency(head.currency||hf.currency||"INR"); setConversionRate(String(head.conversion_rate||hf.conversionRate||1));
+      setCustomerName(head.customer_name||hf.customerName||pendingNewSlNo.prefillCustomerName||""); setCustomerAddress(head.customer_address||hf.customerAddress||"");
+      setContactName(head.contact_name||hf.contactName||""); setContactDesignation(head.contact_designation||hf.contactDesignation||"");
+      setSignatoryName(head.signatory_name||hf.signatoryName||""); setSignatoryDesignation(head.signatory_designation||hf.signatoryDesignation||"");
+      if(hf.linkedProjectId){ setLinkedProjectId(hf.linkedProjectId); setLinkedProjectName(hf.linkedProjectName||""); }
       setRefNumber(ref); setItemSlNo(String(pendingNewSlNo.item_sl_no)); setRefDesc("");
       setGatewayConfirmedNewSlNo(true);
-      setCustomerCountry(await fetchCustomerCountry(head.customer_name||pendingNewSlNo.prefillCustomerName));
+      setCustomerCountry(await fetchCustomerCountry(head.customer_name||hf.customerName||pendingNewSlNo.prefillCustomerName));
       setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no, isNewQuote, linked_allocation_id:pendingNewSlNo.linked_allocation_id||null});
       // Existing quote: header already carries over, and Description will
       // auto-fill once a model's BOM loads — no separate popup needed here.
@@ -8900,6 +8902,47 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [showAddNewModal,setShowAddNewModal]=useState(false);
   const [addNewInput,setAddNewInput]=useState("");
   const [addNewMsg,setAddNewMsg]=useState(null); // {type:"exists", rn, label} | {type:"invalid", text}
+
+  // Header-first flow (Phase 2) — "Make new quote" now asks for Enquiry
+  // #/Customer/etc BEFORE the item picker, not after the BOM is built. This
+  // only intercepts the "Make New Quote" entry point (confirmAddNew below);
+  // the Estimator's own separate "Add to estimate" gateway (showAddGateway)
+  // is untouched — deliberately kept as two separate paths rather than
+  // consolidated, per the 20 Aug scope decision. Collected fields ride
+  // through the existing pendingNewSlNo bridge into the Estimator and
+  // pre-fill the Save Estimate popup there — the actual saveReference/
+  // insert logic is completely unchanged, this only changes when the user
+  // is asked for the header, not how it gets saved.
+  const [showQuoteHeaderModal,setShowQuoteHeaderModal]=useState(false);
+  const [qhRef,setQhRef]=useState("");
+  const [qhEnquiryNumber,setQhEnquiryNumber]=useState(""); const [qhEnquiryDate,setQhEnquiryDate]=useState("");
+  const [qhQuoteDate,setQhQuoteDate]=useState(""); const [qhCurrency,setQhCurrency]=useState("INR"); const [qhConversionRate,setQhConversionRate]=useState("1");
+  const [qhCustomerName,setQhCustomerName]=useState(""); const [qhCustomerAddress,setQhCustomerAddress]=useState("");
+  const [qhContactName,setQhContactName]=useState(""); const [qhContactDesignation,setQhContactDesignation]=useState("");
+  const [qhSignatoryName,setQhSignatoryName]=useState(""); const [qhSignatoryDesignation,setQhSignatoryDesignation]=useState("");
+  const [qhLinkedProjectId,setQhLinkedProjectId]=useState(null); const [qhLinkedProjectName,setQhLinkedProjectName]=useState("");
+  const [qhError,setQhError]=useState("");
+  const resetQuoteHeaderForm = ()=>{
+    setQhEnquiryNumber(""); setQhEnquiryDate(""); setQhQuoteDate(""); setQhCurrency("INR"); setQhConversionRate("1");
+    setQhCustomerName(""); setQhCustomerAddress(""); setQhContactName(""); setQhContactDesignation("");
+    setQhSignatoryName(""); setQhSignatoryDesignation(""); setQhLinkedProjectId(null); setQhLinkedProjectName(""); setQhError("");
+  };
+  const confirmQuoteHeader = ()=>{
+    if(!qhEnquiryNumber.trim()){ setQhError("Enter an Enquiry number."); return; }
+    if(!qhCustomerName.trim()){ setQhError("Pick a customer."); return; }
+    setShowQuoteHeaderModal(false);
+    const headerFields = {
+      enquiryNumber:qhEnquiryNumber.trim(), enquiryDate:qhEnquiryDate, quoteDate:qhQuoteDate,
+      currency:qhCurrency, conversionRate:qhConversionRate,
+      customerName:qhCustomerName.trim(), customerAddress:qhCustomerAddress.trim(),
+      contactName:qhContactName.trim(), contactDesignation:qhContactDesignation.trim(),
+      signatoryName:qhSignatoryName.trim(), signatoryDesignation:qhSignatoryDesignation.trim(),
+      linkedProjectId:qhLinkedProjectId, linkedProjectName:qhLinkedProjectName
+    };
+    if(onNewSlNo) onNewSlNo(qhRef, 1, headerFields);
+    else if(onGoToTab) onGoToTab("estimator");
+  };
+
   const [newQuoteConfirm,setNewQuoteConfirm]=useState(null); // null | {ready:boolean, missing:[...]}
   const flagQuoteAbandoned = async(ref)=>{
     await sb.from("estimates").update({abandoned_flag:true, abandoned_at:new Date().toISOString(), abandoned_by:user?.username||"unknown"}).eq("reference_number",ref);
@@ -8923,8 +8966,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const hit = refOptionsList.find(o=>o.rn===val);
     if(hit){ setAddNewMsg({type:"exists", rn:hit.rn, label:hit.label}); return; }
     setShowAddNewModal(false);
-    if(onNewSlNo) onNewSlNo(val, 1);
-    else if(onGoToTab) onGoToTab("estimator");
+    setQhRef(val); resetQuoteHeaderForm(); setShowQuoteHeaderModal(true);
   };
   const openExistingFromAddNew = ()=>{
     if(!addNewMsg || addNewMsg.type!=="exists") return;
@@ -12966,6 +13008,76 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("button",{onClick:confirmAddNew,style:{...btnPrimary,flex:1}},"Continue"),
               h("button",{onClick:()=>setShowAddNewModal(false),style:{...btnSecondary,flex:1}},"Cancel")
             )
+      )
+    ),
+    // Header-first modal (Phase 2) — shown right after a genuinely new
+    // Quote# is confirmed free, before the item/size/model picker. Same
+    // field set as the Save Estimate popup in the Estimator (reuses the
+    // same CustomerSelect/MajorProjectSelect components), so it's really
+    // just an earlier capture of the same data, still reviewable/editable
+    // at actual save time since existingQuoteHeader is falsy for a brand
+    // new quote either way.
+    showQuoteHeaderModal && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:640,maxWidth:"100%",maxHeight:"85vh",overflow:"auto",padding:"20px 22px"}},
+        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:2}},"New quote — "+qhRef),
+        h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Enquiry number and customer are required. Everything else can be filled in later."),
+        h("div",{style:{display:"flex",gap:12,flexWrap:"wrap",marginBottom:14}},
+          h("div",{style:{flex:1,minWidth:160}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Enquiry number"),
+            h("input",{value:qhEnquiryNumber,autoFocus:true,onChange:e=>{setQhEnquiryNumber(e.target.value);setQhError("");},placeholder:"e.g. ENQ-8821",style:inputStyle})
+          ),
+          h("div",{style:{width:150}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Enquiry date"),
+            h("input",{type:"date",value:qhEnquiryDate,onChange:e=>setQhEnquiryDate(e.target.value),style:inputStyle})
+          ),
+          h("div",{style:{width:150}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Quote date"),
+            h("input",{type:"date",value:qhQuoteDate,onChange:e=>setQhQuoteDate(e.target.value),style:inputStyle})
+          ),
+          h("div",{style:{width:110}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Currency required"),
+            h("select",{value:qhCurrency,onChange:e=>{ const v=e.target.value; setQhCurrency(v); if(v==="INR") setQhConversionRate("1"); },style:inputStyle},
+              h("option",{value:"INR"},"INR"),h("option",{value:"USD"},"USD"),h("option",{value:"EUR"},"EUR"),h("option",{value:"AED"},"AED")
+            )
+          ),
+          h("div",{style:{width:150}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}}, qhCurrency==="INR" ? "Conversion rate" : ("1 "+qhCurrency+" = ? INR")),
+            h("input",{type:"number",step:"0.0001",value:qhConversionRate,onChange:e=>setQhConversionRate(e.target.value),disabled:qhCurrency==="INR",placeholder:"e.g. 83.5000",style:{...inputStyle,background:qhCurrency==="INR"?"#f4f2ea":"#fff"}})
+          ),
+          h("div",{style:{flex:1,minWidth:220}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Customer"),
+            h(CustomerSelect,{value:qhCustomerName,user,onSelect:(p)=>{ setQhCustomerName(p.company_name); setQhCustomerAddress(p.address); if(p.contact_name) setQhContactName(p.contact_name); if(p.contact_designation) setQhContactDesignation(p.contact_designation); setQhError(""); const isIndia=(p.billing_country||"").trim().toLowerCase()==="india"; setQhCurrency(isIndia?"INR":"USD"); if(isIndia) setQhConversionRate("1"); }})
+          ),
+          h("div",{style:{flex:1,minWidth:200}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Major project (optional)"),
+            h(MajorProjectSelect,{value:qhLinkedProjectName,onSelect:(p)=>{ setQhLinkedProjectId(p?p.id:null); setQhLinkedProjectName(p?p.project_name:""); }})
+          ),
+          h("div",{style:{flex:1,minWidth:180}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Address"),
+            h("textarea",{rows:5,value:qhCustomerAddress,onChange:e=>setQhCustomerAddress(e.target.value),placeholder:"Street\nCity\nState\nPIN\nCountry",style:{...inputStyle,resize:"vertical",fontFamily:"inherit"}})
+          ),
+          h("div",{style:{width:170}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Attention — Contact"),
+            h("input",{value:qhContactName,onChange:e=>setQhContactName(e.target.value),placeholder:"Contact name",style:inputStyle})
+          ),
+          h("div",{style:{width:150}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Attention — Designation"),
+            h("input",{value:qhContactDesignation,onChange:e=>setQhContactDesignation(e.target.value),placeholder:"Designation",style:inputStyle})
+          ),
+          h("div",{style:{width:170}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Signatory"),
+            h("input",{value:qhSignatoryName,onChange:e=>setQhSignatoryName(e.target.value),placeholder:"Name on the quote",style:inputStyle})
+          ),
+          h("div",{style:{width:160}},
+            h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Signatory Designation"),
+            h("input",{value:qhSignatoryDesignation,onChange:e=>setQhSignatoryDesignation(e.target.value),placeholder:"Designation",style:inputStyle})
+          )
+        ),
+        qhError && h("div",{style:{fontSize:12,color:colors.danger,marginBottom:10}},qhError),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,borderTop:"1px solid "+colors.border,paddingTop:12}},
+          h("button",{onClick:()=>{setShowQuoteHeaderModal(false);setShowAddNewModal(true);},style:btnSecondary},"Back"),
+          h("button",{onClick:confirmQuoteHeader,style:{...btnPrimary,background:"var(--fill-primary,#1c1c1a)"}},"Add sl no")
+        )
       )
     ),
     // Cart screen — Screen 1 of the Go to Cart flow. Just a friendlier list
@@ -22675,7 +22787,7 @@ function App() {
       h(MenuTabs,{user,active:tab,onChange:setTab})
     ),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,sessionCompany,onRefresh:refresh,onOpenQuote:(ref,slNo,openDatasheet)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo,openDatasheet:!!openDatasheet});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null),pendingNewSlNo,onConsumedPendingNewSlNo:()=>setPendingNewSlNo(null),onGoToTab:setTab})),
-    tab==="saved"?h(SavedEstimates,{user,sessionCompany,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo});setTab("estimator");}}):
+    tab==="saved"?h(SavedEstimates,{user,sessionCompany,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo,headerFields)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo,headerFields:headerFields||null});setTab("estimator");}}):
     tab==="reports"?h(ReportsScreen,{user,onOpenModel:(m)=>{setOpenModelTarget(m);setTab("estimator");}}):
     tab==="reports_activity"?h(ActivityByUserReport,{user}):
     tab==="reports_quotes"?h(QuoteReports,{user}):
