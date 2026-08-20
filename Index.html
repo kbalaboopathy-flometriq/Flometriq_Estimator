@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-20T14:39:45Z";
+  var APP_BUILD_VERSION = "2026-08-20T15:15:56Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -6464,6 +6464,122 @@ async function getPdfPageCountFromStorage(filePath, storageBucket){
   } catch(e){ console.error("Could not read attached PDF page count for "+filePath, e); return 0; }
 }
 
+// ---- Summarised Datasheet engine (20 Aug) ----
+// Two things happen when "Summarised" is chosen at Generate PDF time instead
+// of the default "Detailed" (one page per Sl No, unchanged):
+//   1. Sl Nos whose entire content EXCEPT Process Data/Design Data matches
+//      exactly (same item, same BOM lines, same every other section) merge
+//      onto one page, identified by an Identification table (Sl No, Sl No
+//      in Enq, Tag no., Location per physical unit) instead of duplicating
+//      near-identical pages.
+//   2. Process Data and Design Data are pulled OUT of every page (merged or
+//      not) into two summary tables, grouped by item type, rows themselves
+//      also merged where every value matches.
+// "Matches exactly" is normalized (trim + lowercase) — but a pair that only
+// matches AFTER normalizing, not before, is flagged as a near-miss (likely
+// a typo) rather than silently merged or silently left apart. See
+// findNearMisses() / buildSummaryGroups() below.
+function normalizeVal(v){ return String(v==null?"":v).trim().toLowerCase().replace(/\s+/g," "); }
+function isProcessOrDesignSection(title){
+  const t = normalizeVal(title);
+  return t==="process data" || t==="design data";
+}
+// raw=false (default) -> normalized fingerprint, used to find CANDIDATE
+// matches. raw=true -> literal fingerprint, used to confirm a candidate
+// group is a clean merge (every member's raw values agree, not just
+// normalized) vs a near-miss needing user review.
+function fingerprintNonProcessDesign(inst, lines, raw){
+  const conv = raw ? (v)=>String(v==null?"":v) : normalizeVal;
+  const secPart = (inst.sectionsRows||[])
+    .filter(sec=>!isProcessOrDesignSection(sec.title))
+    .map(sec=> sec.title+"|"+sec.rows.map(r=>r.label+":"+conv(r.value)).join(";"))
+    .join("||");
+  const linePart = (lines||[])
+    .map(l=> [l.sub_assembly,l.component,l.material_spec,l.grade,l.qty_required].map(conv).join(":"))
+    .sort().join(";");
+  return inst.itemName+"##"+secPart+"##"+linePart;
+}
+function fingerprintSection(sec, raw){
+  const conv = raw ? (v)=>String(v==null?"":v) : normalizeVal;
+  return (sec?sec.rows:[]).map(r=>r.label+":"+conv(r.value)).join(";");
+}
+// Finds the first field that differs only after normalizing (the actual
+// near-miss), across every non-Process/Design section field and every BOM
+// line's material_spec/grade — for a readable "X vs Y" prompt rather than
+// just knowing SOMEWHERE differs.
+function diffFieldRaw(instA, instB, linesA, linesB){
+  const rowsOf = (inst)=>{ const out=[]; (inst.sectionsRows||[]).forEach(sec=>{ if(!isProcessOrDesignSection(sec.title)) sec.rows.forEach(r=>out.push({label:sec.title+" — "+r.label, value:r.value})); }); return out; };
+  const rowsA = rowsOf(instA), rowsB = rowsOf(instB);
+  const mapB = new Map(rowsB.map(r=>[r.label,r.value]));
+  for(const ra of rowsA){
+    const rb = mapB.get(ra.label);
+    if(rb===undefined) continue;
+    if(normalizeVal(ra.value)===normalizeVal(rb) && String(ra.value)!==String(rb)) return { label:ra.label, a:String(ra.value), b:String(rb) };
+  }
+  const lineRowsOf = (lines)=> (lines||[]).map(l=>({label:"BOM — "+(l.component||l.sub_assembly||"line"), value:[l.material_spec,l.grade].filter(Boolean).join(", ")}));
+  const la = lineRowsOf(linesA), lb = lineRowsOf(linesB);
+  for(const a of la){
+    const match = lb.find(b=>b.label===a.label);
+    if(match && normalizeVal(a.value)===normalizeVal(match.value) && a.value!==match.value) return { label:a.label, a:a.value, b:match.value };
+  }
+  return null;
+}
+// Pairwise scan, same-item only (different items would never be expected to
+// merge). keepSeparate is a Set of "slA::slB::label" keys the user has
+// already confirmed are genuinely different (not a typo) — excluded from
+// the returned list so a resolved defect doesn't keep reappearing.
+function findNearMisses(dsList, linesBySlNo, keepSeparate){
+  const out = [];
+  for(let i=0;i<dsList.length;i++){
+    for(let j=i+1;j<dsList.length;j++){
+      const a=dsList[i], b=dsList[j];
+      if(a.itemName!==b.itemName) continue;
+      const normA = fingerprintNonProcessDesign(a, linesBySlNo.get(a.slNo));
+      const normB = fingerprintNonProcessDesign(b, linesBySlNo.get(b.slNo));
+      if(normA!==normB) continue; // not even a normalized candidate match — genuinely different, nothing to flag
+      const rawA = fingerprintNonProcessDesign(a, linesBySlNo.get(a.slNo), true);
+      const rawB = fingerprintNonProcessDesign(b, linesBySlNo.get(b.slNo), true);
+      if(rawA===rawB) continue; // clean exact match, no defect
+      const diff = diffFieldRaw(a, b, linesBySlNo.get(a.slNo), linesBySlNo.get(b.slNo));
+      if(!diff) continue;
+      const key = a.slNo+"::"+b.slNo+"::"+diff.label;
+      if(keepSeparate && keepSeparate.has(key)) continue;
+      out.push({ slNoA:a.slNo, slNoB:b.slNo, itemName:a.itemName, label:diff.label, a:diff.a, b:diff.b, key });
+    }
+  }
+  return out;
+}
+// Final grouping once no unresolved near-misses remain — candidates match
+// on the NORMALIZED fingerprint; a pair still raw-mismatched (the user
+// chose "keep separate", or a fix genuinely wasn't applied) stays apart —
+// checking raw equality directly is simpler and just as correct as
+// tracking which exact pairs were dismissed.
+function buildSummaryGroups(dsList, linesBySlNo){
+  const used = new Set();
+  const groups = [];
+  dsList.forEach(inst=>{
+    if(used.has(inst.slNo)) return;
+    const norm = fingerprintNonProcessDesign(inst, linesBySlNo.get(inst.slNo));
+    const raw = fingerprintNonProcessDesign(inst, linesBySlNo.get(inst.slNo), true);
+    const members = [inst];
+    used.add(inst.slNo);
+    dsList.forEach(other=>{
+      if(used.has(other.slNo) || other.itemName!==inst.itemName) return;
+      const oNorm = fingerprintNonProcessDesign(other, linesBySlNo.get(other.slNo));
+      if(oNorm!==norm) return;
+      const oRaw = fingerprintNonProcessDesign(other, linesBySlNo.get(other.slNo), true);
+      if(oRaw!==raw) return; // still a genuine mismatch (unresolved or user kept it separate) — stay apart
+      members.push(other); used.add(other.slNo);
+    });
+    groups.push({ itemName:inst.itemName, members, sectionsRows: inst.sectionsRows.filter(sec=>!isProcessOrDesignSection(sec.title)),
+      hasProcess: inst.sectionsRows.some(sec=>normalizeVal(sec.title)==="process data" && sec.rows.length),
+      hasDesign: inst.sectionsRows.some(sec=>normalizeVal(sec.title)==="design data" && sec.rows.length) });
+  });
+  return groups;
+}
+
+
+// Merges attached-PDF pages (from Custom/Direct Price Sl Nos) into an
 // already-built jsPDF quote doc, at the exact page each insertion recorded
 // as "afterPage" (1-based count from doc.internal.getNumberOfPages() at the
 // moment that Sl No's own content finished drawing — see the Annexure III
@@ -8935,6 +9051,30 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     }
   };
 
+  // Same draft/save-on-blur pattern as updateCartRowQty above, generalized
+  // for any plain text column on `estimates` (tag_number, location,
+  // sl_no_in_enq) — Sl No in Enq is deliberately the CUSTOMER's own
+  // numbering, kept separate from Flometriq's own item_sl_no rather than
+  // replacing it.
+  const [cartTextDraft,setCartTextDraft]=useState({}); // {`${refId}:${field}`: string}
+  const [cartTextSaving,setCartTextSaving]=useState({});
+  const updateCartRowText = async(ref, field, val)=>{
+    const draftKey = ref.id+":"+field;
+    const trimmed = (val||"").trim();
+    if(trimmed===(ref[field]||"")){ setCartTextDraft(d=>{ const c={...d}; delete c[draftKey]; return c; }); return; }
+    setCartTextSaving(s=>({...s,[draftKey]:true}));
+    try{
+      const { error } = await sb.from("estimates").update({[field]:trimmed||null}).eq("id",ref.id);
+      if(error) throw error;
+      setRefs(rs=>rs.map(r=>r.id===ref.id?{...r,[field]:trimmed||null}:r));
+      if(openRef && openRef.id===ref.id) setOpenRef(r=>r?{...r,[field]:trimmed||null}:r);
+    } catch(e){ alert("Couldn't save: "+e.message); }
+    finally {
+      setCartTextSaving(s=>({...s,[draftKey]:false}));
+      setCartTextDraft(d=>{ const c={...d}; delete c[draftKey]; return c; });
+    }
+  };
+
   // "+ Add new" — prompts for a quote number, checks if it's taken, and
   // either offers to open the existing one or hands off to the Estimator
   // to create it, same as the search box's not-found flow.
@@ -11147,6 +11287,70 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [showNoDocsGenerateConfirm,setShowNoDocsGenerateConfirm]=useState(false);
   const [pendingTestingMode,setPendingTestingMode]=useState("separate");
   const [pendingWatermark,setPendingWatermark]=useState(false);
+  // Detailed vs Summarised — a per-generation choice, not saved on the
+  // quote. Detailed is today's unchanged build. Summarised runs the
+  // near-miss check below before anything gets drawn.
+  const [summaryMode,setSummaryMode]=useState(false);
+  const [summaryNearMisses,setSummaryNearMisses]=useState(null); // null = not checked yet; [] = checked, clean
+  const [summaryKeepSeparate,setSummaryKeepSeparate]=useState(new Set());
+  const [summaryFixBusy,setSummaryFixBusy]=useState(null); // near-miss key in flight
+  const [pendingAfterReview,setPendingAfterReview]=useState(null); // {testingMode,watermark} — resumes attemptGenerateQuotePdf once the review modal clears
+  const runSummaryReview = async()=>{
+    const { estimatesRows, linesRows, datasheetsRows } = await fetchQuoteBundle(quoteExportRef);
+    const dsList = await buildQuoteDatasheetsBySlNo(estimatesRows, linesRows, datasheetsRows);
+    const linesBySlNo = new Map();
+    linesRows.forEach(l=>{ if(!linesBySlNo.has(l.item_sl_no)) linesBySlNo.set(l.item_sl_no,[]); linesBySlNo.get(l.item_sl_no).push(l); });
+    const misses = findNearMisses(dsList, linesBySlNo, summaryKeepSeparate);
+    setSummaryNearMisses(misses);
+    return misses;
+  };
+  // "Fix" writes the B side's value to match A — resolves via whichever
+  // source actually holds that field: a BOM line's material_spec/grade
+  // (label starts with "BOM — ") or a Datasheet section's field_values
+  // JSON (anything else, keyed by section title + field label as best-effort
+  // match against the item's template field keys).
+  const resolveNearMissFix = async(miss)=>{
+    setSummaryFixBusy(miss.key);
+    try{
+      if(miss.label.startsWith("BOM — ")){
+        const targetComponent = miss.label.replace("BOM — ","");
+        const { data: lines } = await sb.from("estimate_lines").select("*").eq("reference_number",quoteExportRef).eq("item_sl_no",miss.slNoB);
+        const line = (lines||[]).find(l=>(l.component||l.sub_assembly||"line")===targetComponent);
+        if(line){
+          const [spec,grade] = miss.a.split(", ");
+          await sb.from("estimate_lines").update({material_spec:spec||line.material_spec, grade:grade||line.grade}).eq("id",line.id);
+          await logAudit("UPDATE","estimate_lines",quoteExportRef+"-"+miss.slNoB,"Fixed near-miss on \""+targetComponent+"\" — set to match Sl No "+miss.slNoA+" (\""+miss.a+"\") for datasheet summarising",user?.username||"unknown",{value:miss.b},{value:miss.a});
+        }
+      } else {
+        const [secTitle, fieldLabel] = miss.label.split(" — ");
+        const { data: dsRow } = await sb.from("datasheets").select("*").eq("reference_number",quoteExportRef).eq("item_sl_no",miss.slNoB).maybeSingle();
+        if(dsRow){
+          const template = await loadDatasheetMaster(miss.itemName);
+          const sec = template && template.sections.find(s=>normalizeVal(s.title)===normalizeVal(secTitle));
+          const field = sec && sec.fields.find(f=>f.label===fieldLabel);
+          if(field){
+            const newValues = { ...(dsRow.field_values||{}), [field.key]: miss.a };
+            await sb.from("datasheets").update({field_values:newValues}).eq("id",dsRow.id);
+            await logAudit("UPDATE","datasheets",quoteExportRef+"-"+miss.slNoB,"Fixed near-miss on \""+miss.label+"\" — set to match Sl No "+miss.slNoA+" (\""+miss.a+"\") for datasheet summarising",user?.username||"unknown",{value:miss.b},{value:miss.a});
+          }
+        }
+      }
+      const remaining = await runSummaryReview();
+      return remaining;
+    } catch(e){ alert("Couldn't apply the fix: "+e.message); return null; }
+    finally { setSummaryFixBusy(null); }
+  };
+  const keepNearMissSeparate = (miss)=>{
+    setSummaryKeepSeparate(s=>new Set([...s, miss.key]));
+    setSummaryNearMisses(list=> (list||[]).filter(m=>m.key!==miss.key));
+  };
+  const continueAfterSummaryReview = ()=>{
+    if(!pendingAfterReview) return;
+    const { testingMode, watermark } = pendingAfterReview;
+    setSummaryNearMisses(null); setPendingAfterReview(null);
+    if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setPendingTestingMode(testingMode); setPendingWatermark(watermark); setShowNoDocsGenerateConfirm(true); return; }
+    generateQuotePdf(testingMode, watermark, summaryMode);
+  };
   const attemptGenerateQuotePdf = async ()=>{
     if(!quoteExportRef) return;
     try {
@@ -11176,14 +11380,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         }
       }
       const testingMode = await resolveTestingMode(quoteExportRef, user?.username);
+      if(summaryMode){
+        const misses = await runSummaryReview();
+        if(misses.length){ setPendingAfterReview({testingMode,watermark}); return; } // review modal now showing — resumes from there
+      }
       if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setPendingTestingMode(testingMode); setPendingWatermark(watermark); setShowNoDocsGenerateConfirm(true); return; }
-      generateQuotePdf(testingMode, watermark);
+      generateQuotePdf(testingMode, watermark, summaryMode);
     } catch(e){
       console.error("Generate Quote PDF setup failed", e);
       alert("Could not start PDF generation: "+e.message);
     }
   };
-  const generateQuotePdf = async(testingMode="separate", watermark=false)=>{
+  const generateQuotePdf = async(testingMode="separate", watermark=false, summarised=false)=>{
     if(!quoteExportRef) return;
     setGeneratingQuotePdf(true);
     try {
@@ -11680,6 +11888,115 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const pdfMergeInsertions = []; // {afterPage, filePath, fileName} — spliced in by mergeAttachedPdfPages() after the whole doc is built
       doc.addPage();
       const dsStartPage = doc.internal.getNumberOfPages();
+      const linesBySlNoForSummary = new Map();
+      linesRows.forEach(l=>{ if(!linesBySlNoForSummary.has(l.item_sl_no)) linesBySlNoForSummary.set(l.item_sl_no,[]); linesBySlNoForSummary.get(l.item_sl_no).push(l); });
+      if(summarised){
+        const groups = buildSummaryGroups(dsList, linesBySlNoForSummary);
+        const estBySlNo = new Map(estimatesRows.map(e=>[e.item_sl_no,e]));
+        groups.forEach((grp,idx)=>{
+          if(idx>0) doc.addPage();
+          letterhead("ANNEXURE III - TECHNICAL DATA SHEET");
+          let yy=34;
+          doc.setFontSize(9); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+          const titleSlNos = grp.members.map(m=>m.slNo).join(", ");
+          doc.text("Sl No "+titleSlNos+" — "+grp.itemName,12,yy);
+          let cursorY = yy+6;
+          // Identification table — its own separate autoTable since it's a
+          // real multi-column grid (Sl No/Sl No in Enq/Tag/Location), not
+          // the label:value pair layout the rest of the page uses. Only
+          // drawn when there's actually more than one member, or at least
+          // one of these fields is filled in anywhere in the group — an
+          // unmerged Sl No with nothing to show here just skips it.
+          const idRows = grp.members.map(m=>{ const est=estBySlNo.get(m.slNo)||{}; return { slNo:m.slNo, enq:est.sl_no_in_enq||"", tag:est.tag_number||"", loc:est.location||"" }; });
+          const showEnq = idRows.some(r=>r.enq), showTag = idRows.some(r=>r.tag), showLoc = idRows.some(r=>r.loc);
+          if(grp.members.length>1 || showEnq || showTag || showLoc){
+            const idHead = ["Sl No"]; if(showEnq) idHead.push("Sl No in Enq"); if(showTag) idHead.push("Tag no."); if(showLoc) idHead.push("Location");
+            const idBody = idRows.map(r=>{ const row=[String(r.slNo)]; if(showEnq) row.push(r.enq||"—"); if(showTag) row.push(r.tag||"—"); if(showLoc) row.push(r.loc||"—"); return row; });
+            doc.autoTable({
+              startY:cursorY, head:[idHead], body:idBody, theme:"plain",
+              styles:{font:"helvetica",fontSize:8.5,textColor:dark,cellPadding:{top:1,right:5,bottom:1,left:5}},
+              headStyles:{fontStyle:"bold",font:"times",fontSize:9},
+              margin:{top:32,left:12,right:12,bottom:16},
+              didDrawPage:()=>letterhead("ANNEXURE III - TECHNICAL DATA SHEET")
+            });
+            cursorY = doc.lastAutoTable.finalY+6;
+          }
+          const body=[];
+          grp.sectionsRows.forEach(sec=>{
+            if(!sec.rows.length) return;
+            body.push([{content:sec.title,colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
+            sec.rows.forEach(r=>body.push([r.label, r.value]));
+          });
+          if(grp.hasProcess) body.push([{content:"Process data",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}],["Reference","Refer to table attached"]);
+          if(grp.hasDesign) body.push([{content:"Design data",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}],["Reference","Refer to chart attached"]);
+          // Options/Testing — union across every member, deduplicated by
+          // label/test name, since a merged group's members could each
+          // carry their own Options & Testing picks even though the BOM
+          // and every other section matched exactly.
+          const slOptionsUnion=[]; const seenOpt=new Set();
+          grp.members.forEach(m=>(slExtraByItem.get(m.slNo)||[]).forEach(o=>{ if(!seenOpt.has(o.label)){ seenOpt.add(o.label); slOptionsUnion.push(o); } }));
+          if(slOptionsUnion.length){ body.push([{content:"Options",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]); slOptionsUnion.forEach(o=>body.push([o.label,""])); }
+          const slTestsUnion=[]; const seenTest=new Set();
+          grp.members.forEach(m=>[...(slTestingByItem.get(m.slNo)||[]), ...(globalTestingByItem.get(m.slNo)||[]).map(g=>({test_name:g.test_name}))].forEach(t=>{ if(!seenTest.has(t.test_name)){ seenTest.add(t.test_name); slTestsUnion.push(t); } }));
+          if(slTestsUnion.length){ body.push([{content:"Testing",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]); slTestsUnion.forEach(t=>body.push([t.test_name+" — Included in scope",""])); }
+          doc.autoTable({
+            startY:cursorY, body, theme:"plain",
+            styles:{font:"helvetica",fontSize:8.5,textColor:dark,cellPadding:{top:1,right:5,bottom:1,left:5}},
+            columnStyles:{0:{cellWidth:60},1:{cellWidth:"auto"}},
+            margin:{top:32,left:12,right:12,bottom:16},
+            didDrawPage:()=>letterhead("ANNEXURE III - TECHNICAL DATA SHEET")
+          });
+          grp.members.forEach(m=>{ if(m.attachedFilePath) pdfMergeInsertions.push({ afterPage: doc.internal.getNumberOfPages(), filePath:m.attachedFilePath, fileName:m.attachedFileName }); });
+        });
+        // ---- Process Data / Design Data summary tables, grouped by item type, rows merged where every value is identical ----
+        ["Process data","Design data"].forEach(secName=>{
+          const byItem = new Map();
+          dsList.forEach(inst=>{
+            const sec = (inst.sectionsRows||[]).find(s=>normalizeVal(s.title)===normalizeVal(secName));
+            if(!sec || !sec.rows.length) return;
+            if(!byItem.has(inst.itemName)) byItem.set(inst.itemName, []);
+            byItem.get(inst.itemName).push({ inst, sec });
+          });
+          byItem.forEach((entries, itemName)=>{
+            doc.addPage();
+            letterhead("ANNEXURE III - TECHNICAL DATA SHEET");
+            doc.setFontSize(9); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
+            doc.text(secName+" — "+itemName,12,34);
+            // Merge rows sharing an identical (normalized) set of field values.
+            const rowGroups = [];
+            const usedR = new Set();
+            entries.forEach((e,i)=>{
+              if(usedR.has(i)) return;
+              const fp = fingerprintSection(e.sec);
+              const members=[e]; usedR.add(i);
+              entries.forEach((e2,j)=>{ if(usedR.has(j)||j<=i) return; if(fingerprintSection(e2.sec)===fp){ members.push(e2); usedR.add(j); } });
+              rowGroups.push(members);
+            });
+            const est2 = new Map(estimatesRows.map(x=>[x.item_sl_no,x]));
+            const allSlNos = entries.map(e=>e.inst.slNo);
+            const showEnq2 = allSlNos.some(sl=>(est2.get(sl)||{}).sl_no_in_enq), showTag2 = allSlNos.some(sl=>(est2.get(sl)||{}).tag_number), showLoc2 = allSlNos.some(sl=>(est2.get(sl)||{}).location);
+            const fieldLabels = Array.from(new Set(entries.flatMap(e=>e.sec.rows.map(r=>r.label))));
+            const head = ["Sl No"]; if(showEnq2) head.push("Sl No in Enq"); if(showTag2) head.push("Tag no."); if(showLoc2) head.push("Location"); head.push(...fieldLabels);
+            const bodyRows = rowGroups.map(members=>{
+              const slList = members.map(m=>m.inst.slNo).join(", ");
+              const row=[slList];
+              if(showEnq2) row.push(members.map(m=>(est2.get(m.inst.slNo)||{}).sl_no_in_enq).filter(Boolean).join(", ")||"—");
+              if(showTag2) row.push(members.map(m=>(est2.get(m.inst.slNo)||{}).tag_number).filter(Boolean).join(", ")||"—");
+              if(showLoc2) row.push(members.map(m=>(est2.get(m.inst.slNo)||{}).location).filter(Boolean).join(", ")||"—");
+              const rowVals = new Map(members[0].sec.rows.map(r=>[r.label,r.value]));
+              fieldLabels.forEach(fl=>row.push(rowVals.get(fl)!==undefined ? String(rowVals.get(fl)) : "—"));
+              return row;
+            });
+            doc.autoTable({
+              startY:40, head:[head], body:bodyRows, theme:"grid",
+              styles:{font:"helvetica",fontSize:7.5,textColor:dark,cellPadding:{top:2,right:4,bottom:2,left:4}},
+              headStyles:{fillColor:[240,239,232],textColor:dark,fontStyle:"bold",font:"times",fontSize:8},
+              margin:{top:32,left:12,right:12,bottom:16},
+              didDrawPage:()=>letterhead("ANNEXURE III - TECHNICAL DATA SHEET")
+            });
+          });
+        });
+      } else {
       dsList.forEach((inst,idx)=>{
         if(inst.renderOwnPdfPage!==false){
           if(idx>0) doc.addPage();
@@ -11719,6 +12036,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           pdfMergeInsertions.push({ afterPage: doc.internal.getNumberOfPages(), filePath: inst.attachedFilePath, fileName: inst.attachedFileName });
         }
       });
+      }
       const dsEndPage = doc.internal.getNumberOfPages();
 
       // ---- Fill in the Index now that every page number is known —
@@ -12340,6 +12658,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               quoteExportRef && quoteExportRef===refFilter && !readiness.loading && !readiness.ready && h("span",{style:{fontSize:9.5,fontWeight:700,color:"#854f0b"}},readiness.missing.reduce((s,m)=>s+m.items.length,0)+" items missing")
             ),
             h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Cover + index + summary + terms + datasheets"),
+            h("label",{style:{display:"flex",alignItems:"center",gap:6,fontSize:11,color:colors.muted,marginBottom:8,cursor:"pointer"}},
+              h("input",{type:"checkbox",checked:summaryMode,onChange:e=>setSummaryMode(e.target.checked)}),
+              "Summarised datasheets (merge identical Sl Nos, Process/Design data as tables)"
+            ),
             renderReadinessBar(readiness.categories, {height:38, doneLabel: generatingQuotePdf?"Generating…":"✓ Generate Quote PDF", onClick: (quoteExportRef&&!generatingQuotePdf)?attemptGenerateQuotePdf:undefined}),
             pdfGenCounts.total>0 && h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginTop:8,paddingTop:8,borderTop:"1px solid #eceae0"}},
               h("div",{style:{fontSize:11,color:colors.text}},h("strong",null,pdfGenCounts.total),h("span",{style:{color:colors.mutedLight}}," generated")),
@@ -13140,13 +13462,43 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,overflow:"hidden"}},
           h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:13}},
             h("thead",null,h("tr",{style:{background:"#faf9f4",borderBottom:"2px solid "+colors.dark,textAlign:"left"}},
-              h("th",{style:{padding:"8px 10px"}},"Sl No"),h("th",{style:{padding:"8px 10px"}},"Item"),h("th",{style:{padding:"8px 10px"}},"Size"),h("th",{style:{padding:"8px 10px"}},"Model"),h("th",{style:{padding:"8px 10px"}},"Qty"),h("th",{style:{padding:"8px 10px"}},"")
+              h("th",{style:{padding:"8px 10px"}},"Sl No"),h("th",{style:{padding:"8px 10px"}},"Sl No in Enq"),h("th",{style:{padding:"8px 10px"}},"Tag no."),h("th",{style:{padding:"8px 10px"}},"Location"),h("th",{style:{padding:"8px 10px"}},"Item"),h("th",{style:{padding:"8px 10px"}},"Size"),h("th",{style:{padding:"8px 10px"}},"Model"),h("th",{style:{padding:"8px 10px"}},"Qty"),h("th",{style:{padding:"8px 10px"}},"")
             )),
             h("tbody",null,
               refs.filter(r=>r.reference_number===refFilter).length===0
-                ? h("tr",null,h("td",{colSpan:6,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},"No Sl Nos on this quote yet."))
+                ? h("tr",null,h("td",{colSpan:9,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},"No Sl Nos on this quote yet."))
                 : refs.filter(r=>r.reference_number===refFilter).sort((a,b)=>a.item_sl_no-b.item_sl_no).map(r=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
                     h("td",{style:{padding:"8px 10px",fontWeight:700,color:"#0f6e56"}},r.item_sl_no),
+                    h("td",{style:{padding:"8px 10px"}},
+                      h("input",{type:"text",placeholder:"—",
+                        value: cartTextDraft[r.id+":sl_no_in_enq"]!==undefined ? cartTextDraft[r.id+":sl_no_in_enq"] : (r.sl_no_in_enq||""),
+                        disabled: !!cartTextSaving[r.id+":sl_no_in_enq"],
+                        onChange:e=>setCartTextDraft(d=>({...d,[r.id+":sl_no_in_enq"]:e.target.value})),
+                        onBlur:e=>updateCartRowText(r,"sl_no_in_enq",e.target.value),
+                        onKeyDown:e=>{ if(e.key==="Enter") e.target.blur(); },
+                        style:{width:80,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4,opacity:cartTextSaving[r.id+":sl_no_in_enq"]?0.6:1}
+                      })
+                    ),
+                    h("td",{style:{padding:"8px 10px"}},
+                      h("input",{type:"text",placeholder:"—",
+                        value: cartTextDraft[r.id+":tag_number"]!==undefined ? cartTextDraft[r.id+":tag_number"] : (r.tag_number||""),
+                        disabled: !!cartTextSaving[r.id+":tag_number"],
+                        onChange:e=>setCartTextDraft(d=>({...d,[r.id+":tag_number"]:e.target.value})),
+                        onBlur:e=>updateCartRowText(r,"tag_number",e.target.value),
+                        onKeyDown:e=>{ if(e.key==="Enter") e.target.blur(); },
+                        style:{width:80,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4,opacity:cartTextSaving[r.id+":tag_number"]?0.6:1}
+                      })
+                    ),
+                    h("td",{style:{padding:"8px 10px"}},
+                      h("input",{type:"text",placeholder:"—",
+                        value: cartTextDraft[r.id+":location"]!==undefined ? cartTextDraft[r.id+":location"] : (r.location||""),
+                        disabled: !!cartTextSaving[r.id+":location"],
+                        onChange:e=>setCartTextDraft(d=>({...d,[r.id+":location"]:e.target.value})),
+                        onBlur:e=>updateCartRowText(r,"location",e.target.value),
+                        onKeyDown:e=>{ if(e.key==="Enter") e.target.blur(); },
+                        style:{width:100,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4,opacity:cartTextSaving[r.id+":location"]?0.6:1}
+                      })
+                    ),
                     h("td",{style:{padding:"8px 10px",color:colors.muted}},modelItemMap.get(r.model)||r.model||"—"),
                     h("td",{style:{padding:"8px 10px",color:colors.muted}},modelSizeMap.get(r.model)||"—"),
                     h("td",{style:{padding:"8px 10px",color:colors.muted}},r.model||"—"),
@@ -13500,13 +13852,50 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
+    // Near-miss review — shown when Summarised is ticked and the scan finds
+    // values that only match after normalizing (trim+lowercase), not raw.
+    // Each is a likely typo blocking a merge that should have happened, or
+    // occasionally a genuine difference that just happens to normalize the
+    // same. "Fix" writes B to match A's raw value (via resolveNearMissFix,
+    // which routes to estimate_lines or datasheets.field_values depending
+    // on where that field actually lives) and re-scans; "Keep separate"
+    // just excludes that pair going forward. Continue only enables once the
+    // list is empty.
+    summaryNearMisses!==null && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1050,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"18px 20px",width:480,maxWidth:"100%",maxHeight:"85vh",display:"flex",flexDirection:"column"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}}, summaryNearMisses.length ? "Before generating — "+summaryNearMisses.length+" near-match"+(summaryNearMisses.length!==1?"es":"")+" found" : "Before generating"),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14,lineHeight:1.5}},
+          summaryNearMisses.length
+            ? "These values only match after ignoring spacing/capitalization. Confirm they're really the same, or fix the one that's off."
+            : "No near-matches found — ready to generate."
+        ),
+        h("div",{style:{overflowY:"auto",flex:1,marginBottom:14}},
+          summaryNearMisses.map(miss=>h("div",{key:miss.key,style:{border:"1px solid #e8c165",background:"#fff8e1",borderRadius:8,padding:"10px 12px",marginBottom:10}},
+            h("div",{style:{fontSize:12,marginBottom:8}},h("strong",null,miss.label)," — Sl No "+miss.slNoA+" vs Sl No "+miss.slNoB),
+            h("div",{style:{display:"flex",gap:8,alignItems:"center",fontSize:12,marginBottom:8,flexWrap:"wrap"}},
+              h("span",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"4px 8px"}},"\""+miss.a+"\""),
+              h("span",{style:{color:colors.mutedLight}},"vs"),
+              h("span",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"4px 8px"}},"\""+miss.b+"\"")
+            ),
+            h("div",{style:{display:"flex",gap:6}},
+              h("button",{onClick:()=>resolveNearMissFix(miss),disabled:summaryFixBusy===miss.key,style:{...btnSmall,fontSize:11,padding:"4px 10px"}},summaryFixBusy===miss.key?"…":"Fix Sl No "+miss.slNoB+" to match"),
+              h("button",{onClick:()=>keepNearMissSeparate(miss),disabled:summaryFixBusy===miss.key,style:{...btnSmall,fontSize:11,padding:"4px 10px"}},"These are different — keep separate")
+            )
+          ))
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>{ setSummaryNearMisses(null); setPendingAfterReview(null); },style:btnSecondary},"Go back"),
+          h("button",{onClick:continueAfterSummaryReview,disabled:summaryNearMisses.length>0,style:{...btnPrimary,opacity:summaryNearMisses.length>0?0.5:1}},"Continue to generate")
+        )
+      )
+    ),
     showNoDocsGenerateConfirm && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1050,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 22px",width:360,maxWidth:"94vw"}},
         h("div",{style:{fontSize:14,fontWeight:700,marginBottom:6}},"No documents attached"),
         h("div",{style:{fontSize:12.5,color:colors.mutedLight,marginBottom:16}},"Do you want to attach documents before generating this quote?"),
         h("div",{style:{display:"flex",gap:8}},
           h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); openDocumentsPanel(); },style:{...btnPrimary,flex:1}},"Yes"),
-          h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); generateQuotePdf(pendingTestingMode, pendingWatermark); },style:{...btnSecondary,flex:1}},"No, generate anyway")
+          h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); generateQuotePdf(pendingTestingMode, pendingWatermark, summaryMode); },style:{...btnSecondary,flex:1}},"No, generate anyway")
         )
       )
     ),
