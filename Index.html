@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-20T14:12:20Z";
+  var APP_BUILD_VERSION = "2026-08-20T14:39:45Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -4321,6 +4321,13 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const [showMOC,setShowMOC]=useState(false);
   const [mocLines,setMocLines]=useState([]);
   const [mocSelections,setMocSelections]=useState({});
+  // Pull-out state (20 Aug) — Set of "shapeKey::subAssemblyName" keys. A
+  // component pulled out of its shape group (e.g. "Filter Plate" out of
+  // "Plate", because it genuinely needs a different grade than "Body
+  // Bottom Plate") gets its own one-off grade row. One-off/session-only by
+  // design, per the same reasoning as the rest of this wizard's state below
+  // — resets on close/new model, doesn't persist onto the MOC rule itself.
+  const [pulledOut,setPulledOut]=useState(new Set());
   // Exploded-row state — only relevant for a shape group whose lines
   // already carry more than one distinct grade (genuine divergence, not
   // just "multiple grade options exist"). mocLineSelections/mocLineLabels
@@ -4542,22 +4549,19 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   },[itemFilterEst]);
 
   const shapeGroups = useMemo(()=>{
-
-    const groups = [];
-    const matchedLineIds = new Set();
-    if(mocRuleForItem && mocRuleForItem.parameters && mocRuleForItem.parameters.length){
-      mocRuleForItem.parameters.forEach(p=>{
-        const matchVals = mocParamValues(p);
-        const matched = mocLines.filter(l=> matchVals.includes(p.match_field==="sub_assembly" ? l.sub_assembly : l.component));
-        if(matched.length===0) return;
-        matched.forEach(l=>matchedLineIds.add(l.id));
-        groups.push({ shape: p.label||"(unlabeled)", lines: matched, isRuleGroup:true });
-      });
-    }
-    // Fallback — anything the rule didn't cover (or no rule at all) keeps
-    // the original Shape-based grouping so every line stays reachable.
+    // Every line groups by its real material shape (falling back to spec
+    // if shape is blank) — a MOC rule parameter no longer creates its own
+    // row here (previously: shape:p.label per rule.parameters entry). A
+    // rule parameter like "Cover" can span genuinely different material
+    // shapes depending on the model, so grouping by parameter was actually
+    // showing one row per COMPONENT, defeating the point of a shape-level
+    // grade picker (confirmed 20 Aug: this is what the picker's rows should
+    // never have been). The rule itself still drives the separate
+    // Incomplete-BOM readiness check elsewhere — that check reads directly
+    // off estimate_lines vs rule.parameters, not off this grouping, so this
+    // change doesn't touch it.
     const map = new Map();
-    mocLines.filter(l=>!matchedLineIds.has(l.id)).forEach(l=>{
+    mocLines.forEach(l=>{
       const shape = l.material_shape||"";
       const spec = l.material_spec||"";
       if(!shape && !spec) return;
@@ -4565,7 +4569,30 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       if(!map.has(key)) map.set(key,{ shape:key, lines:[], gradeOptions:[], isRuleGroup:false });
       map.get(key).lines.push(l);
     });
-    groups.push(...map.values());
+
+    // Pulled-out sub-assemblies (e.g. "Filter Plate" split out of "Plate")
+    // become their own one-off group and are removed from their parent
+    // shape's line list HERE — the single source both this picker's render
+    // and applyMOC's write-out read from — so a pulled line's own grade
+    // selection is what actually gets applied to it, not the parent
+    // group's.
+    const groups = [];
+    const pulledGroups = [];
+    map.forEach((grp, shapeKey)=>{
+      const keep = [];
+      const bySub = new Map();
+      grp.lines.forEach(l=>{
+        const subKey = shapeKey+"::"+(l.sub_assembly||"");
+        if(pulledOut.has(subKey)){
+          if(!bySub.has(subKey)) bySub.set(subKey, { shape:l.sub_assembly||"(unnamed)", lines:[], gradeOptions:[], isRuleGroup:false, pulledFrom:shapeKey, pulledKey:subKey });
+          bySub.get(subKey).lines.push(l);
+        } else keep.push(l);
+      });
+      grp.lines = keep;
+      pulledGroups.push(...bySub.values());
+    });
+    map.forEach(grp=>{ if(grp.lines.length) groups.push(grp); });
+    groups.push(...pulledGroups);
 
     // For each group, find available grades from material_rates via gradesBySpec
     // grades are keyed by material_spec — find specs that have this shape
@@ -4595,7 +4622,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       }
     });
     return groups.sort((a,b)=>b.lines.length-a.lines.length);
-  },[mocLines, gradesBySpec, mocRuleForItem]);
+  },[mocLines, gradesBySpec, pulledOut]);
 
   const applyMOC = ()=>{
     // Every ambiguous line in an exploded group needs a label before Apply
@@ -4646,14 +4673,14 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     logAudit("DELETE","estimate_lines",(refNumber||"(unsaved)")+"-"+(itemSlNo||"?"),"Removed ambiguous BOM line (\""+(line.component||line.material_shape||"line")+"\") via MOC wizard — flagged as exception",user?.username||"unknown",line,null);
   };
 
-  const cancelMOC = ()=>{ setShowMOC(false); setMocMode("shape"); setFreeText(""); setParsedMatches(null); };
+  const cancelMOC = ()=>{ setShowMOC(false); setMocMode("shape"); setFreeText(""); setParsedMatches(null); setPulledOut(new Set()); };
   // Distinct from cancelMOC above: that one deliberately keeps the model
   // selected and drops you into manual per-line grading. This one fully
   // abandons the model pick and returns to "no model selected" — Escape
   // always does this; the popup also gets an explicit close button for it.
   const abandonModelSelection = ()=>{
     setShowMOC(false); setSelectedModel(null); setLines([]); setOverrides({}); setMocDeletedExceptions([]);
-    setMocSelections({}); setMocLines([]); setMocLineSelections({}); setMocLineLabels({}); setMocMode("shape"); setFreeText(""); setParsedMatches(null);
+    setMocSelections({}); setMocLines([]); setMocLineSelections({}); setMocLineLabels({}); setMocMode("shape"); setFreeText(""); setParsedMatches(null); setPulledOut(new Set());
   };
   useEffect(()=>{
     if(!showMOC) return;
@@ -5549,14 +5576,26 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
             const uniformGrade = sg.lines[0] && sg.lines[0].grade;
             const gradeIsUniform = uniformGrade && sg.lines.every(l=>l.grade===uniformGrade);
             return !sg.needsExplode
-            ? h("div", {key:sg.shape, style:{display:"flex",alignItems:"center",padding:"10px 12px",borderRadius:8,border:"0.5px solid #d8d4c5",marginBottom:8,background:"#faf9f4",gap:12}},
+            ? h("div", {key:sg.pulledKey||sg.shape, style:{display:"flex",alignItems:"center",padding:"10px 12px",borderRadius:8,border:"0.5px solid "+(sg.pulledFrom?"#e8c165":"#d8d4c5"),marginBottom:8,background:sg.pulledFrom?"#fff8e1":"#faf9f4",gap:12}},
                 h("div", {style:{minWidth:170}},
                   h("div", {style:{fontSize:13,fontWeight:600,color:"#1c1f1a"}}, sg.shape||"(no shape)"),
-                  h("div", {style:{fontSize:11,color:"#8a8f7e"}},
-                    distinctSubAssemblies.length ? distinctSubAssemblies.join(", ") : "",
-                    gradeIsUniform ? (distinctSubAssemblies.length?" — ":"")+uniformGrade : "",
-                    " · "+sg.lines.length+" line"+(sg.lines.length!==1?"s":"")
-                  )
+                  sg.pulledFrom
+                    ? h("div",{style:{display:"flex",alignItems:"center",gap:6,marginTop:3}},
+                        h("span",{style:{fontSize:10.5,color:"#7a5000"}},"pulled from "+sg.pulledFrom),
+                        h("button",{onClick:()=>setPulledOut(s=>{ const n=new Set(s); n.delete(sg.pulledKey); return n; }),style:{fontSize:10,padding:"2px 8px",border:"0.5px solid #d8d4c5",borderRadius:6,background:"#fff",cursor:"pointer",color:"#6b6f60",fontFamily:"inherit"}},"Rejoin "+sg.pulledFrom)
+                      )
+                    : h(React.Fragment,null,
+                        distinctSubAssemblies.length>0 && h("div",{style:{display:"flex",gap:5,flexWrap:"wrap",marginTop:3}},
+                          distinctSubAssemblies.map(sub=> distinctSubAssemblies.length>1
+                            ? h("button",{key:sub,title:"Pull \""+sub+"\" into its own grade row",onClick:()=>setPulledOut(s=>new Set([...s, sg.shape+"::"+sub])),style:{background:"#e1f5ee",color:"#0f6e56",fontSize:10,padding:"2px 8px",borderRadius:10,border:"none",cursor:"pointer",fontFamily:"inherit"}}, sub)
+                            : h("span",{key:sub,style:{background:"#e1f5ee",color:"#0f6e56",fontSize:10,padding:"2px 8px",borderRadius:10}}, sub)
+                          )
+                        ),
+                        h("div", {style:{fontSize:11,color:"#8a8f7e",marginTop:3}},
+                          gradeIsUniform ? uniformGrade+" · " : "",
+                          sg.lines.length+" line"+(sg.lines.length!==1?"s":"")
+                        )
+                      )
                 ),
                 h("select", {value:mocSelections[sg.shape]||"", onChange:e=>setMocSelections(s=>({...s,[sg.shape]:e.target.value})), style:{flex:1,padding:"8px 10px",border:"0.5px solid #d8d4c5",borderRadius:6,fontSize:13,background:"#fff",color:"#1c1f1a",fontFamily:"inherit"}},
                   h("option",{value:""},"Select grade…"),
@@ -5564,7 +5603,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
                 ),
                 mocSelections[sg.shape]&&h("span",{style:{background:"#e1f5ee",color:"#0f6e56",fontSize:11,padding:"3px 8px",borderRadius:10,whiteSpace:"nowrap",marginLeft:4}},"✓")
               )
-            : h("div",{key:sg.shape, style:{marginBottom:10}},
+            : h("div",{key:sg.pulledKey||sg.shape, style:{marginBottom:10}},
                 h("div",{style:{background:"#fff8e1",border:"0.5px solid #e8c165",borderRadius:8,padding:"8px 12px",marginBottom:6,fontSize:11.5,color:"#7a5000"}},
                   sg.shape+" — "+distinctSubAssemblies.join(", ")+" — multiple grades, different components, same spec"
                 ),
