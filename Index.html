@@ -43,7 +43,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-17T05:00:00Z";
+  var APP_BUILD_VERSION = "2026-08-17T06:00:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1430,38 +1430,37 @@ function BomEntryForm({ onGoToTab, user }) {
     if(bomEntryBottomScrollRef.current) setBomEntryMeasuredWidth(bomEntryBottomScrollRef.current.querySelector("table")?.scrollWidth||0);
   },[fullScreenBomEntry, subRows.length]);
 
-  useEffect(()=>{
-    (async()=>{
-      const [modelRows, items, sizes, ciTbl, saTbl, shapes, specs, rates, uoms] = await Promise.all([
-        fetchAll("model_tbl","item,size,model"),
-        fetchAll("item_tbl","item"),
-        fetchAll("size_tbl","size"),
-        fetchAll("component_item_tbl","component,item"),
-        fetchAll("subassembly_tbl","item,component,sub_assembly"),
-        fetchAll("materials_shape","shape"),
-        fetchAll("material_spec","material_spec,material_shape"),
-        fetchAll("material_rates","material_spec,material_grade,rate,uom"),
-        fetchAll("uom_tbl","uom"),
-      ]);
-      const catalog = (modelRows||[]).filter(r=>r.model);
-      setModelCatalog(catalog);
-      // allModels now reflects every model REGISTERED in model_tbl (not just
-      // ones that already have bom rows) — fixes a latent bug the Item→Size→
-      // Model cascade would otherwise have surfaced constantly: picking a
-      // freshly-registered model with zero BOM lines yet used to wrongly hit
-      // the "doesn't exist" prompt, since the old list only had bom's models.
-      setAllModels(Array.from(new Set(catalog.map(r=>r.model))).sort(naturalCompare));
-      const gradesBySpec = new Map(), rateBySpecGrade = new Map();
-      rates.forEach(r=>{
-        if(!r.material_spec||!r.material_grade) return;
-        if(!gradesBySpec.has(r.material_spec)) gradesBySpec.set(r.material_spec,[]);
-        gradesBySpec.get(r.material_spec).push({grade:r.material_grade,rate:r.rate||0,uom:r.uom||""});
-        rateBySpecGrade.set(r.material_spec+"||"+r.material_grade,{rate:r.rate||0});
-      });
-      setMasterData({ items, sizes, ciTbl, saTbl, shapes, specs, uoms, gradesBySpec, rateBySpecGrade });
-      setLoadingMasters(false);
-    })();
-  },[]);
+  const refreshBomEntryMasterData = async()=>{
+    const [modelRows, items, sizes, ciTbl, saTbl, shapes, specs, rates, uoms] = await Promise.all([
+      fetchAll("model_tbl","item,size,model"),
+      fetchAll("item_tbl","item"),
+      fetchAll("size_tbl","size"),
+      fetchAll("component_item_tbl","component,item"),
+      fetchAll("subassembly_tbl","item,component,sub_assembly"),
+      fetchAll("materials_shape","shape"),
+      fetchAll("material_spec","material_spec,material_shape"),
+      fetchAll("material_rates","material_spec,material_grade,rate,uom"),
+      fetchAll("uom_tbl","uom"),
+    ]);
+    const catalog = (modelRows||[]).filter(r=>r.model);
+    setModelCatalog(catalog);
+    // allModels now reflects every model REGISTERED in model_tbl (not just
+    // ones that already have bom rows) — fixes a latent bug the Item→Size→
+    // Model cascade would otherwise have surfaced constantly: picking a
+    // freshly-registered model with zero BOM lines yet used to wrongly hit
+    // the "doesn't exist" prompt, since the old list only had bom's models.
+    setAllModels(Array.from(new Set(catalog.map(r=>r.model))).sort(naturalCompare));
+    const gradesBySpec = new Map(), rateBySpecGrade = new Map();
+    rates.forEach(r=>{
+      if(!r.material_spec||!r.material_grade) return;
+      if(!gradesBySpec.has(r.material_spec)) gradesBySpec.set(r.material_spec,[]);
+      gradesBySpec.get(r.material_spec).push({grade:r.material_grade,rate:r.rate||0,uom:r.uom||""});
+      rateBySpecGrade.set(r.material_spec+"||"+r.material_grade,{rate:r.rate||0});
+    });
+    setMasterData({ items, sizes, ciTbl, saTbl, shapes, specs, uoms, gradesBySpec, rateBySpecGrade });
+    setLoadingMasters(false);
+  };
+  useEffect(()=>{ refreshBomEntryMasterData(); },[]);
 
   const loadSubForm = async(model)=>{
     setLoadingSub(true); setSubRows([]);
@@ -2052,7 +2051,12 @@ function BomEntryForm({ onGoToTab, user }) {
             modelInput&&allModels.includes(modelInput.trim())&&h("button",{
               onClick:()=>{ if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false); setEditingRowId(null); setEditRowDraft({}); setEditAllMode(false); setEditAllDrafts({}); loadSubForm(modelInput.trim()); },
               style:btnSecondary
-            },"Reload")
+            },"Reload"),
+            h("button",{
+              onClick:()=>{ if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false); setEditingRowId(null); setEditRowDraft({}); setEditAllMode(false); setEditAllDrafts({}); refreshBomEntryMasterData(); },
+              title:"Pull the latest Models, Items, Sizes, Components, Sub-assemblies, Shapes, Specs, Grades, Rates and UOM — useful if you (or someone else, in another tab) just added or fixed one",
+              style:btnSecondary
+            },"↻ Refresh master data")
           ),
           h("datalist",{id:"bom-model-list"},modelOptionsForItemSize.map(m=>h("option",{key:m,value:m})))
         )
@@ -2811,8 +2815,7 @@ function MasterEditor({ tableKey, user }) {
   const [mrSpecOptions,setMrSpecOptions]=useState([]); // ALL specs (fallback only — edit forms use specsByShape now)
   const [specsByShape,setSpecsByShape]=useState(new Map()); // shape -> [specs] — Spec depends on Shape
   const [gradesByShape,setGradesByShape]=useState(new Map()); // shape -> [grades] — Grade also depends on Shape (sibling to Spec, not dependent on it)
-  useEffect(()=>{
-    if(tableKey!=="material_rates") return;
+  const refreshMrCascades = ()=>{
     fetchAll("material_spec","material_spec,material_shape").then(d=>{
       const m=new Map(); const bySh=new Map();
       d.forEach(r=>{
@@ -2832,6 +2835,10 @@ function MasterEditor({ tableKey, user }) {
     });
     fetchAll("materials_shape","shape").then(d=>setMrShapeOptionsAll(Array.from(new Set(d.map(r=>r.shape).filter(Boolean))).sort()));
     fetchAll("uom_tbl","uom").then(d=>setMrUomOptions(Array.from(new Set(d.map(r=>r.uom).filter(Boolean))).sort()));
+  };
+  useEffect(()=>{
+    if(tableKey!=="material_rates") return;
+    refreshMrCascades();
   },[tableKey]);
   const notInListMsg = (masterLabel,masterPath)=>(v)=>"\""+v+"\" isn't a recognized "+masterLabel+". Add it in Master Data \u2192 "+masterPath+" first.";
 
@@ -3592,6 +3599,7 @@ function MasterEditor({ tableKey, user }) {
         tableKey==="model_tbl"&&h("button",{onClick:()=>{setShowRename(v=>!v);setRenameMsg("");},style:btnSecondary},"Rename model"),
         tableKey==="bom"&&h("button",{onClick:downloadCleanupTracker,style:btnSecondary},"Download cleanup tracker"),
         tableKey==="material_rates"&&zeroRateCount>0&&h("button",{onClick:openZeroRateTable,style:{...btnDanger,fontWeight:600}},"⚠ Rate = 0 ("+zeroRateCount+")"),
+        tableKey==="material_rates"&&h("button",{onClick:refreshMrCascades,title:"Pull the latest Shape, Spec, Grade and UOM options into the Add/Edit form's dropdowns — useful if you (or someone else, in another tab) just added or fixed one",style:btnSecondary},"↻ Refresh options"),
         tableKey==="material_rates"&&h("button",{onClick:()=>setShowMrBulkUpload(true),style:btnSecondary},"Bulk upload"),
         tableKey==="material_rates"&&(user.role==="admin"||user.role==="super_admin")&&h("button",{onClick:()=>setShowMrGlobalRestore(true),style:{...btnSecondary,border:"1px solid #a3312a",color:"#a3312a"}},"Global restore"),
         tableKey==="material_rates"&&mrFilteredRows.length>0&&h("button",{onClick:()=>setMrZoomOpen(true),style:btnSecondary},"⤢ Zoom"),
@@ -5729,7 +5737,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
             h("div",{style:{display:"flex",alignItems:"center",gap:10,marginTop:4}},
               h("span",{style:{fontSize:12,color:colors.mutedLight}},computedLines.length+" line items · "+summaryRows.length+" groups"),
               h("button",{onClick:()=>{setMocLines(lines);setMocSelections({});setShowMOC(true);},style:{...btnSecondary,fontSize:12,padding:"5px 12px"}},"Set MOC"),
-              h("button",{onClick:onRefresh,title:"Pull the latest Shapes, Specs, Grades and Rates — useful if you (or someone else, in another tab) just added or fixed one",style:{...btnSecondary,fontSize:12,padding:"5px 12px"}},"↻ Refresh rates")
+              h("button",{onClick:onRefresh,title:"Pull the latest Models, Items, Components, Sub-assemblies, Shapes, Specs, Grades, Rates and UOM — useful if you (or someone else, in another tab) just added or fixed one",style:{...btnSecondary,fontSize:12,padding:"5px 12px"}},"↻ Refresh master data")
             )
           ),
           h("div",{style:{display:"flex",gap:16,alignItems:"center",flexWrap:"wrap"}},
@@ -8585,6 +8593,107 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(onNewSlNo) onNewSlNo(refFilter, Number(newSlNoInput));
   };
 
+  // Clone Sl No — duplicates a Sl No's BOM, Datasheet, and Options &
+  // Testing byte-for-byte into a new Sl No on the SAME quote (same spec,
+  // second instance — e.g. two tag numbers, one item). Documents are
+  // deliberately left untouched: they're quote-level (universal_documents_tbl,
+  // entity_type="quote"), not Sl No-level, so there's nothing to clone there.
+  // Sl No is auto-suggested (next available) but editable/overridable —
+  // same duplicate check as the ordinary "+ Add New Sl No" flow above.
+  // Direct Price Line cost/sales_price/validation_status are copied with
+  // ZERO modification regardless of qty, since that field is already a
+  // per-unit price multiplied by order_qty only at total-computation time
+  // (see totalSales) — rescaling it here the way updateOrderQty rescales
+  // rate-based lines would incorrectly zero it out (rate/sf are 0 on a
+  // Direct Price Line). This is the one deliberate deviation from a literal
+  // "run it through updateOrderQty" — everything else matches that path.
+  const [cloneTarget,setCloneTarget]=useState(null); // source estimates row
+  const [cloneSlNoInput,setCloneSlNoInput]=useState("");
+  const [cloneQtyInput,setCloneQtyInput]=useState("");
+  const [cloneSlNoError,setCloneSlNoError]=useState("");
+  const [cloningBusy,setCloningBusy]=useState(false);
+
+  const openCloneSlNo = (ref)=>{
+    const existing = refs.filter(r=>r.reference_number===ref.reference_number).map(r=>r.item_sl_no);
+    const suggested = existing.length ? Math.max(...existing)+1 : 1;
+    setCloneTarget(ref);
+    setCloneSlNoInput(String(suggested));
+    setCloneQtyInput(String(ref.order_qty||1));
+    setCloneSlNoError("");
+  };
+
+  const cloneSlNo = async(sourceRef, newSlNo, newQty)=>{
+    const [{data:estRowArr},{data:lineRows},{data:dsRows},{data:slEpRows},{data:slTestRows}] = await Promise.all([
+      sb.from("estimates").select("*").eq("reference_number",sourceRef.reference_number).eq("item_sl_no",sourceRef.item_sl_no).limit(1),
+      sb.from("estimate_lines").select("*").eq("reference_number",sourceRef.reference_number).eq("item_sl_no",sourceRef.item_sl_no).order("sl_no"),
+      sb.from("datasheets").select("*").eq("reference_number",sourceRef.reference_number).eq("item_sl_no",sourceRef.item_sl_no),
+      sb.from("quote_sl_extra_price_tbl").select("*").eq("reference_number",sourceRef.reference_number).eq("item_sl_no",sourceRef.item_sl_no),
+      sb.from("quote_sl_testing_tbl").select("*").eq("reference_number",sourceRef.reference_number).eq("item_sl_no",sourceRef.item_sl_no),
+    ]);
+    const estRow = estRowArr && estRowArr[0];
+    if(!estRow) throw new Error("Source Sl No not found — it may have been removed.");
+    const stripId = (r)=>{ const c={...r}; delete c.id; return c; };
+
+    const { data:newEst, error:estErr } = await sb.from("estimates").insert({
+      ...stripId(estRow), item_sl_no:newSlNo, order_qty:Number(newQty)||1, created_by:user.username
+    }).select().single();
+    if(estErr) throw estErr;
+
+    if(lineRows && lineRows.length){
+      const lineInserts = lineRows.map(l=>{
+        const clean = stripId(l);
+        clean.item_sl_no = newSlNo; clean.estimate_id = newEst.id;
+        if(!clean.is_direct_price){
+          const qty = Number(l.qty_required)||0;
+          const rate = Number(l.rate)||0;
+          const sf = Number(l.sf)||3.1;
+          clean.cost = Number((qty*Number(newQty)*rate).toFixed(4));
+          clean.sales_price = Number((clean.cost*sf).toFixed(4));
+        }
+        return clean;
+      });
+      const { error:lineErr } = await sb.from("estimate_lines").insert(lineInserts);
+      if(lineErr) throw lineErr;
+    }
+    if(dsRows && dsRows.length){
+      const { error } = await sb.from("datasheets").insert(dsRows.map(r=>({...stripId(r), item_sl_no:newSlNo})));
+      if(error) throw error;
+    }
+    if(slEpRows && slEpRows.length){
+      const { error } = await sb.from("quote_sl_extra_price_tbl").insert(slEpRows.map(r=>({...stripId(r), item_sl_no:newSlNo})));
+      if(error) throw error;
+    }
+    if(slTestRows && slTestRows.length){
+      const { error } = await sb.from("quote_sl_testing_tbl").insert(slTestRows.map(r=>({...stripId(r), item_sl_no:newSlNo})));
+      if(error) throw error;
+    }
+
+    setRefs(rs=>[...rs, newEst]);
+    await logAudit("INSERT","estimates",sourceRef.reference_number+"-"+newSlNo,
+      "Cloned Sl No "+sourceRef.item_sl_no+" \u2192 Sl No "+newSlNo+" on Quote# "+sourceRef.reference_number+" ("+(lineRows?lineRows.length:0)+" BOM line(s), qty "+newQty+")",
+      user?.username||"unknown", null, {source_sl_no:sourceRef.item_sl_no, new_sl_no:newSlNo, order_qty:newQty});
+    return newEst;
+  };
+
+  const confirmCloneSlNo = async()=>{
+    if(!cloneTarget) return;
+    const n = Number(cloneSlNoInput);
+    if(!cloneSlNoInput.trim() || !Number.isInteger(n) || n<=0){ setCloneSlNoError("Enter a whole number greater than 0."); return; }
+    const existing = refs.filter(r=>r.reference_number===cloneTarget.reference_number).map(r=>r.item_sl_no);
+    if(existing.includes(n)){ setCloneSlNoError("Sl No "+n+" already exists for Quote# "+cloneTarget.reference_number+". Pick a different number."); return; }
+    const q = Number(cloneQtyInput);
+    if(!cloneQtyInput.trim() || !Number.isFinite(q) || q<=0){ setCloneSlNoError("Enter an order qty greater than 0."); return; }
+    setCloningBusy(true); setCloneSlNoError("");
+    try{
+      await cloneSlNo(cloneTarget, n, q);
+      setCloneTarget(null);
+    } catch(e){
+      setCloneSlNoError("Clone failed: "+e.message);
+    } finally {
+      setCloningBusy(false);
+    }
+  };
+
   // "+ Add new" — prompts for a quote number, checks if it's taken, and
   // either offers to open the existing one or hands off to the Estimator
   // to create it, same as the search box's not-found flow.
@@ -9706,13 +9815,27 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   },[loadCtMasters]);
 
   useEffect(()=>{
+    refreshModelItemMap();
+  },[]);
+  const refreshModelItemMap = ()=>{
     fetchAll("model_tbl","item,model").then(rows=>{
       const m=new Map();
       rows.forEach(row=>{ if(row.model) m.set(row.model, row.item||""); });
       setModelItemMap(m);
     });
-  },[]);
+  };
 
+  // Covers every piece of master data this screen loads once on mount and
+  // otherwise never revisits — Rate/Grade, UOM, Item options, Spec list,
+  // and the Model→Item map. A narrower refresh (rates only) left the rest
+  // stale even after clicking it, which was the actual reported bug.
+  const refreshMasterData = ()=>{
+    loadRatesAndGrades();
+    refreshModelItemMap();
+    fetchAll("uom_tbl","uom").then(rows=>setUoms(rows.map(r=>r.uom).filter(Boolean)));
+    fetchAll("item_tbl","item").then(rows=>setDpItemOptions(rows.map(r=>r.item).filter(Boolean)));
+    fetchAll("material_spec","material_spec").then(rows=>setAllSpecs(Array.from(new Set(rows.map(r=>r.material_spec).filter(Boolean))).sort()));
+  };
   const loadRatesAndGrades = ()=>{
     fetchAll("material_rates","material_spec,material_grade,rate,uom").then(rows=>{
       const g=new Map(), r=new Map();
@@ -12105,7 +12228,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                       : {...btnSmall,border:"1px solid #0f6e56",color:"#0f6e56",opacity:refreshingPrice?0.6:1}
                   }, refreshingPrice?"Refreshing…":"Refresh price"),
                   h("button",{onClick:()=>setShowBomRefreshConfirm(true),style:{...btnSmall,border:"1px solid #a3312a",color:"#a3312a"}},"Refresh BOM from master"),
-                  h("button",{onClick:loadRatesAndGrades,title:"Pull the latest Shapes, Specs, Grades and Rates — useful if you (or someone else, in another tab) just added or fixed one",style:{...btnSmall,border:"1px solid "+colors.border,color:colors.text}},"↻ Refresh rates"),
+                  h("button",{onClick:refreshMasterData,title:"Pull the latest Shapes, Specs, Grades, Rates, UOM and Item options — useful if you (or someone else, in another tab) just added or fixed one",style:{...btnSmall,border:"1px solid "+colors.border,color:colors.text}},"↻ Refresh master data"),
                   isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No"),
                   h("button",{onClick:()=>setFullScreenBOM(f=>!f),style:{...btnSecondary,fontSize:11,padding:"4px 10px"}}, fullScreenBOM?"Esc · Close full screen":"⛶ Full screen BOM")
                 )
@@ -12591,6 +12714,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                     h("td",{style:{padding:"8px 10px"}},r.order_qty||1),
                     h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
                       h("button",{onClick:async()=>{ setShowCartScreen(false); await openEstimate(r); },style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Goto BOM"),
+                      h("button",{onClick:()=>openCloneSlNo(r),style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6,borderColor:"#1c8c75",color:"#0f6e56"}},"Clone Sl No"),
                       isAdmin && h("button",{onClick:()=>deleteSlNo(r),disabled:deletingSlNo===r.id,style:{border:"none",background:"transparent",color:colors.danger,cursor:"pointer",fontSize:12}},deletingSlNo===r.id?"…":"Remove")
                     )
                   ))
@@ -12624,6 +12748,27 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("button",{onClick:()=>setNewSlNoStep("input"),style:{...btnSecondary,flex:1}},"Back")
             )
           )
+        )
+      )
+    ),
+    // Clone Sl No dialog — Sl No auto-suggested (next available) but
+    // editable/overridable, duplicate-blocked same as the "+ New Sl No"
+    // flow above; Order Qty defaults to the source's own qty. Everything
+    // else (BOM, Datasheet, Options & Testing) is cloned byte-for-byte in
+    // cloneSlNo() with zero form input — no model picker, no size/model
+    // choice, since the spec is deliberately identical to the source.
+    cloneTarget && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
+      h("div",{style:{background:"#fff",borderRadius:8,width:360,padding:"20px 22px"}},
+        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:6}},"Clone Sl No "+cloneTarget.item_sl_no),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:16,lineHeight:1.5}},"Copies BOM, datasheet, and options & testing byte for byte. Fully editable after."),
+        h("div",{style:{fontSize:11,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:4}},"New Sl No"),
+        h("input",{type:"number",value:cloneSlNoInput,autoFocus:true,onChange:e=>{setCloneSlNoInput(e.target.value);setCloneSlNoError("");},style:{...inputStyle,width:"100%",marginBottom:12,boxSizing:"border-box"}}),
+        h("div",{style:{fontSize:11,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:4}},"Order qty"),
+        h("input",{type:"number",min:1,value:cloneQtyInput,onChange:e=>{setCloneQtyInput(e.target.value);setCloneSlNoError("");},style:{...inputStyle,width:"100%",marginBottom:12,boxSizing:"border-box"}}),
+        cloneSlNoError && h("div",{style:{fontSize:12,color:colors.danger,marginBottom:10}},cloneSlNoError),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{disabled:cloningBusy,onClick:confirmCloneSlNo,style:{...btnPrimary,flex:1,opacity:cloningBusy?0.6:1}},cloningBusy?"Cloning…":"Clone"),
+          h("button",{disabled:cloningBusy,onClick:()=>setCloneTarget(null),style:{...btnSecondary,flex:1}},"Cancel")
         )
       )
     ),
