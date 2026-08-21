@@ -26,7 +26,7 @@ td:hover > .hoverPeekPop { display:block; }
   .layout { flex-direction: column !important; }
   .sidebar { width: 100% !important; max-height: 200px; }
   .topbar-user { display: none !important; }
-  .menu-tabs { overflow-x: auto; white-space: nowrap; }
+  .menu-tabs { overflow-x: visible; white-space: normal; flex-wrap: wrap; row-gap: 4px; }
 }
 @keyframes hourglass-flip { 0%,100% { transform: rotate(0deg); } 50% { transform: rotate(180deg); } }
 .hourglass-spin { display: inline-block; animation: hourglass-flip 1.4s ease-in-out infinite; }
@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-21T02:42:42Z";
+  var APP_BUILD_VERSION = "2026-08-21T12:50:09Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1208,6 +1208,9 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Daily", tabs:[
         {key:"my_worklist",label:"My Worklist"},
       ]},
+      ...(isAdmin?[{ label:"Master", tabs:[
+        {key:"crm_helper_masters",label:"Package & Type Masters"},
+      ]}]:[]),
     ]},
     { label:"Reports", subgroups:[
       { label:"General", tabs:[
@@ -1245,7 +1248,6 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Engineering", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"}] },
       { label:"Company", tabs:[{key:"company_master",label:"Company Master"}] },
       { label:"HR", tabs: byKeys(["employee_tbl","department_tbl","crm_role_tbl","employee_status_tbl","designation_tbl"]) },
-      { label:"Major Projects", tabs:[{key:"crm_helper_masters",label:"Package & Type Masters"}] },
     ]});
     groups.push({ label:"Rules", subgroups:[
       { label:"Rules", tabs:[{key:"item_moc_rules",label:"Datasheet MOC"},{key:"description_master",label:"Description"}] }
@@ -1280,8 +1282,8 @@ function MenuTabs({ user, active, onChange }) {
     fontWeight: active===t.key ? 700 : 400, width:"100%", fontFamily:"inherit"
   });
 
-  return h("div",{ref:rootRef, className:"menu-tabs", style:{background:"#fff",borderBottom:"1px solid "+colors.border,padding:"6px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"relative"}},
-    h("div",{style:{display:"flex",gap:4,alignItems:"center"}},
+  return h("div",{ref:rootRef, className:"menu-tabs", style:{background:"#fff",borderBottom:"1px solid "+colors.border,padding:"6px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"relative",flexWrap:"wrap",rowGap:4}},
+    h("div",{style:{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap",rowGap:4}},
       groups.map((g,gi)=>{
         const isOpen = openGroup===gi;
         const flat = !!g.tabs;
@@ -9868,6 +9870,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const { data: allLinesForBom } = await sb.from("estimate_lines").select("item_sl_no,component,sub_assembly").eq("reference_number",refNumber);
     const { data: bomExceptionRows } = await sb.from("bom_line_exceptions").select("item_sl_no,parameter_label").eq("reference_number",refNumber).eq("exception_type","marked_missing");
     const exceptedKeys = new Set((bomExceptionRows||[]).map(r=>r.item_sl_no+"::"+r.parameter_label));
+    // Model-level, permanent Incomplete BOM exemptions (bom_incomplete_exemption_tbl) —
+    // different from bom_line_exceptions above: this one is keyed by Model, not by
+    // Sl No, so a checked exemption clears the same missing component for every
+    // quote using that Model, not just this one.
+    const { data: bomModelExemptionRows } = await sb.from("bom_incomplete_exemption_tbl").select("model,parameter_label");
+    const exemptedModelKeys = new Set((bomModelExemptionRows||[]).map(r=>r.model+"::"+r.parameter_label));
     const itemsInPlay = Array.from(new Set(estimatesRows.map(est=>modelItemMap.get(est.model)||est.model).filter(Boolean)));
     const { data: mocRulesForBom } = itemsInPlay.length ? await sb.from("item_moc_rules").select("*").in("item",itemsInPlay) : {data:[]};
     const rulesByItem = new Map((mocRulesForBom||[]).map(r=>[r.item,r]));
@@ -9881,10 +9889,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const slLines = (allLinesForBom||[]).filter(l=>l.item_sl_no===est.item_sl_no);
       const missingParams = rule.parameters
         .filter(p=> !slLines.some(l=> mocParamValues(p).includes(p.match_field==="sub_assembly"?l.sub_assembly:l.component)))
-        .filter(p=> !exceptedKeys.has(est.item_sl_no+"::"+(p.label||mocParamValues(p).join(" or "))));
+        .filter(p=> !exceptedKeys.has(est.item_sl_no+"::"+(p.label||mocParamValues(p).join(" or "))))
+        .filter(p=> !exemptedModelKeys.has(est.model+"::"+(p.label||mocParamValues(p).join(" or "))));
       if(missingParams.length){
         missing.push({section:"Sl No "+est.item_sl_no, items:["Incomplete BOM (\""+itemName+"\") — missing: "+missingParams.map(p=>p.label||mocParamValues(p).join(" or ")).join(", ")], type:"bom", slNo:est.item_sl_no});
-        incompleteBomDetails.push({slNo:est.item_sl_no, itemName, missingParams});
+        incompleteBomDetails.push({slNo:est.item_sl_no, itemName, model:est.model, missingParams});
       } else {
         bomDoneCount++;
       }
@@ -9965,6 +9974,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [bomFixUnlocked,setBomFixUnlocked]=useState(null); // {slNo,itemName,missingParams} once a code is validated
   const [bomFixDraft,setBomFixDraft]=useState({component:"",sub_assembly:"",material_spec:""});
   const [savingBomFix,setSavingBomFix]=useState(false);
+  // Model-level, permanent exemptions — separate from the master-template
+  // fix flow above. Admin-only, lists every currently-flagging (Model,
+  // missing component) line from THIS quote's own readiness check; a
+  // checked line is saved to bom_incomplete_exemption_tbl and clears that
+  // Model everywhere, not just here.
+  const [showBomExemptions,setShowBomExemptions]=useState(false);
   const openBomFix = ()=>{
     if(quoteAnyNonDraft()){ alert("This quote has already left Draft — correcting the master BOM here isn't available. Start an amendment instead if this still needs fixing."); return; }
     if(isAdmin) setShowBomFixPrompt(true);
@@ -12542,8 +12557,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("div",{style:{fontSize:12,color:"#a3312a"}},
               h("strong",null,"Incomplete BOM"),": this item's master template is missing a required component — "+readiness.incompleteBomDetails.map(d=>"Sl No "+d.slNo+" (\""+d.itemName+"\"): "+d.missingParams.map(p=>p.label||mocParamValues(p).join(" or ")).join(", ")).join("; ")
             ),
-            h("button",{onClick:openBomFix,style:{...btnSmall,fontSize:11,padding:"4px 9px",border:"1px solid #a3312a",color:"#a3312a"}},isAdmin?"Fix now":"Enter code to fix")
+            h("div",{style:{display:"flex",gap:6}},
+              isAdmin && h("button",{onClick:()=>setShowBomExemptions(true),style:{...btnSmall,fontSize:11,padding:"4px 9px",border:"1px solid #a3312a",color:"#a3312a"}},"Exemptions"),
+              h("button",{onClick:openBomFix,style:{...btnSmall,fontSize:11,padding:"4px 9px",border:"1px solid #a3312a",color:"#a3312a"}},isAdmin?"Fix now":"Enter code to fix")
+            )
           ),
+          showBomExemptions && h(IncompleteBomExemptionModal,{
+            details: readiness.incompleteBomDetails,
+            user,
+            onClose: ()=>setShowBomExemptions(false),
+            onSaved: async()=>{ setShowBomExemptions(false); await refreshReadiness(refFilter); }
+          }),
           h("div",{style:{display:"flex",gap:8}},
             h("button",{onClick:()=>setShowCartScreen(true),style:{...btnSmall,border:"1px solid "+colors.border,display:"flex",alignItems:"center",gap:5}},h("i",{className:"ti ti-shopping-cart","aria-hidden":"true",style:{fontSize:13}}),"Go to Cart"),
             isAdmin && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete this Revision"),
@@ -20307,6 +20331,87 @@ const BACKUP_EXTRA_TABLES = [
 ];
 const BACKUP_ALL_TABLES = Array.from(new Set([...MASTER_TABLES.map(t=>t.key), ...BACKUP_EXTRA_TABLES]));
 
+// Model-level, permanent Incomplete BOM exemptions. Separate from the
+// per-Sl-No bom_line_exceptions mechanism used elsewhere — a checked line
+// here writes to bom_incomplete_exemption_tbl (model, parameter_label,
+// reason) and clears that missing component for every quote using that
+// Model, not just the one currently open. Admin-only.
+function IncompleteBomExemptionModal({ details, user, onClose, onSaved }){
+  // Flatten this quote's own incompleteBomDetails into one row per
+  // (model, missing parameter) — the same row can repeat across Sl Nos
+  // if more than one Sl No in this quote uses the same Model, so dedupe.
+  const rows = [];
+  const seen = new Set();
+  (details||[]).forEach(d=>{
+    d.missingParams.forEach(p=>{
+      const label = p.label || (p.match_field ? "" : "") || (Array.isArray(p.match_values)?p.match_values.join(" or "):"");
+      const key = d.model+"::"+label;
+      if(seen.has(key)) return;
+      seen.add(key);
+      rows.push({ model:d.model, itemName:d.itemName, slNo:d.slNo, label });
+    });
+  });
+  const [checked,setChecked] = useState({});
+  const [reasons,setReasons] = useState({});
+  const [saving,setSaving] = useState(false);
+  const toggle = (key)=> setChecked(c=>({...c,[key]:!c[key]}));
+  const setReason = (key,val)=> setReasons(r=>({...r,[key]:val}));
+
+  const save = async()=>{
+    const toSave = rows.filter(r=>checked[r.model+"::"+r.label]);
+    if(toSave.length===0){ onClose(); return; }
+    const missingReason = toSave.find(r=> !((reasons[r.model+"::"+r.label]||"").trim()));
+    if(missingReason){ alert("Every checked line needs a reason before it can be saved."); return; }
+    setSaving(true);
+    try{
+      for(const r of toSave){
+        const key = r.model+"::"+r.label;
+        const { error } = await sb.from("bom_incomplete_exemption_tbl").insert({
+          model:r.model, parameter_label:r.label, reason:reasons[key].trim(),
+          exempted_by:user?.username||"unknown", exempted_at:new Date().toISOString()
+        });
+        if(error) throw error;
+        await logAudit("INSERT","bom_incomplete_exemption_tbl",r.model,"Exempted \""+r.label+"\" for Model "+r.model+" — "+reasons[key].trim(),user?.username||"unknown",null,null);
+      }
+      onSaved();
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally{ setSaving(false); }
+  };
+
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"18px 20px",width:680,maxWidth:"95vw",maxHeight:"85vh",overflowY:"auto"}},
+      h("div",{style:{fontSize:15,fontWeight:700,marginBottom:2}},"Incomplete BOM exemptions"),
+      h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},"Check a line to exempt it permanently for that Model — it will stop flagging on every quote using that Model, not just this one. Requires a reason."),
+      rows.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"Nothing to exempt right now.") :
+      h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12.5}},
+        h("thead",null,h("tr",{style:{borderBottom:"1px solid "+colors.border}},
+          h("th",{style:{width:24}}),
+          h("th",{style:{textAlign:"left",padding:"6px 4px",color:colors.muted,fontWeight:500}},"Model"),
+          h("th",{style:{textAlign:"left",padding:"6px 4px",color:colors.muted,fontWeight:500}},"Missing component"),
+          h("th",{style:{textAlign:"left",padding:"6px 4px",color:colors.muted,fontWeight:500}},"Reason")
+        )),
+        h("tbody",null, rows.map(r=>{
+          const key = r.model+"::"+r.label;
+          return h("tr",{key,style:{borderBottom:"1px solid #f0eee6"}},
+            h("td",{style:{padding:"8px 4px"}},h("input",{type:"checkbox",checked:!!checked[key],onChange:()=>toggle(key)})),
+            h("td",{style:{padding:"8px 4px",fontWeight:600}},r.model),
+            h("td",{style:{padding:"8px 4px"}},r.label),
+            h("td",{style:{padding:"8px 4px"}},h("input",{
+              value:reasons[key]||"", onChange:e=>setReason(key,e.target.value),
+              disabled:!checked[key], placeholder:"e.g. screwed cover, no drain needed",
+              style:{width:"100%",fontSize:11.5,padding:"4px 6px",border:"1px solid "+colors.border,borderRadius:4}
+            }))
+          );
+        }))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16}},
+        h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save exemptions")
+      )
+    )
+  );
+}
+
 function AbandonedQuotesCleanupScreen({ user, onChanged }){
   const isAdmin = user.role==="admin" || user.role==="super_admin";
   const [rows,setRows]=useState([]);
@@ -20349,6 +20454,32 @@ function AbandonedQuotesCleanupScreen({ user, onChanged }){
     } catch(e){ console.error("Bulk delete failed",e); alert("Delete failed: "+e.message); }
     finally{ setBusy(false); }
   };
+  // "Clear flag" — for quotes that actually got completed through a path
+  // the auto-clear logic (leaving Draft, marking Ready) didn't catch. Just
+  // clears abandoned_flag, doesn't touch the quote itself. No delete code
+  // needed since nothing destructive happens.
+  const doClearFlagOne = async(ref)=>{
+    setBusy(true);
+    try{
+      const { error } = await sb.from("estimates").update({abandoned_flag:false}).eq("reference_number",ref);
+      if(error) throw error;
+      await logAudit("UPDATE","estimates",ref,"Cleared abandoned-incomplete flag on "+ref+" — quote confirmed complete",user?.username||"unknown",null,null);
+      await load(); if(onChanged) onChanged();
+    } catch(e){ console.error("Clear flag failed",e); alert("Clear flag failed: "+e.message); }
+    finally{ setBusy(false); }
+  };
+  const doClearFlagSelected = async()=>{
+    setBusy(true);
+    try{
+      for(const ref of selected){
+        const { error } = await sb.from("estimates").update({abandoned_flag:false}).eq("reference_number",ref);
+        if(error) throw error;
+        await logAudit("UPDATE","estimates",ref,"Cleared abandoned-incomplete flag on "+ref+" — quote confirmed complete",user?.username||"unknown",null,null);
+      }
+      await load(); if(onChanged) onChanged();
+    } catch(e){ console.error("Bulk clear flag failed",e); alert("Clear flag failed: "+e.message); }
+    finally{ setBusy(false); }
+  };
   // Every delete from this screen needs a Super-Admin-issued delete code,
   // regardless of the flagged quote's Draft status — deliberately stricter
   // than the header's own delete buttons, since reaching this cleanup
@@ -20362,7 +20493,10 @@ function AbandonedQuotesCleanupScreen({ user, onChanged }){
         h("div",{style:{fontSize:16,fontWeight:700}},"Abandoned incomplete quotes"),
         h("div",{style:{fontSize:12,color:"#8a8577",marginTop:2}},"Quotes someone chose to close while still not Ready. Every delete here needs a Super Admin code.")
       ),
-      selected.size>0 && h("button",{onClick:gateAndDeleteSelected,disabled:busy,style:{background:"#a3312a",color:"#fff",border:"none",borderRadius:5,padding:"7px 14px",fontSize:12.5,fontWeight:600,cursor:busy?"default":"pointer",opacity:busy?0.6:1}},"Delete selected ("+selected.size+")")
+      selected.size>0 && h("div",{style:{display:"flex",gap:8}},
+        h("button",{onClick:doClearFlagSelected,disabled:busy,style:{background:"#fff",color:"#0f6e3f",border:"1px solid #0f6e3f",borderRadius:5,padding:"7px 14px",fontSize:12.5,fontWeight:600,cursor:busy?"default":"pointer",opacity:busy?0.6:1}},"Clear selected ("+selected.size+")"),
+        h("button",{onClick:gateAndDeleteSelected,disabled:busy,style:{background:"#a3312a",color:"#fff",border:"none",borderRadius:5,padding:"7px 14px",fontSize:12.5,fontWeight:600,cursor:busy?"default":"pointer",opacity:busy?0.6:1}},"Delete selected ("+selected.size+")")
+      )
     ),
     loading ? h("div",null,"Loading…") :
     rows.length===0 ? h("div",{style:{color:"#8a8577",fontSize:13}},"Nothing flagged right now.") :
@@ -20387,7 +20521,10 @@ function AbandonedQuotesCleanupScreen({ user, onChanged }){
             h("td",{style:{padding:"8px 4px",fontWeight:600}},r.reference_number),
             h("td",{style:{padding:"8px 4px"}},r.customer_name||"—"),
             h("td",{style:{padding:"8px 4px",color:"#8a8577"}},(r.abandoned_by||"unknown")+", "+(r.abandoned_at?new Date(r.abandoned_at).toLocaleDateString():"—")),
-            h("td",{style:{padding:"8px 4px",textAlign:"right"}},h("button",{onClick:()=>gateAndDeleteOne(r.reference_number),disabled:busy,style:{fontSize:11.5,padding:"5px 10px",border:"1px solid #a3312a",color:"#a3312a",background:"#fff",borderRadius:5,cursor:busy?"default":"pointer"}},"Delete"))
+            h("td",{style:{padding:"8px 4px",textAlign:"right",display:"flex",gap:6,justifyContent:"flex-end"}},
+              h("button",{onClick:()=>doClearFlagOne(r.reference_number),disabled:busy,style:{fontSize:11.5,padding:"5px 10px",border:"1px solid #0f6e3f",color:"#0f6e3f",background:"#fff",borderRadius:5,cursor:busy?"default":"pointer"}},"Clear flag"),
+              h("button",{onClick:()=>gateAndDeleteOne(r.reference_number),disabled:busy,style:{fontSize:11.5,padding:"5px 10px",border:"1px solid #a3312a",color:"#a3312a",background:"#fff",borderRadius:5,cursor:busy?"default":"pointer"}},"Delete")
+            )
           ))
         )
       )
@@ -23261,13 +23398,13 @@ function App() {
     showDraftPanel && h(DraftOfferReminder,{user,onDone:()=>{ setShowDraftPanel(false); refreshDraftCount(); }}),
     h("div",{id:"app-sticky-header",style:{position:"sticky",top:0,zIndex:60}},
       h(TopBar,{user,sessionCompanyId,sessionCompany,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyIdPersisted(null)):null,onLogout:()=>{setUserPersisted(null);setSessionCompanyIdPersisted(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
-      draftCount>0 && h("div",{onClick:()=>setShowDraftPanel(true),style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
-        "⚠ "+draftCount+" quote"+(draftCount===1?"":"s")+" still in Draft — click to review and update status"
-      ),
-      user.role==="super_admin" && abandonedCount>0 && h("div",{onClick:()=>setTab("abandoned_quotes_cleanup"),style:{cursor:"pointer",background:"#fdecea",borderBottom:"1px solid #f0997b",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#a3312a"}},
-        "⚠ "+abandonedCount+" abandoned incomplete quote"+(abandonedCount===1?"":"s")+" — click to review"
-      ),
       h(MenuTabs,{user,active:tab,onChange:setTab})
+    ),
+    draftCount>0 && h("div",{onClick:()=>setShowDraftPanel(true),style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
+      "⚠ "+draftCount+" quote"+(draftCount===1?"":"s")+" still in Draft — click to review and update status"
+    ),
+    user.role==="super_admin" && abandonedCount>0 && h("div",{onClick:()=>setTab("abandoned_quotes_cleanup"),style:{cursor:"pointer",background:"#fdecea",borderBottom:"1px solid #f0997b",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#a3312a"}},
+      "⚠ "+abandonedCount+" abandoned incomplete quote"+(abandonedCount===1?"":"s")+" — click to review"
     ),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,sessionCompany,onRefresh:refresh,onOpenQuote:(ref,slNo,openDatasheet)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo,openDatasheet:!!openDatasheet});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null),pendingNewSlNo,onConsumedPendingNewSlNo:()=>setPendingNewSlNo(null),onGoToTab:setTab})),
     tab==="saved"?h(SavedEstimates,{user,sessionCompany,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo,headerFields)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo,headerFields:headerFields||null});setTab("estimator");}}):
