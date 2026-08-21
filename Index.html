@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-21T13:10:54Z";
+  var APP_BUILD_VERSION = "2026-08-21T13:27:14Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -20337,6 +20337,8 @@ const BACKUP_ALL_TABLES = Array.from(new Set([...MASTER_TABLES.map(t=>t.key), ..
 // reason) and clears that missing component for every quote using that
 // Model, not just the one currently open. Admin-only.
 function IncompleteBomExemptionModal({ details, user, onClose, onSaved }){
+  const isAdmin = user?.role==="admin" || user?.role==="super_admin";
+  const isSuperAdmin = user?.role==="super_admin";
   // Flatten this quote's own incompleteBomDetails into one row per
   // (model, missing parameter) — the same row can repeat across Sl Nos
   // if more than one Sl No in this quote uses the same Model, so dedupe.
@@ -20353,60 +20355,211 @@ function IncompleteBomExemptionModal({ details, user, onClose, onSaved }){
   });
   const [checked,setChecked] = useState({});
   const [reasons,setReasons] = useState({});
+  const [bulkReason,setBulkReason] = useState("");
   const [saving,setSaving] = useState(false);
   const toggle = (key)=> setChecked(c=>({...c,[key]:!c[key]}));
   const setReason = (key,val)=> setReasons(r=>({...r,[key]:val}));
+  const allChecked = rows.length>0 && rows.every(r=>checked[r.model+"::"+r.label]);
+  const toggleAll = ()=>{
+    const next = !allChecked;
+    const nextChecked = {};
+    rows.forEach(r=>{ nextChecked[r.model+"::"+r.label] = next; });
+    setChecked(nextChecked);
+  };
+  const applyBulkReason = ()=>{
+    if(!bulkReason.trim()) return;
+    setReasons(r=>{
+      const next = {...r};
+      rows.forEach(row=>{ const key=row.model+"::"+row.label; if(checked[key] && !(next[key]||"").trim()) next[key]=bulkReason.trim(); });
+      return next;
+    });
+  };
 
-  const save = async()=>{
+  // Two very different scopes. "Just this quote" is the same permanent-
+  // for-this-Sl-No mechanism the readiness gate already uses elsewhere
+  // (bom_line_exceptions, exception_type='marked_missing') — Admin
+  // instant, regular user needs a one-time code from an Admin (existing
+  // action_type "bom_component_exception"). "Always" is the new
+  // Model-wide table (bom_incomplete_exemption_tbl) — this is
+  // deliberately stricter: even an Admin needs a one-time code, and only
+  // a Super Admin can generate that code (new action_type
+  // "bom_incomplete_model_exemption").
+  const [scopeStep,setScopeStep] = useState(null); // null | "choose" | "code_quote" | "code_always"
+  const [codeInput,setCodeInput] = useState("");
+  const [codeError,setCodeError] = useState("");
+  const [generatingCode,setGeneratingCode] = useState(false);
+  const [justGeneratedCode,setJustGeneratedCode] = useState(null);
+
+  const beginSave = ()=>{
     const toSave = rows.filter(r=>checked[r.model+"::"+r.label]);
     if(toSave.length===0){ onClose(); return; }
     const missingReason = toSave.find(r=> !((reasons[r.model+"::"+r.label]||"").trim()));
     if(missingReason){ alert("Every checked line needs a reason before it can be saved."); return; }
+    setScopeStep("choose");
+  };
+
+  const writeQuoteScope = async()=>{
+    const toSave = rows.filter(r=>checked[r.model+"::"+r.label]);
+    for(const r of toSave){
+      const key = r.model+"::"+r.label;
+      const { error } = await sb.from("bom_line_exceptions").insert({
+        item_sl_no:r.slNo, parameter_label:r.label, reason:reasons[key].trim(),
+        exception_type:"marked_missing"
+      });
+      if(error) throw error;
+      await logAudit("INSERT","bom_line_exceptions",String(r.slNo),"Marked \""+r.label+"\" as exception on Sl No "+r.slNo+" only — "+reasons[key].trim(),user?.username||"unknown",null,null);
+    }
+  };
+  const writeAlwaysScope = async()=>{
+    const toSave = rows.filter(r=>checked[r.model+"::"+r.label]);
+    for(const r of toSave){
+      const key = r.model+"::"+r.label;
+      const { error } = await sb.from("bom_incomplete_exemption_tbl").insert({
+        model:r.model, parameter_label:r.label, reason:reasons[key].trim(),
+        exempted_by:user?.username||"unknown", exempted_at:new Date().toISOString()
+      });
+      if(error) throw error;
+      await logAudit("INSERT","bom_incomplete_exemption_tbl",r.model,"Exempted \""+r.label+"\" for Model "+r.model+" for all future quotes — "+reasons[key].trim(),user?.username||"unknown",null,null);
+    }
+  };
+
+  const chooseQuoteScope = async()=>{
+    if(isAdmin){
+      setSaving(true);
+      try{ await writeQuoteScope(); onSaved(); }
+      catch(e){ alert("Save failed: "+e.message); }
+      finally{ setSaving(false); }
+    } else {
+      setCodeInput(""); setCodeError(""); setScopeStep("code_quote");
+    }
+  };
+  const chooseAlwaysScope = ()=>{
+    if(isSuperAdmin){
+      (async()=>{
+        setSaving(true);
+        try{ await writeAlwaysScope(); onSaved(); }
+        catch(e){ alert("Save failed: "+e.message); }
+        finally{ setSaving(false); }
+      })();
+    } else {
+      setCodeInput(""); setCodeError(""); setScopeStep("code_always");
+    }
+  };
+
+  const submitQuoteCode = async()=>{
+    const res = await verifyAndConsumeGatedPin("bom_component_exception", codeInput, user?.username||"unknown", "estimates", null, "Marked "+rows.filter(r=>checked[r.model+"::"+r.label]).length+" Incomplete BOM line(s) as exception, this quote only");
+    if(!res.ok){ setCodeError(res.message); return; }
     setSaving(true);
-    try{
-      for(const r of toSave){
-        const key = r.model+"::"+r.label;
-        const { error } = await sb.from("bom_incomplete_exemption_tbl").insert({
-          model:r.model, parameter_label:r.label, reason:reasons[key].trim(),
-          exempted_by:user?.username||"unknown", exempted_at:new Date().toISOString()
-        });
-        if(error) throw error;
-        await logAudit("INSERT","bom_incomplete_exemption_tbl",r.model,"Exempted \""+r.label+"\" for Model "+r.model+" — "+reasons[key].trim(),user?.username||"unknown",null,null);
-      }
-      onSaved();
-    } catch(e){ alert("Save failed: "+e.message); }
+    try{ await writeQuoteScope(); onSaved(); }
+    catch(e){ alert("Save failed: "+e.message); }
     finally{ setSaving(false); }
+  };
+  const submitAlwaysCode = async()=>{
+    const res = await verifyAndConsumeGatedPin("bom_incomplete_model_exemption", codeInput, user?.username||"unknown", "bom_incomplete_exemption_tbl", null, "Exempted "+rows.filter(r=>checked[r.model+"::"+r.label]).length+" Model line(s) for all future quotes");
+    if(!res.ok){ setCodeError(res.message); return; }
+    setSaving(true);
+    try{ await writeAlwaysScope(); onSaved(); }
+    catch(e){ alert("Save failed: "+e.message); }
+    finally{ setSaving(false); }
+  };
+  const generateAlwaysCode = async()=>{
+    setGeneratingCode(true);
+    const code = String(Math.floor(100000+Math.random()*900000));
+    try{
+      const { data:existing } = await sb.from("gated_action_pin_tbl").select("id").eq("action_type","bom_incomplete_model_exemption").maybeSingle();
+      if(existing) await sb.from("gated_action_pin_tbl").update({pin:code,is_used:false}).eq("id",existing.id);
+      else await sb.from("gated_action_pin_tbl").insert({action_type:"bom_incomplete_model_exemption",pin:code,is_used:false});
+      await logAudit("UPDATE","gated_action_pin_tbl","bom_incomplete_model_exemption","Generated a one-time code for a permanent, all-future-quotes Incomplete BOM exemption",user?.username||"unknown",null,null);
+      setJustGeneratedCode(code);
+    } catch(e){ alert("Could not generate code: "+e.message); }
+    finally{ setGeneratingCode(false); }
   };
 
   return h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"18px 20px",width:680,maxWidth:"95vw",maxHeight:"85vh",overflowY:"auto"}},
-      h("div",{style:{fontSize:15,fontWeight:700,marginBottom:2}},"Incomplete BOM exemptions"),
-      h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},"Check a line to exempt it permanently for that Model — it will stop flagging on every quote using that Model, not just this one. Requires a reason."),
-      rows.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"Nothing to exempt right now.") :
-      h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12.5}},
-        h("thead",null,h("tr",{style:{borderBottom:"1px solid "+colors.border}},
-          h("th",{style:{width:24}}),
-          h("th",{style:{textAlign:"left",padding:"6px 4px",color:colors.muted,fontWeight:500}},"Model"),
-          h("th",{style:{textAlign:"left",padding:"6px 4px",color:colors.muted,fontWeight:500}},"Missing component"),
-          h("th",{style:{textAlign:"left",padding:"6px 4px",color:colors.muted,fontWeight:500}},"Reason")
-        )),
-        h("tbody",null, rows.map(r=>{
-          const key = r.model+"::"+r.label;
-          return h("tr",{key,style:{borderBottom:"1px solid #f0eee6"}},
-            h("td",{style:{padding:"8px 4px"}},h("input",{type:"checkbox",checked:!!checked[key],onChange:()=>toggle(key)})),
-            h("td",{style:{padding:"8px 4px",fontWeight:600}},r.model),
-            h("td",{style:{padding:"8px 4px"}},r.label),
-            h("td",{style:{padding:"8px 4px"}},h("input",{
-              value:reasons[key]||"", onChange:e=>setReason(key,e.target.value),
-              disabled:!checked[key], placeholder:"e.g. screwed cover, no drain needed",
-              style:{width:"100%",fontSize:11.5,padding:"4px 6px",border:"1px solid "+colors.border,borderRadius:4}
-            }))
-          );
-        }))
+
+      scopeStep===null && h(React.Fragment,null,
+        h("div",{style:{fontSize:15,fontWeight:700,marginBottom:2}},"Incomplete BOM exemptions"),
+        h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},"Check a line to exempt it. You'll choose whether it's for this quote only or for every future quote using that Model. Requires a reason."),
+        rows.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"Nothing to exempt right now.") :
+        h(React.Fragment,null,
+        h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:10}},
+          h("input",{
+            value:bulkReason, onChange:e=>setBulkReason(e.target.value),
+            placeholder:"Reason for all checked lines…",
+            style:{flex:1,fontSize:11.5,padding:"5px 8px",border:"1px solid "+colors.border,borderRadius:4}
+          }),
+          h("button",{onClick:applyBulkReason,style:{...btnSmall,fontSize:11}},"Apply to checked")
+        ),
+        h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12.5}},
+          h("thead",null,h("tr",{style:{borderBottom:"1px solid "+colors.border}},
+            h("th",{style:{width:24}},h("input",{type:"checkbox","aria-label":"Exempt all",checked:allChecked,onChange:toggleAll})),
+            h("th",{style:{textAlign:"left",padding:"6px 4px",color:colors.muted,fontWeight:500}},"Model"),
+            h("th",{style:{textAlign:"left",padding:"6px 4px",color:colors.muted,fontWeight:500}},"Missing component"),
+            h("th",{style:{textAlign:"left",padding:"6px 4px",color:colors.muted,fontWeight:500}},"Reason")
+          )),
+          h("tbody",null, rows.map(r=>{
+            const key = r.model+"::"+r.label;
+            return h("tr",{key,style:{borderBottom:"1px solid #f0eee6"}},
+              h("td",{style:{padding:"8px 4px"}},h("input",{type:"checkbox",checked:!!checked[key],onChange:()=>toggle(key)})),
+              h("td",{style:{padding:"8px 4px",fontWeight:600}},r.model),
+              h("td",{style:{padding:"8px 4px"}},r.label),
+              h("td",{style:{padding:"8px 4px"}},h("input",{
+                value:reasons[key]||"", onChange:e=>setReason(key,e.target.value),
+                disabled:!checked[key], placeholder:"e.g. screwed cover, no drain needed",
+                style:{width:"100%",fontSize:11.5,padding:"4px 6px",border:"1px solid "+colors.border,borderRadius:4}
+              }))
+            );
+          }))
+        )
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16}},
+          h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
+          h("button",{onClick:beginSave,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},"Continue")
+        )
       ),
-      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16}},
-        h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
-        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save exemptions")
+
+      scopeStep==="choose" && h(React.Fragment,null,
+        h("div",{style:{fontSize:15,fontWeight:700,marginBottom:8}},"Apply this exemption as…"),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:10,marginBottom:16}},
+          h("button",{onClick:chooseQuoteScope,disabled:saving,style:{...btnSecondary,textAlign:"left",padding:"12px 14px"}},
+            h("div",{style:{fontWeight:700,fontSize:13}},"Just this quote"),
+            h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginTop:2}},isAdmin?"Applies now, only to this quote.":"Needs a one-time code from an Admin.")
+          ),
+          h("button",{onClick:chooseAlwaysScope,disabled:saving,style:{...btnSecondary,textAlign:"left",padding:"12px 14px",borderColor:colors.danger}},
+            h("div",{style:{fontWeight:700,fontSize:13,color:colors.danger}},"Always — every future quote using this Model"),
+            h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginTop:2}},isSuperAdmin?"Applies now, for every future quote.":"Needs a one-time code from a Super Admin, even for an Admin.")
+          )
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setScopeStep(null),disabled:saving,style:btnSecondary},"Back")
+        )
+      ),
+
+      scopeStep==="code_quote" && h(React.Fragment,null,
+        h("div",{style:{fontSize:15,fontWeight:700,marginBottom:8}},"Enter Admin code"),
+        h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:10}},"An Admin can give you this — same code used elsewhere for BOM component exceptions."),
+        h("input",{value:codeInput,onChange:e=>{setCodeInput(e.target.value);setCodeError("");},placeholder:"6-digit code",style:{width:"100%",fontSize:14,padding:"8px 10px",border:"1px solid "+colors.border,borderRadius:5,marginBottom:6}}),
+        codeError && h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:6}},codeError),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:10}},
+          h("button",{onClick:()=>setScopeStep("choose"),disabled:saving,style:btnSecondary},"Back"),
+          h("button",{onClick:submitQuoteCode,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Verify and save")
+        )
+      ),
+
+      scopeStep==="code_always" && h(React.Fragment,null,
+        h("div",{style:{fontSize:15,fontWeight:700,marginBottom:8}},"Enter Super Admin code"),
+        h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:10}},"A permanent, all-future-quotes exemption needs a one-time code only a Super Admin can generate."),
+        isSuperAdmin && h("div",{style:{marginBottom:12,padding:"10px 12px",background:"#fdecea",border:"1px solid #f0997b",borderRadius:6}},
+          h("button",{onClick:generateAlwaysCode,disabled:generatingCode,style:{...btnPrimary,background:colors.danger}},generatingCode?"Generating…":"Generate Super Admin code"),
+          justGeneratedCode && h("div",{style:{marginTop:8,fontSize:22,fontWeight:700,letterSpacing:3,color:"#a3312a"}},justGeneratedCode)
+        ),
+        h("input",{value:codeInput,onChange:e=>{setCodeInput(e.target.value);setCodeError("");},placeholder:"6-digit code",style:{width:"100%",fontSize:14,padding:"8px 10px",border:"1px solid "+colors.border,borderRadius:5,marginBottom:6}}),
+        codeError && h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:6}},codeError),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:10}},
+          h("button",{onClick:()=>setScopeStep("choose"),disabled:saving,style:btnSecondary},"Back"),
+          h("button",{onClick:submitAlwaysCode,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1,background:colors.danger}},saving?"Saving…":"Verify and save")
+        )
       )
     )
   );
