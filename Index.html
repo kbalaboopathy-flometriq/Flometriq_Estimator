@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-21T01:15:40Z";
+  var APP_BUILD_VERSION = "2026-08-21T01:39:53Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -4266,6 +4266,15 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const [orderQtyGate,setOrderQtyGate]=useState(null); // {cartOverride} while the gate is open, else null
   const [orderQtyGateInput,setOrderQtyGateInput]=useState("");
   const [orderQtyGateSaving,setOrderQtyGateSaving]=useState(false);
+  // Tag Number / Location / Sl No in Enq — asked right here, same moment
+  // as Order Qty, precisely because they're otherwise easy to miss (they
+  // only live as three columns deep in the Cart table otherwise). All
+  // optional — Order Qty stays the only hard requirement of this gate —
+  // but surfacing them here means a Sl No essentially never gets created
+  // without the user at least seeing the question.
+  const [orderQtyGateTag,setOrderQtyGateTag]=useState("");
+  const [orderQtyGateLocation,setOrderQtyGateLocation]=useState("");
+  const [orderQtyGateEnq,setOrderQtyGateEnq]=useState("");
   // Datasheet Yes/No — same gate, only shown when the cart being saved
   // contains a Direct Price line (a real catalog Sl No never gets asked
   // this; the requirement stays hard for those). null = unanswered.
@@ -5417,6 +5426,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         setOrderQtyGate({cartOverride: effectiveCart});
         setOrderQtyGateInput("");
         setDatasheetChoice(null);
+        setOrderQtyGateTag(""); setOrderQtyGateLocation(""); setOrderQtyGateEnq("");
         return false;
       }
       if(existing&&existing.length>0){
@@ -5475,9 +5485,17 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     const gateCart = orderQtyGate.cartOverride||[];
     const hasDirectPrice = gateCart.some(l=>l.is_direct_price===true);
     const ok = await saveReference(orderQtyGate.cartOverride, Number(orderQtyGateInput), hasDirectPrice && datasheetChoice==="no");
+    if(ok && (orderQtyGateTag.trim()||orderQtyGateLocation.trim()||orderQtyGateEnq.trim())){
+      await sb.from("estimates").update({
+        tag_number: orderQtyGateTag.trim()||null,
+        location: orderQtyGateLocation.trim()||null,
+        sl_no_in_enq: orderQtyGateEnq.trim()||null
+      }).eq("reference_number",refNumber).eq("item_sl_no",Number(itemSlNo));
+    }
     setOrderQtyGateSaving(false);
     if(ok){
       setOrderQtyGate(null); setOrderQtyGateInput(""); setDatasheetChoice(null);
+      setOrderQtyGateTag(""); setOrderQtyGateLocation(""); setOrderQtyGateEnq("");
       setShowSave(false); setSaveMaximised(true);
       if(holdingNewSlNo) await afterNewSlNoSave();
     }
@@ -6281,7 +6299,21 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           onKeyDown:e=>{ if(e.key==="Enter" && qtyOk && dsOk && !orderQtyGateSaving) confirmOrderQtyGate(); },
           placeholder:"units", style:{...inputStyle,width:"100%",fontSize:15,padding:"9px 10px",marginBottom:6}}),
         !qtyOk && orderQtyGateInput!=="" && h("div",{style:{fontSize:11,color:colors.danger,marginBottom:6}},"Must be 1 or more."),
-        h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginBottom:hasDirectPrice?14:14}},"Required — must be 1 or more."),
+        h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginBottom:14}},"Required — must be 1 or more."),
+        h("div",{style:{display:"flex",gap:8,marginBottom:14}},
+          h("div",{style:{flex:1}},
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.mutedLight,marginBottom:3}},"Tag no."),
+            h("input",{type:"text",value:orderQtyGateTag,onChange:e=>setOrderQtyGateTag(e.target.value),placeholder:"optional",style:{...inputStyle,width:"100%",padding:"6px 8px",fontSize:12.5,boxSizing:"border-box"}})
+          ),
+          h("div",{style:{flex:1}},
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.mutedLight,marginBottom:3}},"Sl No in Enq"),
+            h("input",{type:"text",value:orderQtyGateEnq,onChange:e=>setOrderQtyGateEnq(e.target.value),placeholder:"optional",style:{...inputStyle,width:"100%",padding:"6px 8px",fontSize:12.5,boxSizing:"border-box"}})
+          )
+        ),
+        h("div",{style:{marginBottom:14}},
+          h("label",{style:{display:"block",fontSize:10.5,color:colors.mutedLight,marginBottom:3}},"Location"),
+          h("input",{type:"text",value:orderQtyGateLocation,onChange:e=>setOrderQtyGateLocation(e.target.value),placeholder:"optional",style:{...inputStyle,width:"100%",padding:"6px 8px",fontSize:12.5,boxSizing:"border-box"}})
+        ),
         hasDirectPrice && h("div",{style:{marginBottom:14,paddingTop:10,borderTop:"1px solid "+colors.border}},
           h("div",{style:{fontSize:12.5,fontWeight:600,marginBottom:8}},"Does this line need a Datasheet?"),
           h("div",{style:{display:"flex",gap:8}},
@@ -9018,6 +9050,43 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // rate/sf are 0 on those lines, so applying the formula would zero them.
   const [cartQtyDraft,setCartQtyDraft]=useState({}); // {refId: string} local text while editing
   const [cartQtySaving,setCartQtySaving]=useState({}); // {refId: true} while in flight
+  // Item/Size/Model are permanently locked in the Cart — they're the BOM's
+  // real identity and this screen was never meant to let someone silently
+  // swap them out from under an already-built BOM. Clicking one guides the
+  // user to where a change is actually possible instead of just doing
+  // nothing.
+  const guideToChangeItemFields = (r)=>{
+    alert("Item, Size, and Model can't be changed from the Cart. Use Goto BOM on Sl No "+r.item_sl_no+" — the Refresh BOM tool there lets you rebuild it against a different item.");
+  };
+
+  // Explicit Edit/Save/Cancel per row for the four fields the Cart CAN
+  // change (Sl No in Enq, Tag no., Location, Qty) — replaces the earlier
+  // auto-save-on-blur behavior, which risked a silent write from a stray
+  // click. Only one row editable at a time. Save reuses the existing
+  // updateCartRowText/updateCartRowQty helpers (only for fields that
+  // actually changed) rather than re-implementing their write/recompute
+  // logic here.
+  const [editingCartRow,setEditingCartRow]=useState(null); // ref.id, or null
+  const [cartRowDraft,setCartRowDraft]=useState({});
+  const startEditCartRow = (r)=>{
+    setEditingCartRow(r.id);
+    setCartRowDraft({ sl_no_in_enq:r.sl_no_in_enq||"", tag_number:r.tag_number||"", location:r.location||"", order_qty:String(r.order_qty||1) });
+  };
+  const cancelEditCartRow = ()=>{ setEditingCartRow(null); setCartRowDraft({}); };
+  const [savingCartRowEdits,setSavingCartRowEdits]=useState(false);
+  const saveCartRowEdits = async(r)=>{
+    const d = cartRowDraft;
+    if(!(Number(d.order_qty)>=1)){ alert("Enter a qty greater than 0."); return; }
+    setSavingCartRowEdits(true);
+    try{
+      if(d.sl_no_in_enq.trim()!==(r.sl_no_in_enq||"")) await updateCartRowText(r,"sl_no_in_enq",d.sl_no_in_enq);
+      if(d.tag_number.trim()!==(r.tag_number||"")) await updateCartRowText(r,"tag_number",d.tag_number);
+      if(d.location.trim()!==(r.location||"")) await updateCartRowText(r,"location",d.location);
+      if(Number(d.order_qty)!==Number(r.order_qty||1)) await updateCartRowQty(r,d.order_qty);
+      setEditingCartRow(null); setCartRowDraft({});
+    } finally { setSavingCartRowEdits(false); }
+  };
+
   const updateCartRowQty = async(ref, val)=>{
     const n = Number(val);
     if(!Number.isFinite(n) || n<=0){ alert("Enter a qty greater than 0."); setCartQtyDraft(d=>{ const c={...d}; delete c[ref.id]; return c; }); return; }
@@ -13456,58 +13525,48 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("tbody",null,
               refs.filter(r=>r.reference_number===refFilter).length===0
                 ? h("tr",null,h("td",{colSpan:9,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},"No Sl Nos on this quote yet."))
-                : refs.filter(r=>r.reference_number===refFilter).sort((a,b)=>a.item_sl_no-b.item_sl_no).map(r=>h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
+                : refs.filter(r=>r.reference_number===refFilter).sort((a,b)=>a.item_sl_no-b.item_sl_no).map(r=>{
+                    const isEditing = editingCartRow===r.id;
+                    return h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
                     h("td",{style:{padding:"8px 10px",fontWeight:700,color:"#0f6e56"}},r.item_sl_no),
                     h("td",{style:{padding:"8px 10px"}},
-                      h("input",{type:"text",placeholder:"—",
-                        value: cartTextDraft[r.id+":sl_no_in_enq"]!==undefined ? cartTextDraft[r.id+":sl_no_in_enq"] : (r.sl_no_in_enq||""),
-                        disabled: !!cartTextSaving[r.id+":sl_no_in_enq"],
-                        onChange:e=>setCartTextDraft(d=>({...d,[r.id+":sl_no_in_enq"]:e.target.value})),
-                        onBlur:e=>updateCartRowText(r,"sl_no_in_enq",e.target.value),
-                        onKeyDown:e=>{ if(e.key==="Enter") e.target.blur(); },
-                        style:{width:80,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4,opacity:cartTextSaving[r.id+":sl_no_in_enq"]?0.6:1}
-                      })
+                      isEditing
+                        ? h("input",{type:"text",placeholder:"—",value:cartRowDraft.sl_no_in_enq,onChange:e=>setCartRowDraft(d=>({...d,sl_no_in_enq:e.target.value})),style:{width:80,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4}})
+                        : h("span",{style:{color:r.sl_no_in_enq?colors.text:colors.mutedLight}},r.sl_no_in_enq||"—")
                     ),
                     h("td",{style:{padding:"8px 10px"}},
-                      h("input",{type:"text",placeholder:"—",
-                        value: cartTextDraft[r.id+":tag_number"]!==undefined ? cartTextDraft[r.id+":tag_number"] : (r.tag_number||""),
-                        disabled: !!cartTextSaving[r.id+":tag_number"],
-                        onChange:e=>setCartTextDraft(d=>({...d,[r.id+":tag_number"]:e.target.value})),
-                        onBlur:e=>updateCartRowText(r,"tag_number",e.target.value),
-                        onKeyDown:e=>{ if(e.key==="Enter") e.target.blur(); },
-                        style:{width:80,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4,opacity:cartTextSaving[r.id+":tag_number"]?0.6:1}
-                      })
+                      isEditing
+                        ? h("input",{type:"text",placeholder:"—",value:cartRowDraft.tag_number,onChange:e=>setCartRowDraft(d=>({...d,tag_number:e.target.value})),style:{width:80,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4}})
+                        : h("span",{style:{color:r.tag_number?colors.text:colors.mutedLight}},r.tag_number||"—")
                     ),
                     h("td",{style:{padding:"8px 10px"}},
-                      h("input",{type:"text",placeholder:"—",
-                        value: cartTextDraft[r.id+":location"]!==undefined ? cartTextDraft[r.id+":location"] : (r.location||""),
-                        disabled: !!cartTextSaving[r.id+":location"],
-                        onChange:e=>setCartTextDraft(d=>({...d,[r.id+":location"]:e.target.value})),
-                        onBlur:e=>updateCartRowText(r,"location",e.target.value),
-                        onKeyDown:e=>{ if(e.key==="Enter") e.target.blur(); },
-                        style:{width:100,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4,opacity:cartTextSaving[r.id+":location"]?0.6:1}
-                      })
+                      isEditing
+                        ? h("input",{type:"text",placeholder:"—",value:cartRowDraft.location,onChange:e=>setCartRowDraft(d=>({...d,location:e.target.value})),style:{width:100,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4}})
+                        : h("span",{style:{color:r.location?colors.text:colors.mutedLight}},r.location||"—")
                     ),
-                    h("td",{style:{padding:"8px 10px",color:colors.muted}},modelItemMap.get(r.model)||r.model||"—"),
-                    h("td",{style:{padding:"8px 10px",color:colors.muted}},modelSizeMap.get(r.model)||"—"),
-                    h("td",{style:{padding:"8px 10px",color:colors.muted}},r.model||"—"),
+                    h("td",{style:{padding:"8px 10px",color:colors.muted,cursor:"pointer"},title:"Click to see how to change this",onClick:()=>guideToChangeItemFields(r)},modelItemMap.get(r.model)||r.model||"—"),
+                    h("td",{style:{padding:"8px 10px",color:colors.muted,cursor:"pointer"},title:"Click to see how to change this",onClick:()=>guideToChangeItemFields(r)},modelSizeMap.get(r.model)||"—"),
+                    h("td",{style:{padding:"8px 10px",color:colors.muted,cursor:"pointer"},title:"Click to see how to change this",onClick:()=>guideToChangeItemFields(r)},r.model||"—"),
                     h("td",{style:{padding:"8px 10px"}},
-                      h("input",{type:"number",min:1,
-                        value: cartQtyDraft[r.id]!==undefined ? cartQtyDraft[r.id] : (r.order_qty||1),
-                        disabled: !!cartQtySaving[r.id],
-                        onChange:e=>setCartQtyDraft(d=>({...d,[r.id]:e.target.value})),
-                        onBlur:e=>updateCartRowQty(r,e.target.value),
-                        onKeyDown:e=>{ if(e.key==="Enter") e.target.blur(); },
-                        style:{width:60,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4,opacity:cartQtySaving[r.id]?0.6:1}
-                      })
+                      isEditing
+                        ? h("input",{type:"number",min:1,value:cartRowDraft.order_qty,onChange:e=>setCartRowDraft(d=>({...d,order_qty:e.target.value})),style:{width:60,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4}})
+                        : h("span",null,r.order_qty||1)
                     ),
                     h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
-                      h("button",{onClick:async()=>{ setShowCartScreen(false); await openEstimate(r); },style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Goto BOM"),
-                      h("button",{onClick:()=>{ setShowCartScreen(false); openEstimate(r); setShowDatasheet(true); },style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Datasheet"),
-                      h("button",{onClick:()=>openCloneSlNo(r),style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6,borderColor:"#1c8c75",color:"#0f6e56"}},"Clone Sl No"),
-                      isAdmin && h("button",{onClick:()=>deleteSlNo(r),disabled:deletingSlNo===r.id,style:{border:"none",background:"transparent",color:colors.danger,cursor:"pointer",fontSize:12}},deletingSlNo===r.id?"…":"Remove")
+                      isEditing
+                        ? h(React.Fragment,null,
+                            h("button",{onClick:()=>saveCartRowEdits(r),disabled:savingCartRowEdits,style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6,borderColor:"#1c8c75",color:"#0f6e56",opacity:savingCartRowEdits?0.6:1}},savingCartRowEdits?"Saving…":"Save"),
+                            h("button",{onClick:cancelEditCartRow,disabled:savingCartRowEdits,style:{...btnSecondary,padding:"4px 9px",fontSize:11.5}},"Cancel")
+                          )
+                        : h(React.Fragment,null,
+                            h("button",{onClick:()=>startEditCartRow(r),style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Edit"),
+                            h("button",{onClick:async()=>{ setShowCartScreen(false); await openEstimate(r); },style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Goto BOM"),
+                            h("button",{onClick:()=>{ setShowCartScreen(false); openEstimate(r); setShowDatasheet(true); },style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Datasheet"),
+                            h("button",{onClick:()=>openCloneSlNo(r),style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6,borderColor:"#1c8c75",color:"#0f6e56"}},"Clone Sl No"),
+                            isAdmin && h("button",{onClick:()=>deleteSlNo(r),disabled:deletingSlNo===r.id,style:{border:"none",background:"transparent",color:colors.danger,cursor:"pointer",fontSize:12}},deletingSlNo===r.id?"…":"Remove")
+                          )
                     )
-                  ))
+                  );})
             )
           )
         )
