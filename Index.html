@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-22T05:04:46Z";
+  var APP_BUILD_VERSION = "2026-08-22T05:12:22Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8022,6 +8022,37 @@ function AddToMasterPanel({ table, fieldLabel, valueCol, onClose, onAdded }){
   const [val,setVal] = useState("");
   const [saving,setSaving] = useState(false);
   const [err,setErr] = useState("");
+  // Component casing rule (22 Aug): every new Component auto-corrects to
+  // Title Case here — the single entry point every "+ Add" for Component
+  // routes through, matching the Title-Case normalization already applied
+  // app-wide. Scoped to component_item_tbl only. Session user is read
+  // directly from sessionStorage rather than threaded as a prop, since
+  // MasterSelect (which opens this panel) is used in dozens of places
+  // app-wide and doesn't currently carry a user prop.
+  const getSessionUser = ()=>{ try{ const raw=sessionStorage.getItem("flometriq_user"); return raw?JSON.parse(raw):null; } catch(e){ return null; } };
+  const sessionUser = getSessionUser();
+  const isSuperAdmin = sessionUser?.role==="super_admin";
+  const toTitleCase = (s)=> s.split(/(\s+)/).map(word=> word.trim()==="" ? word : word.split(/(\/)/).map(part=> part==="/" ? part : (part.charAt(0).toUpperCase()+part.slice(1).toLowerCase())).join("")).join("");
+  const [pendingCorrection,setPendingCorrection] = useState(null); // {typed, corrected} once a Component auto-correct is caught
+  const [showOverride,setShowOverride] = useState(false);
+  const [overrideCode,setOverrideCode] = useState("");
+  const [overrideCodeError,setOverrideCodeError] = useState("");
+  const [generatingOverrideCode,setGeneratingOverrideCode] = useState(false);
+  const [justGeneratedOverrideCode,setJustGeneratedOverrideCode] = useState(null);
+
+  const doSave = async(value)=>{
+    setSaving(true); setErr("");
+    try {
+      const { error } = await sb.from(table).insert({ [col]: value });
+      if(error){
+        if(String(error.message||"").toLowerCase().includes("duplicate")){ onAdded(value); onClose(); return; }
+        throw error;
+      }
+      onAdded(value); onClose();
+    } catch(e){ setErr(e.message||"Could not save."); }
+    finally { setSaving(false); }
+  };
+
   const save = async()=>{
     let trimmed = val.trim();
     if(!trimmed){ setErr("Enter a value."); return; }
@@ -8030,26 +8061,73 @@ function AddToMasterPanel({ table, fieldLabel, valueCol, onClose, onAdded }){
     // new value never gets stored wrong in the first place. Scoped to
     // size_tbl only; not applied to every master table's free text.
     if(table==="size_tbl") trimmed = trimmed.replace(/NB/g,"nb");
-    setSaving(true); setErr("");
-    try {
-      const { error } = await sb.from(table).insert({ [col]: trimmed });
-      if(error){
-        if(String(error.message||"").toLowerCase().includes("duplicate")){ onAdded(trimmed); onClose(); return; }
-        throw error;
-      }
-      onAdded(trimmed); onClose();
-    } catch(e){ setErr(e.message||"Could not save."); }
-    finally { setSaving(false); }
+    if(table==="component_item_tbl"){
+      const corrected = toTitleCase(trimmed);
+      if(corrected!==trimmed){ setPendingCorrection({typed:trimmed, corrected}); return; }
+    }
+    await doSave(trimmed);
   };
+
+  const acceptCorrection = ()=>{ if(pendingCorrection) doSave(pendingCorrection.corrected); };
+  const requestOverride = ()=>{
+    if(isSuperAdmin){ doSave(pendingCorrection.typed); return; }
+    setOverrideCode(""); setOverrideCodeError(""); setShowOverride(true);
+  };
+  const submitOverrideCode = async()=>{
+    const res = await verifyAndConsumeGatedPin("component_casing_override", overrideCode, sessionUser?.username||"unknown", "component_item_tbl", null, "Saved \""+pendingCorrection.typed+"\" as typed, overriding the Title Case auto-correct");
+    if(!res.ok){ setOverrideCodeError(res.message); return; }
+    await doSave(pendingCorrection.typed);
+  };
+  const generateOverrideCode = async()=>{
+    setGeneratingOverrideCode(true);
+    const code = String(Math.floor(100000+Math.random()*900000));
+    try{
+      const { data:existing } = await sb.from("gated_action_pin_tbl").select("id").eq("action_type","component_casing_override").maybeSingle();
+      if(existing) await sb.from("gated_action_pin_tbl").update({pin:code,is_used:false}).eq("id",existing.id);
+      else await sb.from("gated_action_pin_tbl").insert({action_type:"component_casing_override",pin:code,is_used:false});
+      await logAudit("UPDATE","gated_action_pin_tbl","component_casing_override","Generated a one-time code to save a Component value without Title Case auto-correction",sessionUser?.username||"unknown",null,null);
+      setJustGeneratedOverrideCode(code);
+    } catch(e){ alert("Could not generate code: "+e.message); }
+    finally { setGeneratingOverrideCode(false); }
+  };
+
   return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.35)",zIndex:1200,display:"flex",justifyContent:"flex-end"}},
     h("div",{style:{width:340,maxWidth:"90vw",height:"100%",background:"#fff",boxShadow:"-2px 0 12px rgba(0,0,0,0.15)",padding:"20px 22px",display:"flex",flexDirection:"column"}},
-      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Add to "+(fieldLabel||table)),
-      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"This adds a new option to the "+(fieldLabel||table)+" master. It'll be available here and everywhere else this field is used."),
-      h("input",{value:val,onChange:e=>setVal(e.target.value),autoFocus:true,style:{...inputStyle,padding:"9px 11px",fontSize:13,marginBottom:8},placeholder:"New "+(fieldLabel||"value").toLowerCase(),onKeyDown:e=>{ if(e.key==="Enter") save(); }}),
-      err&&h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},err),
-      h("div",{style:{marginTop:"auto",display:"flex",justifyContent:"flex-end",gap:8}},
-        h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
-        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save and use")
+
+      !pendingCorrection && h(React.Fragment,null,
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Add to "+(fieldLabel||table)),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"This adds a new option to the "+(fieldLabel||table)+" master. It'll be available here and everywhere else this field is used."),
+        h("input",{value:val,onChange:e=>setVal(e.target.value),autoFocus:true,style:{...inputStyle,padding:"9px 11px",fontSize:13,marginBottom:8},placeholder:"New "+(fieldLabel||"value").toLowerCase(),onKeyDown:e=>{ if(e.key==="Enter") save(); }}),
+        err&&h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},err),
+        h("div",{style:{marginTop:"auto",display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
+          h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save")
+        )
+      ),
+
+      pendingCorrection && !showOverride && h(React.Fragment,null,
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Auto-corrected to Title Case"),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14}},"\""+pendingCorrection.typed+"\" → \""+pendingCorrection.corrected+"\" — every Component name follows this rule so casing stays consistent everywhere."),
+        h("div",{style:{marginTop:"auto",display:"flex",flexDirection:"column",gap:8}},
+          h("button",{onClick:acceptCorrection,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save as \""+pendingCorrection.corrected+"\""),
+          h("button",{onClick:requestOverride,disabled:saving,style:btnSecondary},isSuperAdmin?"Keep as typed":"Keep as typed (needs Super Admin code)"),
+          h("button",{onClick:()=>setPendingCorrection(null),disabled:saving,style:{...btnSecondary,fontSize:11.5}},"Back")
+        )
+      ),
+
+      pendingCorrection && showOverride && h(React.Fragment,null,
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Enter Super Admin code"),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:10}},"Saving \""+pendingCorrection.typed+"\" without the Title Case correction needs a one-time code only a Super Admin can generate."),
+        isSuperAdmin && h("div",{style:{marginBottom:12,padding:"10px 12px",background:"#fdecea",border:"1px solid #f0997b",borderRadius:6}},
+          h("button",{onClick:generateOverrideCode,disabled:generatingOverrideCode,style:{...btnPrimary,background:colors.danger}},generatingOverrideCode?"Generating…":"Generate Super Admin code"),
+          justGeneratedOverrideCode && h("div",{style:{marginTop:8,fontSize:22,fontWeight:700,letterSpacing:3,color:"#a3312a"}},justGeneratedOverrideCode)
+        ),
+        h("input",{value:overrideCode,onChange:e=>{setOverrideCode(e.target.value);setOverrideCodeError("");},placeholder:"6-digit code",style:{width:"100%",fontSize:14,padding:"8px 10px",border:"1px solid "+colors.border,borderRadius:5,marginBottom:6}}),
+        overrideCodeError && h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:6}},overrideCodeError),
+        h("div",{style:{marginTop:"auto",display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:()=>setShowOverride(false),style:btnSecondary},"Back"),
+          h("button",{onClick:submitOverrideCode,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1,background:colors.danger}},saving?"Saving…":"Verify and save")
+        )
       )
     )
   );
