@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-22T13:50:06Z";
+  var APP_BUILD_VERSION = "2026-08-22T14:40:35Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -4259,6 +4259,13 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const [lines,setLines]=useState([]); const [overrides,setOverrides]=useState({});
   const [loadingLines,setLoadingLines]=useState(false); const [error,setError]=useState("");
   const [cart,setCart]=useState([]); const [showSave,setShowSave]=useState(false);
+  // Guards saveEstimateFromBom against a repeat click while the Quote#/Sl No
+  // gateway popup is up — that path never touches simpleSaving (it just opens
+  // the popup and returns), so the button stayed clickable and a second click
+  // there used to append this model's lines onto the cart a second time. See
+  // saveEstimateFromBom itself for the other half of this fix (replace, not
+  // append, for the same model).
+  const [cartBusy,setCartBusy]=useState(false);
   // Order Qty gate — fires only the very first time a Sl No is actually
   // created (see saveReference below, right where "existing" determines
   // create-vs-overwrite). No Cancel/close by design: a genuinely new Sl No
@@ -4313,6 +4320,52 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const [customerCountry,setCustomerCountry]=useState(""); // drives the currency default and the missing-country PDF-generation gate
   const [contactName,setContactName]=useState(""); const [contactDesignation,setContactDesignation]=useState("");
   const [signatoryName,setSignatoryName]=useState(""); const [signatoryDesignation,setSignatoryDesignation]=useState("");
+  // Signatory (22 Aug rebuild): defaults to the logged-in user's OWN
+  // Employee master record (name + designation) the moment a brand-new
+  // Sl No starts — not a blank field to fill in. Admin/Super Admin can
+  // freely override to a different employee. A plain "user" can also
+  // override, but doing so is flagged: they get a confirm() warning up
+  // front, and the change is written to signatory_override_notice_tbl at
+  // save time so the Super Admin sees it (audit log + a popup on their
+  // next login — see App()'s SignatoryOverrideNoticesPopup).
+  const isSignatoryAdminOrAbove = user.role==="admin" || user.role==="super_admin";
+  const [activeSignatoryEmployees,setActiveSignatoryEmployees]=useState([]); // [{employee_name,designation}]
+  useEffect(()=>{
+    sb.from("employee_tbl").select("employee_name,designation").neq("status","Inactive").order("employee_name")
+      .then(({data})=>setActiveSignatoryEmployees((data||[]).filter(e=>e.employee_name)));
+  },[]);
+  const [signatoryDefault,setSignatoryDefault]=useState(null); // {employee_name,designation} — the logged-in user's own record
+  useEffect(()=>{
+    sb.from("employee_tbl").select("employee_name,designation").eq("app_user_id",user.id).limit(1).maybeSingle()
+      .then(({data})=>setSignatoryDefault(data||null));
+  },[user.id]);
+  // Auto-fills Signatory the moment the screen is genuinely blank/fresh
+  // (no Quote# typed yet, nothing already set) — never overwrites a
+  // header that's actually being loaded (existingQuoteHeader/
+  // chooseAddLineItem always set refNumber alongside signatoryName, so
+  // this condition goes false before it could clobber a real load).
+  useEffect(()=>{
+    if(!signatoryDefault) return;
+    if(!refNumber.trim() && !signatoryName.trim()){
+      setSignatoryName(signatoryDefault.employee_name||"");
+      setSignatoryDesignation(signatoryDefault.designation||"");
+    }
+  },[signatoryDefault, refNumber, signatoryName]);
+  // True once the CURRENT value genuinely differs from the logged-in
+  // user's own default — this, not any particular click, is what
+  // saveReference checks at save time to decide whether to write a
+  // notice for Super Admin.
+  const signatoryIsOverridden = !!(signatoryDefault && signatoryName.trim() && signatoryName.trim()!==(signatoryDefault.employee_name||"").trim());
+  const onSignatoryNameChange = (name)=>{
+    if(!isSignatoryAdminOrAbove && signatoryDefault && name && name!==signatoryDefault.employee_name){
+      if(!confirm("You're changing Signatory to someone other than yourself — the Super Admin will be notified of this change. Continue?")){
+        return; // revert — value stays whatever it already was
+      }
+    }
+    setSignatoryName(name);
+    const match = activeSignatoryEmployees.find(e=>e.employee_name===name);
+    if(match) setSignatoryDesignation(match.designation||"");
+  };
   const [itemSlNo,setItemSlNo]=useState(""); 
   const [enquiryNumber,setEnquiryNumber]=useState(""); const [enquiryDate,setEnquiryDate]=useState("");
   const [quoteDate,setQuoteDate]=useState("");
@@ -4739,19 +4792,30 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const totalSalesPrice=useMemo(()=>computedLines.reduce((s,l)=>s+(l.salesPrice||0),0),[computedLines]);
   const pendingCount=computedLines.filter(l=>l.hasSpec&&!l.selGrade&&overrides[l.id]?.rate===undefined).length;
   const isAdminOrSuper = user.role==="admin" || user.role==="super_admin";
+  // Whether the Description Master lookup below is still in flight — a
+  // separate, independent fetch from whatever loads the BOM/pricing data,
+  // so the screen can look fully ready (Total Cost, MOC groups, Summary
+  // panels all populated) while this is still resolving. A user who clicks
+  // Save in that window used to hit a confusing "Description is required"
+  // — see saveExistingSlNoDirect, the single choke point both Save buttons
+  // route through, for the actual guard.
+  const [descMasterLoading,setDescMasterLoading]=useState(false);
   useEffect(()=>{
     if(!lines.length || refDesc.trim()) return; // don't run with nothing to build from, and never clobber a description the user already has
     const itemName = lines[0]?.item || "";
     const sizeText = lines[0]?.size || "";
     if(!itemName) return;
+    setDescMasterLoading(true);
     (async()=>{
-      const { data } = await sb.from("description_master").select("*").eq("item",itemName).maybeSingle();
-      if(data){
-        const built = buildAutoDescription(data, computedLines, itemName, sizeText);
-        if(built) setRefDesc(built);
-      } else if(isAdminOrSuper && !descMasterDismissedItems.has(itemName)){
-        setDescMasterPrompt(itemName);
-      }
+      try{
+        const { data } = await sb.from("description_master").select("*").eq("item",itemName).maybeSingle();
+        if(data){
+          const built = buildAutoDescription(data, computedLines, itemName, sizeText);
+          if(built) setRefDesc(built);
+        } else if(isAdminOrSuper && !descMasterDismissedItems.has(itemName)){
+          setDescMasterPrompt(itemName);
+        }
+      } finally { setDescMasterLoading(false); }
     })();
   },[lines]);
   const [showSummary,setShowSummary]=useState(false);
@@ -5080,18 +5144,26 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   // directly into the save functions (cartOverride) instead of relying on
   // `cart` state, which wouldn't have caught up yet inside this same click.
   const saveEstimateFromBom = async()=>{
+    if(cartBusy || simpleSaving) return; // blocks a repeat click while the gateway popup is up or a save is already in flight
     const toAdd = addCurrentModelToCart();
     if(!toAdd) return; // addCurrentModelToCart already alerted why
-    const newCart = cart.concat(toAdd);
+    setCartBusy(true);
+    // Replace this model's lines rather than appending onto whatever's
+    // already there — a repeat click of this exact button (the gateway
+    // popup below leaves it clickable) used to concat a second copy of
+    // every line instead of harmlessly re-adding the same model.
+    const newCart = cart.filter(l=>l.model!==selectedModel).concat(toAdd);
     setCart(()=>newCart);
     if(!holdingNewSlNo){
       // Fresh session, no Quote#/Sl No known yet — ask for it. This gateway
       // popup is itself the visible feedback for this click.
       setShowAddGateway(true); setGatewayStep("quote"); setGatewayRef(""); setGatewaySiblings(null); setGatewaySlNoInput(""); setGatewaySlNoWarn(false); loadQuoteOptions();
+      setCartBusy(false);
       return;
     }
-    if(holdingNewSlNo.isNewQuote){ setShowSave(true); return; } // needs header details first — no way around that popup
+    if(holdingNewSlNo.isNewQuote){ setShowSave(true); setCartBusy(false); return; } // needs header details first — no way around that popup
     await saveExistingSlNoDirect(false, newCart);
+    setCartBusy(false);
   };
 
   const removeFromCart = (idx)=>setCart(c=>c.filter((_,i)=>i!==idx));
@@ -5306,6 +5378,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const saveExistingSlNoDirect = async(skipDatasheetPrompt, cartOverride)=>{
     const effectiveCart = cartOverride || cart;
     if(effectiveCart.length===0){ alert("Add at least one model's lines to the cart first."); return false; }
+    if(descMasterLoading){ alert("Still looking up the Description for this item — give it a moment and click Save again."); return false; }
     if(!refDesc.trim()){ alert("Description is required — it should have auto-filled once the model loaded; enter one manually if this item has no Description Master entry yet."); return false; }
     setSimpleSaving(true);
     const ok = await saveReference(cartOverride);
@@ -5370,6 +5443,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     if(!refNumber.trim()){fail("Enter a Quote#.");return;}
     if(!String(itemSlNo).trim()){fail("Enter a Sl No.");return;}
     if(!enquiryNumber.trim()){fail("Enter an Enquiry number.");return;}
+    if(descMasterLoading){fail("Still looking up the Description for this item — give it a moment and try Save again.");return;}
     if(!refDesc.trim()){fail("Description is required for every Sl No.");return;}
     if(customerName.trim() && !customerCountry.trim()){fail("This customer has no country on file. Add one in Master Data → Customers before continuing — currency and conversion rate depend on it.");return;}
     if(currency!=="INR" && !(Number(conversionRate)>10)){fail("Enter a valid conversion rate (1 "+currency+" = ? INR, must be greater than 10) before saving — required for any non-INR quote.");return;}
@@ -5459,6 +5533,22 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         } catch(exErr){ /* non-fatal — the quote itself saved fine; the exception record is best-effort */ }
         setMocDeletedExceptions([]);
       }
+      // Signatory override notice (22 Aug) — only for a plain "user" role;
+      // Admin/Super Admin overriding their own default isn't flagged.
+      // Best-effort, matches the pattern above: the quote itself already
+      // saved successfully by this point regardless of whether this write
+      // succeeds.
+      if(!isSignatoryAdminOrAbove && signatoryIsOverridden){
+        try{
+          await sb.from("signatory_override_notice_tbl").insert({
+            reference_number:ref, item_sl_no:slNo, changed_by:user.username,
+            previous_signatory_name:signatoryDefault?.employee_name||"", previous_signatory_designation:signatoryDefault?.designation||"",
+            new_signatory_name:signatoryName.trim(), new_signatory_designation:signatoryDesignation.trim(),
+            acknowledged:false, created_at:new Date().toISOString()
+          });
+          await logAudit("UPDATE","estimates",ref+"-"+slNo,"Signatory changed by "+user.username+" from their own default (\""+(signatoryDefault?.employee_name||"")+"\") to \""+signatoryName.trim()+"\" — flagged for Super Admin",user.username,null,null);
+        } catch(notifErr){ /* non-fatal — best-effort, same as the moc-exception write above */ }
+      }
       const successMsg = "Saved as Quote# \""+ref+"\" Sl No "+slNo+" with "+rows.length+" line(s).";
       setSaveMsg(successMsg); if(!showSave) alert(successMsg);
       setCart([]); setRefNumber(""); setRefDesc(""); setItemSlNo(""); setEnquiryNumber(""); setEnquiryDate(""); setQuoteDate(""); setCurrency("INR"); setConversionRate("1"); setCustomerName(""); setCustomerAddress(""); setContactName(""); setContactDesignation(""); setSignatoryName(""); setSignatoryDesignation(""); setExistingQuoteHeader(null); setShowSave(false); setLinkedProjectId(null); setLinkedProjectName("");
@@ -5518,9 +5608,9 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
             if(cart.length===0){ alert("Add at least one model's lines to the cart first."); return; }
             if(holdingNewSlNo.isNewQuote) setShowSave(true); else saveExistingSlNoDirect();
           },
-          disabled:cart.length===0||simpleSaving,
-          style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"none",cursor:(cart.length===0||simpleSaving)?"not-allowed":"pointer",background:(cart.length===0||simpleSaving)?"#b5d4f4":"#0c447c",color:"#fff"}
-        },simpleSaving?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Save to estimate"),
+          disabled:cart.length===0||simpleSaving||descMasterLoading,
+          style:{padding:"7px 14px",fontSize:12,fontWeight:600,borderRadius:6,border:"none",cursor:(cart.length===0||simpleSaving||descMasterLoading)?"not-allowed":"pointer",background:(cart.length===0||simpleSaving||descMasterLoading)?"#b5d4f4":"#0c447c",color:"#fff"}
+        },simpleSaving?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):(descMasterLoading?"Loading description…":"Save to estimate")),
         h("button",{
           onClick:()=>{
             // Cancel abandons THIS in-progress Sl No add and returns to the
@@ -6039,7 +6129,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
             if(!confirm("Clear all "+lines.length+" line item(s) from this draft? This cannot be undone.")) return;
             requestCodeConfirm("Confirm clearing the lines","This removes all "+lines.length+" line item(s) from the current draft BOM. This can't be undone.","Clear all lines",()=>{ setLines([]); setOverrides({}); setMocDeletedExceptions([]); });
           },disabled:lines.length===0,style:{...btnSecondary,color:colors.danger,borderColor:"#f0b8b8",opacity:lines.length===0?0.5:1}},"Clear all lines"),
-          h("button",{onClick:saveEstimateFromBom,disabled:simpleSaving,style:{...btnPrimary,marginLeft:"auto",opacity:simpleSaving?0.6:1}},simpleSaving?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):"Save estimate")
+          h("button",{onClick:saveEstimateFromBom,disabled:simpleSaving||cartBusy||descMasterLoading,style:{...btnPrimary,marginLeft:"auto",opacity:(simpleSaving||cartBusy||descMasterLoading)?0.6:1}},simpleSaving?h(React.Fragment,null,h("i",{className:"ti ti-hourglass hourglass-spin","aria-hidden":"true",style:{marginRight:6}}),"Saving…"):(descMasterLoading?"Loading description…":"Save estimate"))
         )
       )
     ),
@@ -6196,11 +6286,11 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           ),
           h("div",{style:{width:170}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Signatory"),
-            h("input",{value:signatoryName,disabled:!!existingQuoteHeader,onChange:e=>setSignatoryName(e.target.value),placeholder:"Name on the quote",style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
+            h(LimitToListCombo,{value:signatoryName,disabled:!!existingQuoteHeader,onChange:onSignatoryNameChange,options:activeSignatoryEmployees.map(e=>e.employee_name),placeholder:"Start typing a name…",invalidMessage:v=>"\""+v+"\" isn't an active employee on file — check Master Data \u2192 HR \u2192 Employees.",style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
           ),
           h("div",{style:{width:160}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Signatory Designation"),
-            h("input",{value:signatoryDesignation,disabled:!!existingQuoteHeader,onChange:e=>setSignatoryDesignation(e.target.value),placeholder:"Designation",style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
+            h("input",{value:signatoryDesignation,disabled:!!existingQuoteHeader,onChange:e=>setSignatoryDesignation(e.target.value),placeholder:"Auto-fills from Employee master",style:{...inputStyle,background:existingQuoteHeader?"#f4f2ea":"#fff"}})
           ),
           existingQuoteHeader && h("div",{style:{flexBasis:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,fontSize:11,color:"#085041",background:"#eaf9f4",border:"1px solid #8fd0bf",borderRadius:4,padding:"6px 10px"}},
             h("span",null,"Quote# \""+refNumber.trim()+"\" already exists — Enquiry number/dates are shared across its Sl Nos and locked here. Sl No(s) already used: "+existingQuoteHeader.usedSlNos.join(", ")+". Enter a new Sl No to add another line item, or an existing one to overwrite it."),
@@ -8422,6 +8512,15 @@ function QuoteNotesPanel({ referenceNumber, user }){
 
 function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, onGoToTab, onNewSlNo }) {
   const [refs,setRefs]=useState([]); const [loading,setLoading]=useState(true);
+  // Signatory sources from Employee master (22 Aug) — shared by both
+  // header-edit forms in this component (Quick Edit's headerDraft and the
+  // Header-first new-quote flow's qhSignatoryName). Active employees only,
+  // Designation auto-fills from that employee's own record on pick.
+  const [activeSignatoryEmployees,setActiveSignatoryEmployees]=useState([]); // [{employee_name,designation}]
+  useEffect(()=>{
+    sb.from("employee_tbl").select("employee_name,designation").neq("status","Inactive").order("employee_name")
+      .then(({data})=>setActiveSignatoryEmployees((data||[]).filter(e=>e.employee_name)));
+  },[]);
   const [refFilter,setRefFilter]=useState(""); const [slNoFilter,setSlNoFilter]=useState(""); const [descSearch,setDescSearch]=useState(""); const [openRef,setOpenRef]=useState(null);
   // Entry gate: New offer / Existing offer, shown every time this screen is
   // reached directly. Skipped when arriving via a deep link (e.g. returning
@@ -9337,6 +9436,26 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(isQuoteLocked(openRef.quote_status,user)){ setAuthGate({requiredType:"edit",action:doRebuild}); return; }
     doRebuild();
   };
+  // Auto-refresh (22 Aug) — reverses the earlier "badge only, never touch
+  // the text" design: now, any time the BOM actually changes (line edited,
+  // added, removed, or Refreshed from master), the Description is silently
+  // rebuilt and saved to match — even overwriting a manually-typed one, by
+  // explicit decision. Pass the FRESH lines array (not the openLines
+  // closure, which won't have updated yet at the call site) so this always
+  // builds from what was just saved, not what was on screen a moment ago.
+  const autoRefreshDescriptionFromLines = async(freshLines)=>{
+    if(!descMasterRowForItem || !openRef) return;
+    const item = freshLines[0]?.item || openLines[0]?.item || "";
+    const size = freshLines[0]?.size || openLines[0]?.size || "";
+    const built = buildAutoDescription(descMasterRowForItem, freshLines, item, size);
+    if(!built) return;
+    if(built.trim()===(openRef.description||"").trim()) return; // already matches — nothing to do
+    try{
+      await sb.from("estimates").update({description:built}).eq("id",openRef.id);
+      setOpenRef(r=>r?{...r,description:built}:r);
+      setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:built}:r));
+    } catch(e){ console.error("Auto-refresh description failed",e); }
+  };
   const quoteAnyNonDraft = ()=> refs.some(r=>r.reference_number===refFilter && r.quote_status && r.quote_status!=="Draft");
   const quoteFamilyAnyNonDraft = ()=>{
     const base = (refFilter||"").replace(/-Rev-\d+$/,"");
@@ -10155,6 +10274,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       await logAudit("UPDATE","estimate_lines",estRow.reference_number+"-"+estRow.item_sl_no,"Refresh BOM: added "+willAdd.length+", removed "+willRemove.length+" line(s) to match the master template",user?.username||"unknown",null,{added:willAdd.length,removed:willRemove.length});
       setBomRefreshPreview(null);
       await refreshAll();
+      // refreshAll's own setOpenLines hasn't landed in this closure's
+      // `openLines` yet (React state, not synchronous) — fetch directly so
+      // autoRefreshDescriptionFromLines builds from what was actually just
+      // saved, not a stale pre-refresh snapshot.
+      const { data: freshLinesAfterRefresh } = await sb.from("estimate_lines").select("*").eq("reference_number",estRow.reference_number).eq("item_sl_no",estRow.item_sl_no);
+      if(freshLinesAfterRefresh) await autoRefreshDescriptionFromLines(freshLinesAfterRefresh);
       await refreshReadiness(refFilter);
     } catch(e){ alert("Refresh failed: "+e.message); }
     finally { setBomRefreshBusy(false); }
@@ -10236,7 +10361,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         });
         if(logs.length){ await Promise.all(logs); setBomChangedRows(s=>new Set([...s, line.item_sl_no+"|"+line.sl_no])); }
       }
-      setOpenLines(ls=>ls.map(l=>l.reference_number===line.reference_number&&l.sl_no===line.sl_no?{...l,...payload}:l));
+      setOpenLines(ls=>{
+        const updated = ls.map(l=>l.reference_number===line.reference_number&&l.sl_no===line.sl_no?{...l,...payload}:l);
+        autoRefreshDescriptionFromLines(updated);
+        return updated;
+      });
       setLineEdits(e=>{ const n={...e}; delete n[key]; return n; });
     } catch(err){ console.error("Save failed",err); }
     finally{ setSavingLine(s=>{ const n={...s}; delete n[key]; return n; }); }
@@ -10645,7 +10774,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       };
       const{data,error:err}=await sb.from("estimate_lines").insert(payload).select().single();
       if(err) throw err;
-      setOpenLines(l=>[...l,data]);
+      setOpenLines(l=>{ const updated=[...l,data]; autoRefreshDescriptionFromLines(updated); return updated; });
       setAddSubAssembly(""); setAddComponent(""); setAddSpec(""); setAddGrade(""); setAddQty(""); setAddUom(""); setAddSf(3.1); setAddCuttingPlan(""); setAddCutPlanQty(""); setAddCuttingUom("");
       setAddMsg("Line added as Sl No "+nextSl+".");
     } catch(e){setAddMsg("Failed: "+e.message);} finally{setSavingAdd(false);}
@@ -10656,7 +10785,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const{data:rowData}=await sb.from("estimate_lines").select("*").eq("reference_number",refNumber).eq("item_sl_no",itemSlNo).eq("sl_no",slNo).single();
     await sb.from("estimate_lines").delete().eq("reference_number",refNumber).eq("item_sl_no",itemSlNo).eq("sl_no",slNo);
     await logAudit("DELETE","estimate_lines",refNumber+"-"+itemSlNo+"-"+slNo,"Quote#: "+refNumber+" Sl: "+itemSlNo+" Line: "+slNo+(rowData?.component?" — "+rowData.component:""),user?.username||"unknown",rowData,null);
-    setOpenLines(l=>l.filter(x=>!(x.reference_number===refNumber&&x.item_sl_no===itemSlNo&&x.sl_no===slNo)));
+    setOpenLines(l=>{ const updated=l.filter(x=>!(x.reference_number===refNumber&&x.item_sl_no===itemSlNo&&x.sl_no===slNo)); autoRefreshDescriptionFromLines(updated); return updated; });
   };
 
   // Global Sf change: overwrites Sf across every line, in every Sl No, under
@@ -12808,8 +12937,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 h("div",{style:{width:130}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Attention — Designation"),h("input",{value:headerDraft.contact_designation,onChange:e=>setHeaderDraft(d=>({...d,contact_designation:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}}))
               ),
               h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}},
-                h("div",{style:{width:170}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Signatory"),h("input",{value:headerDraft.signatory_name,onChange:e=>setHeaderDraft(d=>({...d,signatory_name:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
-                h("div",{style:{width:160}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Signatory Designation"),h("input",{value:headerDraft.signatory_designation,onChange:e=>setHeaderDraft(d=>({...d,signatory_designation:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}}))
+                h("div",{style:{width:170}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Signatory"),h(LimitToListCombo,{value:headerDraft.signatory_name,onChange:v=>{ const match=activeSignatoryEmployees.find(e=>e.employee_name===v); setHeaderDraft(d=>({...d,signatory_name:v,signatory_designation:(match&&match.designation)?match.designation:d.signatory_designation})); },options:activeSignatoryEmployees.map(e=>e.employee_name),placeholder:"Start typing a name…",invalidMessage:v=>"\""+v+"\" isn't an active employee on file — check Master Data \u2192 HR \u2192 Employees.",style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
+                h("div",{style:{width:160}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Signatory Designation"),h("input",{value:headerDraft.signatory_designation,onChange:e=>setHeaderDraft(d=>({...d,signatory_designation:e.target.value})),placeholder:"Auto-fills from Employee master",style:{...inputStyle,padding:"6px 8px",fontSize:12}}))
               ),
               h("div",{style:{display:"flex",gap:8}},
                 h("button",{onClick:saveQuoteHeader,disabled:savingHeader,style:{...btnPrimary,fontSize:12}},savingHeader?"Saving…":"Save (applies to all Sl Nos)"),
@@ -13609,11 +13738,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           ),
           h("div",{style:{width:170}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Signatory"),
-            h("input",{value:qhSignatoryName,onChange:e=>setQhSignatoryName(e.target.value),placeholder:"Name on the quote",style:inputStyle})
+            h(LimitToListCombo,{value:qhSignatoryName,onChange:v=>{ setQhSignatoryName(v); const match=activeSignatoryEmployees.find(e=>e.employee_name===v); if(match&&match.designation) setQhSignatoryDesignation(match.designation); },options:activeSignatoryEmployees.map(e=>e.employee_name),placeholder:"Start typing a name…",invalidMessage:v=>"\""+v+"\" isn't an active employee on file — check Master Data \u2192 HR \u2192 Employees.",style:inputStyle})
           ),
           h("div",{style:{width:160}},
             h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Signatory Designation"),
-            h("input",{value:qhSignatoryDesignation,onChange:e=>setQhSignatoryDesignation(e.target.value),placeholder:"Designation",style:inputStyle})
+            h("input",{value:qhSignatoryDesignation,onChange:e=>setQhSignatoryDesignation(e.target.value),placeholder:"Auto-fills from Employee master",style:inputStyle})
           )
         ),
         qhError && h("div",{style:{fontSize:12,color:colors.danger,marginBottom:10}},qhError),
@@ -18003,6 +18132,39 @@ function DeleteActivityReportScreen({ user }){
 
 // Shown to any user on login — lists every Sl No still marked Draft app-wide,
 // in case an offer was actually sent but the status was never updated.
+// Shown to a Super Admin, once per session start, if any regular "user"
+// (not admin/super_admin) has overridden a quote's Signatory away from
+// their own logged-in default since the last time this was acknowledged.
+// Each notice can be dismissed individually or all at once.
+function SignatoryOverrideNoticesPopup({ notices, onAcknowledgeOne, onAcknowledgeAll, onClose }){
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 24px",width:560,maxWidth:"96vw",maxHeight:"80vh",display:"flex",flexDirection:"column"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Signatory changed by a user"),
+      h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},notices.length+" quote"+(notices.length===1?"":"s")+" had its Signatory changed away from the logged-in user's own default. Review below."),
+      h("div",{style:{overflowY:"auto",flex:1,marginBottom:14}},
+        notices.map(n=>h("div",{key:n.id,style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px",marginBottom:8}},
+          h("div",{style:{fontSize:12.5,fontWeight:600,marginBottom:3}},n.reference_number+" · Sl No "+n.item_sl_no),
+          h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:6}},
+            "Changed by "+n.changed_by+" — "+new Date(n.created_at).toLocaleString()
+          ),
+          h("div",{style:{fontSize:12}},
+            h("span",{style:{color:colors.mutedLight}},"From: "),(n.previous_signatory_name||"—")+(n.previous_signatory_designation?" ("+n.previous_signatory_designation+")":""),
+            h("br"),
+            h("span",{style:{color:colors.mutedLight}},"To: "),h("strong",null,(n.new_signatory_name||"—")+(n.new_signatory_designation?" ("+n.new_signatory_designation+")":""))
+          ),
+          h("div",{style:{textAlign:"right",marginTop:6}},
+            h("button",{onClick:()=>onAcknowledgeOne(n.id),style:{...btnSmall,fontSize:11}},"Acknowledge")
+          )
+        ))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:onClose,style:btnSecondary},"Review later"),
+        h("button",{onClick:onAcknowledgeAll,style:btnPrimary},"Acknowledge all")
+      )
+    )
+  );
+}
+
 function DraftOfferReminder({ user, onDone }){
   const [rows,setRows] = useState([]);
   const [statuses,setStatuses] = useState([]);
@@ -23638,6 +23800,29 @@ function App() {
   const refreshAbandonedCount = useCallback(()=>{
     sb.from("estimates").select("id",{count:"exact",head:true}).eq("abandoned_flag",true).then(({count})=>setAbandonedCount(count||0));
   },[]);
+  // Signatory override notices (22 Aug) — a regular "user" (not admin/super_
+  // admin) can override the Signatory away from their own logged-in default,
+  // but doing so is flagged for Super Admin. Popup shown once per Super
+  // Admin session start, same shape as the abandoned-quotes banner above but
+  // as a modal since it needs individual acknowledgement, not just a count.
+  const [signatoryNotices,setSignatoryNotices]=useState([]);
+  const [showSignatoryNoticesPopup,setShowSignatoryNoticesPopup]=useState(false);
+  const refreshSignatoryNotices = useCallback(()=>{
+    if(!user || user.role!=="super_admin") return;
+    sb.from("signatory_override_notice_tbl").select("*").eq("acknowledged",false).order("created_at",{ascending:false})
+      .then(({data})=>{ setSignatoryNotices(data||[]); if(data && data.length>0) setShowSignatoryNoticesPopup(true); });
+  },[user]);
+  useEffect(()=>{ refreshSignatoryNotices(); },[user, refreshSignatoryNotices]);
+  const acknowledgeSignatoryNotice = async(id)=>{
+    await sb.from("signatory_override_notice_tbl").update({acknowledged:true,acknowledged_at:new Date().toISOString()}).eq("id",id);
+    setSignatoryNotices(list=>list.filter(n=>n.id!==id));
+  };
+  const acknowledgeAllSignatoryNotices = async()=>{
+    const ids = signatoryNotices.map(n=>n.id);
+    if(ids.length===0){ setShowSignatoryNoticesPopup(false); return; }
+    await sb.from("signatory_override_notice_tbl").update({acknowledged:true,acknowledged_at:new Date().toISOString()}).in("id",ids);
+    setSignatoryNotices([]); setShowSignatoryNoticesPopup(false);
+  };
   const [showDraftPanel,setShowDraftPanel]=useState(false);
   const [showOverduePrompt,setShowOverduePrompt]=useState(()=>{
     try{ return sessionStorage.getItem("flometriq_overdue_prompt_date")!==new Date().toISOString().slice(0,10); }catch(e){ return true; }
@@ -23681,6 +23866,7 @@ function App() {
     user.role==="super_admin" && !monthlyArchiveDone && h(MonthlyArchivePrompt,{user,onDone:()=>setMonthlyArchiveDone(true)}),
     showOverduePrompt && h(OverdueCallsPrompt,{user,onDone:dismissOverduePrompt}),
     showDraftPanel && h(DraftOfferReminder,{user,onDone:()=>{ setShowDraftPanel(false); refreshDraftCount(); }}),
+    showSignatoryNoticesPopup && h(SignatoryOverrideNoticesPopup,{notices:signatoryNotices,onAcknowledgeOne:acknowledgeSignatoryNotice,onAcknowledgeAll:acknowledgeAllSignatoryNotices,onClose:()=>setShowSignatoryNoticesPopup(false)}),
     h("div",{id:"app-sticky-header",style:{position:"sticky",top:0,zIndex:60}},
       h(TopBar,{user,sessionCompanyId,sessionCompany,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyIdPersisted(null)):null,onLogout:()=>{setUserPersisted(null);setSessionCompanyIdPersisted(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
       h(MenuTabs,{user,active:tab,onChange:setTab})
