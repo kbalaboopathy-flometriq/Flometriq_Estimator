@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-21T13:35:38Z";
+  var APP_BUILD_VERSION = "2026-08-22T05:04:46Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -20732,6 +20732,29 @@ function DataBackupScreen({ user }){
   // ever-growing table's full history into one Excel sheet is exactly what
   // stalled this screen before.
   const LOG_TABLE_DATE_COL = { audit_log:"performed_at", login_history:"logged_in_at", calc_history:"performed_at" };
+  // Shared by runBackup and runRestore so a suffix backup adds to break a
+  // truncation collision (see runBackup) is always reversible by restore —
+  // both build the identical name->table map from the same table list in
+  // the same order, so a "~2" sheet name resolves back to the right table.
+  const buildSheetNameMap = (tables)=>{
+    const usedSheetNames = new Set();
+    const map = new Map(); // sheetName -> table
+    tables.forEach(table=>{
+      let base = table.slice(0,31);
+      let name = base;
+      if(usedSheetNames.has(base)){
+        for(let n=2;n<1000;n++){
+          const suffix = "~"+n;
+          const candidate = table.slice(0,31-suffix.length)+suffix;
+          if(!usedSheetNames.has(candidate)){ name = candidate; break; }
+        }
+      }
+      usedSheetNames.add(name);
+      map.set(name, table);
+    });
+    return map;
+  };
+
   const runBackup = async()=>{
     setRunning(true);
     setProgress({done:0,total:tableList.length,current:""});
@@ -20739,6 +20762,16 @@ function DataBackupScreen({ user }){
       const wb = XLSX.utils.book_new();
       let successCount = 0, failCount = 0;
       const cutoff = new Date(Date.now() - backupDays*24*60*60*1000).toISOString();
+      // Excel caps sheet names at 31 chars. Two DIFFERENT table names can
+      // truncate to the SAME 31-char string (this is exactly what crashed
+      // the backup once already — a leftover snapshot table's name
+      // collided with another's after truncation, and the crash-recovery
+      // path below tried to reuse that same colliding name and failed
+      // too, killing the whole export with nothing downloaded). This
+      // reuses the same map runRestore uses, so a name can never repeat
+      // AND restore can always reverse it back to the right table.
+      const sheetNameByTable = new Map(Array.from(buildSheetNameMap(tableList), ([name,table])=>[table,name]));
+      const uniqueSheetName = (table)=> sheetNameByTable.get(table) || table.slice(0,31);
       for(let i=0;i<tableList.length;i++){
         const table = tableList[i];
         setProgress({done:i,total:tableList.length,current:table});
@@ -20773,12 +20806,13 @@ function DataBackupScreen({ user }){
                 return flat;
               }))
             : XLSX.utils.aoa_to_sheet([[LOG_TABLE_DATE_COL[table]?"(no rows in the last "+backupDays+" day(s) — deletions/exports are kept in full for audit_log)":"(no rows)"]]);
-          // Sheet names are capped at 31 characters in Excel
-          XLSX.utils.book_append_sheet(wb, ws, table.slice(0,31));
+          // Sheet names are capped at 31 characters in Excel — uniqueSheetName
+          // guarantees no two tables ever collide after truncation.
+          XLSX.utils.book_append_sheet(wb, ws, uniqueSheetName(table));
           successCount++;
         } catch(e){
           console.error("Backup failed for table",table,e);
-          XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Could not export: "+(e.message||e)]]), table.slice(0,31));
+          XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Could not export: "+(e.message||e)]]), uniqueSheetName(table));
           failCount++;
         }
       }
@@ -20811,8 +20845,13 @@ function DataBackupScreen({ user }){
       const buf = await restoreFile.arrayBuffer();
       const wb = XLSX.read(buf, {type:"array"});
       const results = [];
+      // Same map runBackup builds — resolves a "~2"-suffixed sheet name
+      // (from a truncation collision at backup time) back to its real
+      // table, not just a naive re-truncation that would miss it.
+      const liveMap = buildSheetNameMap(tableList);
+      const fallbackMap = buildSheetNameMap(BACKUP_ALL_TABLES);
       for(const sheetName of wb.SheetNames){
-        const table = tableList.find(t=>t.slice(0,31)===sheetName) || BACKUP_ALL_TABLES.find(t=>t.slice(0,31)===sheetName);
+        const table = liveMap.get(sheetName) || fallbackMap.get(sheetName);
         if(!table){ results.push({table:sheetName,status:"skipped",detail:"Not a recognized table"}); setRestoreResults([...results]); continue; }
         const ws = wb.Sheets[sheetName];
         let rows = XLSX.utils.sheet_to_json(ws, {defval:null});
