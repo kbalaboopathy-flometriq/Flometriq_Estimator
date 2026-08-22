@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-22T14:51:59Z";
+  var APP_BUILD_VERSION = "2026-08-22T15:08:54Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1224,6 +1224,10 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports_status_history",label:"Status Change History"},
         {key:"reports_po_register",label:"PO Register"},
         {key:"reports_grn_status",label:"GRN Status Report"},
+      ]},
+      { label:"Employee", tabs:[
+        {key:"reports_my_timesheet",label:"Timesheet"},
+        {key:"reports_hr_timesheet",label:"HR Reports"},
       ]},
       ...(isAdmin?[{ label:"Admin only", tabs:[
         {key:"reports_masters",label:"Material Rates"},
@@ -23222,6 +23226,276 @@ function ReportsScreen({ user, onOpenModel }) {
 }
 
 /* ---- ACTIVITY BY USER ---- */
+// Shared PDF drawer for both the personal Timesheet and the HR consolidated
+// report (22 Aug). When `doc` is passed in, draws into that existing
+// document at `startY` and returns the Y position reached, so a caller can
+// place several employees' sections into one file, one page per employee.
+// When `doc` is omitted, creates its own, saves, and downloads.
+function buildTimesheetPdf({ employeeName, department, designation, dateLabel, rangeLabel, newQuoteRows, addedSlNoRows, activityRows, doc, W, startY, dateStr }){
+  const { jsPDF } = window.jspdf;
+  const standalone = !doc;
+  if(standalone) doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
+  W = W || doc.internal.pageSize.getWidth();
+  let y = startY || 20;
+
+  doc.setFont("times","bold"); doc.setFontSize(14); doc.setTextColor(28,31,26);
+  doc.text("Daily Activity Summary", W/2, y, {align:"center"}); y+=8;
+  doc.setFont("times","normal"); doc.setFontSize(10);
+  doc.text(employeeName+(designation?" — "+designation:"")+(department?"  ("+department+")":""), W/2, y, {align:"center"}); y+=6;
+  doc.text(rangeLabel||dateLabel||"", W/2, y, {align:"center"}); y+=10;
+
+  doc.setFont("times","bold"); doc.setFontSize(10.5); doc.setTextColor(28,31,26);
+  doc.text("New Quotes Created ("+newQuoteRows.length+")",12,y); y+=2;
+  if(newQuoteRows.length){
+    doc.autoTable({ startY:y+3, head:[["Quote#","Sl No","Customer","Item / Model"]],
+      body:newQuoteRows.map(r=>[r.reference_number,String(r.item_sl_no),r.customer_name||"—",r.model||r.description||"—"]),
+      theme:"grid", headStyles:{fontSize:8.4,font:"times",fontStyle:"bold"}, bodyStyles:{fontSize:8,font:"helvetica"}, margin:{left:12,right:12} });
+    y = doc.lastAutoTable.finalY + 8;
+  } else { doc.setFont("times","normal"); doc.setFontSize(9); doc.setTextColor(120,120,120); doc.text("None",14,y+5); doc.setTextColor(28,31,26); y+=12; }
+
+  doc.setFont("times","bold"); doc.setFontSize(10.5);
+  doc.text("Sl Nos Added to Existing Quotes ("+addedSlNoRows.length+")",12,y); y+=2;
+  if(addedSlNoRows.length){
+    doc.autoTable({ startY:y+3, head:[["Quote#","Sl No","Customer","Item / Model"]],
+      body:addedSlNoRows.map(r=>[r.reference_number,String(r.item_sl_no),r.customer_name||"—",r.model||r.description||"—"]),
+      theme:"grid", headStyles:{fontSize:8.4,font:"times",fontStyle:"bold"}, bodyStyles:{fontSize:8,font:"helvetica"}, margin:{left:12,right:12} });
+    y = doc.lastAutoTable.finalY + 8;
+  } else { doc.setFont("times","normal"); doc.setFontSize(9); doc.setTextColor(120,120,120); doc.text("None",14,y+5); doc.setTextColor(28,31,26); y+=12; }
+
+  const counts = new Map();
+  activityRows.forEach(r=>{ const k=(r.action||"?")+" — "+(r.table_name||"?"); counts.set(k,(counts.get(k)||0)+1); });
+  doc.setFont("times","bold"); doc.setFontSize(10.5);
+  doc.text("Other Activity — Summary ("+activityRows.length+" total)",12,y); y+=2;
+  if(counts.size){
+    doc.autoTable({ startY:y+3, head:[["Action","Count"]],
+      body:Array.from(counts.entries()).sort((a,b)=>b[1]-a[1]).map(([k,v])=>[k,String(v)]),
+      theme:"grid", headStyles:{fontSize:8.4,font:"times",fontStyle:"bold"}, bodyStyles:{fontSize:8,font:"helvetica"}, margin:{left:12,right:12} });
+    y = doc.lastAutoTable.finalY + 8;
+  } else { doc.setFont("times","normal"); doc.setFontSize(9); doc.setTextColor(120,120,120); doc.text("None",14,y+5); doc.setTextColor(28,31,26); y+=12; }
+
+  if(activityRows.length){
+    doc.setFont("times","bold"); doc.setFontSize(10.5);
+    doc.text("Other Activity — Full Detail",12,y); y+=2;
+    doc.autoTable({ startY:y+3, head:[["Time","Action","Table","Record","Summary"]],
+      body:activityRows.map(r=>[new Date(r.performed_at).toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"}),r.action||"",r.table_name||"",r.record_id||"",(r.record_summary||"").slice(0,90)]),
+      theme:"grid", headStyles:{fontSize:8,font:"times",fontStyle:"bold"}, bodyStyles:{fontSize:7.2,font:"helvetica"}, columnStyles:{4:{cellWidth:70}}, margin:{left:12,right:12} });
+    y = doc.lastAutoTable.finalY + 10;
+  }
+
+  if(standalone){
+    const pageCount = doc.internal.getNumberOfPages();
+    for(let p=1;p<=pageCount;p++){ doc.setPage(p); doc.setFontSize(7); doc.setTextColor(150);
+      doc.text("Page "+p+" of "+pageCount, W-12, doc.internal.pageSize.getHeight()-8, {align:"right"}); }
+    doc.save((employeeName||"timesheet").replace(/\s+/g,"_")+"_"+(dateStr||"range")+".pdf");
+  }
+  return y;
+}
+
+// Groups a user's estimates rows created on a given day into "brand new
+// quote" vs "Sl No added to an existing quote", by checking whether the
+// EARLIEST Sl No under that same reference_number also falls in the same
+// window — if so, this user genuinely started that Quote# that day;
+// otherwise they only added to something that already existed.
+async function splitNewVsAddedQuotes(estRows, rangeStart, rangeEnd){
+  const refNumbers = Array.from(new Set((estRows||[]).map(r=>r.reference_number)));
+  const newQuoteRefs = new Set();
+  if(refNumbers.length){
+    const { data: allSiblings } = await sb.from("estimates").select("reference_number,created_at").in("reference_number",refNumbers);
+    const earliestByRef = new Map();
+    (allSiblings||[]).forEach(r=>{ const cur=earliestByRef.get(r.reference_number); if(!cur||r.created_at<cur) earliestByRef.set(r.reference_number,r.created_at); });
+    refNumbers.forEach(ref=>{ const earliest=earliestByRef.get(ref); if(earliest && earliest>=rangeStart && earliest<=rangeEnd) newQuoteRefs.add(ref); });
+  }
+  return {
+    newQuoteRows: (estRows||[]).filter(r=>newQuoteRefs.has(r.reference_number)),
+    addedSlNoRows: (estRows||[]).filter(r=>!newQuoteRefs.has(r.reference_number))
+  };
+}
+
+// Self-service — any logged-in user, their own day only. Meant to be
+// downloaded and posted in a WhatsApp group as a daily submission, so the
+// PDF reads as a clean summary (quotes + a full activity trail), not a raw
+// technical log.
+function DailyTimesheetScreen({ user }){
+  const todayStr = new Date().toISOString().slice(0,10);
+  const [date,setDate]=useState(todayStr);
+  const [generating,setGenerating]=useState(false);
+  const [myEmployee,setMyEmployee]=useState(null);
+  useEffect(()=>{
+    sb.from("employee_tbl").select("employee_name,department,designation").eq("app_user_id",user.id).limit(1).maybeSingle()
+      .then(({data})=>setMyEmployee(data||null));
+  },[user.id]);
+
+  const generate = async()=>{
+    setGenerating(true);
+    try{
+      const rangeStart = date+"T00:00:00", rangeEnd = date+"T23:59:59";
+      const { data: estRows } = await sb.from("estimates").select("reference_number,item_sl_no,description,customer_name,model,created_at")
+        .eq("created_by",user.username).gte("created_at",rangeStart).lte("created_at",rangeEnd);
+      const { newQuoteRows, addedSlNoRows } = await splitNewVsAddedQuotes(estRows, rangeStart, rangeEnd);
+      const { data: activityRows } = await sb.from("audit_log").select("*").eq("performed_by",user.username)
+        .gte("performed_at",rangeStart).lte("performed_at",rangeEnd).order("performed_at",{ascending:true});
+      buildTimesheetPdf({
+        employeeName: myEmployee?.employee_name || user.username,
+        department: myEmployee?.department || "", designation: myEmployee?.designation || "",
+        dateLabel: new Date(date+"T12:00:00").toLocaleDateString("en-IN",{weekday:"long",year:"numeric",month:"long",day:"numeric"}),
+        dateStr: date, newQuoteRows, addedSlNoRows, activityRows: activityRows||[]
+      });
+    } catch(e){ alert("Could not generate timesheet: "+e.message); }
+    finally { setGenerating(false); }
+  };
+
+  return h("div",{style:{padding:20,maxWidth:520}},
+    h("h2",{style:{marginTop:0}},"My Daily Timesheet"),
+    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},"Download a PDF summary of your quotes and other activity for a chosen day — handy for a WhatsApp submission."),
+    h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"18px 20px"}},
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Date"),
+      h("input",{type:"date",value:date,max:todayStr,onChange:e=>setDate(e.target.value),style:{...inputStyle,marginBottom:14,width:200}}),
+      h("div",null,
+        h("button",{onClick:generate,disabled:generating,style:{...btnPrimary,opacity:generating?0.6:1}},generating?"Generating…":"Generate PDF")
+      )
+    )
+  );
+}
+
+// HR / Super Admin only. "HR" access is resolved from the logged-in user's
+// OWN Employee master record (department containing "HR") rather than a
+// separate app role, since app_users.role only ever holds user/admin/
+// super_admin — Super Admin always has access regardless of department.
+function HrTimesheetReportScreen({ user }){
+  const [myDept,setMyDept]=useState("");
+  const [deptChecked,setDeptChecked]=useState(false);
+  useEffect(()=>{
+    if(user.role==="admin"||user.role==="super_admin"){ setDeptChecked(true); return; }
+    sb.from("employee_tbl").select("department").eq("app_user_id",user.id).limit(1).maybeSingle()
+      .then(({data})=>{ setMyDept(data?.department||""); setDeptChecked(true); });
+  },[user.id,user.role]);
+  const isAuthorized = user.role==="admin" || user.role==="super_admin" || (myDept||"").toLowerCase().includes("hr");
+
+  const todayStr = new Date().toISOString().slice(0,10);
+  const [from,setFrom]=useState(()=>{ const d=new Date(); return new Date(d.getFullYear(),d.getMonth(),1).toISOString().slice(0,10); });
+  const [to,setTo]=useState(todayStr);
+  const [scope,setScope]=useState("all"); // all | department | employee
+  const [scopeValue,setScopeValue]=useState("");
+  const [employees,setEmployees]=useState([]);
+  const [departments,setDepartments]=useState([]);
+  const [generating,setGenerating]=useState(false);
+  const [summary,setSummary]=useState(null);
+
+  useEffect(()=>{
+    if(!isAuthorized) return;
+    sb.from("employee_tbl").select("employee_name,department,designation,app_user_id").neq("status","Inactive").order("employee_name").then(({data})=>setEmployees(data||[]));
+    sb.from("department_tbl").select("department").order("department").then(({data})=>setDepartments((data||[]).map(d=>d.department).filter(Boolean)));
+  },[isAuthorized]);
+
+  const setPreset = (p)=>{
+    const d=new Date(); const iso=dt=>dt.toISOString().slice(0,10);
+    if(p==="month") setFrom(iso(new Date(d.getFullYear(),d.getMonth(),1)));
+    else if(p==="quarter") setFrom(iso(new Date(d.getFullYear(),Math.floor(d.getMonth()/3)*3,1)));
+    else if(p==="year") setFrom(iso(new Date(d.getFullYear(),0,1)));
+    setTo(iso(d));
+  };
+
+  const runReport = async()=>{
+    setGenerating(true);
+    try{
+      let targetEmployees = employees;
+      if(scope==="employee") targetEmployees = employees.filter(e=>e.employee_name===scopeValue);
+      else if(scope==="department") targetEmployees = employees.filter(e=>e.department===scopeValue);
+      const userIds = targetEmployees.map(e=>e.app_user_id).filter(Boolean);
+      const { data: appUsers } = userIds.length ? await sb.from("app_users").select("id,username").in("id",userIds) : {data:[]};
+      const usernameByAppUserId = new Map((appUsers||[]).map(u=>[u.id,u.username]));
+      const rangeStart = from+"T00:00:00", rangeEnd = to+"T23:59:59";
+      const results = [];
+      for(const emp of targetEmployees){
+        const username = usernameByAppUserId.get(emp.app_user_id);
+        if(!username){ results.push({...emp, newQuoteRows:[], addedSlNoRows:[], activityRows:[]}); continue; }
+        const { data: estRows } = await sb.from("estimates").select("reference_number,item_sl_no,description,customer_name,model,created_at")
+          .eq("created_by",username).gte("created_at",rangeStart).lte("created_at",rangeEnd);
+        const { newQuoteRows, addedSlNoRows } = await splitNewVsAddedQuotes(estRows, rangeStart, rangeEnd);
+        const { data: activityRows } = await sb.from("audit_log").select("*").eq("performed_by",username)
+          .gte("performed_at",rangeStart).lte("performed_at",rangeEnd).order("performed_at",{ascending:true});
+        results.push({...emp, newQuoteRows, addedSlNoRows, activityRows: activityRows||[]});
+      }
+      setSummary(results);
+    } catch(e){ alert("Could not run report: "+e.message); }
+    finally { setGenerating(false); }
+  };
+
+  const downloadConsolidatedPdf = ()=>{
+    if(!summary || summary.length===0) return;
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
+    const W = doc.internal.pageSize.getWidth();
+    const rangeLabel = "From "+new Date(from+"T12:00:00").toLocaleDateString("en-IN",{day:"numeric",month:"short",year:"numeric"})+" to "+new Date(to+"T12:00:00").toLocaleDateString("en-IN",{day:"numeric",month:"short",year:"numeric"});
+    summary.forEach((emp,idx)=>{
+      if(idx>0) doc.addPage();
+      buildTimesheetPdf({ employeeName: emp.employee_name, department: emp.department||"", designation: emp.designation||"",
+        rangeLabel, newQuoteRows: emp.newQuoteRows, addedSlNoRows: emp.addedSlNoRows, activityRows: emp.activityRows, doc, W, startY:20 });
+    });
+    const pageCount = doc.internal.getNumberOfPages();
+    for(let p=1;p<=pageCount;p++){ doc.setPage(p); doc.setFontSize(7); doc.setTextColor(150);
+      doc.text("Page "+p+" of "+pageCount, W-12, doc.internal.pageSize.getHeight()-8, {align:"right"}); }
+    doc.save("HR_Timesheet_Report_"+from+"_to_"+to+".pdf");
+  };
+
+  if(!deptChecked) return h("div",{style:{padding:20,fontSize:12.5,color:colors.mutedLight}},"Loading…");
+  if(!isAuthorized) return h("div",{style:{padding:20}},h("div",{style:{fontSize:13,color:colors.danger}},"This report is only available to HR or Super Admin."));
+
+  return h("div",{style:{padding:20,maxWidth:820}},
+    h("h2",{style:{marginTop:0}},"HR Timesheet Reports"),
+    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},"Date-ranged activity summary — one employee, one department, or everyone."),
+    h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"18px 20px",marginBottom:16}},
+      h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10,alignItems:"flex-end"}},
+        h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"From"),h("input",{type:"date",value:from,onChange:e=>setFrom(e.target.value),style:{...inputStyle,width:150}})),
+        h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"To"),h("input",{type:"date",value:to,max:todayStr,onChange:e=>setTo(e.target.value),style:{...inputStyle,width:150}})),
+        h("button",{onClick:()=>setPreset("month"),style:btnSmall},"This Month"),
+        h("button",{onClick:()=>setPreset("quarter"),style:btnSmall},"This Quarter"),
+        h("button",{onClick:()=>setPreset("year"),style:btnSmall},"This Year")
+      ),
+      h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:14,alignItems:"flex-end"}},
+        h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Scope"),
+          h("select",{value:scope,onChange:e=>{ setScope(e.target.value); setScopeValue(""); },style:{...inputStyle,width:160}},
+            h("option",{value:"all"},"All employees"), h("option",{value:"department"},"One department"), h("option",{value:"employee"},"One employee")
+          )
+        ),
+        scope==="department" && h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Department"),
+          h("select",{value:scopeValue,onChange:e=>setScopeValue(e.target.value),style:{...inputStyle,width:180}},
+            h("option",{value:""},"Select…"), departments.map(d=>h("option",{key:d,value:d},d))
+          )
+        ),
+        scope==="employee" && h("div",null,h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Employee"),
+          h("select",{value:scopeValue,onChange:e=>setScopeValue(e.target.value),style:{...inputStyle,width:200}},
+            h("option",{value:""},"Select…"), employees.map(e=>h("option",{key:e.employee_name,value:e.employee_name},e.employee_name))
+          )
+        )
+      ),
+      h("button",{onClick:runReport,disabled:generating||(scope!=="all"&&!scopeValue),style:{...btnPrimary,opacity:(generating||(scope!=="all"&&!scopeValue))?0.6:1}},generating?"Running…":"Run Report")
+    ),
+    summary && h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"18px 20px"}},
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
+        h("div",{style:{fontWeight:700,fontSize:13}},summary.length+" employee(s)"),
+        h("button",{onClick:downloadConsolidatedPdf,style:btnPrimary},"Download PDF")
+      ),
+      h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12.5}},
+        h("thead",null,h("tr",{style:{borderBottom:"1px solid "+colors.border}},
+          h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Employee"),
+          h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Department"),
+          h("th",{style:{textAlign:"right",padding:"6px 4px"}},"New Quotes"),
+          h("th",{style:{textAlign:"right",padding:"6px 4px"}},"Sl Nos Added"),
+          h("th",{style:{textAlign:"right",padding:"6px 4px"}},"Other Activity")
+        )),
+        h("tbody",null, summary.map(e=>h("tr",{key:e.employee_name,style:{borderBottom:"1px solid #f0eee6"}},
+          h("td",{style:{padding:"6px 4px"}},e.employee_name),
+          h("td",{style:{padding:"6px 4px"}},e.department||"—"),
+          h("td",{style:{padding:"6px 4px",textAlign:"right"}},e.newQuoteRows.length),
+          h("td",{style:{padding:"6px 4px",textAlign:"right"}},e.addedSlNoRows.length),
+          h("td",{style:{padding:"6px 4px",textAlign:"right"}},e.activityRows.length)
+        )))
+      )
+    )
+  );
+}
+
 function ActivityByUserReport({ user }){
   const todayStr = new Date().toISOString().slice(0,10);
   const [from,setFrom]=useState(todayStr); const [to,setTo]=useState(todayStr);
@@ -23904,6 +24178,8 @@ function App() {
     tab==="saved"?h(SavedEstimates,{user,sessionCompany,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo,headerFields)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo,headerFields:headerFields||null});setTab("estimator");}}):
     tab==="reports"?h(ReportsScreen,{user,onOpenModel:(m)=>{setOpenModelTarget(m);setTab("estimator");}}):
     tab==="reports_activity"?h(ActivityByUserReport,{user}):
+    tab==="reports_my_timesheet"?h(DailyTimesheetScreen,{user}):
+    tab==="reports_hr_timesheet"?h(HrTimesheetReportScreen,{user}):
     tab==="reports_quotes"?h(QuoteReports,{user}):
     tab==="reports_masters"?h(MaterialRatesReport,{user}):
     tab==="reports_missing_rates"?h(MissingRatesReport,{user}):
