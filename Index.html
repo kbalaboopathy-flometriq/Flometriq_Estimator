@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-22T14:40:35Z";
+  var APP_BUILD_VERSION = "2026-08-22T14:51:59Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8914,6 +8914,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [headerEditOpen,setHeaderEditOpen]=useState(false);
   const [historyOpen,setHistoryOpen]=useState(false);
   const [headerDraft,setHeaderDraft]=useState({});
+  // Dirty-tracking (22 Aug) — headerDraftOriginal is the snapshot taken the
+  // moment the form opens (or right after a successful save); isHeaderDirty
+  // compares the two so Save can disable itself and window.__unsavedGuard
+  // can reflect whether there's actually anything to lose, instead of being
+  // hardcoded true the instant the form opens regardless of real edits.
+  const [headerDraftOriginal,setHeaderDraftOriginal]=useState({});
+  const isHeaderDirty = useMemo(()=> JSON.stringify(headerDraft)!==JSON.stringify(headerDraftOriginal), [headerDraft, headerDraftOriginal]);
+  const [justSavedHeader,setJustSavedHeader]=useState(false);
+  useEffect(()=>{
+    if(!headerEditOpen) return;
+    setUnsavedGuard(isHeaderDirty, "You have unsaved Quote Header changes. Leave anyway?", doSaveQuoteHeader);
+  },[headerEditOpen, isHeaderDirty]);
   const [headerCustomerCountry,setHeaderCustomerCountry]=useState(""); // drives prominent currency badge + missing-country gate
   const [savingHeader,setSavingHeader]=useState(false);
   // The row currently backing the shared quote-level fields — any Sl No under
@@ -8949,22 +8961,25 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   },[]);
   const openHeaderEdit = ()=>{
     if(!quoteHeaderRow) return;
+    let draft;
     if((refFilter||"").includes("-Rev-")){
       // Amendment ghost mode: every field starts blank. Blank = keep the
       // existing (cloned) value; only fill in what's actually changing.
-      setHeaderDraft({ enquiry_number:"", enquiry_date:"", quote_date:"", currency:"", conversion_rate:"", customer_address:"", contact_name:"", contact_designation:"", signatory_name:"", signatory_designation:"" });
+      draft = { enquiry_number:"", enquiry_date:"", quote_date:"", currency:"", conversion_rate:"", customer_address:"", contact_name:"", contact_designation:"", signatory_name:"", signatory_designation:"" };
     } else {
-      setHeaderDraft({
+      draft = {
         enquiry_number: quoteHeaderRow.enquiry_number||"", enquiry_date: quoteHeaderRow.enquiry_date||"",
         quote_date: quoteHeaderRow.quote_date||"", currency: quoteHeaderRow.currency||"INR",
         conversion_rate: String(quoteHeaderRow.conversion_rate||1),
         customer_name: quoteHeaderRow.customer_name||"", customer_address: quoteHeaderRow.customer_address||"",
         contact_name: quoteHeaderRow.contact_name||"", contact_designation: quoteHeaderRow.contact_designation||"",
         signatory_name: quoteHeaderRow.signatory_name||"", signatory_designation: quoteHeaderRow.signatory_designation||""
-      });
+      };
     }
+    setHeaderDraft(draft);
+    setHeaderDraftOriginal(draft);
+    setJustSavedHeader(false);
     setHeaderEditOpen(true);
-    setUnsavedGuard(true,"You have unsaved Quote Header changes. Leave anyway?",doSaveQuoteHeader);
   };
   const [quickCurrencyEditOpen,setQuickCurrencyEditOpen]=useState(false);
   const openQuickCurrencyEdit = ()=>{
@@ -9517,9 +9532,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       await logAudit("UPDATE","estimates",refFilter,"Quote header fields updated for "+refFilter+" (applied to all Sl Nos)",user?.username||"unknown",null,payload);
       setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,...payload}:r));
       if(openRef && openRef.reference_number===refFilter) setOpenRef(r=>({...r,...payload}));
-      return true;
-      setHeaderEditOpen(false);
+      // Re-baseline so Save disables again immediately (there's nothing left
+      // unsaved right after a successful save) and clear the guard — this
+      // used to be dead code, sitting after an early `return true` that
+      // never let it run.
+      setHeaderDraftOriginal({...headerDraft});
       setUnsavedGuard(false);
+      setJustSavedHeader(true);
+      setTimeout(()=>setJustSavedHeader(false), 2500);
+      return true;
     } catch(e){ alert("Save failed: "+(e.message||e)); }
     finally{ setSavingHeader(false); }
   };
@@ -12911,9 +12932,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                     )
                   : h("div",{style:{fontSize:10.5,color:colors.mutedLight,width:200}},"No saved addresses for this customer yet — add one in Master Data → Customers first.")
               ),
-              h("div",{style:{display:"flex",gap:8,marginTop:8}},
-                h("button",{onClick:saveQuoteHeader,disabled:savingHeader,style:{...btnPrimary,fontSize:12}},savingHeader?"Saving…":"Save amendment"),
-                h("button",{onClick:()=>{ setHeaderEditOpen(false); setUnsavedGuard(false); },style:{...btnSecondary,fontSize:12}},"Cancel")
+              h("div",{style:{display:"flex",gap:8,marginTop:8,alignItems:"center"}},
+                h("button",{onClick:saveQuoteHeader,disabled:savingHeader||!isHeaderDirty,style:{...btnPrimary,fontSize:12,opacity:(savingHeader||!isHeaderDirty)?0.6:1}},savingHeader?"Saving…":"Save amendment"),
+                h("button",{onClick:()=>{ setHeaderEditOpen(false); setUnsavedGuard(false); },style:{...btnSecondary,fontSize:12}},"Cancel"),
+                justSavedHeader && h("span",{style:{fontSize:11.5,color:"#0f6e3f",fontWeight:600}},"✓ Saved")
               )
             ),
         headerEditOpen && !isRevisionRef && h("div",null,
@@ -12940,9 +12962,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 h("div",{style:{width:170}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Signatory"),h(LimitToListCombo,{value:headerDraft.signatory_name,onChange:v=>{ const match=activeSignatoryEmployees.find(e=>e.employee_name===v); setHeaderDraft(d=>({...d,signatory_name:v,signatory_designation:(match&&match.designation)?match.designation:d.signatory_designation})); },options:activeSignatoryEmployees.map(e=>e.employee_name),placeholder:"Start typing a name…",invalidMessage:v=>"\""+v+"\" isn't an active employee on file — check Master Data \u2192 HR \u2192 Employees.",style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
                 h("div",{style:{width:160}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Signatory Designation"),h("input",{value:headerDraft.signatory_designation,onChange:e=>setHeaderDraft(d=>({...d,signatory_designation:e.target.value})),placeholder:"Auto-fills from Employee master",style:{...inputStyle,padding:"6px 8px",fontSize:12}}))
               ),
-              h("div",{style:{display:"flex",gap:8}},
-                h("button",{onClick:saveQuoteHeader,disabled:savingHeader,style:{...btnPrimary,fontSize:12}},savingHeader?"Saving…":"Save (applies to all Sl Nos)"),
-                h("button",{onClick:()=>{ setHeaderEditOpen(false); setUnsavedGuard(false); },style:{...btnSecondary,fontSize:12}},"Cancel")
+              h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+                h("button",{onClick:saveQuoteHeader,disabled:savingHeader||!isHeaderDirty,style:{...btnPrimary,fontSize:12,opacity:(savingHeader||!isHeaderDirty)?0.6:1}},savingHeader?"Saving…":"Save (applies to all Sl Nos)"),
+                h("button",{onClick:()=>{ setHeaderEditOpen(false); setUnsavedGuard(false); },style:{...btnSecondary,fontSize:12}},"Cancel"),
+                justSavedHeader && h("span",{style:{fontSize:11.5,color:"#0f6e3f",fontWeight:600}},"✓ Saved")
               )
             )
       ),
