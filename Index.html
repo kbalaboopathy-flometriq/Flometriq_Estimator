@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-23T01:28:38Z";
+  var APP_BUILD_VERSION = "2026-08-23T02:53:33Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1201,6 +1201,8 @@ function MenuTabs({ user, active, onChange }) {
         {key:"major_projects",label:"Projects"},
         {key:"major_projects_kanban",label:"Package Board"},
         {key:"major_projects_bulk_import",label:"Bulk Import"},
+        {key:"enquiries_list",label:"Enquiries"},
+        {key:"enquiry_review",label:"Enquiry Review"},
       ]},
       { label:"Funnel", tabs:[
         {key:"crm_funnel",label:"Funnel"},
@@ -5309,7 +5311,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
       setRefNumber(ref); setItemSlNo(String(pendingNewSlNo.item_sl_no)); setRefDesc("");
       setGatewayConfirmedNewSlNo(true);
       setCustomerCountry(await fetchCustomerCountry(head.customer_name||hf.customerName||pendingNewSlNo.prefillCustomerName));
-      setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no, isNewQuote, linked_allocation_id:pendingNewSlNo.linked_allocation_id||null});
+      setHoldingNewSlNo({reference_number:ref, item_sl_no:pendingNewSlNo.item_sl_no, isNewQuote, linked_allocation_id:pendingNewSlNo.linked_allocation_id||null, linked_enquiry_id:pendingNewSlNo.linked_enquiry_id||null});
       // Existing quote: header already carries over, and Description will
       // auto-fill once a model's BOM loads — no separate popup needed here.
       // Just land on the model picker (the banner above shows what's
@@ -5525,7 +5527,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         await sb.from("estimates").update(headerPayload).eq("id",estimateId);
         await sb.from("estimate_lines").delete().eq("reference_number",ref).eq("item_sl_no",slNo);
       } else {
-        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,order_qty:Number(orderQty),quote_status:resolvedQuoteStatus,company_id:resolvedCompanyId,created_by:user.username,datasheet_not_required:skipDatasheet===true,linked_allocation_id:(holdingNewSlNo&&holdingNewSlNo.linked_allocation_id)||null,linked_project_id:linkedProjectId||null}).select().single();
+        const{data:created,error:err}=await sb.from("estimates").insert({reference_number:ref,item_sl_no:slNo,...headerPayload,order_qty:Number(orderQty),quote_status:resolvedQuoteStatus,company_id:resolvedCompanyId,created_by:user.username,datasheet_not_required:skipDatasheet===true,linked_allocation_id:(holdingNewSlNo&&holdingNewSlNo.linked_allocation_id)||null,linked_project_id:linkedProjectId||null,linked_enquiry_id:(holdingNewSlNo&&holdingNewSlNo.linked_enquiry_id)||null}).select().single();
         if(err) throw err;
         estimateId=created.id; createdNewHeader=true;
         promoteCompanyToLead(resolvedCompanyId, headerPayload.customer_name);
@@ -5534,6 +5536,12 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         // as major_project_package_tbl.linked_reference_number in Phase 1.
         if(holdingNewSlNo && holdingNewSlNo.linked_allocation_id){
           await sb.from("package_customer_allocation_tbl").update({linked_reference_number:ref,updated_at:new Date().toISOString()}).eq("id",holdingNewSlNo.linked_allocation_id);
+        }
+        // Same reasoning for Enquiry (23 Aug SOP) — only marked Converted
+        // once the Quote# genuinely exists, not eagerly when the button
+        // was clicked.
+        if(holdingNewSlNo && holdingNewSlNo.linked_enquiry_id){
+          await sb.from("enquiry_tbl").update({status:"Converted",linked_reference_number:ref}).eq("id",holdingNewSlNo.linked_enquiry_id);
         }
       }
       const rows=effectiveCart.map((l,idx)=>({reference_number:ref,item_sl_no:slNo,sl_no:idx+1,estimate_id:estimateId,model:l.model,item:l.item,size:l.size,sub_assembly:l.sub_assembly,component:l.component,material_shape:l.material_shape||"",material_spec:l.material_spec,grade:l.grade,qty_required:l.qty_required,uom:l.uom,rate:l.rate,cost:l.cost,sf:l.sf,sales_price:l.sales_price,cutting_plan_layout_size:l.cutting_plan_layout_size||"",cutting_plan_qty:Number(l.cutting_plan_qty)||0,cutting_plan_uom:l.cutting_plan_uom||"",is_direct_price:l.is_direct_price===true,validation_status:l.validation_status||null,excel_file_name:l.excel_file_name||null,excel_file_path:l.excel_file_path||null,no_excel_code_used:l.no_excel_code_used||null,added_by:l.added_by||null,custom_item:l.custom_item||null,custom_model_recorded:l.custom_model_recorded||null}));
@@ -13205,7 +13213,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             ),
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
               h("div",null,
-                h("h3",{style:{margin:0}},openRef.reference_number+"  ·  Sl No "+openRef.item_sl_no),
+                h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
+                  h("h3",{style:{margin:0}},openRef.reference_number+"  ·  Sl No "+openRef.item_sl_no),
+                  openRef.linked_enquiry_id && h(EnquiryBacklinkBadge,{enquiryId:openRef.linked_enquiry_id,onGoToTab})
+                ),
                 h("div",{style:{fontSize:10.5,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginTop:6,marginBottom:2}},"Description"),
                 h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
                   openRef.description
@@ -18756,7 +18767,9 @@ function MajorProjectFormModal({ initial, onCancel, onSaved, user }){
   const save = async()=>{
     if(!f.project_name.trim()){ alert("Project name is required."); return; }
     if(!f.end_user_company_name.trim()){ alert("End user is required."); return; }
-    if(!f.main_epc_company_name.trim()){ alert("Main EPC is required."); return; }
+    // Main EPC deliberately optional (23 Aug SOP) — a Project is often
+    // raw intelligence at first (Project name + End User only), with the
+    // EPC discovered and filled in later once chased down.
     if(!f.primary_sales_rep){ alert("Primary sales rep is required — accept the suggestion or pick one."); return; }
     setSaving(true);
     try{
@@ -18960,11 +18973,23 @@ function PackageAllocationsSection({ pkg, project, user, onCreateQuoteFromAlloca
   const [loading,setLoading] = useState(true);
   const [showAdd,setShowAdd] = useState(false);
   const [linkFor,setLinkFor] = useState(null);
+  const [logEnquiryFor,setLogEnquiryFor] = useState(null);
+  // Enquiries keyed by allocation_id (23 Aug SOP) — "Create quote" no
+  // longer jumps straight to a Quote# from here; it logs an Enquiry
+  // first, and this map tells the row whether one already exists so it
+  // shows the right state instead of offering to log a duplicate.
+  const [enquiriesByAllocation,setEnquiriesByAllocation] = useState({});
 
   const load = useCallback(async()=>{
     setLoading(true);
     const { data } = await sb.from("package_customer_allocation_tbl").select("*").eq("package_id",pkg.id).order("created_at");
     setRows(data||[]);
+    if(data && data.length){
+      const { data: enqs } = await sb.from("enquiry_tbl").select("id,enquiry_number,status,allocation_id,linked_reference_number").in("allocation_id",data.map(r=>r.id));
+      const byAlloc = {};
+      (enqs||[]).forEach(e=>{ byAlloc[e.allocation_id]=e; });
+      setEnquiriesByAllocation(byAlloc);
+    } else setEnquiriesByAllocation({});
     setLoading(false);
   },[pkg.id]);
   useEffect(()=>{ load(); },[load]);
@@ -18992,23 +19017,165 @@ function PackageAllocationsSection({ pkg, project, user, onCreateQuoteFromAlloca
           h("div",{style:{fontWeight:600,fontSize:13}},row.company_name),
           h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},row.allocation_status+(row.subcategory?(" · "+row.subcategory):""))
         ),
-        row.linked_reference_number
-          ? h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
-              h("span",{style:{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Linked to Quote# "+row.linked_reference_number),
-              onOpenQuote && h("button",{onClick:()=>onOpenQuote(row.linked_reference_number,1),style:btnSmall},"Open Quote#")
-            )
-          : h("div",{style:{display:"flex",gap:8}},
-              h("button",{onClick:()=>createQuoteFor(row),style:btnSmall},"Create quote"),
-              h("button",{onClick:()=>setLinkFor(row),style:btnSmall},"Link existing Quote#")
-            )
+        (()=>{
+          const enq = enquiriesByAllocation[row.id];
+          if(row.linked_reference_number || (enq && enq.linked_reference_number)){
+            const refNum = row.linked_reference_number || enq.linked_reference_number;
+            return h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+              h("span",{style:{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Linked to Quote# "+refNum),
+              onOpenQuote && h("button",{onClick:()=>onOpenQuote(refNum,1),style:btnSmall},"Open Quote#")
+            );
+          }
+          if(enq){
+            const unassigned = enq.status==="Received";
+            return h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+              h("span",{style:{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,background:unassigned?"#fdecea":"#fff4d6",color:unassigned?"#a3312a":"#854f0b"}},
+                enq.enquiry_number+" — "+(unassigned?"Unassigned":enq.status)
+              )
+            );
+          }
+          return h("div",{style:{display:"flex",gap:8}},
+            h("button",{onClick:()=>setLogEnquiryFor(row),style:btnSmall},"Log enquiry"),
+            h("button",{onClick:()=>setLinkFor(row),style:btnSmall},"Link existing Quote#")
+          );
+        })()
       ))
     ),
     showAdd && h(AddAllocationModal,{pkg,project,user,onCancel:()=>setShowAdd(false),onSaved:()=>{setShowAdd(false);load();}}),
-    linkFor && h(LinkExistingQuoteModal,{allocation:linkFor,onCancel:()=>setLinkFor(null),onSaved:()=>{setLinkFor(null);load();}})
+    linkFor && h(LinkExistingQuoteModal,{allocation:linkFor,onCancel:()=>setLinkFor(null),onSaved:()=>{setLinkFor(null);load();}}),
+    logEnquiryFor && h(LogEnquiryModal,{
+      user,
+      allocation: logEnquiryFor, pkg, project,
+      onCancel: ()=>setLogEnquiryFor(null),
+      onSaved: ()=>{ setLogEnquiryFor(null); load(); }
+    })
   );
 }
 
-// Search an existing company, allocate it to this package, and — if it
+// Small badge — Quote header backlink to its originating enquiry (23 Aug
+// SOP). Fetches just the enquiry_number for display; clicking jumps to
+// the Enquiries list (doesn't try to deep-link into one row, that list
+// is short enough to scan).
+function EnquiryBacklinkBadge({ enquiryId, onGoToTab }){
+  const [enquiryNumber,setEnquiryNumber] = useState(null);
+  useEffect(()=>{
+    sb.from("enquiry_tbl").select("enquiry_number").eq("id",enquiryId).maybeSingle()
+      .then(({data})=>setEnquiryNumber(data?.enquiry_number||null));
+  },[enquiryId]);
+  if(!enquiryNumber) return null;
+  return h("span",{
+    onClick:()=> onGoToTab && onGoToTab("enquiries_list"),
+    style:{fontSize:11,fontWeight:600,padding:"3px 9px",borderRadius:10,background:"#e6f1fb",color:"#0c447c",cursor:onGoToTab?"pointer":"default"}
+  },"From "+enquiryNumber);
+}
+
+// Log Enquiry (23 Aug SOP, Phase 1). Two shapes of the same form: called
+// with allocation/pkg/project context (from the chase pipeline — that
+// whole trail is read-only, just add what's being asked for), or called
+// with none of that (a manual/walk-in entry — only Customer is required).
+// Always saves as Unassigned; assignment is a separate screen entirely.
+function LogEnquiryModal({ user, allocation, pkg, project, onCancel, onSaved }){
+  const fromChase = !!allocation;
+  const [companyName,setCompanyName] = useState(allocation?.company_name || "");
+  const [enquiryDate,setEnquiryDate] = useState(new Date().toISOString().slice(0,10));
+  const [enquiryType,setEnquiryType] = useState("");
+  const [source,setSource] = useState(fromChase ? "From project chase" : "");
+  const [details,setDetails] = useState("");
+  const [items,setItems] = useState([{item:"",qty:""}]);
+  const [types,setTypes] = useState([]);
+  const [sources,setSources] = useState([]);
+  const [itemOptions,setItemOptions] = useState([]);
+  const [saving,setSaving] = useState(false);
+  const [err,setErr] = useState("");
+
+  useEffect(()=>{
+    sb.from("enquiry_type_tbl").select("value").then(({data})=>setTypes((data||[]).map(r=>r.value)));
+    sb.from("enquiry_source_tbl").select("value").then(({data})=>setSources((data||[]).map(r=>r.value)));
+    sb.from("item_tbl").select("item").then(({data})=>setItemOptions((data||[]).map(r=>r.item).filter(Boolean)));
+  },[]);
+
+  const setItemRow = (i,field,val)=> setItems(rows=>rows.map((r,idx)=>idx===i?{...r,[field]:val}:r));
+  const addItemRow = ()=> setItems(rows=>[...rows,{item:"",qty:""}]);
+  const removeItemRow = (i)=> setItems(rows=>rows.filter((_,idx)=>idx!==i));
+
+  const save = async()=>{
+    if(!companyName.trim()){ setErr("Customer is required."); return; }
+    setSaving(true); setErr("");
+    try{
+      const datePart = new Date().toISOString().slice(2,10).replace(/-/g,"");
+      const { count } = await sb.from("enquiry_tbl").select("id",{count:"exact",head:true}).gte("created_at",new Date().toISOString().slice(0,10)+"T00:00:00");
+      const enquiryNumber = "ENQ-"+datePart+"-"+String((count||0)+1).padStart(2,"0");
+      const { data: created, error } = await sb.from("enquiry_tbl").insert({
+        enquiry_number: enquiryNumber, enquiry_date: enquiryDate,
+        project_id: project?.id || null, package_id: pkg?.id || null, allocation_id: allocation?.id || null,
+        company_name: companyName.trim(), enquiry_type: enquiryType || null, source: source || null,
+        details: details.trim() || null, assigned_to: "Unassigned", status: "Received",
+        created_by: user?.username || "unknown"
+      }).select().single();
+      if(error) throw error;
+      const validItems = items.filter(r=>r.item.trim());
+      if(validItems.length){
+        const { error: itemErr } = await sb.from("enquiry_item_tbl").insert(
+          validItems.map(r=>({enquiry_id:created.id, item:r.item.trim(), qty: r.qty?Number(r.qty):null}))
+        );
+        if(itemErr) throw itemErr;
+      }
+      await logAudit("INSERT","enquiry_tbl",enquiryNumber,"Logged enquiry for "+companyName.trim()+(fromChase?" (from project chase)":" (manual entry)"),user?.username||"unknown",null,{company_name:companyName.trim()});
+      onSaved();
+    } catch(e){ setErr(e.message||"Could not save enquiry."); }
+    finally{ setSaving(false); }
+  };
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"96vw",maxHeight:"88vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Log enquiry"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},
+        fromChase ? "Traced from "+(project?.project_name||"—")+" → "+(pkg?.package_name||"—")+" → "+companyName : "Manual entry — no pipeline context needed."
+      ),
+      fromChase && h("div",{style:{padding:"10px 12px",background:"#f4f2ea",borderRadius:6,marginBottom:12,fontSize:12.5}},
+        h("div",null,h("strong",null,"Project: "),project?.project_name||"—"),
+        h("div",null,h("strong",null,"Package: "),pkg?.package_name||"—"),
+        h("div",null,h("strong",null,"Customer: "),companyName)
+      ),
+      !fromChase && h("div",{style:{marginBottom:10}},
+        h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Customer"),
+        h("input",{value:companyName,onChange:e=>setCompanyName(e.target.value),placeholder:"Type or pick a customer",style:{...inputStyle,padding:"7px 9px",fontSize:12}})
+      ),
+      h("div",{style:{display:"flex",gap:10,marginBottom:10}},
+        h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Enquiry date"),h("input",{type:"date",value:enquiryDate,onChange:e=>setEnquiryDate(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})),
+        h("div",{style:{flex:1}},h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Type"),
+          h("select",{value:enquiryType,onChange:e=>setEnquiryType(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+            h("option",{value:""},"—"), types.map(t=>h("option",{key:t,value:t},t))
+          )
+        )
+      ),
+      h("div",{style:{marginBottom:12}},
+        h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Source"),
+        h("select",{value:source,onChange:e=>setSource(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+          h("option",{value:""},"—"), sources.map(s=>h("option",{key:s,value:s},s))
+        )
+      ),
+      h("div",{style:{marginBottom:12}},
+        h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Details"),
+        h("textarea",{rows:2,value:details,onChange:e=>setDetails(e.target.value),placeholder:"What are they asking for?",style:{...inputStyle,padding:"7px 9px",fontSize:12,resize:"vertical"}})
+      ),
+      h("div",{style:{borderTop:"1px solid "+colors.border,paddingTop:10,marginBottom:12}},
+        h("div",{style:{fontSize:11.5,fontWeight:600,marginBottom:6}},"Items"),
+        items.map((row,i)=>h("div",{key:i,style:{display:"flex",gap:6,marginBottom:6}},
+          h(LimitToListCombo,{value:row.item,onChange:v=>setItemRow(i,"item",v),options:itemOptions,limitToList:false,placeholder:"Item",style:{flex:2,fontSize:12}}),
+          h("input",{value:row.qty,onChange:e=>setItemRow(i,"qty",e.target.value),placeholder:"Qty",style:{...inputStyle,flex:1,padding:"7px 9px",fontSize:12}}),
+          items.length>1 && h("button",{onClick:()=>removeItemRow(i),style:{...btnSmall,padding:"6px 10px"}},"✕")
+        )),
+        h("button",{onClick:addItemRow,style:{...btnSmall,fontSize:11.5}},"+ Add item")
+      ),
+      err && h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:10}},err),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save enquiry")
+      )
+    )
+  );
+}
 // doesn't already carry this package's name as a Customer Type — offer to
 // tag it right there. The type vocabulary grows from real assignments.
 function AddAllocationModal({ pkg, project, user, onCancel, onSaved }){
@@ -19454,6 +19621,171 @@ function PackageActivitySection({ pkg, project, user }){
 // matched and reused, never duplicated. Also tags the allocated company's
 // own "Packages handled" list, same as the interactive Add Allocation flow
 // already does, for consistency.
+// Enquiries — the actual list, plus manual/walk-in logging (23 Aug SOP,
+// Phase 1). Scoped to the logged-in user's own assigned enquiries, except
+// admin/super_admin who see everything — same pattern as the gaps
+// dashboard this feeds into.
+function EnquiriesListScreen({ user, onGoToTab, onOpenQuote, onCreateQuoteFromEnquiry }){
+  const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
+  const [myEmployeeName,setMyEmployeeName] = useState(null);
+  useEffect(()=>{
+    if(isAdminOrAbove) return;
+    sb.from("employee_tbl").select("employee_name").eq("app_user_id",user.id).limit(1).maybeSingle()
+      .then(({data})=>setMyEmployeeName(data?.employee_name||null));
+  },[user.id,isAdminOrAbove]);
+
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [showLog,setShowLog] = useState(false);
+  const [editingDueFor,setEditingDueFor] = useState(null);
+  const [dueDraft,setDueDraft] = useState("");
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    let q = sb.from("enquiry_tbl").select("*").order("created_at",{ascending:false});
+    if(!isAdminOrAbove && myEmployeeName) q = q.eq("assigned_to",myEmployeeName);
+    const { data } = await q;
+    setRows(data||[]);
+    setLoading(false);
+  },[isAdminOrAbove,myEmployeeName]);
+  useEffect(()=>{ if(isAdminOrAbove || myEmployeeName!==null) load(); },[load,isAdminOrAbove,myEmployeeName]);
+
+  const convertToQuote = (enq)=>{
+    const ref = prompt("New Quote# for "+enq.company_name+" (e.g. FEX260601):");
+    if(!ref || !ref.trim()) return;
+    (async()=>{
+      const { data:existing } = await sb.from("estimates").select("reference_number").eq("reference_number",ref.trim()).limit(1);
+      if(existing && existing.length>0){ alert("Quote# \""+ref.trim()+"\" already exists — pick a different number."); return; }
+      onCreateQuoteFromEnquiry(ref.trim(), enq.id, enq.company_name);
+    })();
+  };
+
+  const saveDueDate = async(enq)=>{
+    const canOverride = user.role==="super_admin" || user.username===enq.assigned_by;
+    if(!canOverride){ alert("Only "+(enq.assigned_by||"whoever assigned this")+" or a Super Admin can change this due date."); return; }
+    await sb.from("enquiry_tbl").update({due_date:dueDraft||null}).eq("id",enq.id);
+    await logAudit("UPDATE","enquiry_tbl",enq.enquiry_number,"Due date changed to "+(dueDraft||"—"),user?.username||"unknown",null,{due_date:dueDraft});
+    setEditingDueFor(null);
+    load();
+  };
+
+  const statusBadge = (enq)=>{
+    if(enq.status==="Converted") return h("span",{style:{fontSize:11,padding:"3px 9px",borderRadius:10,background:"#eaf9f4",color:"#085041"}},"Converted");
+    if(enq.assigned_to==="Unassigned") return h("span",{style:{fontSize:11,padding:"3px 9px",borderRadius:10,background:"#fdecea",color:"#a3312a"}},"Unassigned");
+    const overdue = enq.due_date && new Date(enq.due_date) < new Date();
+    if(overdue) return h("span",{style:{fontSize:11,padding:"3px 9px",borderRadius:10,background:"#fdecea",color:"#a3312a"}},"Overdue");
+    return h("span",{style:{fontSize:11,padding:"3px 9px",borderRadius:10,background:"#fff4d6",color:"#854f0b"}},"Assigned");
+  };
+
+  return h("div",{style:{padding:20}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+      h("h2",{style:{margin:0}},"Enquiries"),
+      h("button",{onClick:()=>setShowLog(true),style:btnPrimary},"+ Log enquiry")
+    ),
+    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},isAdminOrAbove?"All enquiries.":"Your assigned enquiries."),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    rows.length===0?h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"No enquiries yet."):
+    h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px"}},
+      h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12.5}},
+        h("thead",null,h("tr",{style:{borderBottom:"1px solid "+colors.border}},
+          h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Enquiry"),
+          h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Customer"),
+          h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Assigned to"),
+          h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Due"),
+          h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Status"),
+          h("th",{style:{textAlign:"right",padding:"6px 4px"}})
+        )),
+        h("tbody",null, rows.map(enq=>h("tr",{key:enq.id,style:{borderBottom:"1px solid #f0eee6"}},
+          h("td",{style:{padding:"7px 4px",fontWeight:600}},enq.enquiry_number),
+          h("td",{style:{padding:"7px 4px"}},enq.company_name),
+          h("td",{style:{padding:"7px 4px"}},enq.assigned_to),
+          h("td",{style:{padding:"7px 4px"}},
+            editingDueFor===enq.id
+              ? h("div",{style:{display:"flex",gap:4}},
+                  h("input",{type:"date",value:dueDraft,onChange:e=>setDueDraft(e.target.value),style:{fontSize:11.5,padding:"3px 5px"}}),
+                  h("button",{onClick:()=>saveDueDate(enq),style:{...btnSmall,fontSize:10.5,padding:"3px 7px"}},"Save")
+                )
+              : h("span",{style:{cursor:enq.due_date?"pointer":"default"},onClick:()=>{ if(enq.due_date){ setEditingDueFor(enq.id); setDueDraft(enq.due_date); } }},enq.due_date||"—")
+          ),
+          h("td",{style:{padding:"7px 4px"}},statusBadge(enq)),
+          h("td",{style:{padding:"7px 4px",textAlign:"right"}},
+            enq.status==="Converted"
+              ? h("button",{onClick:()=>onOpenQuote(enq.linked_reference_number,1),style:{...btnSmall,fontSize:11}},"Open Quote#")
+              : (enq.assigned_to!=="Unassigned" && h("button",{onClick:()=>convertToQuote(enq),style:{...btnSmall,fontSize:11}},"Convert to quote"))
+          )
+        )))
+      )
+    ),
+    showLog && h(LogEnquiryModal,{user,allocation:null,pkg:null,project:null,onCancel:()=>setShowLog(false),onSaved:()=>{setShowLog(false);load();}})
+  );
+}
+
+// Daily assignment review (23 Aug SOP, Phase 1) — every Unassigned
+// enquiry, oldest first. Assigning sets a due date that defaults to 3
+// days from today, editable right here before saving; after that, only
+// whoever assigned it (or a Super Admin) can change it — see
+// EnquiriesListScreen's saveDueDate for that later-edit path.
+function EnquiryReviewScreen({ user }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [salesTeam,setSalesTeam] = useState([]);
+  const [drafts,setDrafts] = useState({}); // id -> {assignTo, dueDate}
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("enquiry_tbl").select("*").eq("assigned_to","Unassigned").order("created_at",{ascending:true});
+    setRows(data||[]);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+  useEffect(()=>{
+    sb.from("employee_tbl").select("employee_name").neq("status","Inactive").order("employee_name")
+      .then(({data})=>setSalesTeam((data||[]).map(e=>e.employee_name)));
+  },[]);
+
+  const defaultDue = ()=>{ const d=new Date(); d.setDate(d.getDate()+3); return d.toISOString().slice(0,10); };
+  const setDraft = (id,field,val)=> setDrafts(d=>({...d,[id]:{...(d[id]||{assignTo:"",dueDate:defaultDue()}),[field]:val}}));
+
+  const assign = async(enq)=>{
+    const draft = drafts[enq.id] || {};
+    if(!draft.assignTo){ alert("Pick who this goes to."); return; }
+    const dueDate = draft.dueDate || defaultDue();
+    await sb.from("enquiry_tbl").update({
+      assigned_to: draft.assignTo, assigned_by: user.username, assigned_at: new Date().toISOString(),
+      due_date: dueDate, status: "Assigned"
+    }).eq("id",enq.id);
+    await logAudit("UPDATE","enquiry_tbl",enq.enquiry_number,"Assigned to "+draft.assignTo+", due "+dueDate,user?.username||"unknown",null,{assigned_to:draft.assignTo,due_date:dueDate});
+    load();
+  };
+
+  return h("div",{style:{padding:20}},
+    h("h2",{style:{marginTop:0}},"Enquiry review"),
+    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},rows.length+" unassigned · sorted oldest first."),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    rows.length===0?h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"Nothing unassigned right now."):
+    h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px"}},
+      rows.map(enq=>{
+        const draft = drafts[enq.id] || {assignTo:"",dueDate:defaultDue()};
+        const ageDays = Math.floor((Date.now()-new Date(enq.created_at))/86400000);
+        return h("div",{key:enq.id,style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:"1px solid #f0eee6"}},
+          h("div",null,
+            h("div",{style:{fontSize:13,fontWeight:600}},enq.enquiry_number+" — "+enq.company_name),
+            h("div",{style:{fontSize:11.5,color:colors.muted}},enq.details||"—"),
+            h("div",{style:{fontSize:11,color:colors.danger,marginTop:2}},"Unassigned · "+ageDays+" day"+(ageDays===1?"":"s")+" old")
+          ),
+          h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
+            h("select",{value:draft.assignTo,onChange:e=>setDraft(enq.id,"assignTo",e.target.value),style:{fontSize:11.5,padding:"5px 6px",width:130}},
+              h("option",{value:""},"Assign to…"), salesTeam.map(n=>h("option",{key:n,value:n},n))
+            ),
+            h("input",{type:"date",value:draft.dueDate,onChange:e=>setDraft(enq.id,"dueDate",e.target.value),style:{fontSize:11.5,padding:"5px 6px",width:130}}),
+            h("button",{onClick:()=>assign(enq),style:{...btnSmall,fontSize:11}},"Assign")
+          )
+        );
+      })
+    )
+  );
+}
+
 function MajorProjectsBulkImport({ user }){
   const [file,setFile] = useState(null);
   const [analyzing,setAnalyzing] = useState(false);
@@ -24283,6 +24615,11 @@ function App() {
     }):
     tab==="major_projects_kanban"?h(MajorProjectPackageKanban,{user}):
     tab==="major_projects_bulk_import"?h(MajorProjectsBulkImport,{user}):
+    tab==="enquiries_list"?h(EnquiriesListScreen,{user,onGoToTab:setTab,
+      onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");},
+      onCreateQuoteFromEnquiry:(ref,enquiryId,prefillCustomerName)=>{ setPendingNewSlNo({reference_number:ref,item_sl_no:1,linked_enquiry_id:enquiryId,prefillCustomerName}); setTab("estimator"); }
+    }):
+    tab==="enquiry_review"?h(EnquiryReviewScreen,{user}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
