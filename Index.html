@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-23T03:05:47Z";
+  var APP_BUILD_VERSION = "2026-08-23T03:13:15Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1228,6 +1228,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Enquiries", tabs:[
         {key:"enquiries_list",label:"Enquiries"},
         {key:"enquiry_review",label:"Enquiry Review"},
+        {key:"gaps_dashboard",label:"What Needs Chasing"},
       ]},
     ]},
     { label:"Reports", subgroups:[
@@ -18678,6 +18679,121 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote })
   );
 }
 
+// Checkbox multi-select for awarding Packages (Phase 2, 23 Aug SOP) — the
+// fast entry point once an EPC confirms which Packages they've awarded.
+// Checking a box creates a real major_project_package_tbl row immediately
+// (not a separate "confirm" step). Adding a Package not on the master
+// list needs a one-time code — Admin instant, everyone else needs a code
+// only a Super Admin can generate, same pattern as the Component casing
+// and Incomplete BOM overrides built earlier this session.
+function PackageCheckboxModal({ project, user, existingPackageNames, onCancel, onSaved }){
+  const isAdmin = user.role==="admin" || user.role==="super_admin";
+  const isSuperAdmin = user.role==="super_admin";
+  const [allPackages,setAllPackages] = useState([]);
+  const [checked,setChecked] = useState({});
+  const [saving,setSaving] = useState(false);
+  const [newPackageName,setNewPackageName] = useState("");
+  const [showNewPackageCode,setShowNewPackageCode] = useState(false);
+  const [newPackageCode,setNewPackageCode] = useState("");
+  const [newPackageCodeError,setNewPackageCodeError] = useState("");
+  const [generatingCode,setGeneratingCode] = useState(false);
+  const [justGeneratedCode,setJustGeneratedCode] = useState(null);
+  const existingSet = new Set(existingPackageNames);
+
+  const load = ()=> sb.from("package_name_tbl").select("value").order("value").then(({data})=>setAllPackages((data||[]).map(r=>r.value)));
+  useEffect(()=>{ load(); },[]);
+
+  const toggle = (name)=> setChecked(c=>({...c,[name]:!c[name]}));
+
+  const save = async()=>{
+    const toAdd = Object.keys(checked).filter(name=>checked[name] && !existingSet.has(name));
+    if(toAdd.length===0){ onCancel(); return; }
+    setSaving(true);
+    try{
+      for(const name of toAdd){
+        const { error } = await sb.from("major_project_package_tbl").insert({project_id:project.id, package_name:name, package_status:"Unknown", sales_rep:project.primary_sales_rep||"", created_by:user.username});
+        if(error) throw error;
+      }
+      await logAudit("INSERT","major_project_package_tbl",String(project.id),"Awarded "+toAdd.length+" package(s) via checkbox: "+toAdd.join(", "),user.username,null,{packages:toAdd});
+      onSaved();
+    } catch(e){ alert("Save failed: "+e.message); }
+    finally{ setSaving(false); }
+  };
+
+  const addNewPackageType = async()=>{
+    if(!newPackageName.trim()) return;
+    if(isAdmin){
+      const { error } = await sb.from("package_name_tbl").insert({value:newPackageName.trim()});
+      if(error){ alert("Could not add: "+error.message); return; }
+      await logAudit("INSERT","package_name_tbl",newPackageName.trim(),"New Package type added from the award-packages checkbox",user.username,null,null);
+      setNewPackageName(""); load();
+    } else {
+      setNewPackageCode(""); setNewPackageCodeError(""); setShowNewPackageCode(true);
+    }
+  };
+  const submitNewPackageCode = async()=>{
+    const res = await verifyAndConsumeGatedPin("package_checkbox_new_type", newPackageCode, user.username, "package_name_tbl", null, "Added new Package type \""+newPackageName.trim()+"\" from the award-packages checkbox");
+    if(!res.ok){ setNewPackageCodeError(res.message); return; }
+    const { error } = await sb.from("package_name_tbl").insert({value:newPackageName.trim()});
+    if(error){ alert("Could not add: "+error.message); return; }
+    setShowNewPackageCode(false); setNewPackageName(""); load();
+  };
+  const generateNewPackageCode = async()=>{
+    setGeneratingCode(true);
+    const code = String(Math.floor(100000+Math.random()*900000));
+    try{
+      const { data:existing } = await sb.from("gated_action_pin_tbl").select("id").eq("action_type","package_checkbox_new_type").maybeSingle();
+      if(existing) await sb.from("gated_action_pin_tbl").update({pin:code,is_used:false}).eq("id",existing.id);
+      else await sb.from("gated_action_pin_tbl").insert({action_type:"package_checkbox_new_type",pin:code,is_used:false});
+      await logAudit("UPDATE","gated_action_pin_tbl","package_checkbox_new_type","Generated a one-time code to add a new Package type",user.username,null,null);
+      setJustGeneratedCode(code);
+    } catch(e){ alert("Could not generate code: "+e.message); }
+    finally{ setGeneratingCode(false); }
+  };
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:480,maxWidth:"96vw",maxHeight:"85vh",overflowY:"auto"}},
+
+      !showNewPackageCode && h(React.Fragment,null,
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Award packages — "+project.project_name),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Which packages has this EPC awarded so far? Check all that apply."),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:4,marginBottom:14}},
+          allPackages.map(name=>{
+            const already = existingSet.has(name);
+            return h("label",{key:name,style:{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",border:"1px solid "+colors.border,borderRadius:6,opacity:already?0.55:1}},
+              h("input",{type:"checkbox",checked:already||!!checked[name],disabled:already,onChange:()=>toggle(name)}),
+              name, already && h("span",{style:{fontSize:10.5,color:colors.mutedLight,marginLeft:"auto"}},"already added")
+            );
+          })
+        ),
+        h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:16}},
+          h("input",{value:newPackageName,onChange:e=>setNewPackageName(e.target.value),placeholder:"Package not listed?",style:{...inputStyle,flex:1,padding:"7px 9px",fontSize:12}}),
+          h("button",{onClick:addNewPackageType,style:{...btnSmall,fontSize:11,whiteSpace:"nowrap"}},isAdmin?"+ Add":"+ Add (needs code)")
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
+          h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save")
+        )
+      ),
+
+      showNewPackageCode && h(React.Fragment,null,
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Enter Super Admin code"),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:10}},"Adding a new Package type needs a one-time code only a Super Admin can generate."),
+        isSuperAdmin && h("div",{style:{marginBottom:12,padding:"10px 12px",background:"#fdecea",border:"1px solid #f0997b",borderRadius:6}},
+          h("button",{onClick:generateNewPackageCode,disabled:generatingCode,style:{...btnPrimary,background:colors.danger}},generatingCode?"Generating…":"Generate Super Admin code"),
+          justGeneratedCode && h("div",{style:{marginTop:8,fontSize:22,fontWeight:700,letterSpacing:3,color:"#a3312a"}},justGeneratedCode)
+        ),
+        h("input",{value:newPackageCode,onChange:e=>{setNewPackageCode(e.target.value);setNewPackageCodeError("");},placeholder:"6-digit code",style:{width:"100%",fontSize:14,padding:"8px 10px",border:"1px solid "+colors.border,borderRadius:5,marginBottom:6}}),
+        newPackageCodeError && h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:6}},newPackageCodeError),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:10}},
+          h("button",{onClick:()=>setShowNewPackageCode(false),style:btnSecondary},"Back"),
+          h("button",{onClick:submitNewPackageCode,style:{...btnPrimary,background:colors.danger}},"Verify and add")
+        )
+      )
+    )
+  );
+}
+
 // MS-Access-style subform — Packages for this Project, editable inline as
 // a grid instead of the modal-per-package flow. That flow still exists
 // unchanged on the Project detail page (per "keep this interface") — this
@@ -18691,6 +18807,7 @@ function ProjectPackagesSubform({ project, user }){
   const [packageNameOptions,setPackageNameOptions] = useState([]);
   const [allocByPackage,setAllocByPackage] = useState({});
   const [addAllocFor,setAddAllocFor] = useState(null);
+  const [showCheckbox,setShowCheckbox] = useState(false);
 
   const refreshPackageNames = ()=> sb.from("package_name_tbl").select("value").order("value").then(({data})=>setPackageNameOptions((data||[]).map(r=>r.value)));
 
@@ -18724,7 +18841,10 @@ function ProjectPackagesSubform({ project, user }){
   };
 
   return h("div",{style:{marginBottom:14,borderTop:"1px solid "+colors.border,paddingTop:12}},
-    h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,marginBottom:6}},"PACKAGES"),
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
+      h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted}},"PACKAGES"),
+      h("button",{onClick:()=>setShowCheckbox(true),style:{...btnSmall,fontSize:11}},"+ Award packages")
+    ),
     loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
     h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
       h("div",{style:{display:"grid",gridTemplateColumns:"1.3fr 2fr 1fr",background:"#faf9f4",fontSize:10.5,color:colors.muted,padding:"6px 8px"}},
@@ -18742,6 +18862,11 @@ function ProjectPackagesSubform({ project, user }){
       )),
       h("div",{onClick:addRow,style:{padding:"6px 8px",borderTop:"1px solid "+colors.border,cursor:"pointer",fontSize:11.5,color:colors.mutedLight}},"+ add package row")
     ),
+    showCheckbox && h(PackageCheckboxModal,{
+      project, user, existingPackageNames: rows.map(r=>r.package_name).filter(Boolean),
+      onCancel:()=>setShowCheckbox(false),
+      onSaved:()=>{ setShowCheckbox(false); load(); }
+    }),
     addAllocFor && h(AddAllocationModal,{pkg:addAllocFor, project, user, onCancel:()=>setAddAllocFor(null), onSaved:()=>{ setAddAllocFor(null); load(); }})
   );
 }
@@ -19642,6 +19767,117 @@ function PackageActivitySection({ pkg, project, user }){
 // Phase 1). Scoped to the logged-in user's own assigned enquiries, except
 // admin/super_admin who see everything — same pattern as the gaps
 // dashboard this feeds into.
+// The gaps/chase dashboard (Phase 2, 23 Aug SOP) — "the essence of the
+// session." Five tracked states across the whole pipeline: no EPC yet, no
+// packages yet, no customer yet, no enquiry yet, and overdue offers (an
+// assigned Enquiry past its due date, not yet converted). Age is computed
+// from when each gap's own parent record was created — a fair
+// approximation of "when the gap first appeared" without needing a
+// separate timestamp per gap type. Scoped to the logged-in user's own
+// sales_rep unless admin/super_admin, who see everything.
+function GapsChaseDashboard({ user }){
+  const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
+  const [myEmployeeName,setMyEmployeeName] = useState(null);
+  useEffect(()=>{
+    if(isAdminOrAbove) return;
+    sb.from("employee_tbl").select("employee_name").eq("app_user_id",user.id).limit(1).maybeSingle()
+      .then(({data})=>setMyEmployeeName(data?.employee_name||null));
+  },[user.id,isAdminOrAbove]);
+
+  const [loading,setLoading] = useState(true);
+  const [gaps,setGaps] = useState({noEpc:[],noPackages:[],noCustomer:[],noEnquiry:[],overdue:[]});
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    let projQuery = sb.from("major_project_tbl").select("*");
+    if(!isAdminOrAbove && myEmployeeName) projQuery = projQuery.eq("primary_sales_rep",myEmployeeName);
+    const { data: projects } = await projQuery;
+    const projectIds = (projects||[]).map(p=>p.id);
+    const { data: packages } = projectIds.length ? await sb.from("major_project_package_tbl").select("*").in("project_id",projectIds) : {data:[]};
+    const packageIds = (packages||[]).map(p=>p.id);
+    const { data: allocations } = packageIds.length ? await sb.from("package_customer_allocation_tbl").select("*").in("package_id",packageIds) : {data:[]};
+    const allocationIds = (allocations||[]).map(a=>a.id);
+    const { data: enquiries } = allocationIds.length ? await sb.from("enquiry_tbl").select("*").in("allocation_id",allocationIds) : {data:[]};
+    // Overdue is scoped to this user's own assigned enquiries when not
+    // admin/super_admin — a chase gap belongs to whoever's chasing it.
+    let overdueQuery = sb.from("enquiry_tbl").select("*").neq("status","Converted").not("due_date","is",null).lt("due_date",new Date().toISOString().slice(0,10));
+    if(!isAdminOrAbove && myEmployeeName) overdueQuery = overdueQuery.eq("assigned_to",myEmployeeName);
+    const { data: overdueRows } = await overdueQuery;
+
+    const projById = new Map((projects||[]).map(p=>[p.id,p]));
+    const pkgById = new Map((packages||[]).map(p=>[p.id,p]));
+    const enqByAlloc = new Set((enquiries||[]).map(e=>e.allocation_id));
+    const pkgsByProject = new Map();
+    (packages||[]).forEach(p=>{ if(!pkgsByProject.has(p.project_id)) pkgsByProject.set(p.project_id,[]); pkgsByProject.get(p.project_id).push(p); });
+    const allocsByPackage = new Map();
+    (allocations||[]).forEach(a=>{ if(!allocsByPackage.has(a.package_id)) allocsByPackage.set(a.package_id,[]); allocsByPackage.get(a.package_id).push(a); });
+
+    const ageDays = (dateStr)=> Math.floor((Date.now()-new Date(dateStr))/86400000);
+
+    const noEpc = (projects||[]).filter(p=>!p.main_epc_company_name || !p.main_epc_company_name.trim())
+      .map(p=>({project:p.project_name, detail:"End user: "+(p.end_user_company_name||"—"), age:ageDays(p.created_at)}));
+    const noPackages = (projects||[]).filter(p=>p.main_epc_company_name && p.main_epc_company_name.trim() && !pkgsByProject.has(p.id))
+      .map(p=>({project:p.project_name, detail:"EPC: "+p.main_epc_company_name, age:ageDays(p.created_at)}));
+    const noCustomer = (packages||[]).filter(p=>!allocsByPackage.has(p.id))
+      .map(p=>({project:(projById.get(p.project_id)||{}).project_name||"—", detail:p.package_name, age:ageDays(p.created_at)}));
+    const noEnquiry = (allocations||[]).filter(a=>!enqByAlloc.has(a.id))
+      .map(a=>{ const pkg=pkgById.get(a.package_id); const proj=pkg?projById.get(pkg.project_id):null;
+        return {project:proj?proj.project_name:"—", detail:a.company_name+" — "+(pkg?pkg.package_name:"—"), age:ageDays(a.created_at)}; });
+    const overdue = (overdueRows||[]).map(e=>({project:e.enquiry_number, detail:e.company_name+" — assigned to "+e.assigned_to, age:ageDays(e.due_date)}));
+
+    setGaps({noEpc,noPackages,noCustomer,noEnquiry,overdue});
+    setLoading(false);
+  },[isAdminOrAbove,myEmployeeName]);
+  useEffect(()=>{ if(isAdminOrAbove || myEmployeeName!==null) load(); },[load,isAdminOrAbove,myEmployeeName]);
+
+  const allRows = [
+    ...gaps.noEpc.map(r=>({...r,type:"No EPC"})),
+    ...gaps.noPackages.map(r=>({...r,type:"No packages"})),
+    ...gaps.noCustomer.map(r=>({...r,type:"No customer"})),
+    ...gaps.noEnquiry.map(r=>({...r,type:"No enquiry"})),
+    ...gaps.overdue.map(r=>({...r,type:"Overdue"})),
+  ].sort((a,b)=>b.age-a.age);
+
+  const badgeStyle = (type)=> type==="Overdue"
+    ? {background:"#fdecea",color:"#a3312a"}
+    : type==="No EPC" ? {background:"#fdecea",color:"#a3312a"}
+    : type==="No customer" ? {background:"#fff4d6",color:"#854f0b"}
+    : {background:"#e6f1fb",color:"#0c447c"};
+
+  return h("div",{style:{padding:20}},
+    h("h2",{style:{marginTop:0}},"What needs chasing"),
+    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},isAdminOrAbove?"Every open gap across the pipeline.":"Your open gaps across the pipeline."),
+    loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
+    h(React.Fragment,null,
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:20,maxWidth:700}},
+        [["No EPC",gaps.noEpc.length],["No packages",gaps.noPackages.length],["No customer",gaps.noCustomer.length],["No enquiry",gaps.noEnquiry.length],["Overdue",gaps.overdue.length]].map(([label,count])=>
+          h("div",{key:label,style:{background:label==="Overdue"?"#fdecea":"#faf8f0",borderRadius:8,padding:10}},
+            h("div",{style:{fontSize:11,color:label==="Overdue"?"#a3312a":colors.muted}},label),
+            h("div",{style:{fontSize:20,fontWeight:700,marginTop:4,color:label==="Overdue"?"#a3312a":colors.text}},count)
+          )
+        )
+      ),
+      allRows.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"Nothing open right now.") :
+      h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px"}},
+        h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12.5}},
+          h("thead",null,h("tr",{style:{borderBottom:"1px solid "+colors.border}},
+            h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Gap"),
+            h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Project"),
+            h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Detail"),
+            h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Open for")
+          )),
+          h("tbody",null, allRows.map((r,i)=>h("tr",{key:i,style:{borderBottom:"1px solid #f0eee6"}},
+            h("td",{style:{padding:"7px 4px"}},h("span",{style:{fontSize:11,padding:"2px 8px",borderRadius:10,...badgeStyle(r.type)}},r.type)),
+            h("td",{style:{padding:"7px 4px"}},r.project),
+            h("td",{style:{padding:"7px 4px",color:colors.muted}},r.detail),
+            h("td",{style:{padding:"7px 4px"}},r.age+" day"+(r.age===1?"":"s"))
+          )))
+        )
+      )
+    )
+  );
+}
+
 function EnquiriesListScreen({ user, onGoToTab, onOpenQuote, onCreateQuoteFromEnquiry }){
   const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
   const [myEmployeeName,setMyEmployeeName] = useState(null);
@@ -24637,6 +24873,7 @@ function App() {
       onCreateQuoteFromEnquiry:(ref,enquiryId,prefillCustomerName)=>{ setPendingNewSlNo({reference_number:ref,item_sl_no:1,linked_enquiry_id:enquiryId,prefillCustomerName}); setTab("estimator"); }
     }):
     tab==="enquiry_review"?h(EnquiryReviewScreen,{user}):
+    tab==="gaps_dashboard"?h(GapsChaseDashboard,{user}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
