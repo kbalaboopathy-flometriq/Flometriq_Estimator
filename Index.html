@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-23T06:59:00Z";
+  var APP_BUILD_VERSION = "2026-08-23T07:26:40Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -18539,9 +18539,6 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
   const [loadingPackages,setLoadingPackages] = useState(false);
   const [showProjectForm,setShowProjectForm] = useState(false);
   const [editingProject,setEditingProject] = useState(null);
-  const [showPackageForm,setShowPackageForm] = useState(false);
-  const [editingPackage,setEditingPackage] = useState(null);
-  const [selectedPackage,setSelectedPackage] = useState(null); // package row currently drilled into
   // Where "Back" should return to, once opened via a deep-link from one of
   // the entity-wise lookup screens (23 Aug SOP) — set only when arriving
   // that way, cleared on any normal "All projects" navigation.
@@ -18564,8 +18561,6 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
 
   const openProject = (p)=>{ setSelectedProject(p); setView("detail"); loadPackages(p.id); setReturnTo(null); };
   const backToList = ()=>{ setView("list"); setSelectedProject(null); setPackages([]); setReturnTo(null); loadProjects(); };
-  const openPackageDetail = (pkg)=>{ setSelectedPackage(pkg); setView("package_detail"); };
-  const backToPackageList = ()=>{ setView("detail"); setSelectedPackage(null); loadPackages(selectedProject.id); };
 
   // Consume a deep-link target once — open that exact project directly
   // and remember where to send "Back" instead of "All projects".
@@ -18586,22 +18581,6 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
       || (p.end_user_company_name||"").toLowerCase().includes(q)
       || (p.main_epc_company_name||"").toLowerCase().includes(q);
   });
-
-  if(view==="package_detail" && selectedProject && selectedPackage){
-    return h(React.Fragment,null,
-      h(MajorProjectPackageDetail,{
-        pkg:selectedPackage, project:selectedProject, user,
-        onBack:backToPackageList,
-        onEdit:()=>{setEditingPackage(selectedPackage);setShowPackageForm(true);},
-        onCreateQuoteFromAllocation, onOpenQuote
-      }),
-      showPackageForm && h(MajorProjectPackageFormModal,{
-        project:selectedProject, initial:editingPackage, user,
-        onCancel:()=>{setShowPackageForm(false);setEditingPackage(null);},
-        onSaved:(saved)=>{ setShowPackageForm(false); setEditingPackage(null); setSelectedPackage(saved); }
-      })
-    );
-  }
 
   if(view==="detail" && selectedProject){
     return h(React.Fragment,null,
@@ -18646,28 +18625,43 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
     );
   }
 
+  const deleteProject = async(p)=>{
+    const { count } = await sb.from("major_project_package_tbl").select("id",{count:"exact",head:true}).eq("project_id",p.id);
+    if(count>0){ alert("Can't delete \""+p.project_name+"\" — it has "+count+" package(s) under it. Remove those first, or leave the project as-is."); return; }
+    if(!confirm("Delete \""+p.project_name+"\"? This can't be undone.")) return;
+    const { error } = await sb.from("major_project_tbl").delete().eq("id",p.id);
+    if(error){ alert("Delete failed: "+error.message); return; }
+    await logAudit("DELETE","major_project_tbl",p.project_name,"Deleted project (no packages under it)",user?.username||"unknown",null,null);
+    loadProjects();
+  };
+
   return h(React.Fragment,null,
     h("div",{style:{padding:"20px 24px"}},
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
         h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Major Projects"),
         h("div",{style:{display:"flex",gap:8}},
           h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search project, end user, EPC…",style:{...inputStyle,width:260}}),
+          h("button",{onClick:loadProjects,style:btnSecondary},"Refresh"),
           h("button",{onClick:()=>{setEditingProject(null);setShowProjectForm(true);},style:{...btnPrimary,fontWeight:600}},"+ New Project")
         )
       ),
       loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
       filtered.length===0 ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"No projects yet — click + New Project to add the first one (any major EPC account: Aramco, IOCL, BPCL, SABIC, HPCL, DEWA, or others).") :
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
-        h("div",{style:{display:"grid",gridTemplateColumns:"2fr 1.4fr 1.4fr 1fr 1fr 1fr",padding:"8px 14px",background:colors.bg,fontSize:10.5,fontWeight:700,color:colors.muted}},
-          h("div",null,"Project"),h("div",null,"End user"),h("div",null,"Main EPC"),h("div",null,"Stage"),h("div",null,"Est. value"),h("div",null,"Sales rep")
+        h("div",{style:{display:"grid",gridTemplateColumns:"2fr 1.4fr 1.4fr 1fr 1fr 1fr 0.7fr",padding:"8px 14px",background:colors.bg,fontSize:10.5,fontWeight:700,color:colors.muted}},
+          h("div",null,"Project"),h("div",null,"End user"),h("div",null,"Main EPC"),h("div",null,"Stage"),h("div",null,"Est. value"),h("div",null,"Sales rep"),h("div",null,"")
         ),
-        filtered.map((p,i)=>h("div",{key:p.id,onClick:()=>openProject(p),style:{display:"grid",gridTemplateColumns:"2fr 1.4fr 1.4fr 1fr 1fr 1fr",padding:"10px 14px",cursor:"pointer",background:i%2===0?"#fff":"#e6f1fb",fontSize:12.5,borderTop:"1px solid "+colors.border,alignItems:"center"}},
+        filtered.map((p,i)=>h("div",{key:p.id,onClick:()=>openProject(p),style:{display:"grid",gridTemplateColumns:"2fr 1.4fr 1.4fr 1fr 1fr 1fr 0.7fr",padding:"10px 14px",cursor:"pointer",background:i%2===0?"#fff":"#e6f1fb",fontSize:12.5,borderTop:"1px solid "+colors.border,alignItems:"center"}},
           h("div",{style:{fontWeight:600}},p.project_name),
           h("div",null,p.end_user_company_name),
-          h("div",null,p.main_epc_company_name),
+          h("div",null,p.main_epc_company_name||"—"),
           h("div",null,p.project_stage||"—"),
           h("div",null,p.estimated_value?fmt(p.estimated_value):"—"),
-          h("div",null,p.primary_sales_rep||"—")
+          h("div",null,p.primary_sales_rep||"—"),
+          h("div",{style:{display:"flex",gap:4,justifyContent:"flex-end"},onClick:e=>e.stopPropagation()},
+            h("button",{onClick:()=>{setEditingProject(p);setShowProjectForm(true);},style:{...btnSmall,fontSize:11,padding:"3px 8px"}},"Edit"),
+            h("button",{onClick:()=>deleteProject(p),style:{...btnSmall,fontSize:11,padding:"3px 8px",color:colors.danger,borderColor:colors.danger}},"Delete")
+          )
         ))
       )
     ),
@@ -18807,15 +18801,19 @@ function ProjectPackagesSubform({ project, user, onOpenQuote }){
   const [packageNameOptions,setPackageNameOptions] = useState([]);
   const [salesRepOptions,setSalesRepOptions] = useState([]);
   const [showCheckbox,setShowCheckbox] = useState(false);
+  // Cart layout (23 Aug SOP — "similar to the Sl No cart in quotes"):
+  // left sidebar lists every Package awarded to this Project, right panel
+  // is the selected Package's full detail. Selection defaults to the
+  // first row once loaded and follows along as rows change.
+  const [selectedId,setSelectedId] = useState(null);
 
   const refreshPackageNames = ()=> sb.from("package_name_tbl").select("value").order("value").then(({data})=>setPackageNameOptions((data||[]).map(r=>r.value)));
 
-  // Customer/Enquiry data per package is fetched by PackageAllocationsSection
-  // itself, nested inline under each row below — no longer duplicated here.
   const load = useCallback(async()=>{
     setLoading(true);
     const { data } = await sb.from("major_project_package_tbl").select("*").eq("project_id",project.id).order("created_at");
     setRows(data||[]);
+    setSelectedId(prev => (data||[]).some(r=>r.id===prev) ? prev : ((data||[])[0]?.id ?? null));
     setLoading(false);
   },[project.id]);
   useEffect(()=>{ load(); },[load]);
@@ -18830,36 +18828,80 @@ function ProjectPackagesSubform({ project, user, onOpenQuote }){
     await sb.from("major_project_package_tbl").update({...patch,updated_at:new Date().toISOString()}).eq("id",row.id);
   };
 
-  const addRow = async()=>{
-    const { data, error } = await sb.from("major_project_package_tbl").insert({project_id:project.id, package_name:"", package_status:"Unknown", sales_rep:project.primary_sales_rep||"", created_by:user?.username||"unknown"}).select().single();
-    if(error){ alert("Couldn't add row: "+error.message); return; }
-    setRows(rs=>[...rs,data]);
-  };
+  const selected = rows.find(r=>r.id===selectedId);
+  const field = (label,key,type)=> h("div",null,
+    h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},label),
+    h("input",{type:type||"text",value:selected[key]||"",onChange:e=>updateRow(selected,{[key]:e.target.value||null}),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%"}})
+  );
 
   return h("div",{style:{marginBottom:14,borderTop:"1px solid "+colors.border,paddingTop:12}},
-    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
-      h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted}},"PACKAGES"),
-      h("button",{onClick:()=>setShowCheckbox(true),style:{...btnSmall,fontSize:11}},"+ Award packages")
-    ),
+    h("div",{style:{fontSize:10.5,fontWeight:700,color:colors.muted,marginBottom:6}},"PACKAGES"),
     loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
-    h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,maxHeight:360,overflowY:"auto"}},
-      rows.length===0 && h("div",{style:{padding:"10px 8px",fontSize:11.5,color:colors.mutedLight}},"No packages awarded yet."),
-      rows.map(row=>h("div",{key:row.id,style:{borderTop:"1px solid "+colors.border,padding:"8px 10px"}},
-        h("div",{style:{display:"grid",gridTemplateColumns:"1.6fr 1fr",gap:6,alignItems:"center",marginBottom:6}},
-          h(MasterSelect,{value:row.package_name,onChange:v=>updateRow(row,{package_name:v}),options:packageNameOptions,table:"package_name_tbl",valueCol:"value",fieldLabel:"Package name",placeholder:"Select or add…",style:{padding:"5px 7px",fontSize:11.5,fontWeight:600},refreshOptions:refreshPackageNames}),
-          h("select",{value:row.package_status,onChange:e=>updateRow(row,{package_status:e.target.value}),style:{padding:"5px 7px",fontSize:11.5,border:"1px solid "+colors.border,borderRadius:5}},
-            statuses.map(s=>h("option",{key:s,value:s},s))
+    h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:8,overflow:"hidden",maxHeight:560}},
+
+      h("div",{style:{width:210,borderRight:"1px solid "+colors.border,overflowY:"auto",background:"#fff",flexShrink:0}},
+        h("div",{style:{padding:"9px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+          h("span",{style:{fontSize:10.5,fontWeight:700,color:colors.muted}},"PACKAGES"),
+          h("button",{onClick:()=>setShowCheckbox(true),style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"+ Award")
+        ),
+        rows.length===0 && h("div",{style:{padding:"12px 11px",fontSize:11.5,color:colors.mutedLight}},"No packages awarded yet."),
+        rows.map(row=>h("div",{
+          key:row.id, onClick:()=>setSelectedId(row.id),
+          style:{padding:"9px 11px",borderTop:"1px solid "+colors.border,cursor:"pointer",background:row.id===selectedId?"#e6f1fb":"#fff",borderLeft:row.id===selectedId?"3px solid "+colors.accent:"3px solid transparent"}
+        },
+          h("div",{style:{fontSize:12.5,fontWeight:600}},row.package_name||"(unnamed)"),
+          h("div",{style:{fontSize:10.5,color:colors.muted,marginTop:2}},row.package_status||"Unknown")
+        ))
+      ),
+
+      h("div",{style:{flex:1,padding:"14px 16px",overflowY:"auto"}},
+        !selected ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Award a package to get started.") :
+        h(React.Fragment,null,
+          h(MasterSelect,{value:selected.package_name,onChange:v=>updateRow(selected,{package_name:v}),options:packageNameOptions,table:"package_name_tbl",valueCol:"value",fieldLabel:"Package name",placeholder:"Package name",style:{padding:"7px 9px",fontSize:13,fontWeight:600,width:"100%",marginBottom:8},refreshOptions:refreshPackageNames}),
+          h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}},
+            h("div",null,
+              h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Status"),
+              h("select",{value:selected.package_status,onChange:e=>updateRow(selected,{package_status:e.target.value}),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%"}},
+                statuses.map(s=>h("option",{key:s,value:s},s))
+              )
+            ),
+            h("div",null,
+              h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Sales rep"),
+              h(LimitToListCombo,{value:selected.sales_rep||"",onChange:v=>updateRow(selected,{sales_rep:v}),options:salesRepOptions,limitToList:false,placeholder:"Sales rep",style:{padding:"6px 8px",fontSize:12,width:"100%"}})
+            )
+          ),
+          h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}},
+            field("Next follow-up","next_followup_date","date"),
+            field("Est. value","estimated_value"),
+            field("Product type","product_type")
+          ),
+          h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}},
+            field("Size","size"), field("Rating","rating"), field("Material","material")
+          ),
+          h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}},
+            field("Quantity","quantity"), field("Service","service")
+          ),
+          h("div",{style:{marginBottom:8}},
+            h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Technical spec"),
+            h("textarea",{value:selected.technical_spec||"",onChange:e=>updateRow(selected,{technical_spec:e.target.value||null}),rows:2,style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%",resize:"vertical"}})
+          ),
+          h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}},
+            field("RFQ expected","rfq_expected_date","date"), field("Competitor","competitor")
+          ),
+          h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}},
+            field("Vendor list status","vendor_list_status"), field("Next action","next_action")
+          ),
+          h("div",{style:{marginBottom:16}},
+            h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Notes"),
+            h("textarea",{value:selected.notes||"",onChange:e=>updateRow(selected,{notes:e.target.value||null}),rows:2,style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%",resize:"vertical"}})
+          ),
+
+          h(PackageAllocationsSection,{pkg:selected, project, user, onOpenQuote}),
+          h("div",{style:{marginTop:16,paddingTop:12,borderTop:"1px solid "+colors.border}},
+            h(PackageContactsSection,{pkg:selected, project, user})
           )
-        ),
-        h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,alignItems:"center",marginBottom:6}},
-          h(LimitToListCombo,{value:row.sales_rep||"",onChange:v=>updateRow(row,{sales_rep:v}),options:salesRepOptions,limitToList:false,placeholder:"Sales rep",style:{padding:"5px 7px",fontSize:11.5}}),
-          h("input",{type:"date",value:row.next_followup_date||"",onChange:e=>updateRow(row,{next_followup_date:e.target.value||null}),style:{padding:"5px 7px",fontSize:11.5,border:"1px solid "+colors.border,borderRadius:5}})
-        ),
-        row.package_name && h("div",{style:{paddingLeft:14,borderLeft:"2px solid #f0eee6"}},
-          h(PackageAllocationsSection,{pkg:row, project, user, onOpenQuote})
         )
-      )),
-      h("div",{onClick:addRow,style:{padding:"6px 8px",borderTop:"1px solid "+colors.border,cursor:"pointer",fontSize:11.5,color:colors.mutedLight}},"+ add package row")
+      )
     ),
     showCheckbox && h(PackageCheckboxModal,{
       project, user, existingPackageNames: rows.map(r=>r.package_name).filter(Boolean),
@@ -18868,7 +18910,6 @@ function ProjectPackagesSubform({ project, user, onOpenQuote }){
     })
   );
 }
-
 function MajorProjectFormModal({ initial, onCancel, onSaved, user, onOpenQuote }){
   const [f,setF] = useState(initial || {
     project_name:"", end_user_company_name:"", main_epc_company_name:"", location:"",
@@ -18907,10 +18948,11 @@ function MajorProjectFormModal({ initial, onCancel, onSaved, user, onOpenQuote }
   const save = async()=>{
     if(!f.project_name.trim()){ alert("Project name is required."); return; }
     if(!f.end_user_company_name.trim()){ alert("End user is required."); return; }
-    // Main EPC deliberately optional (23 Aug SOP) — a Project is often
-    // raw intelligence at first (Project name + End User only), with the
-    // EPC discovered and filled in later once chased down.
-    if(!f.primary_sales_rep){ alert("Primary sales rep is required — accept the suggestion or pick one."); return; }
+    // Main EPC and Primary sales rep both deliberately optional (23 Aug
+    // SOP) — a Project is often raw intelligence at first (Project name +
+    // End User only). EPC gets filled in once chased down; ownership can
+    // be assigned later from this screen, any of the entity-wise lookup
+    // screens, or the future FSE/Telecaller intake screen.
     setSaving(true);
     try{
       const payload = {...f, estimated_value: f.estimated_value?Number(f.estimated_value):null, epc_award_date: f.epc_award_date||null, expected_completion: f.expected_completion||null};
