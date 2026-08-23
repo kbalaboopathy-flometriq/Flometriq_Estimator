@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-23T11:50:43Z";
+  var APP_BUILD_VERSION = "2026-08-23T12:29:55Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1207,7 +1207,6 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Major Projects", tabs:[
         {key:"major_projects",label:"Projects"},
         {key:"major_projects_overview",label:"Overview"},
-        {key:"major_projects_summary",label:"Summarised Column View"},
         {key:"major_projects_kanban",label:"Package Board"},
         {key:"major_projects_bulk_import",label:"Bulk Import"},
       ]},
@@ -18545,6 +18544,12 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
   // the entity-wise lookup screens (23 Aug SOP) — set only when arriving
   // that way, cleared on any normal "All projects" navigation.
   const [returnTo,setReturnTo] = useState(null); // {type,value} or null
+  // Collapsed (plain table, default) vs Detailed (stacked End user/EPC/
+  // Package/Customer per project) — a toggle on this same screen, not a
+  // separate tab (23 Aug SOP). Persists across a round trip into a
+  // Project's own screen and back, since this state isn't touched by
+  // openProject/backToList.
+  const [listMode,setListMode] = useState("collapsed"); // "collapsed" | "detailed"
 
   const loadProjects = useCallback(async()=>{
     setLoading(true);
@@ -18561,7 +18566,7 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
     setLoadingPackages(false);
   },[]);
 
-  const openProject = (p)=>{ setSelectedProject(p); setView("detail"); loadPackages(p.id); setReturnTo(null); };
+  const openProject = (p,fromDetailedView)=>{ setSelectedProject(p); setView("detail"); loadPackages(p.id); setReturnTo(fromDetailedView?{type:"list"}:null); };
   const backToList = ()=>{ setView("list"); setSelectedProject(null); setPackages([]); setReturnTo(null); loadProjects(); };
 
   // Consume a deep-link target once — open that exact project directly
@@ -18590,8 +18595,8 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16,flexWrap:"wrap",gap:10}},
           h("div",null,
             returnTo
-              ? h("button",{onClick:()=>onGoTo(returnTo.type,returnTo.value),style:{...btnSmall,marginBottom:8}},
-                  returnTo.type==="summary" ? "← Back to Summarised Column View" :
+              ? h("button",{onClick:()=>returnTo.type==="list"?backToList():onGoTo(returnTo.type,returnTo.value),style:{...btnSmall,marginBottom:8}},
+                  returnTo.type==="list" ? "← Back to Major Projects" :
                   "← Back to "+({end_user:"End user",epc:"EPC",package:"Package",customer:"Customer"}[returnTo.type]||"")+": "+returnTo.value
                 )
               : h("button",{onClick:backToList,style:{...btnSmall,marginBottom:8}},"← All projects"),
@@ -18644,12 +18649,21 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
     h("div",{style:{padding:"20px 24px"}},
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}},
         h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Major Projects"),
-        h("div",{style:{display:"flex",gap:8}},
-          h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search project, end user, EPC…",style:{...inputStyle,width:260}}),
+        h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+          h("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search project, end user, EPC…",style:{...inputStyle,width:220}}),
+          h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+            h("button",{onClick:()=>setListMode("collapsed"),style:{fontSize:12,padding:"7px 12px",border:"none",cursor:"pointer",background:listMode==="collapsed"?colors.dark:"#fff",color:listMode==="collapsed"?"#fff":colors.muted}},"Collapsed view"),
+            h("button",{onClick:()=>setListMode("detailed"),style:{fontSize:12,padding:"7px 12px",border:"none",cursor:"pointer",background:listMode==="detailed"?colors.dark:"#fff",color:listMode==="detailed"?"#fff":colors.muted}},"Detailed view")
+          ),
           h("button",{onClick:loadProjects,style:btnSecondary},"Refresh"),
           h("button",{onClick:()=>{setEditingProject(null);setShowProjectForm(true);},style:{...btnPrimary,fontWeight:600}},"+ New Project")
         )
       ),
+      listMode==="detailed" ? h(MajorProjectsDetailedView,{
+        user, projects: filtered,
+        onOpenProject: (p,fromDetailedView)=>openProject(p,fromDetailedView),
+        onEditProject: (p)=>{setEditingProject(p);setShowProjectForm(true);}
+      }) :
       loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
       filtered.length===0 ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"No projects yet — click + New Project to add the first one (any major EPC account: Aramco, IOCL, BPCL, SABIC, HPCL, DEWA, or others).") :
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
@@ -19984,7 +19998,6 @@ function EntityLookupScreen({ user, entityType, preselect, onGoTo, returnTo }){
   relevantPairs.forEach(({project,pkg})=>{ if(!byProject[project.id]) byProject[project.id]=[]; byProject[project.id].push(pkg); });
 
   return h("div",{style:{padding:20,maxWidth:820}},
-    returnTo && returnTo.type==="summary" && h("button",{onClick:()=>onGoTo("summary",null),style:{...btnSmall,marginBottom:10}},"← Back to Summarised Column View"),
     h("h2",{style:{margin:0}},labelFor+(selected?" — "+selected:"")),
     h("select",{value:selected,onChange:e=>setSelected(e.target.value),style:{...inputStyle,width:280,margin:"10px 0 14px"}},
       distinctValues.map(v=>h("option",{key:v,value:v},v))
@@ -20153,67 +20166,167 @@ function MajorProjectsFlatOverview({ user, onOpenQuote }){
 // layout screen already built (Project detail, or the EPC-wise lookup
 // screen), each carrying a "Back to Summarised Column View" button so
 // the round trip is genuine, not a dead end.
-function MajorProjectsSummarisedColumnView({ user, onGoTo }){
+// Detailed view (23 Aug SOP, revised) — every Project as its own
+// permanently-stacked block (not click-to-select cascading): End user /
+// EPC / Package / Customer. This is the "Detailed view" half of the
+// Collapsed/Detailed toggle inside MajorProjectsScreen's list, not a
+// separate screen/tab anymore. Package badges its EPC, Customer badges
+// its Package AND its allocation status. End user and EPC are real
+// editable combos (companies table); Package and Customer items and
+// their "+" buttons navigate into that Project's own cart screen via
+// onOpenProject, reusing all the real add/edit logic already built
+// there rather than duplicating it here. EPC's "+" opens the Project
+// edit form directly (there's only ever one EPC per Project, so "+"
+// here really means "set/change it"), via onEditProject.
+// Known gap, not resolved as of 23 Aug: Customer/Allocation has no
+// "owner" column in the schema, so unlike the other three levels,
+// Customer rows don't get an Owner field here — nothing to bind it to.
+function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProject }){
   const [loading,setLoading] = useState(true);
-  const [projects,setProjects] = useState([]);
   const [packages,setPackages] = useState([]);
   const [allocations,setAllocations] = useState([]);
+  const [salesRepOptions,setSalesRepOptions] = useState([]);
+  const [fProject,setFProject] = useState("");
+  const [fEndUser,setFEndUser] = useState("");
+  const [fEpc,setFEpc] = useState("");
+  const [fPackage,setFPackage] = useState("");
+  const [fCustomer,setFCustomer] = useState("");
 
   const load = useCallback(async()=>{
     setLoading(true);
-    const { data: projRows } = await sb.from("major_project_tbl").select("*").order("project_name");
-    setProjects(projRows||[]);
-    const projectIds = (projRows||[]).map(p=>p.id);
+    const projectIds = projects.map(p=>p.id);
     const { data: pkgRows } = projectIds.length ? await sb.from("major_project_package_tbl").select("*").in("project_id",projectIds).order("package_name") : {data:[]};
     setPackages(pkgRows||[]);
     const packageIds = (pkgRows||[]).map(p=>p.id);
     const { data: allocRows } = packageIds.length ? await sb.from("package_customer_allocation_tbl").select("*").in("package_id",packageIds).order("company_name") : {data:[]};
     setAllocations(allocRows||[]);
     setLoading(false);
-  },[]);
+  },[projects]);
   useEffect(()=>{ load(); },[load]);
+  useEffect(()=>{
+    sb.from("employee_tbl").select("employee_name").neq("status","Inactive").order("employee_name").then(({data})=>setSalesRepOptions((data||[]).map(r=>r.employee_name)));
+  },[]);
 
-  const projById = new Map(projects.map(p=>[p.id,p]));
-  const pkgById = new Map(packages.map(p=>[p.id,p]));
-  const epcNames = Array.from(new Set(projects.map(p=>p.main_epc_company_name).filter(Boolean))).sort();
-  const endUserNames = Array.from(new Set(projects.map(p=>p.end_user_company_name).filter(Boolean))).sort();
+  const updateProject = async(proj,patch)=>{
+    await sb.from("major_project_tbl").update({...patch}).eq("id",proj.id);
+    proj[Object.keys(patch)[0]] = Object.values(patch)[0]; // optimistic, local only — real refresh happens on next load from the parent
+  };
+  const updatePackage = async(pkg,patch)=>{
+    setPackages(rows=>rows.map(r=>r.id===pkg.id?{...r,...patch}:r));
+    await sb.from("major_project_package_tbl").update({...patch,updated_at:new Date().toISOString()}).eq("id",pkg.id);
+  };
 
-  const col = (title, items)=> h("div",{style:{flex:1,minWidth:0,borderRight:"1px solid "+colors.border,overflowY:"auto"}},
-    h("div",{style:{padding:"9px 11px",borderBottom:"1px solid "+colors.border,fontSize:11,fontWeight:600,color:colors.muted}},title),
-    items.length===0 ? h("div",{style:{padding:"12px 11px",fontSize:11.5,color:colors.mutedLight}},"None yet.") : items
-  );
-  const item = (name, badgeText, badgeKind, onClick)=> h("div",{
-    onClick, style:{padding:"9px 11px",borderBottom:"1px solid "+colors.border,cursor:onClick?"pointer":"default"}
-  },
-    h("div",{style:{fontSize:12.5,fontWeight:600,color:onClick?colors.accent:colors.text}},name),
-    badgeText && h("span",{style:{fontSize:10.5,padding:"1px 7px",borderRadius:10,marginTop:3,display:"inline-block",
-      background: badgeKind==="parent"?"#f4f2ea":"#e6f1fb", color: badgeKind==="parent"?colors.muted:"#0c447c"}},badgeText)
-  );
+  const pkgsByProject = new Map();
+  packages.forEach(pk=>{ if(!pkgsByProject.has(pk.project_id)) pkgsByProject.set(pk.project_id,[]); pkgsByProject.get(pk.project_id).push(pk); });
+  const allocsByPackage = new Map();
+  allocations.forEach(a=>{ if(!allocsByPackage.has(a.package_id)) allocsByPackage.set(a.package_id,[]); allocsByPackage.get(a.package_id).push(a); });
 
-  const openProject = (projectId)=> onGoTo("__open_project__",{projectId, returnTo:{type:"summary"}});
+  // Multi-field AND filter — a blank filter field means "all" for that dimension.
+  const visibleProjects = projects.filter(proj=>{
+    if(fProject && proj.project_name!==fProject) return false;
+    if(fEndUser && proj.end_user_company_name!==fEndUser) return false;
+    if(fEpc && proj.main_epc_company_name!==fEpc) return false;
+    const pkgs = pkgsByProject.get(proj.id) || [];
+    if(fPackage && !pkgs.some(pk=>pk.package_name===fPackage)) return false;
+    if(fCustomer){
+      const hasCustomer = pkgs.some(pk=>(allocsByPackage.get(pk.id)||[]).some(a=>a.company_name===fCustomer));
+      if(!hasCustomer) return false;
+    }
+    return true;
+  });
 
-  return h("div",{style:{padding:20}},
-    h("h2",{style:{marginTop:0}},"Summarised Column View"),
-    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},"Every Project, EPC, Package and Customer as four lists — click any item to open its full screen."),
+  const endUserOptions = Array.from(new Set(projects.map(p=>p.end_user_company_name).filter(Boolean))).sort();
+  const epcOptions = Array.from(new Set(projects.map(p=>p.main_epc_company_name).filter(Boolean))).sort();
+  const packageOptions = Array.from(new Set(packages.map(p=>p.package_name).filter(Boolean))).sort();
+  const customerOptions = Array.from(new Set(allocations.map(a=>a.company_name).filter(Boolean))).sort();
+
+  const statusBadgeStyle = (status)=>{
+    if(status==="To find out") return {background:"#fdecea",color:"#a3312a"};
+    if(status==="Order Lost") return {background:"#f4f2ea",color:colors.muted};
+    if(status==="PO Received") return {background:"#eaf9f4",color:"#085041"};
+    return {background:"#fff4d6",color:"#854f0b"};
+  };
+
+  return h("div",null,
+    h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16,padding:"10px 12px",border:"1px solid "+colors.border,borderRadius:8}},
+      h("select",{value:fProject,onChange:e=>setFProject(e.target.value),style:{fontSize:11.5,flex:1,minWidth:120}},
+        h("option",{value:""},"All projects"), projects.map(p=>h("option",{key:p.id,value:p.project_name},p.project_name))
+      ),
+      h("select",{value:fEndUser,onChange:e=>setFEndUser(e.target.value),style:{fontSize:11.5,flex:1,minWidth:120}},
+        h("option",{value:""},"All end users"), endUserOptions.map(v=>h("option",{key:v,value:v},v))
+      ),
+      h("select",{value:fEpc,onChange:e=>setFEpc(e.target.value),style:{fontSize:11.5,flex:1,minWidth:120}},
+        h("option",{value:""},"All EPCs"), epcOptions.map(v=>h("option",{key:v,value:v},v))
+      ),
+      h("select",{value:fPackage,onChange:e=>setFPackage(e.target.value),style:{fontSize:11.5,flex:1,minWidth:120}},
+        h("option",{value:""},"All packages"), packageOptions.map(v=>h("option",{key:v,value:v},v))
+      ),
+      h("select",{value:fCustomer,onChange:e=>setFCustomer(e.target.value),style:{fontSize:11.5,flex:1,minWidth:120}},
+        h("option",{value:""},"All customers"), customerOptions.map(v=>h("option",{key:v,value:v},v))
+      )
+    ),
     loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
-    h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:8,overflow:"hidden",maxHeight:520,background:"#fff"}},
-      col("Project", projects.map(p=> item(p.project_name, null, null, ()=>openProject(p.id)))),
-      col("End user", endUserNames.map(name=> item(name, null, null, ()=>onGoTo("end_user",name,{type:"summary"})))),
-      col("EPC", epcNames.map(name=> item(name, null, null, ()=>onGoTo("epc",name,{type:"summary"})))),
-      col("Package", packages.map(pk=>{
-        const proj = projById.get(pk.project_id);
-        return item(pk.package_name, proj?.main_epc_company_name||"—", "parent", ()=>openProject(pk.project_id));
-      })),
-      col("Customer", allocations.map(a=>{
-        const pk = pkgById.get(a.package_id);
-        return item(a.company_name, pk?.package_name||"—", "child", pk?()=>openProject(pk.project_id):null);
-      }))
-    )
+    visibleProjects.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"No projects match these filters.") :
+    visibleProjects.map(proj=>{
+      const pkgs = pkgsByProject.get(proj.id) || [];
+      const allCustomers = pkgs.flatMap(pk=>(allocsByPackage.get(pk.id)||[]).map(a=>({...a,pkgName:pk.package_name})));
+      return h("div",{key:proj.id,style:{marginBottom:22}},
+        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:6}},proj.project_name),
+        h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:8,overflow:"hidden",background:"#fff"}},
+
+          h("div",{style:{flex:1,minWidth:0,borderRight:"1px solid "+colors.border}},
+            h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,fontSize:11,fontWeight:600,color:colors.muted}},"End user"),
+            h("div",{style:{padding:"9px 11px"}},
+              h(CustomerSelect,{value:proj.end_user_company_name,user,onSelect:(p)=>updateProject(proj,{end_user_company_name:p.company_name})}),
+              h(LimitToListCombo,{value:proj.primary_sales_rep||"",onChange:v=>updateProject(proj,{primary_sales_rep:v}),options:salesRepOptions,limitToList:false,placeholder:"Owner",style:{fontSize:10.5,width:"100%",padding:"3px 6px",marginTop:6}})
+            )
+          ),
+
+          h("div",{style:{flex:1,minWidth:0,borderRight:"1px solid "+colors.border}},
+            h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+              h("span",{style:{fontSize:11,fontWeight:600,color:colors.muted}},"EPC"),
+              h("button",{onClick:()=>onEditProject(proj),title:"Opens the project form",style:{...btnSmall,fontSize:10,padding:"2px 7px"}},"+")
+            ),
+            h("div",{style:{padding:"9px 11px"}},
+              h(CustomerSelect,{value:proj.main_epc_company_name,user,onSelect:(p)=>updateProject(proj,{main_epc_company_name:p.company_name})}),
+              h(LimitToListCombo,{value:proj.epc_owner||"",onChange:v=>updateProject(proj,{epc_owner:v}),options:salesRepOptions,limitToList:false,placeholder:"Owner",style:{fontSize:10.5,width:"100%",padding:"3px 6px",marginTop:6}})
+            )
+          ),
+
+          h("div",{style:{flex:1,minWidth:0,borderRight:"1px solid "+colors.border,overflowY:"auto"}},
+            h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+              h("span",{style:{fontSize:11,fontWeight:600,color:colors.muted}},"Package"),
+              h("button",{onClick:()=>onOpenProject(proj,true),title:"Opens the project screen",style:{...btnSmall,fontSize:10,padding:"2px 7px"}},"+")
+            ),
+            pkgs.length===0 ? h("div",{style:{padding:"12px 11px",fontSize:11.5,color:colors.mutedLight}},"None yet.") :
+            pkgs.map(pk=>h("div",{key:pk.id,style:{padding:"9px 11px",borderBottom:"1px solid #f0eee6"}},
+              h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12.5,fontWeight:600,color:colors.accent,cursor:"pointer"}},pk.package_name),
+              h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:10,display:"inline-block",marginTop:3,...statusBadgeStyle(pk.package_status)}},pk.package_status||"Unknown"),
+              h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:10,display:"inline-block",marginTop:3,marginLeft:4,background:"#f4f2ea",color:colors.muted}},proj.main_epc_company_name||"—")
+            ))
+          ),
+
+          h("div",{style:{flex:1,minWidth:0,overflowY:"auto"}},
+            h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+              h("span",{style:{fontSize:11,fontWeight:600,color:colors.muted}},"Customer"),
+              h("button",{onClick:()=>onOpenProject(proj,true),title:"Opens the project screen",style:{...btnSmall,fontSize:10,padding:"2px 7px"}},"+")
+            ),
+            allCustomers.length===0 ? h("div",{style:{padding:"12px 11px",fontSize:11.5,color:colors.mutedLight}},"None yet.") :
+            allCustomers.map((a,i)=>h("div",{key:a.id||i,style:{padding:"9px 11px",borderBottom:"1px solid #f0eee6"}},
+              h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12.5,fontWeight:600,color:colors.accent,cursor:"pointer"}},a.company_name),
+              h("div",{style:{display:"flex",gap:4,flexWrap:"wrap",marginTop:3}},
+                h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:10,background:"#e6f1fb",color:"#0c447c"}},a.pkgName),
+                h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:10,...statusBadgeStyle(a.allocation_status)}},a.allocation_status||"Unknown")
+              )
+            ))
+          )
+        )
+      );
+    })
   );
 }
 
 function GapsChaseDashboard({ user }){
-  const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
   const [myEmployeeName,setMyEmployeeName] = useState(null);
   useEffect(()=>{
     if(isAdminOrAbove) return;
@@ -25206,7 +25319,7 @@ function App() {
     if(type==="__project_list__"){ setTab("major_projects"); return; } // no dedicated Project-wise screen — the existing Projects list already shows this, just not deep-linked to one row yet
     if(type==="__open_quote__"){ setQuoteToOpen({reference_number:value.ref,item_sl_no:value.slNo}); setTab("saved"); return; }
     if(type==="__open_project__"){ setProjectDeepLink(value); setTab("major_projects"); return; }
-    if(type==="summary"){ setTab("major_projects_summary"); return; }
+    if(type==="summary"){ setTab("major_projects"); return; } // Summarised Column View is now the Detailed-view toggle on the Projects tab itself, not a separate destination
     setEntityLookupPreselect({type,value}); setEntityReturnTo(returnTo||null); setTab("lookup_"+type);
   };
   const [openModelTarget,setOpenModelTarget]=useState(null); // model string bridge from BOM Coverage's "Open BOM" button to Estimator
@@ -25331,7 +25444,6 @@ function App() {
     tab==="major_projects_overview"?h(MajorProjectsFlatOverview,{user,
       onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}
     }):
-    tab==="major_projects_summary"?h(MajorProjectsSummarisedColumnView,{user,onGoTo:goToEntityLookup}):
     tab==="major_projects_kanban"?h(MajorProjectPackageKanban,{user}):
     tab==="major_projects_bulk_import"?h(MajorProjectsBulkImport,{user}):
     tab==="lookup_end_user"?h(EntityLookupScreen,{user,entityType:"end_user",preselect:entityLookupPreselect,onGoTo:goToEntityLookup,returnTo:entityReturnTo}):
