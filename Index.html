@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-23T03:47:03Z";
+  var APP_BUILD_VERSION = "2026-08-23T06:59:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -18529,7 +18529,7 @@ function StatusChangeHistoryReport(){
 // SABIC, HPCL, DEWA, or any future account.
 // ============================================================
 
-function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote }){
+function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, deepLinkTarget, onDeepLinkConsumed, onGoTo }){
   const [view,setView] = useState("list"); // "list" | "detail" | "package_detail"
   const [projects,setProjects] = useState([]);
   const [loading,setLoading] = useState(true);
@@ -18542,6 +18542,10 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote })
   const [showPackageForm,setShowPackageForm] = useState(false);
   const [editingPackage,setEditingPackage] = useState(null);
   const [selectedPackage,setSelectedPackage] = useState(null); // package row currently drilled into
+  // Where "Back" should return to, once opened via a deep-link from one of
+  // the entity-wise lookup screens (23 Aug SOP) — set only when arriving
+  // that way, cleared on any normal "All projects" navigation.
+  const [returnTo,setReturnTo] = useState(null); // {type,value} or null
 
   const loadProjects = useCallback(async()=>{
     setLoading(true);
@@ -18558,10 +18562,22 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote })
     setLoadingPackages(false);
   },[]);
 
-  const openProject = (p)=>{ setSelectedProject(p); setView("detail"); loadPackages(p.id); };
-  const backToList = ()=>{ setView("list"); setSelectedProject(null); setPackages([]); loadProjects(); };
+  const openProject = (p)=>{ setSelectedProject(p); setView("detail"); loadPackages(p.id); setReturnTo(null); };
+  const backToList = ()=>{ setView("list"); setSelectedProject(null); setPackages([]); setReturnTo(null); loadProjects(); };
   const openPackageDetail = (pkg)=>{ setSelectedPackage(pkg); setView("package_detail"); };
   const backToPackageList = ()=>{ setView("detail"); setSelectedPackage(null); loadPackages(selectedProject.id); };
+
+  // Consume a deep-link target once — open that exact project directly
+  // and remember where to send "Back" instead of "All projects".
+  useEffect(()=>{
+    if(!deepLinkTarget) return;
+    (async()=>{
+      const { data } = await sb.from("major_project_tbl").select("*").eq("id",deepLinkTarget.projectId).maybeSingle();
+      if(data){ setSelectedProject(data); setView("detail"); loadPackages(data.id); setReturnTo(deepLinkTarget.returnTo||null); }
+      onDeepLinkConsumed();
+    })();
+  },[deepLinkTarget]);
+
 
   const filtered = projects.filter(p=>{
     const q = search.trim().toLowerCase();
@@ -18592,7 +18608,9 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote })
       h("div",{style:{padding:"20px 24px"}},
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16,flexWrap:"wrap",gap:10}},
           h("div",null,
-            h("button",{onClick:backToList,style:{...btnSmall,marginBottom:8}},"← All projects"),
+            returnTo
+              ? h("button",{onClick:()=>onGoTo(returnTo.type,returnTo.value),style:{...btnSmall,marginBottom:8}},"← Back to "+({end_user:"End user",epc:"EPC",package:"Package",customer:"Customer"}[returnTo.type]||"")+": "+returnTo.value)
+              : h("button",{onClick:backToList,style:{...btnSmall,marginBottom:8}},"← All projects"),
             h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},selectedProject.project_name),
             h("div",{style:{fontSize:12.5,color:colors.muted,marginTop:4}},
               selectedProject.end_user_company_name+" · EPC: "+selectedProject.main_epc_company_name
@@ -18618,36 +18636,12 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote })
             h("div",{style:{fontSize:13,fontWeight:700}},selectedProject.location||"—")
           )
         ),
-        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
-          h("h3",{style:{margin:0,fontSize:14,fontWeight:700}},"Packages"),
-          h("button",{onClick:()=>{setEditingPackage(null);setShowPackageForm(true);},style:btnPrimary},"+ Add package")
-        ),
-        loadingPackages ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
-        packages.length===0 ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"No packages yet. Add one, then allocate customers to it.") :
-        h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
-          packages.map(pkg=>h("div",{key:pkg.id,onClick:()=>openPackageDetail(pkg),style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"12px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
-            h("div",null,
-              h("div",{style:{fontWeight:700,fontSize:13}},pkg.package_name),
-              h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},
-                "Sales rep: "+(pkg.sales_rep||"—")
-              )
-            ),
-            h("div",{style:{display:"flex",alignItems:"center",gap:10}},
-              pkg.next_followup_date && h("div",{style:{fontSize:11,color:colors.mutedLight}},"Next: "+pkg.next_followup_date),
-              h("span",{style:{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,background:"#eaf2fb",color:"#0c447c"}},pkg.package_status)
-            )
-          ))
-        )
+        h(ProjectPackagesSubform,{project:selectedProject, user, onOpenQuote})
       ),
       showProjectForm && h(MajorProjectFormModal,{
         initial:editingProject, user, onOpenQuote,
         onCancel:()=>{setShowProjectForm(false);setEditingProject(null);},
         onSaved:(saved)=>{ setShowProjectForm(false); setEditingProject(null); setSelectedProject(saved); loadProjects(); }
-      }),
-      showPackageForm && h(MajorProjectPackageFormModal,{
-        project:selectedProject, initial:editingPackage, user,
-        onCancel:()=>{setShowPackageForm(false);setEditingPackage(null);},
-        onSaved:()=>{ setShowPackageForm(false); setEditingPackage(null); loadPackages(selectedProject.id); }
       })
     );
   }
@@ -18811,6 +18805,7 @@ function ProjectPackagesSubform({ project, user, onOpenQuote }){
   const [loading,setLoading] = useState(true);
   const [statuses,setStatuses] = useState([]);
   const [packageNameOptions,setPackageNameOptions] = useState([]);
+  const [salesRepOptions,setSalesRepOptions] = useState([]);
   const [showCheckbox,setShowCheckbox] = useState(false);
 
   const refreshPackageNames = ()=> sb.from("package_name_tbl").select("value").order("value").then(({data})=>setPackageNameOptions((data||[]).map(r=>r.value)));
@@ -18827,6 +18822,7 @@ function ProjectPackagesSubform({ project, user, onOpenQuote }){
   useEffect(()=>{
     sb.from("major_project_package_status_tbl").select("status").order("sort_order").then(({data})=>setStatuses((data||[]).map(r=>r.status)));
     refreshPackageNames();
+    sb.from("employee_tbl").select("employee_name").neq("status","Inactive").order("employee_name").then(({data})=>setSalesRepOptions((data||[]).map(r=>r.employee_name)));
   },[]);
 
   const updateRow = async(row,patch)=>{
@@ -18854,6 +18850,10 @@ function ProjectPackagesSubform({ project, user, onOpenQuote }){
           h("select",{value:row.package_status,onChange:e=>updateRow(row,{package_status:e.target.value}),style:{padding:"5px 7px",fontSize:11.5,border:"1px solid "+colors.border,borderRadius:5}},
             statuses.map(s=>h("option",{key:s,value:s},s))
           )
+        ),
+        h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,alignItems:"center",marginBottom:6}},
+          h(LimitToListCombo,{value:row.sales_rep||"",onChange:v=>updateRow(row,{sales_rep:v}),options:salesRepOptions,limitToList:false,placeholder:"Sales rep",style:{padding:"5px 7px",fontSize:11.5}}),
+          h("input",{type:"date",value:row.next_followup_date||"",onChange:e=>updateRow(row,{next_followup_date:e.target.value||null}),style:{padding:"5px 7px",fontSize:11.5,border:"1px solid "+colors.border,borderRadius:5}})
         ),
         row.package_name && h("div",{style:{paddingLeft:14,borderLeft:"2px solid #f0eee6"}},
           h(PackageAllocationsSection,{pkg:row, project, user, onOpenQuote})
@@ -19887,7 +19887,10 @@ function EntityLookupScreen({ user, entityType, preselect, onGoTo }){
             "End user: ",link("end_user",p.end_user_company_name)||"—"," · EPC: ",p.main_epc_company_name?link("epc",p.main_epc_company_name):h("span",{style:{color:colors.danger}},"not set yet")
           ),
           pkgs.map(pk=>h("div",{key:pk.id,style:{marginBottom:8,paddingLeft:14,borderLeft:"2px solid #f0eee6"}},
-            h("div",{style:{fontSize:12.5,fontWeight:600,marginBottom:4}},pk.package_name+"  ·  "+h_text(pk.package_status)),
+            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+              h("div",{style:{fontSize:12.5,fontWeight:600}},pk.package_name+"  ·  "+h_text(pk.package_status)),
+              h("button",{onClick:()=>{ if(confirm("Opens "+p.project_name+" — you'll come right back here once you're done.")) onGoTo("__open_project__",{projectId:p.id, returnTo:{type:entityType, value:selected}}); },style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Edit on project")
+            ),
             h(PackageAllocationsSection,{pkg:pk, project:p, user, onOpenQuote:(ref,slNo)=>onGoTo("__open_quote__",{ref,slNo})})
           ))
         );
@@ -19897,7 +19900,10 @@ function EntityLookupScreen({ user, entityType, preselect, onGoTo }){
     entityType==="package" && h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px",maxHeight:480,overflowY:"auto"}},
       relevantPairs.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"Nothing yet.") :
       relevantPairs.map(({project,pkg},idx)=>h("div",{key:pkg.id,style:{marginBottom:idx<relevantPairs.length-1?18:0}},
-        h("div",{style:{fontSize:12.5,fontWeight:600,marginBottom:2}},link("project",project.project_name)),
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:2}},
+          h("div",{style:{fontSize:12.5,fontWeight:600}},link("project",project.project_name)),
+          h("button",{onClick:()=>{ if(confirm("Opens "+project.project_name+" — you'll come right back here once you're done.")) onGoTo("__open_project__",{projectId:project.id, returnTo:{type:"package", value:selected}}); },style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Edit on project")
+        ),
         h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:8}},
           "End user: ",link("end_user",project.end_user_company_name)||"—"," · EPC: ",project.main_epc_company_name?link("epc",project.main_epc_company_name):h("span",{style:{color:colors.danger}},"not set yet")
         ),
@@ -24890,9 +24896,16 @@ function App() {
   // this and switches tab; the target screen reads it once on mount to
   // preselect instead of defaulting to its first entity.
   const [entityLookupPreselect,setEntityLookupPreselect]=useState(null); // {type:"end_user"|"epc"|"package"|"customer", value:string}
+  // Deep-link into a SPECIFIC Project (not just the list), with a "return
+  // to" context so the Project screen's Back button goes to the exact
+  // entity-wise screen and selection the user came from, not just "All
+  // projects" (23 Aug SOP — "prompt to jump and jump exactly to the
+  // filtered project screen and get back once done").
+  const [projectDeepLink,setProjectDeepLink]=useState(null); // {projectName, returnTo:{type,value}}
   const goToEntityLookup = (type,value)=>{
     if(type==="__project_list__"){ setTab("major_projects"); return; } // no dedicated Project-wise screen — the existing Projects list already shows this, just not deep-linked to one row yet
     if(type==="__open_quote__"){ setQuoteToOpen({reference_number:value.ref,item_sl_no:value.slNo}); setTab("saved"); return; }
+    if(type==="__open_project__"){ setProjectDeepLink(value); setTab("major_projects"); return; }
     setEntityLookupPreselect({type,value}); setTab("lookup_"+type);
   };
   const [openModelTarget,setOpenModelTarget]=useState(null); // model string bridge from BOM Coverage's "Open BOM" button to Estimator
@@ -25011,7 +25024,8 @@ function App() {
     tab==="flange_chart"?h(FlangeChart,{user}):
     tab==="major_projects"?h(MajorProjectsScreen,{user,
       onCreateQuoteFromAllocation:(ref,allocationId,prefillCustomerName)=>{ setPendingNewSlNo({reference_number:ref,item_sl_no:1,linked_allocation_id:allocationId,prefillCustomerName}); setTab("estimator"); },
-      onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}
+      onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");},
+      deepLinkTarget:projectDeepLink, onDeepLinkConsumed:()=>setProjectDeepLink(null), onGoTo:goToEntityLookup
     }):
     tab==="major_projects_kanban"?h(MajorProjectPackageKanban,{user}):
     tab==="major_projects_bulk_import"?h(MajorProjectsBulkImport,{user}):
