@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-23T07:26:40Z";
+  var APP_BUILD_VERSION = "2026-08-23T07:48:22Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -356,7 +356,7 @@ const MASTER_TABLES = [
   { key: "designation_tbl", label: "Designations", columns: ["value"], addLabel:"New designation", freeText:["value"] },
   { key: "state_zone_tbl", label: "States and Zones (India)", columns: ["state","zone"], addLabel:"New state", freeText:["state","zone"], editAllEnabled:true, exportEnabled:true },
   { key: "country_zone_tbl", label: "Countries and Zones (outside India)", columns: ["country","zone"], addLabel:"New country", freeText:["country","zone"], editAllEnabled:true, exportEnabled:true },
-  { key: "employee_tbl", label: "Employees", columns: ["employee_code","employee_name","department","designation","crm_role","phone_primary","email","status"], addLabel:"New employee", cascade:[{col:"department",from:"department_tbl",field:"department"},{col:"designation",from:"designation_tbl",field:"value"},{col:"crm_role",from:"crm_role_tbl",field:"value"},{col:"status",from:"employee_status_tbl",field:"value"}], freeText:["employee_code","employee_name","phone_primary","email"], exportEnabled:true },
+  { key: "employee_tbl", label: "Employees", columns: ["employee_code","employee_name","nickname","department","designation","crm_role","phone_primary","email","status"], addLabel:"New employee", cascade:[{col:"department",from:"department_tbl",field:"department"},{col:"designation",from:"designation_tbl",field:"value"},{col:"crm_role",from:"crm_role_tbl",field:"value"},{col:"status",from:"employee_status_tbl",field:"value"}], freeText:["employee_code","employee_name","nickname","phone_primary","email"], exportEnabled:true },
   { key: "territory_rule_state_tbl", label: "Territory Rules — States", columns: ["employee_name","state"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"state",from:"state_zone_tbl",field:"state"}], groupBy:["employee_name"], editAllEnabled:true },
   { key: "territory_rule_country_tbl", label: "Territory Rules — Countries", columns: ["employee_name","country"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"country",from:"country_zone_tbl",field:"country"}], groupBy:["employee_name"], editAllEnabled:true },
 ];
@@ -18705,7 +18705,7 @@ function PackageCheckboxModal({ project, user, existingPackageNames, onCancel, o
     setSaving(true);
     try{
       for(const name of toAdd){
-        const { error } = await sb.from("major_project_package_tbl").insert({project_id:project.id, package_name:name, package_status:"Unknown", sales_rep:project.primary_sales_rep||"", created_by:user.username});
+        const { error } = await sb.from("major_project_package_tbl").insert({project_id:project.id, package_name:name, package_status:"To find out", sales_rep:project.primary_sales_rep||"", created_by:user.username});
         if(error) throw error;
       }
       await logAudit("INSERT","major_project_package_tbl",String(project.id),"Awarded "+toAdd.length+" package(s) via checkbox: "+toAdd.join(", "),user.username,null,{packages:toAdd});
@@ -18914,11 +18914,13 @@ function MajorProjectFormModal({ initial, onCancel, onSaved, user, onOpenQuote }
   const [f,setF] = useState(initial || {
     project_name:"", end_user_company_name:"", main_epc_company_name:"", location:"",
     project_number:"", epc_award_date:"", project_stage:"Tender", expected_completion:"",
-    estimated_value:"", primary_sales_rep:"", secondary_sales_rep:"", priority:"Medium", source:"", notes:""
+    estimated_value:"", primary_sales_rep:"", secondary_sales_rep:"", priority:"Medium", source:"", notes:"",
+    epc_status:"", epc_owner:""
   });
   const [saving,setSaving] = useState(false);
   const [stages,setStages] = useState([]);
   const [employees,setEmployees] = useState([]);
+  const [epcStatusOptions,setEpcStatusOptions] = useState([]);
   const [suggestedOwner,setSuggestedOwner] = useState("");
   const [ownerSuggestChecked,setOwnerSuggestChecked] = useState(false);
   const set = (k,v)=>setF(d=>({...d,[k]:v}));
@@ -18926,6 +18928,11 @@ function MajorProjectFormModal({ initial, onCancel, onSaved, user, onOpenQuote }
   useEffect(()=>{
     sb.from("major_project_stage_tbl").select("stage").order("sort_order").then(({data})=>setStages((data||[]).map(r=>r.stage)));
     sb.from("employee_tbl").select("employee_name").order("employee_name").then(({data})=>setEmployees((data||[]).map(r=>r.employee_name).filter(Boolean)));
+    // Reuses the same vocabulary as Allocation status (23 Aug) — the file
+    // this decision came from used identical terms ("Order Lost", "PO
+    // Received", "HOLD"...) for both the EPC relationship itself and
+    // each individual Package/Customer chase underneath it.
+    sb.from("allocation_status_tbl").select("status").order("sort_order").then(({data})=>setEpcStatusOptions((data||[]).map(r=>r.status)));
   },[]);
 
   // Ownership auto-suggest — fires when Main EPC is picked (new project
@@ -18985,8 +18992,24 @@ function MajorProjectFormModal({ initial, onCancel, onSaved, user, onOpenQuote }
           h(CustomerSelect,{value:f.end_user_company_name,user,onSelect:(p)=>set("end_user_company_name",p.company_name)})
         ),
         h("div",{style:{flex:1}},
-          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Main EPC contractor *"),
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Main EPC contractor"),
           h(CustomerSelect,{value:f.main_epc_company_name,user,onSelect:(p)=>set("main_epc_company_name",p.company_name)})
+        )
+      ),
+      // EPC status/owner (23 Aug) — tracks whether YOUR company won
+      // business from the EPC contractor itself, separate from any
+      // specific Package underneath it. Only makes sense once an EPC is
+      // actually set, so stays hidden until then.
+      f.main_epc_company_name.trim() && h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"EPC status"),
+          h("select",{value:f.epc_status||"",onChange:e=>set("epc_status",e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
+            h("option",{value:""},"—"), epcStatusOptions.map(s=>h("option",{key:s,value:s},s))
+          )
+        ),
+        h("div",{style:{flex:1}},
+          h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"EPC owner"),
+          h(LimitToListCombo,{value:f.epc_owner||"",onChange:v=>set("epc_owner",v),options:employees,limitToList:false,placeholder:"Who's chasing this EPC",style:{...inputStyle,padding:"7px 9px",fontSize:12}})
         )
       ),
       h("div",{style:{display:"flex",gap:10,marginBottom:8}}, field("Location","location"), field("Project number","project_number")),
@@ -19044,7 +19067,7 @@ function MajorProjectFormModal({ initial, onCancel, onSaved, user, onOpenQuote }
 
 function MajorProjectPackageFormModal({ project, initial, onCancel, onSaved, user }){
   const [f,setF] = useState(initial || {
-    package_name:"", package_status:"Unknown",
+    package_name:"", package_status:"To find out",
     product_type:"", size:"", rating:"", material:"", quantity:"", service:"",
     estimated_value:"", technical_spec:"", rfq_expected_date:"", competitor:"", vendor_list_status:"",
     sales_rep: project.primary_sales_rep||"", next_action:"", next_followup_date:"", notes:""
@@ -19161,6 +19184,17 @@ function PackageAllocationsSection({ pkg, project, user, onCreateQuoteFromAlloca
   // first, and this map tells the row whether one already exists so it
   // shows the right state instead of offering to log a duplicate.
   const [enquiriesByAllocation,setEnquiriesByAllocation] = useState({});
+  // Allocation status (23 Aug) — was a fixed "Unknown" that never
+  // changed anywhere in the UI. Now a real editable field, seeded from
+  // the tracker vocabulary that prompted this.
+  const [statusOptions,setStatusOptions] = useState([]);
+  useEffect(()=>{
+    sb.from("allocation_status_tbl").select("status").order("sort_order").then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
+  },[]);
+  const updateAllocationStatus = async(row,status)=>{
+    setRows(rs=>rs.map(r=>r.id===row.id?{...r,allocation_status:status}:r));
+    await sb.from("package_customer_allocation_tbl").update({allocation_status:status}).eq("id",row.id);
+  };
 
   const load = useCallback(async()=>{
     setLoading(true);
@@ -19197,7 +19231,12 @@ function PackageAllocationsSection({ pkg, project, user, onCreateQuoteFromAlloca
       rows.map(row=>h("div",{key:row.id,style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,background:"#fff"}},
         h("div",null,
           h("div",{style:{fontWeight:600,fontSize:13}},row.company_name),
-          h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},row.allocation_status+(row.subcategory?(" · "+row.subcategory):""))
+          h("div",{style:{display:"flex",alignItems:"center",gap:6,marginTop:3}},
+            h("select",{value:row.allocation_status||"",onChange:e=>updateAllocationStatus(row,e.target.value),style:{fontSize:11,padding:"2px 5px",border:"1px solid "+colors.border,borderRadius:4}},
+              statusOptions.map(s=>h("option",{key:s,value:s},s))
+            ),
+            row.subcategory && h("span",{style:{fontSize:11,color:colors.muted}},"· "+row.subcategory)
+          )
         ),
         (()=>{
           const enq = enquiriesByAllocation[row.id];
@@ -19397,7 +19436,7 @@ function AddAllocationModal({ pkg, project, user, onCancel, onSaved }){
     setSaving(true);
     try{
       const finalSubcat = newSubcat.trim() || subcategory || null;
-      const { error } = await sb.from("package_customer_allocation_tbl").insert({package_id:pkg.id, company_name:picked, allocation_status:"Unknown", subcategory:finalSubcat, created_by:user?.username||"unknown"});
+      const { error } = await sb.from("package_customer_allocation_tbl").insert({package_id:pkg.id, company_name:picked, allocation_status:"Enq. Not Received", subcategory:finalSubcat, created_by:user?.username||"unknown"});
       if(error) throw error;
       if(addType){
         try{ await sb.from("company_package_tbl").insert({company_name:picked, package_name:pkg.package_name, subcategory:finalSubcat, created_by:user?.username||"unknown"}); } catch(ignoreDup){}
@@ -20341,7 +20380,7 @@ function MajorProjectsBulkImport({ user }){
           const { data:existingLine } = await sb.from("major_project_package_tbl").select("id").eq("project_id",proj.id).eq("package_name",row.packageName).maybeSingle();
           if(existingLine) pkgLineId = existingLine.id;
           else{
-            const { data:newLine, error } = await sb.from("major_project_package_tbl").insert({project_id:proj.id, package_name:row.packageName, package_status:"Unknown", created_by:user?.username||"bulk_import"}).select().single();
+            const { data:newLine, error } = await sb.from("major_project_package_tbl").insert({project_id:proj.id, package_name:row.packageName, package_status:"To find out", created_by:user?.username||"bulk_import"}).select().single();
             if(error){ errors.push(row.projectName+" / "+row.packageName+" (package line): "+error.message); continue; }
             pkgLineId = newLine.id; created.packageLines++;
           }
@@ -20364,7 +20403,7 @@ function MajorProjectsBulkImport({ user }){
         const { data:existingAlloc } = await sb.from("package_customer_allocation_tbl").select("id").eq("package_id",pkgLineId).eq("company_name",row.companyName).maybeSingle();
         if(existingAlloc){ created.skippedAllocations++; }
         else{
-          const { error } = await sb.from("package_customer_allocation_tbl").insert({package_id:pkgLineId, company_name:row.companyName, allocation_status:"Unknown", subcategory:row.subcategory||null, created_by:user?.username||"bulk_import"});
+          const { error } = await sb.from("package_customer_allocation_tbl").insert({package_id:pkgLineId, company_name:row.companyName, allocation_status:"Enq. Not Received", subcategory:row.subcategory||null, created_by:user?.username||"bulk_import"});
           if(error){ errors.push(row.companyName+" → "+row.packageName+" (allocation): "+error.message); continue; }
           created.allocations++;
         }
