@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-24T01:26:05Z";
+  var APP_BUILD_VERSION = "2026-08-24T01:46:27Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1209,6 +1209,7 @@ function MenuTabs({ user, active, onChange }) {
         {key:"major_projects_overview",label:"Overview"},
         {key:"major_projects_kanban",label:"Package Board"},
         {key:"major_projects_bulk_import",label:"Bulk Import"},
+        {key:"gaps_dashboard",label:"What Needs Chasing"},
       ]},
       { label:"Lookup", tabs:[
         {key:"lookup_end_user",label:"End User"},
@@ -1230,12 +1231,14 @@ function MenuTabs({ user, active, onChange }) {
     // to be a separate tab"). Deliberately ungated, same as it was inside
     // CRM before — a Telecaller/FSE logging or working an enquiry doesn't
     // need admin rights, only the Package & Type Masters right above still
-    // does.
+    // does. "What Needs Chasing" moved out to CRM → Major Projects (24 Aug)
+    // now that Enquiry itself is unhooked from Major Projects — most of
+    // that dashboard's gap types are Major-Projects data, only Overdue is
+    // genuinely Enquiry-based.
     { label:"Enquiry", subgroups:[
       { label:"Enquiries", tabs:[
         {key:"enquiries_list",label:"Enquiries"},
         {key:"enquiry_review",label:"Enquiry Review"},
-        {key:"gaps_dashboard",label:"What Needs Chasing"},
       ]},
     ]},
     { label:"Reports", subgroups:[
@@ -18634,9 +18637,17 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
     );
   }
 
+  const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
+  const isSuperAdmin = user.role==="super_admin";
   const deleteProject = async(p)=>{
     const { count } = await sb.from("major_project_package_tbl").select("id",{count:"exact",head:true}).eq("project_id",p.id);
     if(count>0){ alert("Can't delete \""+p.project_name+"\" — it has "+count+" package(s) under it. Remove those first, or leave the project as-is."); return; }
+    if(!isSuperAdmin){
+      const code = prompt("Enter a Deletion Code to delete \""+p.project_name+"\":");
+      if(code===null) return;
+      const res = await verifyAndConsumeDeletionCode(code, user?.username||"unknown");
+      if(!res.ok){ alert(res.reason); return; }
+    }
     if(!confirm("Delete \""+p.project_name+"\"? This can't be undone.")) return;
     const { error } = await sb.from("major_project_tbl").delete().eq("id",p.id);
     if(error){ alert("Delete failed: "+error.message); return; }
@@ -18661,7 +18672,8 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
       listMode==="detailed" ? h(MajorProjectsDetailedView,{
         user, projects: filtered,
         onOpenProject: (p,fromDetailedView)=>openProject(p,fromDetailedView),
-        onEditProject: (p)=>{setEditingProject(p);setShowProjectForm(true);}
+        onEditProject: (p)=>{setEditingProject(p);setShowProjectForm(true);},
+        onRefresh: loadProjects
       }) :
       loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
       filtered.length===0 ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"No projects yet — click + New Project to add the first one (any major EPC account: Aramco, IOCL, BPCL, SABIC, HPCL, DEWA, or others).") :
@@ -18678,7 +18690,7 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
           h("div",null,p.primary_sales_rep||"—"),
           h("div",{style:{display:"flex",gap:4,justifyContent:"flex-end"},onClick:e=>e.stopPropagation()},
             h("button",{onClick:()=>{setEditingProject(p);setShowProjectForm(true);},style:{...btnSmall,fontSize:11,padding:"3px 8px"}},"Edit"),
-            h("button",{onClick:()=>deleteProject(p),style:{...btnSmall,fontSize:11,padding:"3px 8px",color:colors.danger,borderColor:colors.danger}},"Delete")
+            isAdminOrAbove && h("button",{onClick:()=>deleteProject(p),style:{...btnSmall,fontSize:11,padding:"3px 8px",color:colors.danger,borderColor:colors.danger}},"Delete")
           )
         ))
       )
@@ -20135,7 +20147,9 @@ function MajorProjectsFlatOverview({ user, onOpenQuote }){
 // Known gap, not resolved as of 23 Aug: Customer/Allocation has no
 // "owner" column in the schema, so unlike the other three levels,
 // Customer rows don't get an Owner field here — nothing to bind it to.
-function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProject }){
+function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProject, onRefresh }){
+  const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
+  const isSuperAdmin = user.role==="super_admin";
   const [loading,setLoading] = useState(true);
   const [packages,setPackages] = useState([]);
   const [allocations,setAllocations] = useState([]);
@@ -20168,7 +20182,11 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
   },[projects]);
   useEffect(()=>{ load(); },[load]);
   useEffect(()=>{
-    sb.from("employee_tbl").select("employee_name").neq("status","Inactive").order("employee_name").then(({data})=>setSalesRepOptions((data||[]).map(r=>r.employee_name)));
+    // Owner combos (24 Aug) are scoped to the Sales department only, not
+    // every active employee — matches the same field elsewhere (Package's
+    // own sales_rep in the Flat Overview screen still pulls all employees;
+    // deliberately left as-is there since it wasn't part of this ask).
+    sb.from("employee_tbl").select("employee_name").eq("department","Sales").neq("status","Inactive").order("employee_name").then(({data})=>setSalesRepOptions((data||[]).map(r=>r.employee_name)));
     sb.from("major_project_package_status_tbl").select("status").order("sort_order").then(({data})=>setStatuses((data||[]).map(r=>r.status)));
   },[]);
 
@@ -20184,7 +20202,27 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
     setAllocations(rows=>rows.map(r=>r.id===alloc.id?{...r,...patch}:r));
     await sb.from("package_customer_allocation_tbl").update({...patch,updated_at:new Date().toISOString()}).eq("id",alloc.id);
   };
+
+  // Delete gating (24 Aug): Project delete is Admin/Super Admin only —
+  // Super Admin goes straight through, Admin needs a Deletion Code, a
+  // plain user never sees the button at all. Package/EPC delete is the
+  // opposite shape: Admin/Super Admin go straight through (it's their
+  // privilege by default), a plain user can still do it but needs a
+  // Deletion Code first. All three reuse the existing Deletion Codes pool
+  // (verifyAndConsumeDeletionCode) rather than a new code system.
+  const requireDeletionCode = async(promptLabel)=>{
+    const code = prompt(promptLabel);
+    if(code===null) return false;
+    const res = await verifyAndConsumeDeletionCode(code, user?.username||"unknown");
+    if(!res.ok){ alert(res.reason); return false; }
+    return true;
+  };
+
   const deletePackage = async(pkg)=>{
+    if(!isAdminOrAbove){
+      const ok = await requireDeletionCode("Enter a Deletion Code to delete \""+pkg.package_name+"\":");
+      if(!ok) return;
+    }
     const allocs = allocsByPackage.get(pkg.id) || [];
     const warn = allocs.length>0
       ? "Delete \""+pkg.package_name+"\"? This will also remove "+allocs.length+" customer allocation"+(allocs.length===1?"":"s")+" under it. This can't be undone."
@@ -20200,6 +20238,37 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
       await logAudit("DELETE","major_project_package_tbl",String(pkg.id),"Deleted package "+pkg.package_name+(allocs.length?" and "+allocs.length+" allocation(s)":""),user?.username||"unknown",null,null);
       setPackages(rows=>rows.filter(r=>r.id!==pkg.id));
       setAllocations(rows=>rows.filter(r=>r.package_id!==pkg.id));
+    } catch(e){ alert("Delete failed: "+e.message); }
+  };
+
+  const deleteEpc = async(proj)=>{
+    if(!isAdminOrAbove){
+      const ok = await requireDeletionCode("Enter a Deletion Code to remove the EPC from \""+proj.project_name+"\":");
+      if(!ok) return;
+    }
+    if(!confirm("Remove EPC \""+(proj.main_epc_company_name||"—")+"\" from \""+proj.project_name+"\"? This can't be undone.")) return;
+    try{
+      const { error } = await sb.from("major_project_tbl").update({main_epc_company_name:null,epc_owner:null}).eq("id",proj.id);
+      if(error) throw error;
+      await logAudit("UPDATE","major_project_tbl",proj.project_name,"Removed EPC",user?.username||"unknown",null,null);
+      if(onRefresh) onRefresh();
+    } catch(e){ alert("Delete failed: "+e.message); }
+  };
+
+  const deleteProject = async(proj)=>{
+    if(!isAdminOrAbove) return; // button isn't shown to a plain user, but guard anyway
+    const pkgs = pkgsByProject.get(proj.id) || [];
+    if(pkgs.length>0){ alert("Can't delete \""+proj.project_name+"\" — it has "+pkgs.length+" package(s) under it. Remove those first, or leave the project as-is."); return; }
+    if(!isSuperAdmin){
+      const ok = await requireDeletionCode("Enter a Deletion Code to delete \""+proj.project_name+"\":");
+      if(!ok) return;
+    }
+    if(!confirm("Delete \""+proj.project_name+"\"? This can't be undone.")) return;
+    try{
+      const { error } = await sb.from("major_project_tbl").delete().eq("id",proj.id);
+      if(error) throw error;
+      await logAudit("DELETE","major_project_tbl",proj.project_name,"Deleted project (Detailed view)",user?.username||"unknown",null,null);
+      if(onRefresh) onRefresh();
     } catch(e){ alert("Delete failed: "+e.message); }
   };
 
@@ -20228,75 +20297,84 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
   const packageOptions = Array.from(new Set(packages.map(p=>p.package_name).filter(Boolean))).sort();
   const customerOptions = Array.from(new Set(allocations.map(a=>a.company_name).filter(Boolean))).sort();
 
+  const deleteBtn = (onClick,title)=> h("button",{onClick,title,style:{...btnSmall,fontSize:10,padding:"2px 7px",color:colors.danger,borderColor:colors.danger,whiteSpace:"nowrap",flexShrink:0}},"Delete");
+
   return h("div",null,
-    h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16,padding:"10px 12px",border:"1px solid "+colors.border,borderRadius:8}},
-      h(LimitToListCombo,{value:fProject,onChange:setFProject,options:projectOptions,placeholder:"All projects",style:{fontSize:11.5,flex:1,minWidth:120,padding:"5px 8px"}}),
-      h(LimitToListCombo,{value:fEndUser,onChange:setFEndUser,options:endUserOptions,placeholder:"All end users",style:{fontSize:11.5,flex:1,minWidth:120,padding:"5px 8px"}}),
-      h(LimitToListCombo,{value:fEpc,onChange:setFEpc,options:epcOptions,placeholder:"All EPCs",style:{fontSize:11.5,flex:1,minWidth:120,padding:"5px 8px"}}),
-      h(LimitToListCombo,{value:fPackage,onChange:setFPackage,options:packageOptions,placeholder:"All packages",style:{fontSize:11.5,flex:1,minWidth:120,padding:"5px 8px"}}),
-      h(LimitToListCombo,{value:fCustomer,onChange:setFCustomer,options:customerOptions,placeholder:"All customers",style:{fontSize:11.5,flex:1,minWidth:120,padding:"5px 8px"}})
+    h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",marginBottom:12,padding:"7px 9px",border:"1px solid "+colors.border,borderRadius:8}},
+      h(LimitToListCombo,{value:fProject,onChange:setFProject,options:projectOptions,placeholder:"All projects",style:{fontSize:11,flex:1,minWidth:110,padding:"4px 6px"}}),
+      h(LimitToListCombo,{value:fEndUser,onChange:setFEndUser,options:endUserOptions,placeholder:"All end users",style:{fontSize:11,flex:1,minWidth:110,padding:"4px 6px"}}),
+      h(LimitToListCombo,{value:fEpc,onChange:setFEpc,options:epcOptions,placeholder:"All EPCs",style:{fontSize:11,flex:1,minWidth:110,padding:"4px 6px"}}),
+      h(LimitToListCombo,{value:fPackage,onChange:setFPackage,options:packageOptions,placeholder:"All packages",style:{fontSize:11,flex:1,minWidth:110,padding:"4px 6px"}}),
+      h(LimitToListCombo,{value:fCustomer,onChange:setFCustomer,options:customerOptions,placeholder:"All customers",style:{fontSize:11,flex:1,minWidth:110,padding:"4px 6px"}})
     ),
     loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
     visibleProjects.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"No projects match these filters.") :
     visibleProjects.map(proj=>{
       const pkgs = pkgsByProject.get(proj.id) || [];
       const allCustomers = pkgs.flatMap(pk=>(allocsByPackage.get(pk.id)||[]).map(a=>({...a,pkgName:pk.package_name})));
-      return h("div",{key:proj.id,style:{marginBottom:22}},
-        h("div",{style:{fontSize:14,fontWeight:700,marginBottom:6}},proj.project_name),
+      return h("div",{key:proj.id,style:{marginBottom:16}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+          h("div",{style:{fontSize:13.5,fontWeight:700}},proj.project_name),
+          isAdminOrAbove && deleteBtn(()=>deleteProject(proj),"Delete project")
+        ),
         h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:8,overflow:"hidden",background:"#fff"}},
 
           h("div",{style:{flex:1,minWidth:0,borderRight:"1px solid "+colors.border}},
-            h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,fontSize:11,fontWeight:600,color:colors.muted}},"End user"),
-            h("div",{style:{padding:"9px 11px"}},
+            h("div",{style:{padding:"6px 9px",borderBottom:"1px solid "+colors.border,fontSize:10.5,fontWeight:600,color:colors.muted}},"End user"),
+            h("div",{style:{padding:"7px 9px"}},
               h(CustomerSelect,{value:proj.end_user_company_name,user,onSelect:(p)=>updateProject(proj,{end_user_company_name:p.company_name})}),
-              h(LimitToListCombo,{value:proj.primary_sales_rep||"",onChange:v=>updateProject(proj,{primary_sales_rep:v}),options:salesRepOptions,limitToList:false,placeholder:"Owner",style:{fontSize:10.5,width:"100%",padding:"3px 6px",marginTop:6}})
+              h(LimitToListCombo,{value:proj.primary_sales_rep||"",onChange:v=>updateProject(proj,{primary_sales_rep:v}),options:salesRepOptions,limitToList:false,placeholder:"Owner",style:{fontSize:10.5,width:"100%",padding:"3px 6px",marginTop:5}})
             )
           ),
 
           h("div",{style:{flex:1,minWidth:0,borderRight:"1px solid "+colors.border}},
-            h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
-              h("span",{style:{fontSize:11,fontWeight:600,color:colors.muted}},"EPC"),
-              h("button",{onClick:()=>onEditProject(proj),title:"Opens the project form",style:{...btnSmall,fontSize:10,padding:"2px 8px",display:"flex",alignItems:"center",gap:3}},"+ Add EPC")
+            h("div",{style:{padding:"6px 9px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+              h("span",{style:{fontSize:10.5,fontWeight:600,color:colors.muted}},"EPC"),
+              h("button",{onClick:()=>onEditProject(proj),title:"Opens the project form",style:{...btnSmall,fontSize:10,padding:"2px 7px",display:"flex",alignItems:"center",gap:3}},"+ Add EPC")
             ),
-            h("div",{style:{padding:"9px 11px"}},
-              h(CustomerSelect,{value:proj.main_epc_company_name,user,onSelect:(p)=>updateProject(proj,{main_epc_company_name:p.company_name})}),
-              h(LimitToListCombo,{value:proj.epc_owner||"",onChange:v=>updateProject(proj,{epc_owner:v}),options:salesRepOptions,limitToList:false,placeholder:"Owner",style:{fontSize:10.5,width:"100%",padding:"3px 6px",marginTop:6}})
+            h("div",{style:{padding:"7px 9px"}},
+              h("div",{style:{display:"flex",gap:4,alignItems:"center",marginBottom:5}},
+                h("div",{style:{flex:1,minWidth:0}},h(CustomerSelect,{value:proj.main_epc_company_name,user,onSelect:(p)=>updateProject(proj,{main_epc_company_name:p.company_name})})),
+                proj.main_epc_company_name && deleteBtn(()=>deleteEpc(proj),"Delete EPC")
+              ),
+              h(LimitToListCombo,{value:proj.epc_owner||"",onChange:v=>updateProject(proj,{epc_owner:v}),options:salesRepOptions,limitToList:false,placeholder:"Owner",style:{fontSize:10.5,width:"100%",padding:"3px 6px"}})
             )
           ),
 
-          h("div",{style:{flex:1,minWidth:0,borderRight:"1px solid "+colors.border,overflowY:"auto"}},
-            h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
-              h("span",{style:{fontSize:11,fontWeight:600,color:colors.muted}},"Package"),
-              h("button",{onClick:()=>setCheckboxProject(proj),title:"Award packages",style:{...btnSmall,fontSize:10,padding:"2px 8px",display:"flex",alignItems:"center",gap:3}},"+ Add package")
+          h("div",{style:{flex:1.3,minWidth:0,borderRight:"1px solid "+colors.border,overflowY:"auto"}},
+            h("div",{style:{padding:"6px 9px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+              h("span",{style:{fontSize:10.5,fontWeight:600,color:colors.muted}},"Package"),
+              h("button",{onClick:()=>setCheckboxProject(proj),title:"Award packages",style:{...btnSmall,fontSize:10,padding:"2px 7px",display:"flex",alignItems:"center",gap:3}},"+ Add package")
             ),
-            pkgs.length===0 ? h("div",{style:{padding:"12px 11px",fontSize:11.5,color:colors.mutedLight}},"None yet.") :
-            pkgs.map(pk=>h("div",{key:pk.id,style:{padding:"9px 11px",borderBottom:"1px solid #f0eee6"}},
-              h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5,gap:6}},
-                h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12.5,fontWeight:600,color:colors.text,cursor:"pointer"}},pk.package_name),
-                h("button",{onClick:()=>deletePackage(pk),title:"Delete package",style:{...btnSmall,fontSize:10.5,padding:"2px 6px",color:colors.danger,borderColor:colors.danger,flexShrink:0}},"✕")
-              ),
-              h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}},
-                h("select",{value:pk.package_status||"",onChange:e=>updatePackage(pk,{package_status:e.target.value}),style:{...inputStyle,padding:"3px 5px",fontSize:10.5,width:"100%"}},
+            pkgs.length===0 ? h("div",{style:{padding:"10px 9px",fontSize:11.5,color:colors.mutedLight}},"None yet.") :
+            pkgs.map(pk=>h("div",{key:pk.id,style:{padding:"7px 9px",borderBottom:"1px solid #f0eee6"}},
+              h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12,fontWeight:600,color:colors.text,cursor:"pointer",marginBottom:4}},pk.package_name),
+              h("div",{style:{display:"grid",gridTemplateColumns:"1fr auto 1fr",gap:4,alignItems:"center"}},
+                h("select",{value:pk.package_status||"",onChange:e=>updatePackage(pk,{package_status:e.target.value}),style:{...inputStyle,padding:"3px 4px",fontSize:10,width:"100%"}},
                   statuses.map(s=>h("option",{key:s,value:s},s))
                 ),
-                h("input",{readOnly:true,value:"",onFocus:e=>{e.target.blur(); setAllocModalPkg({pkg:pk,project:proj});},placeholder:"+ Add customer",style:{...inputStyle,padding:"3px 5px",fontSize:10.5,width:"100%",cursor:"pointer",color:colors.mutedLight}})
+                deleteBtn(()=>deletePackage(pk),"Delete package"),
+                h("input",{readOnly:true,value:"",onFocus:e=>{e.target.blur(); setAllocModalPkg({pkg:pk,project:proj});},placeholder:"+ Add",style:{...inputStyle,padding:"3px 4px",fontSize:10,width:"100%",cursor:"pointer",color:colors.mutedLight}})
               )
             ))
           ),
 
           h("div",{style:{flex:1,minWidth:0,overflowY:"auto"}},
-            h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
-              h("span",{style:{fontSize:11,fontWeight:600,color:colors.muted}},"Customer"),
-              h("button",{onClick:()=>onOpenProject(proj,true),title:"Opens the project screen",style:{...btnSmall,fontSize:10,padding:"2px 8px",display:"flex",alignItems:"center",gap:3}},"+ Add customer")
+            h("div",{style:{padding:"6px 9px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+              h("span",{style:{fontSize:10.5,fontWeight:600,color:colors.muted}},"Customer"),
+              h("button",{onClick:()=>onOpenProject(proj,true),title:"Opens the project screen",style:{...btnSmall,fontSize:10,padding:"2px 7px",display:"flex",alignItems:"center",gap:3}},"+ Add customer")
             ),
-            allCustomers.length===0 ? h("div",{style:{padding:"12px 11px",fontSize:11.5,color:colors.mutedLight}},"None yet.") :
-            allCustomers.map((a,i)=>h("div",{key:a.id||i,style:{padding:"9px 11px",borderBottom:"1px solid #f0eee6"}},
-              h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12.5,fontWeight:600,color:colors.accent,cursor:"pointer",marginBottom:5}},a.company_name),
-              h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}},
-                h("span",{style:{fontSize:11,padding:"3px 7px",borderRadius:10,background:"#e6f1fb",color:"#0c447c",display:"flex",alignItems:"center"}},a.pkgName),
-                h("select",{value:a.allocation_status||"",onChange:e=>updateAllocation(a,{allocation_status:e.target.value}),style:{...inputStyle,padding:"3px 5px",fontSize:10.5,width:"100%"}},
+            allCustomers.length===0 ? h("div",{style:{padding:"10px 9px",fontSize:11.5,color:colors.mutedLight}},"None yet.") :
+            allCustomers.map((a,i)=>h("div",{key:a.id||i,style:{padding:"7px 9px",borderBottom:"1px solid #f0eee6"}},
+              h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12,fontWeight:600,color:colors.accent,cursor:"pointer",marginBottom:4}},a.company_name),
+              h("div",{style:{display:"flex",gap:4,marginBottom:4}},
+                h("span",{style:{fontSize:10.5,padding:"2px 6px",borderRadius:10,background:"#e6f1fb",color:"#0c447c"}},a.pkgName)
+              ),
+              h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}},
+                h("select",{value:a.allocation_status||"",onChange:e=>updateAllocation(a,{allocation_status:e.target.value}),style:{...inputStyle,padding:"3px 4px",fontSize:10,width:"100%"}},
                   statuses.map(s=>h("option",{key:s,value:s},s))
-                )
+                ),
+                h(LimitToListCombo,{value:a.owner||"",onChange:v=>updateAllocation(a,{owner:v}),options:salesRepOptions,limitToList:false,placeholder:"Owner",style:{fontSize:10,width:"100%",padding:"3px 4px"}})
               )
             ))
           )
