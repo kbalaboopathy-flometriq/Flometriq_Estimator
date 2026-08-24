@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-24T02:43:07Z";
+  var APP_BUILD_VERSION = "2026-08-24T08:03:46Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -18536,6 +18536,84 @@ function StatusChangeHistoryReport(){
 // once. This one opens only from a specific Project's own screen, shows
 // just that project's Package/Customer grid, and has no edit controls
 // anywhere on it — pure "grid info" per explicit instruction.
+// Global, all-projects read-only overview (24 Aug) — brings back the old
+// standalone "Overview" tab's actual content (every project, its EPC, and
+// each Package's customers, all at a glance) now that the tab itself is
+// gone. Opened from a button on the Projects list screen instead of
+// living in the nav permanently. Same status accent-color convention as
+// the Trello-style Detailed view and the single-project overview, and no
+// inputs or edit affordances anywhere — pure "grid info" per the original
+// instruction that removed the editable version.
+function AllProjectsOverviewReadOnly({ user, onBack }){
+  const [loading,setLoading] = useState(true);
+  const [projects,setProjects] = useState([]);
+  const [packagesByProject,setPackagesByProject] = useState({});
+  const [allocationsByPackage,setAllocationsByPackage] = useState({});
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data: projRows } = await sb.from("major_project_tbl").select("*").order("project_name");
+    setProjects(projRows||[]);
+    const projectIds = (projRows||[]).map(p=>p.id);
+    const { data: pkgRows } = projectIds.length ? await sb.from("major_project_package_tbl").select("*").in("project_id",projectIds).order("package_name") : {data:[]};
+    const byProj = {};
+    (pkgRows||[]).forEach(p=>{ if(!byProj[p.project_id]) byProj[p.project_id]=[]; byProj[p.project_id].push(p); });
+    setPackagesByProject(byProj);
+    const packageIds = (pkgRows||[]).map(p=>p.id);
+    const { data: allocRows } = packageIds.length ? await sb.from("package_customer_allocation_tbl").select("*").in("package_id",packageIds) : {data:[]};
+    const byPkg = {};
+    (allocRows||[]).forEach(a=>{ if(!byPkg[a.package_id]) byPkg[a.package_id]=[]; byPkg[a.package_id].push(a); });
+    setAllocationsByPackage(byPkg);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const statusAccentColor = (status)=>
+    (status==="To find out"||status==="Order Lost") ? colors.danger :
+    status==="RFQ Received" ? "#1c8c56" : colors.accent;
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
+      h("div",null,
+        h("button",{onClick:onBack,style:{...btnSmall,marginBottom:8}},"← Back to projects"),
+        h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},"Major Projects — overview")
+      ),
+      h("button",{onClick:load,style:btnSecondary},"Refresh")
+    ),
+    loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
+    projects.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"No projects yet.") :
+    h("div",{style:{display:"flex",flexDirection:"column",gap:14}},
+      projects.map(proj=>{
+        const pkgs = packagesByProject[proj.id] || [];
+        return h("div",{key:proj.id,style:{background:colors.bg,borderRadius:12,overflow:"hidden",border:"1px solid "+colors.border}},
+          h("div",{style:{padding:"8px 14px",background:"#185FA5",color:"#fff"}},
+            h("div",{style:{fontSize:13,fontWeight:700}},proj.project_name),
+            h("div",{style:{fontSize:11,opacity:0.9,marginTop:2}},
+              (proj.end_user_company_name||"—")+"  ·  EPC: "+(proj.main_epc_company_name||"—")+"  ·  Owner: "+(proj.primary_sales_rep||"—")
+            )
+          ),
+          h("div",{style:{padding:12}},
+            pkgs.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"No packages yet.") :
+            h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+              pkgs.map(pkg=>h("div",{key:pkg.id,style:{background:"#fff",borderRadius:8,boxShadow:"0 1px 2px rgba(0,0,0,0.08)",padding:"9px 11px"}},
+                h("div",{style:{height:4,width:26,borderRadius:2,background:statusAccentColor(pkg.package_status),marginBottom:5}}),
+                h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:5,gap:8}},
+                  h("span",{style:{fontWeight:600,fontSize:12.5}},pkg.package_name),
+                  h("span",{style:{fontSize:10.5,color:colors.muted}},pkg.package_status||"—")
+                ),
+                h("div",{style:{display:"flex",flexWrap:"wrap",gap:4}},
+                  (allocationsByPackage[pkg.id]||[]).length===0 ? h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"None yet") :
+                  (allocationsByPackage[pkg.id]||[]).map(a=>h("span",{key:a.id,style:{fontSize:10.5,padding:"2px 7px",borderRadius:10,background:a.linked_reference_number?"#eaf9f4":"#f4f2ea",color:a.linked_reference_number?"#085041":colors.muted}},a.company_name+(a.allocation_status?" · "+a.allocation_status:"")))
+                )
+              ))
+            )
+          )
+        );
+      })
+    )
+  );
+}
+
 function ProjectOverviewReadOnly({ project, onBack }){
   const [loading,setLoading] = useState(true);
   const [packages,setPackages] = useState([]);
@@ -18588,7 +18666,7 @@ function ProjectOverviewReadOnly({ project, onBack }){
 }
 
 function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, deepLinkTarget, onDeepLinkConsumed, onGoTo, initialDetailedProjectFilter, onDetailedProjectFilterConsumed }){
-  const [view,setView] = useState("list"); // "list" | "detail" | "package_detail" | "overview"
+  const [view,setView] = useState("list"); // "list" | "detail" | "package_detail" | "overview" | "global_overview"
   const [projects,setProjects] = useState([]);
   const [loading,setLoading] = useState(true);
   const [search,setSearch] = useState("");
@@ -18656,6 +18734,10 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
 
   if(view==="overview" && selectedProject){
     return h(ProjectOverviewReadOnly,{project:selectedProject, onBack:()=>setView("detail")});
+  }
+
+  if(view==="global_overview"){
+    return h(AllProjectsOverviewReadOnly,{user, onBack:()=>setView("list")});
   }
 
   if(view==="detail" && selectedProject){
@@ -18735,6 +18817,7 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
             h("button",{onClick:()=>setListMode("collapsed"),style:{fontSize:12,padding:"7px 12px",border:"none",cursor:"pointer",background:listMode==="collapsed"?colors.dark:"#fff",color:listMode==="collapsed"?"#fff":colors.muted}},"Collapsed view"),
             h("button",{onClick:()=>setListMode("detailed"),style:{fontSize:12,padding:"7px 12px",border:"none",cursor:"pointer",background:listMode==="detailed"?colors.dark:"#fff",color:listMode==="detailed"?"#fff":colors.muted}},"Detailed view")
           ),
+          h("button",{onClick:()=>setView("global_overview"),style:btnSecondary},"Overview"),
           h("button",{onClick:loadProjects,style:btnSecondary},"Refresh"),
           h("button",{onClick:()=>{setEditingProject(null);setShowProjectForm(true);},style:{...btnPrimary,fontWeight:600}},"+ New Project")
         )
@@ -18745,7 +18828,8 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
         onEditProject: (p)=>{setEditingProject(p);setShowProjectForm(true);},
         onRefresh: loadProjects,
         initialProjectFilter: initialDetailedProjectFilter,
-        onInitialProjectFilterConsumed: onDetailedProjectFilterConsumed
+        onInitialProjectFilterConsumed: onDetailedProjectFilterConsumed,
+        onGoTo
       }) :
       loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
       filtered.length===0 ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"No projects yet — click + New Project to add the first one (any major EPC account: Aramco, IOCL, BPCL, SABIC, HPCL, DEWA, or others).") :
@@ -20105,7 +20189,7 @@ function h_text(s){ return s||"—"; }
 // Known gap, not resolved as of 23 Aug: Customer/Allocation has no
 // "owner" column in the schema, so unlike the other three levels,
 // Customer rows don't get an Owner field here — nothing to bind it to.
-function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProject, onRefresh, initialProjectFilter, onInitialProjectFilterConsumed }){
+function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProject, onRefresh, initialProjectFilter, onInitialProjectFilterConsumed, onGoTo }){
   const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
   const isSuperAdmin = user.role==="super_admin";
   const [loading,setLoading] = useState(true);
@@ -20131,12 +20215,18 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
   // component the single-project cart screen uses, so it's the one place
   // that layout lives.
   const [overviewProject,setOverviewProject] = useState(null);
+  // "Fix" from the Gaps dashboard drops the user here pre-filtered but with
+  // no way back — reported same day. A small banner while that filter is
+  // in effect gives two real exits: clear the filter (see every project
+  // again) or jump straight back to the Gaps dashboard.
+  const [cameFromGaps,setCameFromGaps] = useState(false);
 
   // Applies a "Fix"-from-Gaps-dashboard project filter once, then tells the
   // parent it's been consumed so a later normal filter change isn't clobbered.
   useEffect(()=>{
     if(!initialProjectFilter) return;
     setFProject(initialProjectFilter);
+    setCameFromGaps(true);
     if(onInitialProjectFilterConsumed) onInitialProjectFilterConsumed();
   },[initialProjectFilter]);
 
@@ -20293,6 +20383,13 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
   }
 
   return h("div",null,
+    cameFromGaps && h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,padding:"7px 11px",background:"#fff4d6",borderRadius:8,fontSize:12}},
+      h("span",{style:{color:"#854f0b"}},"Filtered to "+(fProject||"one project")+" from the Gaps dashboard."),
+      h("div",{style:{display:"flex",gap:8}},
+        h("button",{onClick:()=>{setFProject(""); setCameFromGaps(false);},style:{...btnSmall,fontSize:11,padding:"3px 9px"}},"Clear filter"),
+        onGoTo && h("button",{onClick:()=>onGoTo("__gaps_dashboard__"),style:{...btnSmall,fontSize:11,padding:"3px 9px"}},"← Back to Gaps dashboard")
+      )
+    ),
     h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",marginBottom:12,padding:"7px 9px",border:"1px solid "+colors.border,borderRadius:8}},
       h(LimitToListCombo,{value:fProject,onChange:setFProject,options:projectOptions,placeholder:"All projects",style:{fontSize:11,flex:1,minWidth:110,padding:"4px 6px"}}),
       h(LimitToListCombo,{value:fEndUser,onChange:setFEndUser,options:endUserOptions,placeholder:"All end users",style:{fontSize:11,flex:1,minWidth:110,padding:"4px 6px"}}),
@@ -25449,6 +25546,7 @@ function App() {
     if(type==="__open_quote__"){ setQuoteToOpen({reference_number:value.ref,item_sl_no:value.slNo}); setTab("saved"); return; }
     if(type==="__open_project__"){ setProjectDeepLink(value); setTab("major_projects"); return; }
     if(type==="__detailed_project__"){ setDetailedProjectFilter(value); setTab("major_projects"); return; }
+    if(type==="__gaps_dashboard__"){ setTab("gaps_dashboard"); return; }
     if(type==="summary"){ setTab("major_projects"); return; } // Summarised Column View is now the Detailed-view toggle on the Projects tab itself, not a separate destination
     setEntityLookupPreselect({type,value}); setEntityReturnTo(returnTo||null); setTab("lookup_"+type);
   };
