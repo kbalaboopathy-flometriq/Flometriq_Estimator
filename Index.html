@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-24T08:03:46Z";
+  var APP_BUILD_VERSION = "2026-08-24T08:48:28Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -15042,6 +15042,59 @@ function AuthCodeGate({ requiredType, onClose, onAuthorized, user }){
 // Company is the primary record in this B2B setup — this screen shows a
 // company as one card with its Contacts nested underneath, instead of two
 // separate flat master tables.
+// "Other Projects" end user (24 Aug) — a lightweight escape hatch for a
+// project whose end user isn't worth a full Company record (no zone,
+// territory, or Packages-handled tracking — it's typed fresh every time,
+// not a shared or reusable entry). Wraps CustomerSelect rather than
+// touching it, since CustomerSelect itself is used for EPC and Customer
+// pickers too, where this option doesn't belong.
+function OtherEndUserModal({ initialName, initialCountry, initialContactName, initialContactInfo, onCancel, onSave }){
+  const [name,setName] = useState(initialName||"");
+  const [country,setCountry] = useState(initialCountry||"");
+  const [contactName,setContactName] = useState(initialContactName||"");
+  const [contactInfo,setContactInfo] = useState(initialContactInfo||"");
+  const submit = ()=>{
+    if(!name.trim()){ alert("End user name is required."); return; }
+    onSave({name:name.trim(), country:country.trim(), contactName:contactName.trim(), contactInfo:contactInfo.trim()});
+  };
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:360,maxWidth:"100%"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Other Projects — end user"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Not a tracked customer — no zone or territory data, just these details for this project."),
+      h("input",{value:name,onChange:e=>setName(e.target.value),placeholder:"End user name *",style:{...inputStyle,width:"100%",marginBottom:8}}),
+      h("input",{value:country,onChange:e=>setCountry(e.target.value),placeholder:"Country",style:{...inputStyle,width:"100%",marginBottom:8}}),
+      h("input",{value:contactName,onChange:e=>setContactName(e.target.value),placeholder:"Contact name",style:{...inputStyle,width:"100%",marginBottom:8}}),
+      h("input",{value:contactInfo,onChange:e=>setContactInfo(e.target.value),placeholder:"Contact phone or email",style:{...inputStyle,width:"100%",marginBottom:14}}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
+        h("button",{onClick:onCancel,style:btnSecondary},"Cancel"),
+        h("button",{onClick:submit,style:btnPrimary},"Save")
+      )
+    )
+  );
+}
+
+function EndUserPicker({ value, onSelect, user, disabled, otherCountry, otherContactName, otherContactInfo, onOtherDetailsChange }){
+  const [showOther,setShowOther] = useState(false);
+  return h("div",null,
+    h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
+      h("div",{style:{flex:1,minWidth:0}}, h(CustomerSelect,{value,onSelect,user,disabled})),
+      !disabled && h("button",{type:"button",onClick:()=>setShowOther(true),style:{border:"1px solid "+colors.border,background:"#fff",color:colors.muted,fontSize:10.5,padding:"6px 8px",borderRadius:5,cursor:"pointer",whiteSpace:"nowrap"}},"Other Projects")
+    ),
+    (otherCountry||otherContactName||otherContactInfo) && h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:3}},
+      [otherCountry,otherContactName,otherContactInfo].filter(Boolean).join(" · ")
+    ),
+    showOther && h(OtherEndUserModal,{
+      initialName: value, initialCountry: otherCountry, initialContactName: otherContactName, initialContactInfo: otherContactInfo,
+      onCancel:()=>setShowOther(false),
+      onSave:(d)=>{
+        onSelect({company_name:d.name, address:"", contact_name:d.contactName, contact_designation:"", billing_country:d.country});
+        if(onOtherDetailsChange) onOtherDetailsChange({country:d.country, contactName:d.contactName, contactInfo:d.contactInfo});
+        setShowOther(false);
+      }
+    })
+  );
+}
+
 function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
   const [f,setF] = useState(initial || {company_name:"",account_type:"",industry:"",rating:"",website:"",phone:"",zone:"",billing_street:"",billing_city:"",billing_state:"",billing_country:"",billing_pin:"",shipping_street:"",shipping_city:"",shipping_state:"",shipping_country:"",shipping_pin:"",gst_tax_id:"",account_owner:"",source:"",notes:""});
   const [saving,setSaving] = useState(false);
@@ -18568,9 +18621,10 @@ function AllProjectsOverviewReadOnly({ user, onBack }){
   },[]);
   useEffect(()=>{ load(); },[load]);
 
-  const statusAccentColor = (status)=>
-    (status==="To find out"||status==="Order Lost") ? colors.danger :
-    status==="RFQ Received" ? "#1c8c56" : colors.accent;
+  const badgeStyle = { fontSize:11, padding:"2px 8px", borderRadius:10, marginRight:4, whiteSpace:"nowrap" };
+  const custBadge = (alloc)=> h("span",{key:alloc.id,style:{...badgeStyle, background: alloc.linked_reference_number?"#eaf9f4":"#f4f2ea", color: alloc.linked_reference_number?"#085041":colors.muted}},
+    alloc.company_name+(alloc.linked_reference_number?" · "+alloc.linked_reference_number:"")
+  );
 
   return h("div",{style:{padding:"20px 24px"}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
@@ -18581,33 +18635,30 @@ function AllProjectsOverviewReadOnly({ user, onBack }){
       h("button",{onClick:load,style:btnSecondary},"Refresh")
     ),
     loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
-    projects.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"No projects yet.") :
-    h("div",{style:{display:"flex",flexDirection:"column",gap:14}},
+    // Exact layout of the original 23 Aug "Flat horizontal overview"
+    // (recovered from its removed source, 24 Aug): one row per Project —
+    // name + EPC badge, then a Package chip per package with its
+    // Customers shown inline inside the chip. The only change from the
+    // original is that chips no longer click to expand an edit panel —
+    // this version is read-only, so there's nothing left to expand into.
+    h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"6px 16px"}},
+      projects.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight,padding:"14px 0"}},"No projects yet.") :
       projects.map(proj=>{
         const pkgs = packagesByProject[proj.id] || [];
-        return h("div",{key:proj.id,style:{background:colors.bg,borderRadius:12,overflow:"hidden",border:"1px solid "+colors.border}},
-          h("div",{style:{padding:"8px 14px",background:"#185FA5",color:"#fff"}},
-            h("div",{style:{fontSize:13,fontWeight:700}},proj.project_name),
-            h("div",{style:{fontSize:11,opacity:0.9,marginTop:2}},
-              (proj.end_user_company_name||"—")+"  ·  EPC: "+(proj.main_epc_company_name||"—")+"  ·  Owner: "+(proj.primary_sales_rep||"—")
-            )
-          ),
-          h("div",{style:{padding:12}},
-            pkgs.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"No packages yet.") :
-            h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
-              pkgs.map(pkg=>h("div",{key:pkg.id,style:{background:"#fff",borderRadius:8,boxShadow:"0 1px 2px rgba(0,0,0,0.08)",padding:"9px 11px"}},
-                h("div",{style:{height:4,width:26,borderRadius:2,background:statusAccentColor(pkg.package_status),marginBottom:5}}),
-                h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:5,gap:8}},
-                  h("span",{style:{fontWeight:600,fontSize:12.5}},pkg.package_name),
-                  h("span",{style:{fontSize:10.5,color:colors.muted}},pkg.package_status||"—")
-                ),
-                h("div",{style:{display:"flex",flexWrap:"wrap",gap:4}},
-                  (allocationsByPackage[pkg.id]||[]).length===0 ? h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"None yet") :
-                  (allocationsByPackage[pkg.id]||[]).map(a=>h("span",{key:a.id,style:{fontSize:10.5,padding:"2px 7px",borderRadius:10,background:a.linked_reference_number?"#eaf9f4":"#f4f2ea",color:a.linked_reference_number?"#085041":colors.muted}},a.company_name+(a.allocation_status?" · "+a.allocation_status:"")))
-                )
-              ))
-            )
-          )
+        return h("div",{key:proj.id,style:{padding:"10px 0",borderBottom:"1px solid "+colors.border,display:"flex",alignItems:"center",flexWrap:"wrap",gap:4}},
+          h("span",{style:{fontSize:13,fontWeight:600,marginRight:6}},proj.project_name),
+          h("span",{style:{...badgeStyle,background:"#f4f2ea",color:colors.muted}},proj.main_epc_company_name||"EPC not set"),
+          h("span",{style:{width:8}}),
+          pkgs.map(pkg=>{
+            const allocs = allocationsByPackage[pkg.id] || [];
+            return h("span",{
+              key:pkg.id,
+              style:{fontSize:12,padding:"3px 9px",borderRadius:6,border:"1px solid "+colors.border,display:"inline-block",marginRight:8,marginBottom:4,background:"#fff"}
+            },
+              pkg.package_name+"  ",
+              allocs.length===0 ? h("span",{style:{...badgeStyle,background:"#fdecea",color:"#a3312a"}},"Not found") : allocs.map(custBadge)
+            );
+          })
         );
       })
     )
@@ -18644,6 +18695,7 @@ function ProjectOverviewReadOnly({ project, onBack }){
     h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},project.project_name+" — overview"),
     h("div",{style:{fontSize:12.5,color:colors.muted,marginTop:4,marginBottom:16}},
       "End user: "+(project.end_user_company_name||"—")+"  ·  EPC: "+(project.main_epc_company_name||"—")+"  ·  Owner: "+(project.primary_sales_rep||"—")
+      +((project.other_end_user_country||project.other_end_user_contact_name||project.other_end_user_contact_info) ? "  ·  "+[project.other_end_user_country,project.other_end_user_contact_name,project.other_end_user_contact_info].filter(Boolean).join(" · ") : "")
     ),
     loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
     packages.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"No packages yet.") :
@@ -19125,7 +19177,8 @@ function MajorProjectFormModal({ initial, onCancel, onSaved, user, onOpenQuote }
     project_name:"", end_user_company_name:"", main_epc_company_name:"", location:"",
     project_number:"", epc_award_date:"", project_stage:"Tender", expected_completion:"",
     estimated_value:"", primary_sales_rep:"", secondary_sales_rep:"", priority:"Medium", source:"", notes:"",
-    epc_status:"", epc_owner:""
+    epc_status:"", epc_owner:"",
+    other_end_user_country:"", other_end_user_contact_name:"", other_end_user_contact_info:""
   });
   const [saving,setSaving] = useState(false);
   const [stages,setStages] = useState([]);
@@ -19200,7 +19253,12 @@ function MajorProjectFormModal({ initial, onCancel, onSaved, user, onOpenQuote }
       h("div",{style:{display:"flex",gap:10,marginBottom:8}},
         h("div",{style:{flex:1}},
           h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"End user (e.g. ADNOC, Aramco, IOCL) *"),
-          h(CustomerSelect,{value:f.end_user_company_name,user,onSelect:(p)=>set("end_user_company_name",p.company_name)})
+          h(EndUserPicker,{
+            value:f.end_user_company_name,user,
+            onSelect:(p)=>set("end_user_company_name",p.company_name),
+            otherCountry:f.other_end_user_country, otherContactName:f.other_end_user_contact_name, otherContactInfo:f.other_end_user_contact_info,
+            onOtherDetailsChange:(d)=>setF(d0=>({...d0, other_end_user_country:d.country, other_end_user_contact_name:d.contactName, other_end_user_contact_info:d.contactInfo}))
+          })
         ),
         h("div",{style:{flex:1}},
           h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Main EPC contractor"),
@@ -20420,7 +20478,12 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
           h("div",null,
             h("div",{style:{padding:"0 2px 6px",fontSize:10.5,fontWeight:600,color:colors.muted}},"End user"),
             h("div",{style:{background:"#fff",borderRadius:8,boxShadow:"0 1px 2px rgba(0,0,0,0.08)",padding:"9px 11px"}},
-              h(CustomerSelect,{value:proj.end_user_company_name,user,onSelect:(p)=>updateProject(proj,{end_user_company_name:p.company_name})}),
+              h(EndUserPicker,{
+                value:proj.end_user_company_name,user,
+                onSelect:(p)=>updateProject(proj,{end_user_company_name:p.company_name}),
+                otherCountry:proj.other_end_user_country, otherContactName:proj.other_end_user_contact_name, otherContactInfo:proj.other_end_user_contact_info,
+                onOtherDetailsChange:(d)=>updateProject(proj,{other_end_user_country:d.country, other_end_user_contact_name:d.contactName, other_end_user_contact_info:d.contactInfo})
+              }),
               ownerSelect(proj.primary_sales_rep, v=>updateProject(proj,{primary_sales_rep:v}), {marginTop:5})
             )
           ),
