@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-24T08:48:28Z";
+  var APP_BUILD_VERSION = "2026-08-24T09:13:13Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1206,7 +1206,6 @@ function MenuTabs({ user, active, onChange }) {
       ]:[]),
       { label:"Major Projects", tabs:[
         {key:"major_projects",label:"Projects"},
-        {key:"major_projects_kanban",label:"Package Board"},
         {key:"major_projects_bulk_import",label:"Bulk Import"},
         {key:"gaps_dashboard",label:"What Needs Chasing"},
       ]},
@@ -20578,6 +20577,7 @@ function GapsChaseDashboard({ user, onGoTo }){
   const [fProject,setFProject] = useState("");
   const [fOwner,setFOwner] = useState("");
   const [fGapType,setFGapType] = useState("");
+  const [viewMode,setViewMode] = useState("list"); // "list" | "kanban"
   useEffect(()=>{
     sb.from("employee_tbl").select("employee_name").eq("department","Sales").neq("status","Inactive").order("employee_name").then(({data})=>setOwnerOptions((data||[]).map(r=>r.employee_name)));
   },[]);
@@ -20669,7 +20669,10 @@ function GapsChaseDashboard({ user, onGoTo }){
   const gapTypeOptions = ["No EPC","No package","No customer","No RFQ or lost","No owner","Overdue"];
 
   return h("div",{style:{padding:20}},
-    h("h2",{style:{marginTop:0}},"What needs chasing"),
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
+      h("h2",{style:{margin:0}},"What needs chasing"),
+      h("button",{onClick:()=>setViewMode(v=>v==="list"?"kanban":"list"),style:btnSecondary},viewMode==="list"?"Switch to Kanban view":"Switch to list view")
+    ),
     h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},isAdminOrAbove?"Every open gap across the pipeline.":"Your open gaps across the pipeline."),
     loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
     h(React.Fragment,null,
@@ -20689,6 +20692,23 @@ function GapsChaseDashboard({ user, onGoTo }){
         )
       ),
       allRows.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"Nothing open right now.") :
+      viewMode==="kanban" ? h("div",{style:{display:"flex",gap:10,overflowX:"auto",paddingBottom:10}},
+        gapTypeOptions.map(type=>{
+          const colRows = allRows.filter(r=>r.type===type);
+          return h("div",{key:type,style:{flex:"0 0 220px",background:type==="Overdue"?"#fdecea":"#f4f2ea",borderRadius:10,padding:10,display:"flex",flexDirection:"column",gap:8,minHeight:120}},
+            h("div",{style:{fontSize:12,fontWeight:700,color:type==="Overdue"?"#a3312a":colors.text}},type+" ("+colRows.length+")"),
+            colRows.map((r,i)=>h("div",{key:i,style:{background:"#fff",borderRadius:8,boxShadow:"0 1px 2px rgba(0,0,0,0.08)",padding:"8px 10px"}},
+              h("div",{style:{fontSize:12,fontWeight:600,marginBottom:2}},r.project),
+              h("div",{style:{fontSize:11,color:colors.muted,marginBottom:6}},r.detail),
+              h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center"}},
+                h("span",{style:{fontSize:10.5,color:colors.mutedLight}},r.age+" day"+(r.age===1?"":"s")),
+                r.type!=="Overdue" && onGoTo && h("button",{onClick:()=>onGoTo("__detailed_project__",r.project),style:{...btnSmall,fontSize:10,padding:"2px 7px"}},"Fix")
+              )
+            )),
+            colRows.length===0 && h("div",{style:{fontSize:11,color:colors.mutedLight,padding:6}},"Nothing here.")
+          );
+        })
+      ) :
       h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"14px 16px"}},
         h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12.5}},
           h("thead",null,h("tr",{style:{borderBottom:"1px solid "+colors.border}},
@@ -21067,85 +21087,6 @@ function MajorProjectsBulkImport({ user }){
           committed.errors.map((e,i)=>h("div",{key:i},"• "+e))
         )
       )
-    )
-  );
-}
-
-function MajorProjectPackageKanban({ user }){
-  const [cards,setCards] = useState([]);
-  const [columnOf,setColumnOf] = useState({}); // package_status -> kanban_column
-  const [firstStatusOfColumn,setFirstStatusOfColumn] = useState({}); // kanban_column -> package_status (lowest sort_order)
-  const [loading,setLoading] = useState(true);
-  const [dragCard,setDragCard] = useState(null);
-
-  const load = useCallback(async()=>{
-    setLoading(true);
-    const [{data:pkgRows},{data:colRows},{data:statusRows}] = await Promise.all([
-      sb.from("major_project_package_tbl").select("*, major_project_tbl(project_name,main_epc_company_name,end_user_company_name)").order("created_at",{ascending:false}),
-      sb.from("major_project_kanban_column_tbl").select("package_status,kanban_column"),
-      sb.from("major_project_package_status_tbl").select("status,sort_order").order("sort_order"),
-    ]);
-    const colMap = {};
-    (colRows||[]).forEach(r=>{ colMap[r.package_status] = r.kanban_column; });
-    setColumnOf(colMap);
-    // First (lowest sort_order) detailed status per Kanban column — what a
-    // card becomes when dropped into that column from a different one.
-    const firstMap = {};
-    (statusRows||[]).forEach(r=>{
-      const col = colMap[r.status];
-      if(col && !(col in firstMap)) firstMap[col] = r.status;
-    });
-    setFirstStatusOfColumn(firstMap);
-    setCards(pkgRows||[]);
-    setLoading(false);
-  },[]);
-  useEffect(()=>{ load(); },[load]);
-
-  const moveCard = async(card,targetColumn)=>{
-    const currentColumn = columnOf[card.package_status];
-    if(currentColumn===targetColumn) return;
-    const newStatus = firstStatusOfColumn[targetColumn];
-    if(!newStatus) return;
-    setCards(cs=>cs.map(c=>c.id===card.id?{...c,package_status:newStatus}:c));
-    await sb.from("major_project_package_tbl").update({package_status:newStatus,updated_at:new Date().toISOString()}).eq("id",card.id);
-  };
-
-  const columns = ["Tender","EPC Awarded","RFQ Received"];
-
-  return h("div",{style:{padding:"20px 24px"}},
-    h("h2",{style:{margin:"0 0 14px",fontSize:18,fontWeight:700}},"Package board"),
-    loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
-    h("div",{style:{display:"flex",gap:12,overflowX:"auto",paddingBottom:10}},
-      columns.map(col=>{
-        const colCards = cards.filter(c=>columnOf[c.package_status]===col);
-        const totalValue = colCards.reduce((s,c)=>s+(Number(c.estimated_value)||0),0);
-        return h("div",{
-          key:col,
-          onDragOver:e=>e.preventDefault(),
-          onDrop:()=>{ if(dragCard) moveCard(dragCard,col); setDragCard(null); },
-          style:{flex:"0 0 260px",background:"#f4f2ea",borderRadius:10,padding:10,display:"flex",flexDirection:"column",gap:8,minHeight:160}
-        },
-          h("div",{style:{padding:"2px 4px 6px",borderBottom:"1px solid "+colors.border}},
-            h("div",{style:{fontSize:12.5,fontWeight:700}},col+" ("+colCards.length+")"),
-            h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},fmt(totalValue)+" est.")
-          ),
-          colCards.map(c=>h("div",{
-            key:c.id, draggable:true,
-            onDragStart:()=>setDragCard(c),
-            onDragEnd:()=>setDragCard(null),
-            style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"9px 11px",cursor:"grab"}
-          },
-            h("div",{style:{fontWeight:600,fontSize:12.5}},c.package_name),
-            h("div",{style:{fontSize:11,color:colors.muted,marginTop:2}},(c.major_project_tbl&&c.major_project_tbl.project_name)||"—"),
-            h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:2}},(c.major_project_tbl&&c.major_project_tbl.main_epc_company_name)||"—"),
-            h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:6,paddingTop:5,borderTop:"1px solid #f0efe8"}},
-              h("span",{style:{fontSize:10.5,color:colors.mutedLight}},c.sales_rep||"—"),
-              c.next_followup_date && h("span",{style:{fontSize:10.5,color:colors.mutedLight}},c.next_followup_date)
-            )
-          )),
-          colCards.length===0 && h("div",{style:{fontSize:11,color:colors.mutedLight,padding:6}},"No packages.")
-        );
-      })
     )
   );
 }
@@ -25733,7 +25674,6 @@ function App() {
       deepLinkTarget:projectDeepLink, onDeepLinkConsumed:()=>setProjectDeepLink(null), onGoTo:goToEntityLookup,
       initialDetailedProjectFilter:detailedProjectFilter, onDetailedProjectFilterConsumed:()=>setDetailedProjectFilter(null)
     }):
-    tab==="major_projects_kanban"?h(MajorProjectPackageKanban,{user}):
     tab==="major_projects_bulk_import"?h(MajorProjectsBulkImport,{user}):
     tab==="lookup_end_user"?h(EntityLookupScreen,{user,entityType:"end_user",preselect:entityLookupPreselect,onGoTo:goToEntityLookup,returnTo:entityReturnTo}):
     tab==="lookup_epc"?h(EntityLookupScreen,{user,entityType:"epc",preselect:entityLookupPreselect,onGoTo:goToEntityLookup,returnTo:entityReturnTo}):
