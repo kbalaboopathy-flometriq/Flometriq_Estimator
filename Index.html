@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-24T01:46:27Z";
+  var APP_BUILD_VERSION = "2026-08-24T02:32:36Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1206,7 +1206,6 @@ function MenuTabs({ user, active, onChange }) {
       ]:[]),
       { label:"Major Projects", tabs:[
         {key:"major_projects",label:"Projects"},
-        {key:"major_projects_overview",label:"Overview"},
         {key:"major_projects_kanban",label:"Package Board"},
         {key:"major_projects_bulk_import",label:"Bulk Import"},
         {key:"gaps_dashboard",label:"What Needs Chasing"},
@@ -18532,8 +18531,54 @@ function StatusChangeHistoryReport(){
 // SABIC, HPCL, DEWA, or any future account.
 // ============================================================
 
-function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, deepLinkTarget, onDeepLinkConsumed, onGoTo }){
-  const [view,setView] = useState("list"); // "list" | "detail" | "package_detail"
+// Read-only single-project grid (24 Aug) — replaces the old always-on
+// "Overview" tab, which was fully editable and covered every project at
+// once. This one opens only from a specific Project's own screen, shows
+// just that project's Package/Customer grid, and has no edit controls
+// anywhere on it — pure "grid info" per explicit instruction.
+function ProjectOverviewReadOnly({ project, onBack }){  const [loading,setLoading] = useState(true);
+  const [packages,setPackages] = useState([]);
+  const [allocationsByPackage,setAllocationsByPackage] = useState({});
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data: pkgRows } = await sb.from("major_project_package_tbl").select("*").eq("project_id",project.id).order("created_at");
+    setPackages(pkgRows||[]);
+    const packageIds = (pkgRows||[]).map(p=>p.id);
+    const { data: allocRows } = packageIds.length ? await sb.from("package_customer_allocation_tbl").select("*").in("package_id",packageIds) : {data:[]};
+    const byPkg = {};
+    (allocRows||[]).forEach(a=>{ if(!byPkg[a.package_id]) byPkg[a.package_id]=[]; byPkg[a.package_id].push(a); });
+    setAllocationsByPackage(byPkg);
+    setLoading(false);
+  },[project.id]);
+  useEffect(()=>{ load(); },[load]);
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("button",{onClick:onBack,style:{...btnSmall,marginBottom:12}},"← Back"),
+    h("h2",{style:{margin:0,fontSize:18,fontWeight:700}},project.project_name+" — overview"),
+    h("div",{style:{fontSize:12.5,color:colors.muted,marginTop:4,marginBottom:16}},
+      "End user: "+(project.end_user_company_name||"—")+"  ·  EPC: "+(project.main_epc_company_name||"—")+"  ·  Owner: "+(project.primary_sales_rep||"—")
+    ),
+    loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
+    packages.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"No packages yet.") :
+    h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,overflow:"hidden"}},
+      h("div",{style:{display:"grid",gridTemplateColumns:"1.4fr 1fr 2fr",padding:"8px 14px",background:colors.bg,fontSize:10.5,fontWeight:700,color:colors.muted}},
+        h("div",null,"Package"),h("div",null,"Status"),h("div",null,"Customers")
+      ),
+      packages.map((pkg,i)=>h("div",{key:pkg.id,style:{display:"grid",gridTemplateColumns:"1.4fr 1fr 2fr",padding:"10px 14px",borderTop:"1px solid "+colors.border,fontSize:12.5,background:i%2===0?"#fff":"#faf9f4"}},
+        h("div",{style:{fontWeight:600}},pkg.package_name),
+        h("div",null,pkg.package_status||"—"),
+        h("div",{style:{display:"flex",flexWrap:"wrap",gap:4}},
+          (allocationsByPackage[pkg.id]||[]).length===0 ? h("span",{style:{fontSize:11,color:colors.mutedLight}},"None yet") :
+          (allocationsByPackage[pkg.id]||[]).map(a=>h("span",{key:a.id,style:{fontSize:11,padding:"2px 8px",borderRadius:10,background:a.linked_reference_number?"#eaf9f4":"#f4f2ea",color:a.linked_reference_number?"#085041":colors.muted}},a.company_name+(a.allocation_status?" · "+a.allocation_status:"")))
+        )
+      ))
+    )
+  );
+}
+
+function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, deepLinkTarget, onDeepLinkConsumed, onGoTo, initialDetailedProjectFilter, onDetailedProjectFilterConsumed }){
+  const [view,setView] = useState("list"); // "list" | "detail" | "package_detail" | "overview"
   const [projects,setProjects] = useState([]);
   const [loading,setLoading] = useState(true);
   const [search,setSearch] = useState("");
@@ -18560,6 +18605,14 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
     setLoading(false);
   },[]);
   useEffect(()=>{ loadProjects(); },[loadProjects]);
+
+  // "Fix" from the Gaps dashboard (24 Aug) lands here with a project name
+  // to pre-filter Detailed view to, rather than opening that project's own
+  // cart screen — switch into Detailed view and hand the filter down.
+  useEffect(()=>{
+    if(!initialDetailedProjectFilter) return;
+    setListMode("detailed");
+  },[initialDetailedProjectFilter]);
 
   const loadPackages = useCallback(async(projectId)=>{
     setLoadingPackages(true);
@@ -18591,6 +18644,10 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
       || (p.main_epc_company_name||"").toLowerCase().includes(q);
   });
 
+  if(view==="overview" && selectedProject){
+    return h(ProjectOverviewReadOnly,{project:selectedProject, onBack:()=>setView("detail")});
+  }
+
   if(view==="detail" && selectedProject){
     return h(React.Fragment,null,
       h("div",{style:{padding:"20px 24px"}},
@@ -18607,7 +18664,10 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
               selectedProject.end_user_company_name+" · EPC: "+selectedProject.main_epc_company_name
             )
           ),
-          h("button",{onClick:()=>{setEditingProject(selectedProject);setShowProjectForm(true);},style:btnSecondary},"Edit project")
+          h("div",{style:{display:"flex",gap:8}},
+            h("button",{onClick:()=>setView("overview"),style:btnSecondary},"View overview"),
+            h("button",{onClick:()=>{setEditingProject(selectedProject);setShowProjectForm(true);},style:btnSecondary},"Edit project")
+          )
         ),
         h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:20}},
           h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"8px 14px"}},
@@ -18673,7 +18733,9 @@ function MajorProjectsScreen({ user, onCreateQuoteFromAllocation, onOpenQuote, d
         user, projects: filtered,
         onOpenProject: (p,fromDetailedView)=>openProject(p,fromDetailedView),
         onEditProject: (p)=>{setEditingProject(p);setShowProjectForm(true);},
-        onRefresh: loadProjects
+        onRefresh: loadProjects,
+        initialProjectFilter: initialDetailedProjectFilter,
+        onInitialProjectFilterConsumed: onDetailedProjectFilterConsumed
       }) :
       loading ? h("div",{style:{color:colors.mutedLight,fontSize:13}},"Loading…") :
       filtered.length===0 ? h("div",{style:{color:colors.mutedLight,fontSize:13,padding:"20px 0"}},"No projects yet — click + New Project to add the first one (any major EPC account: Aramco, IOCL, BPCL, SABIC, HPCL, DEWA, or others).") :
@@ -20011,120 +20073,6 @@ function EntityLookupScreen({ user, entityType, preselect, onGoTo, returnTo }){
 // separate node — kept local to this file's h()-based render style.
 function h_text(s){ return s||"—"; }
 
-// Flat horizontal overview (23 Aug SOP) — one row per Project, matching
-// the real spreadsheet's own grammar: Project name + EPC badge, then a
-// Package chip per Package with its Customers shown inline (Quote#
-// badge if linked, "Not found" if none). Clicking a Package chip
-// expands an accordion right below that row for real editing — reuses
-// PackageAllocationsSection unchanged, same as the cart layout, so
-// there's exactly one place that logic lives. Only one Package expands
-// at a time, across the whole screen, so rows stay scannable.
-function MajorProjectsFlatOverview({ user, onOpenQuote }){
-  const [loading,setLoading] = useState(true);
-  const [projects,setProjects] = useState([]);
-  const [packagesByProject,setPackagesByProject] = useState({});
-  const [allocationsByPackage,setAllocationsByPackage] = useState({});
-  const [expandedPackageId,setExpandedPackageId] = useState(null);
-  const [statuses,setStatuses] = useState([]);
-  const [packageNameOptions,setPackageNameOptions] = useState([]);
-  const [salesRepOptions,setSalesRepOptions] = useState([]);
-
-  const load = useCallback(async()=>{
-    setLoading(true);
-    const { data: projRows } = await sb.from("major_project_tbl").select("*").order("project_name");
-    setProjects(projRows||[]);
-    const projectIds = (projRows||[]).map(p=>p.id);
-    const { data: pkgRows } = projectIds.length ? await sb.from("major_project_package_tbl").select("*").in("project_id",projectIds).order("created_at") : {data:[]};
-    const byProj = {};
-    (pkgRows||[]).forEach(pk=>{ if(!byProj[pk.project_id]) byProj[pk.project_id]=[]; byProj[pk.project_id].push(pk); });
-    setPackagesByProject(byProj);
-    const packageIds = (pkgRows||[]).map(p=>p.id);
-    const { data: allocRows } = packageIds.length ? await sb.from("package_customer_allocation_tbl").select("*").in("package_id",packageIds) : {data:[]};
-    const byPkg = {};
-    (allocRows||[]).forEach(a=>{ if(!byPkg[a.package_id]) byPkg[a.package_id]=[]; byPkg[a.package_id].push(a); });
-    setAllocationsByPackage(byPkg);
-    setLoading(false);
-  },[]);
-  useEffect(()=>{ load(); },[load]);
-  useEffect(()=>{
-    sb.from("major_project_package_status_tbl").select("status").order("sort_order").then(({data})=>setStatuses((data||[]).map(r=>r.status)));
-    sb.from("package_name_tbl").select("value").order("value").then(({data})=>setPackageNameOptions((data||[]).map(r=>r.value)));
-    sb.from("employee_tbl").select("employee_name").neq("status","Inactive").order("employee_name").then(({data})=>setSalesRepOptions((data||[]).map(r=>r.employee_name)));
-  },[]);
-
-  const updatePackage = async(pkg,patch)=>{
-    setPackagesByProject(prev=>{
-      const next = {...prev};
-      next[pkg.project_id] = next[pkg.project_id].map(p=>p.id===pkg.id?{...p,...patch}:p);
-      return next;
-    });
-    await sb.from("major_project_package_tbl").update({...patch,updated_at:new Date().toISOString()}).eq("id",pkg.id);
-  };
-
-  const badgeStyle = { fontSize:11, padding:"2px 8px", borderRadius:10, marginRight:4, whiteSpace:"nowrap" };
-  const custBadge = (alloc)=> h("span",{key:alloc.id,style:{...badgeStyle, background: alloc.linked_reference_number?"#eaf9f4":"#f4f2ea", color: alloc.linked_reference_number?"#085041":colors.muted}},
-    alloc.company_name+(alloc.linked_reference_number?" · "+alloc.linked_reference_number:"")
-  );
-
-  const field = (pkg,label,key,type)=> h("div",null,
-    h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},label),
-    h("input",{type:type||"text",value:pkg[key]||"",onChange:e=>updatePackage(pkg,{[key]:e.target.value||null}),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%"}})
-  );
-
-  return h("div",{style:{padding:20}},
-    h("h2",{style:{marginTop:0}},"Projects overview"),
-    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},"Every Project, EPC, Package and Customer at a glance — click a Package to edit it here."),
-    loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
-    h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"6px 16px"}},
-      projects.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight,padding:"14px 0"}},"No projects yet.") :
-      projects.map(proj=>{
-        const pkgs = packagesByProject[proj.id] || [];
-        return h(React.Fragment,{key:proj.id},
-          h("div",{style:{padding:"10px 0",borderBottom:"1px solid "+colors.border,display:"flex",alignItems:"center",flexWrap:"wrap",gap:4}},
-            h("span",{style:{fontSize:13,fontWeight:600,marginRight:6}},proj.project_name),
-            h("span",{style:{...badgeStyle,background:"#f4f2ea",color:colors.muted}},proj.main_epc_company_name||"EPC not set"),
-            h("span",{style:{width:8}}),
-            pkgs.map(pkg=>{
-              const allocs = allocationsByPackage[pkg.id] || [];
-              return h("span",{
-                key:pkg.id, onClick:()=>setExpandedPackageId(id=>id===pkg.id?null:pkg.id),
-                style:{fontSize:12,padding:"3px 9px",borderRadius:6,border:"1px solid "+colors.border,display:"inline-block",cursor:"pointer",marginRight:8,marginBottom:4,background:expandedPackageId===pkg.id?"#e6f1fb":"#fff"}
-              },
-                pkg.package_name+"  ",
-                allocs.length===0 ? h("span",{style:{...badgeStyle,background:"#fdecea",color:"#a3312a"}},"Not found") : allocs.map(custBadge)
-              );
-            })
-          ),
-          pkgs.filter(pkg=>pkg.id===expandedPackageId).map(pkg=>
-            h("div",{key:"detail-"+pkg.id,style:{margin:"8px 0 14px",padding:"12px 14px",border:"1px solid "+colors.border,borderRadius:8,background:"#faf9f4"}},
-              h("div",{style:{fontSize:12.5,fontWeight:600,marginBottom:8}},pkg.package_name+" — detail"),
-              h(MasterSelect,{value:pkg.package_name,onChange:v=>updatePackage(pkg,{package_name:v}),options:packageNameOptions,table:"package_name_tbl",valueCol:"value",fieldLabel:"Package name",placeholder:"Package name",style:{padding:"6px 8px",fontSize:12,fontWeight:600,width:"100%",marginBottom:8}}),
-              h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}},
-                h("div",null,
-                  h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Status"),
-                  h("select",{value:pkg.package_status,onChange:e=>updatePackage(pkg,{package_status:e.target.value}),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"100%"}},
-                    statuses.map(s=>h("option",{key:s,value:s},s))
-                  )
-                ),
-                h("div",null,
-                  h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Sales rep"),
-                  h(LimitToListCombo,{value:pkg.sales_rep||"",onChange:v=>updatePackage(pkg,{sales_rep:v}),options:salesRepOptions,limitToList:false,placeholder:"Sales rep",style:{padding:"6px 8px",fontSize:12,width:"100%"}})
-                )
-              ),
-              h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}},
-                field(pkg,"Next follow-up","next_followup_date","date"),
-                field(pkg,"Est. value","estimated_value"),
-                field(pkg,"Product type","product_type")
-              ),
-              h(PackageAllocationsSection,{pkg, project:proj, user, onOpenQuote})
-            )
-          )
-        );
-      })
-    )
-  );
-}
-
 // Summarised Column View (23 Aug SOP) — Project | EPC | Package | Customer
 // as four parallel lists, each item showing its name with a small badge
 // underneath pointing to its parent (matches the user's own reference
@@ -20147,7 +20095,7 @@ function MajorProjectsFlatOverview({ user, onOpenQuote }){
 // Known gap, not resolved as of 23 Aug: Customer/Allocation has no
 // "owner" column in the schema, so unlike the other three levels,
 // Customer rows don't get an Owner field here — nothing to bind it to.
-function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProject, onRefresh }){
+function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProject, onRefresh, initialProjectFilter, onInitialProjectFilterConsumed }){
   const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
   const isSuperAdmin = user.role==="super_admin";
   const [loading,setLoading] = useState(true);
@@ -20169,6 +20117,18 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
   // there rather than into the Project screen first.
   const [allocModalPkg,setAllocModalPkg] = useState(null);
   const [checkboxProject,setCheckboxProject] = useState(null);
+  // "View overview" (24 Aug) — a read-only screen of its own, same
+  // component the single-project cart screen uses, so it's the one place
+  // that layout lives.
+  const [overviewProject,setOverviewProject] = useState(null);
+
+  // Applies a "Fix"-from-Gaps-dashboard project filter once, then tells the
+  // parent it's been consumed so a later normal filter change isn't clobbered.
+  useEffect(()=>{
+    if(!initialProjectFilter) return;
+    setFProject(initialProjectFilter);
+    if(onInitialProjectFilterConsumed) onInitialProjectFilterConsumed();
+  },[initialProjectFilter]);
 
   const load = useCallback(async()=>{
     setLoading(true);
@@ -20298,6 +20258,21 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
   const customerOptions = Array.from(new Set(allocations.map(a=>a.company_name).filter(Boolean))).sort();
 
   const deleteBtn = (onClick,title)=> h("button",{onClick,title,style:{...btnSmall,fontSize:10,padding:"2px 7px",color:colors.danger,borderColor:colors.danger,whiteSpace:"nowrap",flexShrink:0}},"Delete");
+  // Real dropdown (24 Aug), corrected same day — Owner was a
+  // LimitToListCombo with limitToList:false (a plain free-typeable text
+  // box, not constrained to the list at all). A genuine <select>, and
+  // "Unassigned" is a real list option with an empty value (clears the
+  // owner), not just an unlabeled placeholder — same limit-to-list
+  // pattern used everywhere else in the app, just with a real option
+  // instead of a blank one.
+  const ownerSelect = (value,onChange,style)=> h("select",{value:value||"",onChange:e=>onChange(e.target.value||null),style:{...inputStyle,padding:"3px 6px",fontSize:10.5,width:"100%",...style}},
+    h("option",{value:""},"Unassigned"),
+    salesRepOptions.map(n=>h("option",{key:n,value:n},n))
+  );
+
+  if(overviewProject){
+    return h(ProjectOverviewReadOnly,{project:overviewProject, onBack:()=>setOverviewProject(null)});
+  }
 
   return h("div",null,
     h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",marginBottom:12,padding:"7px 9px",border:"1px solid "+colors.border,borderRadius:8}},
@@ -20315,7 +20290,10 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
       return h("div",{key:proj.id,style:{marginBottom:16}},
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
           h("div",{style:{fontSize:13.5,fontWeight:700}},proj.project_name),
-          isAdminOrAbove && deleteBtn(()=>deleteProject(proj),"Delete project")
+          h("div",{style:{display:"flex",gap:6}},
+            h("button",{onClick:()=>setOverviewProject(proj),style:{...btnSmall,fontSize:10,padding:"2px 7px"}},"View overview"),
+            isAdminOrAbove && deleteBtn(()=>deleteProject(proj),"Delete project")
+          )
         ),
         h("div",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:8,overflow:"hidden",background:"#fff"}},
 
@@ -20323,7 +20301,7 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
             h("div",{style:{padding:"6px 9px",borderBottom:"1px solid "+colors.border,fontSize:10.5,fontWeight:600,color:colors.muted}},"End user"),
             h("div",{style:{padding:"7px 9px"}},
               h(CustomerSelect,{value:proj.end_user_company_name,user,onSelect:(p)=>updateProject(proj,{end_user_company_name:p.company_name})}),
-              h(LimitToListCombo,{value:proj.primary_sales_rep||"",onChange:v=>updateProject(proj,{primary_sales_rep:v}),options:salesRepOptions,limitToList:false,placeholder:"Owner",style:{fontSize:10.5,width:"100%",padding:"3px 6px",marginTop:5}})
+              ownerSelect(proj.primary_sales_rep, v=>updateProject(proj,{primary_sales_rep:v}), {marginTop:5})
             )
           ),
 
@@ -20337,7 +20315,7 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
                 h("div",{style:{flex:1,minWidth:0}},h(CustomerSelect,{value:proj.main_epc_company_name,user,onSelect:(p)=>updateProject(proj,{main_epc_company_name:p.company_name})})),
                 proj.main_epc_company_name && deleteBtn(()=>deleteEpc(proj),"Delete EPC")
               ),
-              h(LimitToListCombo,{value:proj.epc_owner||"",onChange:v=>updateProject(proj,{epc_owner:v}),options:salesRepOptions,limitToList:false,placeholder:"Owner",style:{fontSize:10.5,width:"100%",padding:"3px 6px"}})
+              ownerSelect(proj.epc_owner, v=>updateProject(proj,{epc_owner:v}))
             )
           ),
 
@@ -20374,7 +20352,7 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
                 h("select",{value:a.allocation_status||"",onChange:e=>updateAllocation(a,{allocation_status:e.target.value}),style:{...inputStyle,padding:"3px 4px",fontSize:10,width:"100%"}},
                   statuses.map(s=>h("option",{key:s,value:s},s))
                 ),
-                h(LimitToListCombo,{value:a.owner||"",onChange:v=>updateAllocation(a,{owner:v}),options:salesRepOptions,limitToList:false,placeholder:"Owner",style:{fontSize:10,width:"100%",padding:"3px 4px"}})
+                ownerSelect(a.owner, v=>updateAllocation(a,{owner:v}), {fontSize:10,padding:"3px 4px"})
               )
             ))
           )
@@ -20395,7 +20373,8 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
   );
 }
 
-function GapsChaseDashboard({ user }){
+function GapsChaseDashboard({ user, onGoTo }){
+  const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
   const [myEmployeeName,setMyEmployeeName] = useState(null);
   useEffect(()=>{
     if(isAdminOrAbove) return;
@@ -20404,27 +20383,34 @@ function GapsChaseDashboard({ user }){
   },[user.id,isAdminOrAbove]);
 
   const [loading,setLoading] = useState(true);
-  const [gaps,setGaps] = useState({noEpc:[],noPackages:[],noCustomer:[],noEnquiry:[],overdue:[]});
+  const [gaps,setGaps] = useState({noEpc:[],noPackages:[],noCustomer:[],noRfq:[],noOwner:[],overdue:[]});
+  const [projectOptions,setProjectOptions] = useState([]);
+  const [ownerOptions,setOwnerOptions] = useState([]);
+  const [fProject,setFProject] = useState("");
+  const [fOwner,setFOwner] = useState("");
+  const [fGapType,setFGapType] = useState("");
+  useEffect(()=>{
+    sb.from("employee_tbl").select("employee_name").eq("department","Sales").neq("status","Inactive").order("employee_name").then(({data})=>setOwnerOptions((data||[]).map(r=>r.employee_name)));
+  },[]);
 
   const load = useCallback(async()=>{
     setLoading(true);
     let projQuery = sb.from("major_project_tbl").select("*");
     if(!isAdminOrAbove && myEmployeeName) projQuery = projQuery.eq("primary_sales_rep",myEmployeeName);
     const { data: projects } = await projQuery;
+    setProjectOptions((projects||[]).map(p=>p.project_name).filter(Boolean).sort());
     const projectIds = (projects||[]).map(p=>p.id);
     const { data: packages } = projectIds.length ? await sb.from("major_project_package_tbl").select("*").in("project_id",projectIds) : {data:[]};
     const packageIds = (packages||[]).map(p=>p.id);
     const { data: allocations } = packageIds.length ? await sb.from("package_customer_allocation_tbl").select("*").in("package_id",packageIds) : {data:[]};
-    // "No enquiry" (24 Aug, scope pulled back): the standalone Enquiry
-    // entity is unhooked from Major Projects, so this gap no longer
-    // checks enquiry_tbl — it now reads straight off the allocation's own
-    // status field, same list as Package status. The gap is "not yet at
-    // or past RFQ Received" (per explicit instruction); anything before
-    // that index, including a null/unrecognized status, counts as open.
-    const { data: statusRows } = await sb.from("major_project_package_status_tbl").select("status").order("sort_order");
-    const statusOrder = (statusRows||[]).map(r=>r.status);
-    const rfqIdx = statusOrder.indexOf("RFQ Received");
-    const atOrAfterRfq = new Set(rfqIdx>=0 ? statusOrder.slice(rfqIdx) : []);
+    // "No RFQ or lost" (24 Aug): the standalone Enquiry entity is unhooked
+    // from Major Projects, so this gap reads straight off the allocation's
+    // own status field. Resolved (not a gap) once status is "RFQ Received"
+    // or "Order Lost" — anything else, including a null/unrecognized
+    // status, counts as open. Deliberately a fixed pair of terminal values
+    // rather than a sort_order cutoff, since "Order Lost" isn't later in
+    // the sequence than RFQ Received, it's a separate closed-off branch.
+    const resolvedStatuses = new Set(["RFQ Received","Order Lost"]);
     // Overdue is scoped to this user's own assigned enquiries when not
     // admin/super_admin — a chase gap belongs to whoever's chasing it.
     let overdueQuery = sb.from("enquiry_tbl").select("*").neq("status","Converted").not("due_date","is",null).lt("due_date",new Date().toISOString().slice(0,10));
@@ -20441,42 +20427,72 @@ function GapsChaseDashboard({ user }){
     const ageDays = (dateStr)=> Math.floor((Date.now()-new Date(dateStr))/86400000);
 
     const noEpc = (projects||[]).filter(p=>!p.main_epc_company_name || !p.main_epc_company_name.trim())
-      .map(p=>({project:p.project_name, detail:"End user: "+(p.end_user_company_name||"—"), age:ageDays(p.created_at)}));
+      .map(p=>({project:p.project_name, detail:"End user: "+(p.end_user_company_name||"—"), age:ageDays(p.created_at), owner:p.primary_sales_rep||null}));
     const noPackages = (projects||[]).filter(p=>p.main_epc_company_name && p.main_epc_company_name.trim() && !pkgsByProject.has(p.id))
-      .map(p=>({project:p.project_name, detail:"EPC: "+p.main_epc_company_name, age:ageDays(p.created_at)}));
+      .map(p=>({project:p.project_name, detail:"EPC: "+p.main_epc_company_name, age:ageDays(p.created_at), owner:p.primary_sales_rep||null}));
     const noCustomer = (packages||[]).filter(p=>!allocsByPackage.has(p.id))
-      .map(p=>({project:(projById.get(p.project_id)||{}).project_name||"—", detail:p.package_name, age:ageDays(p.created_at)}));
-    const noEnquiry = (allocations||[]).filter(a=>!atOrAfterRfq.has(a.allocation_status))
+      .map(p=>{ const proj=projById.get(p.project_id);
+        return {project:proj?proj.project_name:"—", detail:p.package_name, age:ageDays(p.created_at), owner:p.sales_rep||(proj?proj.primary_sales_rep:null)||null}; });
+    const noRfq = (allocations||[]).filter(a=>!resolvedStatuses.has(a.allocation_status))
       .map(a=>{ const pkg=pkgById.get(a.package_id); const proj=pkg?projById.get(pkg.project_id):null;
-        return {project:proj?proj.project_name:"—", detail:a.company_name+" — "+(pkg?pkg.package_name:"—"), age:ageDays(a.created_at)}; });
-    const overdue = (overdueRows||[]).map(e=>({project:e.enquiry_number, detail:e.company_name+" — assigned to "+e.assigned_to, age:ageDays(e.due_date)}));
+        return {project:proj?proj.project_name:"—", detail:a.company_name+" — "+(pkg?pkg.package_name:"—"), age:ageDays(a.created_at), owner:a.owner||(proj?proj.primary_sales_rep:null)||null}; });
+    // "No owner" (24 Aug) — checks all three owner fields the app now has:
+    // End user owner and EPC owner on the project, Customer/Allocation
+    // owner. Each missing one is its own row rather than one row per
+    // project, since a project can be missing more than one at once.
+    const noOwner = [];
+    (projects||[]).forEach(p=>{
+      if(!p.primary_sales_rep || !p.primary_sales_rep.trim()) noOwner.push({project:p.project_name, detail:"End user owner missing", age:ageDays(p.created_at), owner:null});
+      if(p.main_epc_company_name && p.main_epc_company_name.trim() && (!p.epc_owner || !p.epc_owner.trim())) noOwner.push({project:p.project_name, detail:"EPC owner missing", age:ageDays(p.created_at), owner:null});
+    });
+    (allocations||[]).forEach(a=>{
+      if(a.owner && a.owner.trim()) return;
+      const pkg=pkgById.get(a.package_id); const proj=pkg?projById.get(pkg.project_id):null;
+      noOwner.push({project:proj?proj.project_name:"—", detail:a.company_name+" — "+(pkg?pkg.package_name:"—")+" (customer owner missing)", age:ageDays(a.created_at), owner:null});
+    });
+    const overdue = (overdueRows||[]).map(e=>({project:e.enquiry_number, detail:e.company_name+" — assigned to "+e.assigned_to, age:ageDays(e.due_date), owner:e.assigned_to||null}));
 
-    setGaps({noEpc,noPackages,noCustomer,noEnquiry,overdue});
+    setGaps({noEpc,noPackages,noCustomer,noRfq,noOwner,overdue});
     setLoading(false);
   },[isAdminOrAbove,myEmployeeName]);
   useEffect(()=>{ if(isAdminOrAbove || myEmployeeName!==null) load(); },[load,isAdminOrAbove,myEmployeeName]);
 
   const allRows = [
     ...gaps.noEpc.map(r=>({...r,type:"No EPC"})),
-    ...gaps.noPackages.map(r=>({...r,type:"No packages"})),
+    ...gaps.noPackages.map(r=>({...r,type:"No package"})),
     ...gaps.noCustomer.map(r=>({...r,type:"No customer"})),
-    ...gaps.noEnquiry.map(r=>({...r,type:"No enquiry"})),
+    ...gaps.noRfq.map(r=>({...r,type:"No RFQ or lost"})),
+    ...gaps.noOwner.map(r=>({...r,type:"No owner"})),
     ...gaps.overdue.map(r=>({...r,type:"Overdue"})),
-  ].sort((a,b)=>b.age-a.age);
+  ].filter(r=>
+    (!fProject || r.project===fProject) &&
+    (!fOwner || r.owner===fOwner) &&
+    (!fGapType || r.type===fGapType)
+  ).sort((a,b)=>b.age-a.age);
 
   const badgeStyle = (type)=> type==="Overdue"
     ? {background:"#fdecea",color:"#a3312a"}
     : type==="No EPC" ? {background:"#fdecea",color:"#a3312a"}
     : type==="No customer" ? {background:"#fff4d6",color:"#854f0b"}
+    : type==="No owner" ? {background:"#f4f2ea",color:colors.muted}
     : {background:"#e6f1fb",color:"#0c447c"};
+
+  const gapTypeOptions = ["No EPC","No package","No customer","No RFQ or lost","No owner","Overdue"];
 
   return h("div",{style:{padding:20}},
     h("h2",{style:{marginTop:0}},"What needs chasing"),
     h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},isAdminOrAbove?"Every open gap across the pipeline.":"Your open gaps across the pipeline."),
     loading?h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…"):
     h(React.Fragment,null,
-      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:20,maxWidth:700}},
-        [["No EPC",gaps.noEpc.length],["No packages",gaps.noPackages.length],["No customer",gaps.noCustomer.length],["No enquiry",gaps.noEnquiry.length],["Overdue",gaps.overdue.length]].map(([label,count])=>
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8,marginBottom:14,maxWidth:700}},
+        h(LimitToListCombo,{value:fProject,onChange:setFProject,options:projectOptions,placeholder:"All projects",style:{fontSize:11,padding:"4px 6px"}}),
+        h(LimitToListCombo,{value:fOwner,onChange:setFOwner,options:ownerOptions,placeholder:"All owners",style:{fontSize:11,padding:"4px 6px"}}),
+        h("select",{value:fGapType,onChange:e=>setFGapType(e.target.value),style:{fontSize:11,padding:"4px 6px"}},
+          h("option",{value:""},"All gap types"), gapTypeOptions.map(t=>h("option",{key:t,value:t},t))
+        )
+      ),
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:20,maxWidth:820}},
+        [["No EPC",gaps.noEpc.length],["No package",gaps.noPackages.length],["No customer",gaps.noCustomer.length],["No RFQ or lost",gaps.noRfq.length],["No owner",gaps.noOwner.length],["Overdue",gaps.overdue.length]].map(([label,count])=>
           h("div",{key:label,style:{background:label==="Overdue"?"#fdecea":"#faf8f0",borderRadius:8,padding:10}},
             h("div",{style:{fontSize:11,color:label==="Overdue"?"#a3312a":colors.muted}},label),
             h("div",{style:{fontSize:20,fontWeight:700,marginTop:4,color:label==="Overdue"?"#a3312a":colors.text}},count)
@@ -20490,13 +20506,17 @@ function GapsChaseDashboard({ user }){
             h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Gap"),
             h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Project"),
             h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Detail"),
-            h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Open for")
+            h("th",{style:{textAlign:"left",padding:"6px 4px"}},"Open for"),
+            h("th",{style:{textAlign:"left",padding:"6px 4px"}},"")
           )),
           h("tbody",null, allRows.map((r,i)=>h("tr",{key:i,style:{borderBottom:"1px solid #f0eee6"}},
             h("td",{style:{padding:"7px 4px"}},h("span",{style:{fontSize:11,padding:"2px 8px",borderRadius:10,...badgeStyle(r.type)}},r.type)),
             h("td",{style:{padding:"7px 4px"}},r.project),
             h("td",{style:{padding:"7px 4px",color:colors.muted}},r.detail),
-            h("td",{style:{padding:"7px 4px"}},r.age+" day"+(r.age===1?"":"s"))
+            h("td",{style:{padding:"7px 4px"}},r.age+" day"+(r.age===1?"":"s")),
+            h("td",{style:{padding:"7px 4px"}},
+              r.type!=="Overdue" && onGoTo && h("button",{onClick:()=>onGoTo("__detailed_project__",r.project),style:{...btnSmall,fontSize:10.5,padding:"2px 8px"}},"Fix")
+            )
           )))
         )
       )
@@ -25391,10 +25411,15 @@ function App() {
   // projects" (23 Aug SOP — "prompt to jump and jump exactly to the
   // filtered project screen and get back once done").
   const [projectDeepLink,setProjectDeepLink]=useState(null); // {projectId, returnTo:{type,value}}
+  // "Fix" from the Gaps dashboard (24 Aug) — jump into Major Projects,
+  // switch to Detailed view, and pre-filter to the one project the gap
+  // is on, rather than opening that project's own cart screen.
+  const [detailedProjectFilter,setDetailedProjectFilter]=useState(null); // project_name string
   const goToEntityLookup = (type,value,returnTo)=>{
     if(type==="__project_list__"){ setTab("major_projects"); return; } // no dedicated Project-wise screen — the existing Projects list already shows this, just not deep-linked to one row yet
     if(type==="__open_quote__"){ setQuoteToOpen({reference_number:value.ref,item_sl_no:value.slNo}); setTab("saved"); return; }
     if(type==="__open_project__"){ setProjectDeepLink(value); setTab("major_projects"); return; }
+    if(type==="__detailed_project__"){ setDetailedProjectFilter(value); setTab("major_projects"); return; }
     if(type==="summary"){ setTab("major_projects"); return; } // Summarised Column View is now the Detailed-view toggle on the Projects tab itself, not a separate destination
     setEntityLookupPreselect({type,value}); setEntityReturnTo(returnTo||null); setTab("lookup_"+type);
   };
@@ -25515,10 +25540,8 @@ function App() {
     tab==="major_projects"?h(MajorProjectsScreen,{user,
       onCreateQuoteFromAllocation:(ref,allocationId,prefillCustomerName)=>{ setPendingNewSlNo({reference_number:ref,item_sl_no:1,linked_allocation_id:allocationId,prefillCustomerName}); setTab("estimator"); },
       onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");},
-      deepLinkTarget:projectDeepLink, onDeepLinkConsumed:()=>setProjectDeepLink(null), onGoTo:goToEntityLookup
-    }):
-    tab==="major_projects_overview"?h(MajorProjectsFlatOverview,{user,
-      onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}
+      deepLinkTarget:projectDeepLink, onDeepLinkConsumed:()=>setProjectDeepLink(null), onGoTo:goToEntityLookup,
+      initialDetailedProjectFilter:detailedProjectFilter, onDetailedProjectFilterConsumed:()=>setDetailedProjectFilter(null)
     }):
     tab==="major_projects_kanban"?h(MajorProjectPackageKanban,{user}):
     tab==="major_projects_bulk_import"?h(MajorProjectsBulkImport,{user}):
@@ -25531,7 +25554,7 @@ function App() {
       onCreateQuoteFromEnquiry:(ref,enquiryId,prefillCustomerName)=>{ setPendingNewSlNo({reference_number:ref,item_sl_no:1,linked_enquiry_id:enquiryId,prefillCustomerName}); setTab("estimator"); }
     }):
     tab==="enquiry_review"?h(EnquiryReviewScreen,{user}):
-    tab==="gaps_dashboard"?h(GapsChaseDashboard,{user}):
+    tab==="gaps_dashboard"?h(GapsChaseDashboard,{user,onGoTo:goToEntityLookup}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
