@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-24T01:07:23Z";
+  var APP_BUILD_VERSION = "2026-08-24T01:26:05Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -13239,8 +13239,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
               h("div",null,
                 h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
-                  h("h3",{style:{margin:0}},openRef.reference_number+"  ·  Sl No "+openRef.item_sl_no),
-                  openRef.linked_enquiry_id && h(EnquiryBacklinkBadge,{enquiryId:openRef.linked_enquiry_id,onGoToTab})
+                  h("h3",{style:{margin:0}},openRef.reference_number+"  ·  Sl No "+openRef.item_sl_no)
                 ),
                 h("div",{style:{fontSize:10.5,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginTop:6,marginBottom:2}},"Description"),
                 h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
@@ -19222,17 +19221,17 @@ function PackageAllocationsSection({ pkg, project, user, onCreateQuoteFromAlloca
   const [loading,setLoading] = useState(true);
   const [showAdd,setShowAdd] = useState(false);
   const [linkFor,setLinkFor] = useState(null);
-  const [logEnquiryFor,setLogEnquiryFor] = useState(null);
-  // Enquiries keyed by allocation_id (23 Aug SOP) — "Create quote" no
-  // longer jumps straight to a Quote# from here; it logs an Enquiry
-  // first, and this map tells the row whether one already exists so it
-  // shows the right state instead of offering to log a duplicate.
-  const [enquiriesByAllocation,setEnquiriesByAllocation] = useState({});
   // Allocation status (23 Aug) — was a fixed "Unknown" that never
   // changed anywhere in the UI. Now a real editable field. Reads from
   // major_project_package_status_tbl, not a separate table — the DB has
   // a real FK from allocation_status to that exact table, so this is
   // the only list that's actually valid to save.
+  // Enquiry tracking (24 Aug, scope pulled back): the standalone Enquiry
+  // entity/module (enquiry_tbl, its list/assignment screens) is deferred
+  // and deliberately unhooked from Major Projects — this section no
+  // longer logs or displays one. The allocation's own status field above
+  // is where progress (including "an enquiry now exists") gets tracked
+  // until that module is rebuilt with its own real back-link.
   const [statusOptions,setStatusOptions] = useState([]);
   useEffect(()=>{
     sb.from("major_project_package_status_tbl").select("status").order("sort_order").then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
@@ -19246,12 +19245,6 @@ function PackageAllocationsSection({ pkg, project, user, onCreateQuoteFromAlloca
     setLoading(true);
     const { data } = await sb.from("package_customer_allocation_tbl").select("*").eq("package_id",pkg.id).order("created_at");
     setRows(data||[]);
-    if(data && data.length){
-      const { data: enqs } = await sb.from("enquiry_tbl").select("id,enquiry_number,status,allocation_id,linked_reference_number").in("allocation_id",data.map(r=>r.id));
-      const byAlloc = {};
-      (enqs||[]).forEach(e=>{ byAlloc[e.allocation_id]=e; });
-      setEnquiriesByAllocation(byAlloc);
-    } else setEnquiriesByAllocation({});
     setLoading(false);
   },[pkg.id]);
   useEffect(()=>{ load(); },[load]);
@@ -19284,56 +19277,17 @@ function PackageAllocationsSection({ pkg, project, user, onCreateQuoteFromAlloca
             row.subcategory && h("span",{style:{fontSize:11,color:colors.muted}},"· "+row.subcategory)
           )
         ),
-        (()=>{
-          const enq = enquiriesByAllocation[row.id];
-          if(row.linked_reference_number || (enq && enq.linked_reference_number)){
-            const refNum = row.linked_reference_number || enq.linked_reference_number;
-            return h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
-              h("span",{style:{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Linked to Quote# "+refNum),
-              onOpenQuote && h("button",{onClick:()=>onOpenQuote(refNum,1),style:btnSmall},"Open Quote#")
-            );
-          }
-          if(enq){
-            const unassigned = enq.status==="Received";
-            return h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
-              h("span",{style:{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,background:unassigned?"#fdecea":"#fff4d6",color:unassigned?"#a3312a":"#854f0b"}},
-                enq.enquiry_number+" — "+(unassigned?"Unassigned":enq.status)
-              )
-            );
-          }
-          return h("div",{style:{display:"flex",gap:8}},
-            h("button",{onClick:()=>setLogEnquiryFor(row),style:btnSmall},"Log enquiry"),
-            h("button",{onClick:()=>setLinkFor(row),style:btnSmall},"Link existing Quote#")
-          );
-        })()
+        row.linked_reference_number
+          ? h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+              h("span",{style:{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Linked to Quote# "+row.linked_reference_number),
+              onOpenQuote && h("button",{onClick:()=>onOpenQuote(row.linked_reference_number,1),style:btnSmall},"Open Quote#")
+            )
+          : h("button",{onClick:()=>setLinkFor(row),style:btnSmall},"Link existing Quote#")
       ))
     ),
     showAdd && h(AddAllocationModal,{pkg,project,user,onCancel:()=>setShowAdd(false),onSaved:()=>{setShowAdd(false);load();}}),
-    linkFor && h(LinkExistingQuoteModal,{allocation:linkFor,onCancel:()=>setLinkFor(null),onSaved:()=>{setLinkFor(null);load();}}),
-    logEnquiryFor && h(LogEnquiryModal,{
-      user,
-      allocation: logEnquiryFor, pkg, project,
-      onCancel: ()=>setLogEnquiryFor(null),
-      onSaved: ()=>{ setLogEnquiryFor(null); load(); }
-    })
+    linkFor && h(LinkExistingQuoteModal,{allocation:linkFor,onCancel:()=>setLinkFor(null),onSaved:()=>{setLinkFor(null);load();}})
   );
-}
-
-// Small badge — Quote header backlink to its originating enquiry (23 Aug
-// SOP). Fetches just the enquiry_number for display; clicking jumps to
-// the Enquiries list (doesn't try to deep-link into one row, that list
-// is short enough to scan).
-function EnquiryBacklinkBadge({ enquiryId, onGoToTab }){
-  const [enquiryNumber,setEnquiryNumber] = useState(null);
-  useEffect(()=>{
-    sb.from("enquiry_tbl").select("enquiry_number").eq("id",enquiryId).maybeSingle()
-      .then(({data})=>setEnquiryNumber(data?.enquiry_number||null));
-  },[enquiryId]);
-  if(!enquiryNumber) return null;
-  return h("span",{
-    onClick:()=> onGoToTab && onGoToTab("enquiries_list"),
-    style:{fontSize:11,fontWeight:600,padding:"3px 9px",borderRadius:10,background:"#e6f1fb",color:"#0c447c",cursor:onGoToTab?"pointer":"default"}
-  },"From "+enquiryNumber);
 }
 
 // Log Enquiry (23 Aug SOP, Phase 1). Two shapes of the same form: called
@@ -20226,6 +20180,28 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
     setPackages(rows=>rows.map(r=>r.id===pkg.id?{...r,...patch}:r));
     await sb.from("major_project_package_tbl").update({...patch,updated_at:new Date().toISOString()}).eq("id",pkg.id);
   };
+  const updateAllocation = async(alloc,patch)=>{
+    setAllocations(rows=>rows.map(r=>r.id===alloc.id?{...r,...patch}:r));
+    await sb.from("package_customer_allocation_tbl").update({...patch,updated_at:new Date().toISOString()}).eq("id",alloc.id);
+  };
+  const deletePackage = async(pkg)=>{
+    const allocs = allocsByPackage.get(pkg.id) || [];
+    const warn = allocs.length>0
+      ? "Delete \""+pkg.package_name+"\"? This will also remove "+allocs.length+" customer allocation"+(allocs.length===1?"":"s")+" under it. This can't be undone."
+      : "Delete \""+pkg.package_name+"\"? This can't be undone.";
+    if(!confirm(warn)) return;
+    try{
+      if(allocs.length>0){
+        const { error: allocErr } = await sb.from("package_customer_allocation_tbl").delete().eq("package_id",pkg.id);
+        if(allocErr) throw allocErr;
+      }
+      const { error } = await sb.from("major_project_package_tbl").delete().eq("id",pkg.id);
+      if(error) throw error;
+      await logAudit("DELETE","major_project_package_tbl",String(pkg.id),"Deleted package "+pkg.package_name+(allocs.length?" and "+allocs.length+" allocation(s)":""),user?.username||"unknown",null,null);
+      setPackages(rows=>rows.filter(r=>r.id!==pkg.id));
+      setAllocations(rows=>rows.filter(r=>r.package_id!==pkg.id));
+    } catch(e){ alert("Delete failed: "+e.message); }
+  };
 
   const pkgsByProject = new Map();
   packages.forEach(pk=>{ if(!pkgsByProject.has(pk.project_id)) pkgsByProject.set(pk.project_id,[]); pkgsByProject.get(pk.project_id).push(pk); });
@@ -20251,13 +20227,6 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
   const epcOptions = Array.from(new Set(projects.map(p=>p.main_epc_company_name).filter(Boolean))).sort();
   const packageOptions = Array.from(new Set(packages.map(p=>p.package_name).filter(Boolean))).sort();
   const customerOptions = Array.from(new Set(allocations.map(a=>a.company_name).filter(Boolean))).sort();
-
-  const statusBadgeStyle = (status)=>{
-    if(status==="To find out") return {background:"#fdecea",color:"#a3312a"};
-    if(status==="Order Lost") return {background:"#f4f2ea",color:colors.muted};
-    if(status==="PO Received") return {background:"#eaf9f4",color:"#085041"};
-    return {background:"#fff4d6",color:"#854f0b"};
-  };
 
   return h("div",null,
     h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16,padding:"10px 12px",border:"1px solid "+colors.border,borderRadius:8}},
@@ -20287,7 +20256,7 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
           h("div",{style:{flex:1,minWidth:0,borderRight:"1px solid "+colors.border}},
             h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
               h("span",{style:{fontSize:11,fontWeight:600,color:colors.muted}},"EPC"),
-              h("button",{onClick:()=>onEditProject(proj),title:"Opens the project form",style:{...btnSmall,fontSize:10,padding:"2px 7px"}},"+")
+              h("button",{onClick:()=>onEditProject(proj),title:"Opens the project form",style:{...btnSmall,fontSize:10,padding:"2px 8px",display:"flex",alignItems:"center",gap:3}},"+ Add EPC")
             ),
             h("div",{style:{padding:"9px 11px"}},
               h(CustomerSelect,{value:proj.main_epc_company_name,user,onSelect:(p)=>updateProject(proj,{main_epc_company_name:p.company_name})}),
@@ -20298,11 +20267,14 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
           h("div",{style:{flex:1,minWidth:0,borderRight:"1px solid "+colors.border,overflowY:"auto"}},
             h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
               h("span",{style:{fontSize:11,fontWeight:600,color:colors.muted}},"Package"),
-              h("button",{onClick:()=>setCheckboxProject(proj),title:"Award packages",style:{...btnSmall,fontSize:10,padding:"2px 7px"}},"+")
+              h("button",{onClick:()=>setCheckboxProject(proj),title:"Award packages",style:{...btnSmall,fontSize:10,padding:"2px 8px",display:"flex",alignItems:"center",gap:3}},"+ Add package")
             ),
             pkgs.length===0 ? h("div",{style:{padding:"12px 11px",fontSize:11.5,color:colors.mutedLight}},"None yet.") :
             pkgs.map(pk=>h("div",{key:pk.id,style:{padding:"9px 11px",borderBottom:"1px solid #f0eee6"}},
-              h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12.5,fontWeight:600,color:colors.text,cursor:"pointer",marginBottom:5}},pk.package_name),
+              h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5,gap:6}},
+                h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12.5,fontWeight:600,color:colors.text,cursor:"pointer"}},pk.package_name),
+                h("button",{onClick:()=>deletePackage(pk),title:"Delete package",style:{...btnSmall,fontSize:10.5,padding:"2px 6px",color:colors.danger,borderColor:colors.danger,flexShrink:0}},"✕")
+              ),
               h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}},
                 h("select",{value:pk.package_status||"",onChange:e=>updatePackage(pk,{package_status:e.target.value}),style:{...inputStyle,padding:"3px 5px",fontSize:10.5,width:"100%"}},
                   statuses.map(s=>h("option",{key:s,value:s},s))
@@ -20315,14 +20287,16 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
           h("div",{style:{flex:1,minWidth:0,overflowY:"auto"}},
             h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
               h("span",{style:{fontSize:11,fontWeight:600,color:colors.muted}},"Customer"),
-              h("button",{onClick:()=>onOpenProject(proj,true),title:"Opens the project screen",style:{...btnSmall,fontSize:10,padding:"2px 7px"}},"+")
+              h("button",{onClick:()=>onOpenProject(proj,true),title:"Opens the project screen",style:{...btnSmall,fontSize:10,padding:"2px 8px",display:"flex",alignItems:"center",gap:3}},"+ Add customer")
             ),
             allCustomers.length===0 ? h("div",{style:{padding:"12px 11px",fontSize:11.5,color:colors.mutedLight}},"None yet.") :
             allCustomers.map((a,i)=>h("div",{key:a.id||i,style:{padding:"9px 11px",borderBottom:"1px solid #f0eee6"}},
-              h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12.5,fontWeight:600,color:colors.accent,cursor:"pointer"}},a.company_name),
-              h("div",{style:{display:"flex",gap:4,flexWrap:"wrap",marginTop:3}},
-                h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:10,background:"#e6f1fb",color:"#0c447c"}},a.pkgName),
-                h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:10,...statusBadgeStyle(a.allocation_status)}},a.allocation_status||"Unknown")
+              h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12.5,fontWeight:600,color:colors.accent,cursor:"pointer",marginBottom:5}},a.company_name),
+              h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}},
+                h("span",{style:{fontSize:11,padding:"3px 7px",borderRadius:10,background:"#e6f1fb",color:"#0c447c",display:"flex",alignItems:"center"}},a.pkgName),
+                h("select",{value:a.allocation_status||"",onChange:e=>updateAllocation(a,{allocation_status:e.target.value}),style:{...inputStyle,padding:"3px 5px",fontSize:10.5,width:"100%"}},
+                  statuses.map(s=>h("option",{key:s,value:s},s))
+                )
               )
             ))
           )
@@ -20363,8 +20337,16 @@ function GapsChaseDashboard({ user }){
     const { data: packages } = projectIds.length ? await sb.from("major_project_package_tbl").select("*").in("project_id",projectIds) : {data:[]};
     const packageIds = (packages||[]).map(p=>p.id);
     const { data: allocations } = packageIds.length ? await sb.from("package_customer_allocation_tbl").select("*").in("package_id",packageIds) : {data:[]};
-    const allocationIds = (allocations||[]).map(a=>a.id);
-    const { data: enquiries } = allocationIds.length ? await sb.from("enquiry_tbl").select("*").in("allocation_id",allocationIds) : {data:[]};
+    // "No enquiry" (24 Aug, scope pulled back): the standalone Enquiry
+    // entity is unhooked from Major Projects, so this gap no longer
+    // checks enquiry_tbl — it now reads straight off the allocation's own
+    // status field, same list as Package status. The gap is "not yet at
+    // or past RFQ Received" (per explicit instruction); anything before
+    // that index, including a null/unrecognized status, counts as open.
+    const { data: statusRows } = await sb.from("major_project_package_status_tbl").select("status").order("sort_order");
+    const statusOrder = (statusRows||[]).map(r=>r.status);
+    const rfqIdx = statusOrder.indexOf("RFQ Received");
+    const atOrAfterRfq = new Set(rfqIdx>=0 ? statusOrder.slice(rfqIdx) : []);
     // Overdue is scoped to this user's own assigned enquiries when not
     // admin/super_admin — a chase gap belongs to whoever's chasing it.
     let overdueQuery = sb.from("enquiry_tbl").select("*").neq("status","Converted").not("due_date","is",null).lt("due_date",new Date().toISOString().slice(0,10));
@@ -20373,7 +20355,6 @@ function GapsChaseDashboard({ user }){
 
     const projById = new Map((projects||[]).map(p=>[p.id,p]));
     const pkgById = new Map((packages||[]).map(p=>[p.id,p]));
-    const enqByAlloc = new Set((enquiries||[]).map(e=>e.allocation_id));
     const pkgsByProject = new Map();
     (packages||[]).forEach(p=>{ if(!pkgsByProject.has(p.project_id)) pkgsByProject.set(p.project_id,[]); pkgsByProject.get(p.project_id).push(p); });
     const allocsByPackage = new Map();
@@ -20387,7 +20368,7 @@ function GapsChaseDashboard({ user }){
       .map(p=>({project:p.project_name, detail:"EPC: "+p.main_epc_company_name, age:ageDays(p.created_at)}));
     const noCustomer = (packages||[]).filter(p=>!allocsByPackage.has(p.id))
       .map(p=>({project:(projById.get(p.project_id)||{}).project_name||"—", detail:p.package_name, age:ageDays(p.created_at)}));
-    const noEnquiry = (allocations||[]).filter(a=>!enqByAlloc.has(a.id))
+    const noEnquiry = (allocations||[]).filter(a=>!atOrAfterRfq.has(a.allocation_status))
       .map(a=>{ const pkg=pkgById.get(a.package_id); const proj=pkg?projById.get(pkg.project_id):null;
         return {project:proj?proj.project_name:"—", detail:a.company_name+" — "+(pkg?pkg.package_name:"—"), age:ageDays(a.created_at)}; });
     const overdue = (overdueRows||[]).map(e=>({project:e.enquiry_number, detail:e.company_name+" — assigned to "+e.assigned_to, age:ageDays(e.due_date)}));
