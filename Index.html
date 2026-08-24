@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-23T12:29:55Z";
+  var APP_BUILD_VERSION = "2026-08-24T01:07:23Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -20186,11 +20186,21 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
   const [packages,setPackages] = useState([]);
   const [allocations,setAllocations] = useState([]);
   const [salesRepOptions,setSalesRepOptions] = useState([]);
+  const [statuses,setStatuses] = useState([]);
   const [fProject,setFProject] = useState("");
   const [fEndUser,setFEndUser] = useState("");
   const [fEpc,setFEpc] = useState("");
   const [fPackage,setFPackage] = useState("");
   const [fCustomer,setFCustomer] = useState("");
+  // Inline "+ Add customer" per package (23 Aug Detailed-view rework) reuses
+  // AddAllocationModal exactly as-is — same search/confirm/Packages-handled/
+  // sub-category flow the Package detail screen uses, just launched from
+  // here instead of after navigating away. checkboxProject launches the
+  // same PackageCheckboxModal used by the Project cart screen's own
+  // "Award packages" entry point, so the Package column's "+" goes straight
+  // there rather than into the Project screen first.
+  const [allocModalPkg,setAllocModalPkg] = useState(null);
+  const [checkboxProject,setCheckboxProject] = useState(null);
 
   const load = useCallback(async()=>{
     setLoading(true);
@@ -20205,6 +20215,7 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
   useEffect(()=>{ load(); },[load]);
   useEffect(()=>{
     sb.from("employee_tbl").select("employee_name").neq("status","Inactive").order("employee_name").then(({data})=>setSalesRepOptions((data||[]).map(r=>r.employee_name)));
+    sb.from("major_project_package_status_tbl").select("status").order("sort_order").then(({data})=>setStatuses((data||[]).map(r=>r.status)));
   },[]);
 
   const updateProject = async(proj,patch)=>{
@@ -20235,6 +20246,7 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
     return true;
   });
 
+  const projectOptions = Array.from(new Set(projects.map(p=>p.project_name).filter(Boolean))).sort();
   const endUserOptions = Array.from(new Set(projects.map(p=>p.end_user_company_name).filter(Boolean))).sort();
   const epcOptions = Array.from(new Set(projects.map(p=>p.main_epc_company_name).filter(Boolean))).sort();
   const packageOptions = Array.from(new Set(packages.map(p=>p.package_name).filter(Boolean))).sort();
@@ -20249,21 +20261,11 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
 
   return h("div",null,
     h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16,padding:"10px 12px",border:"1px solid "+colors.border,borderRadius:8}},
-      h("select",{value:fProject,onChange:e=>setFProject(e.target.value),style:{fontSize:11.5,flex:1,minWidth:120}},
-        h("option",{value:""},"All projects"), projects.map(p=>h("option",{key:p.id,value:p.project_name},p.project_name))
-      ),
-      h("select",{value:fEndUser,onChange:e=>setFEndUser(e.target.value),style:{fontSize:11.5,flex:1,minWidth:120}},
-        h("option",{value:""},"All end users"), endUserOptions.map(v=>h("option",{key:v,value:v},v))
-      ),
-      h("select",{value:fEpc,onChange:e=>setFEpc(e.target.value),style:{fontSize:11.5,flex:1,minWidth:120}},
-        h("option",{value:""},"All EPCs"), epcOptions.map(v=>h("option",{key:v,value:v},v))
-      ),
-      h("select",{value:fPackage,onChange:e=>setFPackage(e.target.value),style:{fontSize:11.5,flex:1,minWidth:120}},
-        h("option",{value:""},"All packages"), packageOptions.map(v=>h("option",{key:v,value:v},v))
-      ),
-      h("select",{value:fCustomer,onChange:e=>setFCustomer(e.target.value),style:{fontSize:11.5,flex:1,minWidth:120}},
-        h("option",{value:""},"All customers"), customerOptions.map(v=>h("option",{key:v,value:v},v))
-      )
+      h(LimitToListCombo,{value:fProject,onChange:setFProject,options:projectOptions,placeholder:"All projects",style:{fontSize:11.5,flex:1,minWidth:120,padding:"5px 8px"}}),
+      h(LimitToListCombo,{value:fEndUser,onChange:setFEndUser,options:endUserOptions,placeholder:"All end users",style:{fontSize:11.5,flex:1,minWidth:120,padding:"5px 8px"}}),
+      h(LimitToListCombo,{value:fEpc,onChange:setFEpc,options:epcOptions,placeholder:"All EPCs",style:{fontSize:11.5,flex:1,minWidth:120,padding:"5px 8px"}}),
+      h(LimitToListCombo,{value:fPackage,onChange:setFPackage,options:packageOptions,placeholder:"All packages",style:{fontSize:11.5,flex:1,minWidth:120,padding:"5px 8px"}}),
+      h(LimitToListCombo,{value:fCustomer,onChange:setFCustomer,options:customerOptions,placeholder:"All customers",style:{fontSize:11.5,flex:1,minWidth:120,padding:"5px 8px"}})
     ),
     loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
     visibleProjects.length===0 ? h("div",{style:{fontSize:12.5,color:colors.mutedLight}},"No projects match these filters.") :
@@ -20296,13 +20298,17 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
           h("div",{style:{flex:1,minWidth:0,borderRight:"1px solid "+colors.border,overflowY:"auto"}},
             h("div",{style:{padding:"8px 11px",borderBottom:"1px solid "+colors.border,display:"flex",justifyContent:"space-between",alignItems:"center"}},
               h("span",{style:{fontSize:11,fontWeight:600,color:colors.muted}},"Package"),
-              h("button",{onClick:()=>onOpenProject(proj,true),title:"Opens the project screen",style:{...btnSmall,fontSize:10,padding:"2px 7px"}},"+")
+              h("button",{onClick:()=>setCheckboxProject(proj),title:"Award packages",style:{...btnSmall,fontSize:10,padding:"2px 7px"}},"+")
             ),
             pkgs.length===0 ? h("div",{style:{padding:"12px 11px",fontSize:11.5,color:colors.mutedLight}},"None yet.") :
             pkgs.map(pk=>h("div",{key:pk.id,style:{padding:"9px 11px",borderBottom:"1px solid #f0eee6"}},
-              h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12.5,fontWeight:600,color:colors.accent,cursor:"pointer"}},pk.package_name),
-              h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:10,display:"inline-block",marginTop:3,...statusBadgeStyle(pk.package_status)}},pk.package_status||"Unknown"),
-              h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:10,display:"inline-block",marginTop:3,marginLeft:4,background:"#f4f2ea",color:colors.muted}},proj.main_epc_company_name||"—")
+              h("div",{onClick:()=>onOpenProject(proj,true),style:{fontSize:12.5,fontWeight:600,color:colors.text,cursor:"pointer",marginBottom:5}},pk.package_name),
+              h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}},
+                h("select",{value:pk.package_status||"",onChange:e=>updatePackage(pk,{package_status:e.target.value}),style:{...inputStyle,padding:"3px 5px",fontSize:10.5,width:"100%"}},
+                  statuses.map(s=>h("option",{key:s,value:s},s))
+                ),
+                h("input",{readOnly:true,value:"",onFocus:e=>{e.target.blur(); setAllocModalPkg({pkg:pk,project:proj});},placeholder:"+ Add customer",style:{...inputStyle,padding:"3px 5px",fontSize:10.5,width:"100%",cursor:"pointer",color:colors.mutedLight}})
+              )
             ))
           ),
 
@@ -20322,6 +20328,17 @@ function MajorProjectsDetailedView({ user, projects, onOpenProject, onEditProjec
           )
         )
       );
+    }),
+    allocModalPkg && h(AddAllocationModal,{
+      pkg: allocModalPkg.pkg, project: allocModalPkg.project, user,
+      onCancel:()=>setAllocModalPkg(null),
+      onSaved:()=>{ setAllocModalPkg(null); load(); }
+    }),
+    checkboxProject && h(PackageCheckboxModal,{
+      project: checkboxProject, user,
+      existingPackageNames: (pkgsByProject.get(checkboxProject.id)||[]).map(p=>p.package_name).filter(Boolean),
+      onCancel:()=>setCheckboxProject(null),
+      onSaved:()=>{ setCheckboxProject(null); load(); }
     })
   );
 }
