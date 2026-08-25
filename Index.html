@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-25T01:54:35Z";
+  var APP_BUILD_VERSION = "2026-08-25T02:34:51Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8668,15 +8668,50 @@ function QuoteNotesPanel({ referenceNumber, user }){
 // everything else → Technical Head. Admin/Super Admin can still approve
 // any section too, as a practical override — same as every other
 // role-gated action in this app.
-function ContractStatusBanner({ contractInfo, user, onChanged }){
+function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, onEditDetails }){
   const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
   const roleFor = { commercial_approved:"accounts_admin", testing_approved:"qc", technical_approved:"technical_head" };
   const roleLabel = { accounts_admin:"Accounts Admin", qc:"QC", technical_head:"Technical Head" };
   const [statusOptions,setStatusOptions] = useState([]);
+  const [poNumber,setPoNumber] = useState(quoteHeaderRow?.po_number||"");
+  const [poDate,setPoDate] = useState(quoteHeaderRow?.po_date||"");
+  useEffect(()=>{ setPoNumber(quoteHeaderRow?.po_number||""); setPoDate(quoteHeaderRow?.po_date||""); },[quoteHeaderRow?.po_number,quoteHeaderRow?.po_date]);
   useEffect(()=>{
     sb.from("sale_order_status_tbl").select("status").order("sort_order").then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
   },[]);
+
+  // Mandatory-before-approval fields (24 Aug follow-up). Ten fields
+  // total; Billing Address is the one exception any role can override
+  // (flagged, not blocked) — the other nine hard-block Approve for
+  // everyone, no override path.
+  const otherMissing = [
+    !quoteHeaderRow?.po_number && "P.O. Number",
+    !quoteHeaderRow?.po_date && "P.O. Date",
+    !contractInfo.shipping_address && "Shipping Address",
+    !contractInfo.drawings_required && "Drawings",
+    !contractInfo.qap_conditions && "QAP Conditions",
+    !contractInfo.inspection_by && "Inspection By",
+    !contractInfo.dispatch_through && "Dispatch Through",
+    !contractInfo.late_delivery && "Late Delivery",
+    !contractInfo.dispatch_to && "Dispatch To",
+  ].filter(Boolean);
+  const billingMissing = !contractInfo.billing_address && !contractInfo.billing_address_overridden;
+  const canApproveAtAll = otherMissing.length===0 && !billingMissing;
+
+  const savePoFields = async()=>{
+    if(!poNumber.trim() || !poDate){ alert("Enter both P.O. Number and P.O. Date."); return; }
+    await sb.from("estimates").update({po_number:poNumber.trim(),po_date:poDate}).eq("reference_number",contractInfo.contract_number);
+    if(onChanged) onChanged();
+  };
+  const overrideBillingAddress = async()=>{
+    if(!confirm("Proceed without a Billing Address? This will be flagged to Admin/Super Admin at login until it's filled in.")) return;
+    await sb.from("sale_order_tbl").update({billing_address_overridden:true}).eq("id",contractInfo.id);
+    await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,"Billing Address overridden by "+(user?.username||"unknown"),user?.username||"unknown",null,null);
+    if(onChanged) onChanged();
+  };
+
   const approve = async(field)=>{
+    if(!canApproveAtAll){ alert("Can't approve yet — still missing: "+[...otherMissing, billingMissing?"Billing Address":null].filter(Boolean).join(", ")); return; }
     if(!isAdminOrAbove && user.role!==roleFor[field]){
       alert("Only "+roleLabel[roleFor[field]]+" (or an Admin/Super Admin) can approve this section.");
       return;
@@ -8702,27 +8737,44 @@ function ContractStatusBanner({ contractInfo, user, onChanged }){
   };
   const row = (label,field)=>{
     const by = contractInfo[field+"_by"];
-    const canApprove = isAdminOrAbove || user.role===roleFor[field];
+    const canApprove = canApproveAtAll && (isAdminOrAbove || user.role===roleFor[field]);
     return h("div",{style:{display:"flex",alignItems:"center",gap:6}},
       h("span",{style:{fontSize:11,color:colors.muted}},label+":"),
       by ? h("span",{style:{fontSize:11,fontWeight:600,color:"#085041"}},"✓ "+by)
         : canApprove ? h("button",{onClick:()=>approve(field),style:{...btnSmall,fontSize:10,padding:"2px 8px"}},"Approve")
-        : h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"Pending")
+        : h("span",{style:{fontSize:10.5,color:colors.mutedLight,cursor: !canApproveAtAll?"help":undefined},title: !canApproveAtAll?"Blocked — missing required fields below":undefined},"Pending")
     );
   };
-  return h("div",{style:{display:"flex",gap:14,flexWrap:"wrap",alignItems:"center",marginTop:10,padding:"8px 12px",background:"#fff",border:"1px solid "+colors.border,borderRadius:6}},
-    h("span",{style:{fontSize:12,fontWeight:700}},"Contract "+contractInfo.contract_number),
-    h("span",{style:{fontSize:11,color:colors.muted}},"from Quote "+contractInfo.quote_reference_number),
-    row("Commercial Terms (Accounts Admin)","commercial_approved"),
-    row("NDE/Testing (QC)","testing_approved"),
-    row("Everything else (Technical Head)","technical_approved"),
-    h("div",{style:{display:"flex",alignItems:"center",gap:5,marginLeft:"auto"}},
-      h("span",{style:{fontSize:11,color:colors.muted}},"Status:"),
-      isAdminOrAbove
-        ? h("select",{value:contractInfo.status||"Draft",onChange:e=>changeStatus(e.target.value),style:{...inputStyle,padding:"3px 6px",fontSize:11}},
-            statusOptions.map(s=>h("option",{key:s,value:s},s))
-          )
-        : h("span",{style:{fontSize:11,fontWeight:600}},contractInfo.status||"Draft")
+  return h("div",{style:{marginTop:10}},
+    (otherMissing.length>0 || billingMissing) && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"10px 12px",marginBottom:8}},
+      h("div",{style:{fontSize:12,fontWeight:700,color:"#a3312a",marginBottom:6}},"Required before this Sale Order can be approved:"),
+      otherMissing.length>0 && h("div",{style:{fontSize:11.5,color:"#a3312a",marginBottom:8}},otherMissing.join(", ")),
+      h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginBottom: (otherMissing.length>0)?8:0}},
+        h("input",{value:poNumber,onChange:e=>setPoNumber(e.target.value),placeholder:"P.O. Number",style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:150}}),
+        h("input",{type:"date",value:poDate||"",onChange:e=>setPoDate(e.target.value),style:{...inputStyle,padding:"5px 8px",fontSize:11.5}}),
+        h("button",{onClick:savePoFields,style:{...btnSmall,fontSize:10.5}},"Save P.O. details"),
+        onEditDetails && h("button",{onClick:onEditDetails,style:{...btnSmall,fontSize:10.5}},"Edit other Sale Order details")
+      ),
+      billingMissing && h("div",{style:{display:"flex",alignItems:"center",gap:8,paddingTop:8,borderTop:"1px solid #f0997b"}},
+        h("span",{style:{fontSize:11.5,color:"#a3312a"}},"Billing Address is also missing."),
+        h("button",{onClick:overrideBillingAddress,style:{...btnSmall,fontSize:10.5}},"Override and flag for later")
+      ),
+      contractInfo.billing_address_overridden && h("div",{style:{fontSize:11,color:"#a3312a",marginTop:6}},"⚠ Billing Address was overridden — flagged to Admin/Super Admin at login until filled in.")
+    ),
+    h("div",{style:{display:"flex",gap:14,flexWrap:"wrap",alignItems:"center",padding:"8px 12px",background:"#fff",border:"1px solid "+colors.border,borderRadius:6}},
+      h("span",{style:{fontSize:12,fontWeight:700}},"Contract "+contractInfo.contract_number),
+      h("span",{style:{fontSize:11,color:colors.muted}},"from Quote "+contractInfo.quote_reference_number),
+      row("Commercial Terms (Accounts Admin)","commercial_approved"),
+      row("NDE/Testing (QC)","testing_approved"),
+      row("Everything else (Technical Head)","technical_approved"),
+      h("div",{style:{display:"flex",alignItems:"center",gap:5,marginLeft:"auto"}},
+        h("span",{style:{fontSize:11,color:colors.muted}},"Status:"),
+        isAdminOrAbove
+          ? h("select",{value:contractInfo.status||"Draft",onChange:e=>changeStatus(e.target.value),style:{...inputStyle,padding:"3px 6px",fontSize:11}},
+              statusOptions.map(s=>h("option",{key:s,value:s},s))
+            )
+          : h("span",{style:{fontSize:11,fontWeight:600}},contractInfo.status||"Draft")
+      )
     )
   );
 }
@@ -8735,6 +8787,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // (Contract = literal clone of a Won Quote, same screen reused rather
   // than rebuilt). contractInfo is the sale_order_tbl row.
   const [refs,setRefs]=useState([]); const [loading,setLoading]=useState(true);
+  const [showEditContractDetails,setShowEditContractDetails]=useState(false);
   // Signatory sources from Employee master (22 Aug) — shared by both
   // header-edit forms in this component (Quick Edit's headerDraft and the
   // Header-first new-quote flow's qhSignatoryName). Active employees only,
@@ -11261,7 +11314,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [showDeleteEntireQuoteModal,setShowDeleteEntireQuoteModal]=useState(false);
   const [deleteEntireQuoteConfirmText,setDeleteEntireQuoteConfirmText]=useState("");
   const openDeleteEntireQuote=()=>{
-    if(!isAdmin){ alert("Only Admins can delete quotes."); return; }
+    if(!isAdmin){ alert(mode==="contract"?"Only Admins can delete Sale Orders.":"Only Admins can delete quotes."); return; }
     if(!refFilter) return;
     setDeleteEntireQuoteConfirmText(""); setShowDeleteEntireQuoteModal(true);
   };
@@ -12178,22 +12231,40 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       letterhead(isContract ? "ORDER ACCEPTANCE" : "QUOTATION");
       let y=39;
       doc.setFontSize(8.5); doc.setTextColor(...dark);
-      doc.setFont("times","bold"); doc.text("Customer Name:",12,y); doc.setFont("times","normal"); doc.text(String(effCustomerName),50,y); y+=6;
+      // Aligned label:value columns (24 Aug) — VALUE_X is wide enough to
+      // fit the longest label on this page ("Contract No. For Future
+      // Reference:") so every row's value starts at the same x
+      // regardless of label length, left-aligned, wrapping via
+      // splitTextToSize rather than overflowing off the page.
+      const VALUE_X = 92;
+      const LABEL_MAX_WIDTH = VALUE_X - 12 - 2;
+      const printLabelValueRow = (label, value, opts={})=>{
+        const labelLines = doc.splitTextToSize(label, LABEL_MAX_WIDTH);
+        doc.setFont("times","bold"); doc.setTextColor(...dark);
+        labelLines.forEach((ln,i)=>doc.text(ln,12,y+i*5));
+        doc.setFont("times", opts.boldValue?"bold":"normal");
+        doc.setTextColor(...(opts.valueColor||dark));
+        const valueLines = doc.splitTextToSize(String(value||"—"), W-12-VALUE_X);
+        valueLines.forEach((ln,i)=>doc.text(ln,VALUE_X,y+i*5));
+        doc.setTextColor(...dark);
+        y += Math.max(6, Math.max(labelLines.length,valueLines.length)*5);
+      };
+      printLabelValueRow("Customer Name:", effCustomerName);
       if(customerAddress){
         const addrLines = String(customerAddress).split("\n").map(s=>s.trim()).filter(Boolean);
         doc.setFont("times","bold"); doc.text("Address:",12,y); doc.setFont("times","normal");
-        addrLines.forEach((line,i)=>{ doc.text(line,50,y+(i*5)); });
+        addrLines.forEach((line,i)=>{ doc.text(line,VALUE_X,y+(i*5)); });
         y += Math.max(6, addrLines.length*5);
       }
-      if(attnName){ doc.setFont("times","bold"); doc.text("Kind Attention:",12,y); doc.setFont("times","normal"); doc.text(attnName+(attnDesignation?", "+attnDesignation:""),50,y); y+=6; }
+      if(attnName){ printLabelValueRow("Kind Attention:", attnName+(attnDesignation?", "+attnDesignation:"")); }
       y+=2;
       if(isContract){
-        doc.setFont("times","bold"); doc.text("Quote No:",12,y); doc.setFont("times","normal"); doc.text(contractInfo?.quote_reference_number||"—",50,y);
-        doc.setFont("times","bold"); doc.text("Quote Date:",120,y); doc.setFont("times","normal"); doc.text(today,150,y); y+=6;
-        doc.setFont("times","bold"); doc.text("Contract No. For Future Reference:",12,y); doc.setFont("times","bold"); doc.setTextColor(180,60,20); doc.text(quoteExportRef,80,y); doc.setTextColor(...dark); y+=6;
+        printLabelValueRow("Quote No:", contractInfo?.quote_reference_number);
+        doc.setFont("times","bold"); doc.setTextColor(...dark); doc.text("Quote Date:",120,y); doc.setFont("times","normal"); doc.text(today,150,y); y+=6;
+        printLabelValueRow("Contract No. For Future Reference:", quoteExportRef, {boldValue:true, valueColor:[180,60,20]});
       } else {
-        doc.setFont("times","bold"); doc.text("Quote No:",12,y); doc.setFont("times","normal"); doc.text(quoteExportRef,50,y);
-        doc.setFont("times","bold"); doc.text("Quote Date:",120,y); doc.setFont("times","normal"); doc.text(today,150,y); y+=6;
+        printLabelValueRow("Quote No:", quoteExportRef);
+        doc.setFont("times","bold"); doc.setTextColor(...dark); doc.text("Quote Date:",120,y); doc.setFont("times","normal"); doc.text(today,150,y); y+=6;
       }
       const revMatch = quoteExportRef.match(/-Rev-(\d+)$/);
       if(revMatch && !isContract){
@@ -13108,10 +13179,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("input",{list:"quote-search-datalist",value:refSearchDisplay,onFocus:comboRefocusRS,onChange:e=>handleRefSearchChange(e.target.value),onBlur:handleRefSearchBlur,placeholder:"Quote number or client name…",style:{...inputStyle,width:260,background:"#185fa5",color:"#fff",border:"1px solid #185fa5",fontWeight:600}}),
           h("datalist",{id:"quote-search-datalist"},refOptionsList.map(o=>h("option",{key:o.rn,value:o.label}))),
           mode!=="contract" && h("button",{onClick:handleMakeNewQuoteClick,style:{...btnSmall,fontWeight:600}},"Make New Quote"),
-          refFilter && h("button",{onClick:()=>{setRefFilter("");setRefSearchDisplay("");setSlNoFilter("");},style:btnSmall},"All quotes")
+          refFilter && h("button",{onClick:()=>{setRefFilter("");setRefSearchDisplay("");setSlNoFilter("");},style:btnSmall},mode==="contract"?"All Sale Orders":"All quotes")
         )
       ),
-      mode==="contract" && contractInfo && h(ContractStatusBanner,{contractInfo, user, onChanged:onContractInfoChanged}),
+      mode==="contract" && contractInfo && h(ContractStatusBanner,{contractInfo, quoteHeaderRow, user, onChanged:onContractInfoChanged, onEditDetails:()=>setShowEditContractDetails(true)}),
+      mode==="contract" && showEditContractDetails && h(SaleOrderHeaderModal,{
+        contractRow: contractInfo,
+        onCancel: ()=>setShowEditContractDetails(false),
+        onSaved: ()=>{ setShowEditContractDetails(false); if(onContractInfoChanged) onContractInfoChanged(); }
+      }),
       refFilter && h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center",marginTop:10}},
         h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"6px 12px"}},
           h("div",{style:{fontSize:10,color:colors.mutedLight}},"Total cost"),
@@ -13137,8 +13213,14 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:1}},quoteHeaderRow.customer_name||"—")
             ),
             h("div",{style:{border:"2px solid "+(readiness.ready?"#1c8c56":"#e0b325"),borderRadius:10,padding:"6px 14px",background:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#eafaf1":"#eaf2fb"):"#fffbea",display:"flex",alignItems:"center",gap:8}},
-              h("span",{style:{fontSize:9.5,color:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c"):"#7a5000",fontWeight:600}},"QUOTE STATUS"),
-              !readiness.ready
+              h("span",{style:{fontSize:9.5,color:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c"):"#7a5000",fontWeight:600}},mode==="contract"?"SO STATUS":"QUOTE STATUS"),
+              mode==="contract"
+                // The real Sale Order status lives on sale_order_tbl (see
+                // ContractStatusBanner, which owns changing it) — this
+                // badge is a read-only display of that same value, not
+                // the cloned Quote's own Won/Lost status underneath it.
+                ? h("span",{style:{fontSize:14,fontWeight:800,color:(contractInfo?.status==="Draft")?"#0f6e3f":"#0c447c"}},(contractInfo?.status||"Draft").toUpperCase())
+              : !readiness.ready
                 ? h("span",{style:{fontSize:14,fontWeight:800,color:"#7a5000"}},"🔒 "+(quoteHeaderRow.quote_status||"Draft").toUpperCase())
                 : h("select",{
                     value:quoteHeaderRow.quote_status||"Draft",
@@ -13180,16 +13262,22 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{display:"flex",gap:8}},
             h("button",{onClick:()=>setShowCartScreen(true),style:{...btnSmall,border:"1px solid "+colors.border,display:"flex",alignItems:"center",gap:5}},h("i",{className:"ti ti-shopping-cart","aria-hidden":"true",style:{fontSize:13}}),"Go to Cart"),
             isAdmin && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete this Revision"),
-            isAdmin && h("button",{onClick:openDeleteEntireQuote,style:{...btnSmall,background:colors.danger,color:"#fff",border:"none",fontWeight:600}},"Delete Entire Quote"),
+            isAdmin && h("button",{onClick:openDeleteEntireQuote,style:{...btnSmall,background:colors.danger,color:"#fff",border:"none",fontWeight:600}},mode==="contract"?"Delete Entire Sale Order":"Delete Entire Quote"),
             h("button",{onClick:()=>attemptCloseOrNewQuotes("close"),style:{padding:"6px 14px",fontSize:12,fontWeight:600,borderRadius:5,border:"none",background:colors.danger,color:"#fff",cursor:"pointer"}},"Close")
           )
         ),
         h("div",{style:{marginTop:14,paddingTop:14,borderTop:"1px solid "+colors.border}},
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
-          h("div",{style:{fontSize:12.5,fontWeight:700}},"Quote Header — "+refFilter),
+          h("div",{style:{fontSize:12.5,fontWeight:700}},(mode==="contract"?"Sale Order Header — ":"Quote Header — ")+refFilter),
           h("div",{style:{display:"flex",gap:8}},
             mode!=="contract" && h("button",{onClick:createSaleOrderFromQuote,style:{...btnSmall,background:"#185FA5",color:"#fff",border:"none"}},"Create Sale Order"),
-            quoteHeaderRow.quote_status!=="Draft" && h("button",{onClick:()=>{ if(isAdmin) setShowAmendPicker(true); else setShowAmendGate(true); },style:{...btnSmall,background:"#0c447c",color:"#fff",border:"none"}},"Amend quote"),
+            // Contract amendment isn't fully built yet (24 Aug) — the
+            // generic clone-into-new-revision logic below would work
+            // mechanically, but wouldn't reset the three approvals or
+            // create a fresh sale_order_tbl row for the new revision, so
+            // this stays hidden in Contract mode rather than offering a
+            // half-working "Amend Sale Order" button.
+            mode!=="contract" && quoteHeaderRow.quote_status!=="Draft" && h("button",{onClick:()=>{ if(isAdmin) setShowAmendPicker(true); else setShowAmendGate(true); },style:{...btnSmall,background:"#0c447c",color:"#fff",border:"none"}},"Amend quote"),
             !headerEditOpen && h("button",{onClick:openHeaderEdit,style:btnSmall},"Edit")
           )
         ),
@@ -13253,7 +13341,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               };
               if(isQuoteLocked(quoteAnyNonDraft()?"Locked":"Draft",user)){ setAuthGate({requiredType:"edit",action:doResolve}); return; }
               doResolve();
-            },style:{...btnSmall,fontSize:11,padding:"4px 9px"}},"Resolve for this quote")
+            },style:{...btnSmall,fontSize:11,padding:"4px 9px"}},mode==="contract"?"Resolve for this Sale Order":"Resolve for this quote")
           )
         ),
         headerEditOpen && isRevisionRef && h("div",null,
@@ -13421,7 +13509,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       ),
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,background:"#fff",padding:"12px 16px",marginBottom:16}},
-        h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},"Export full quote"),
+        h("div",{style:{fontSize:12.5,fontWeight:700,marginBottom:8}},mode==="contract"?"Export full Sale Order":"Export full quote"),
         quoteExportRef && quoteDocuments.filter(d=>!d.is_archived).length===0 && h("div",{style:{border:"1px solid #d4901f",background:"#fffaf0",borderRadius:6,padding:"8px 12px",marginBottom:10,fontSize:11.5,color:"#8a5a10"}},
           "⚠ No documents attached to this quote. If drawings, ITP, or procedures are relevant, add them before sending."
         ),
@@ -13507,7 +13595,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 style:{border:"none",background:"transparent",color:active?"#f0997b":colors.danger,cursor:"pointer",fontSize:15,padding:2,flexShrink:0,opacity:deletingSlNo===r.id?0.5:1}
               },deletingSlNo===r.id?"…":"\u2715")
             );}),
-            filtered.length===0&&h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"No quotes yet.")
+            filtered.length===0&&h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},mode==="contract"?"No Sale Orders yet.":"No quotes yet.")
           ),
           refFilter && h("div",{style:{marginTop:8,textAlign:"center"}},
             h("button",{onClick:()=>{ setNewSlNoInput(""); setNewSlNoError(""); setNewSlNoStep("input"); setShowNewSlNoModal(true); },style:{width:"100%",padding:"12px",fontSize:13.5,fontWeight:600,background:colors.dark,color:"#fff",border:"none",borderRadius:6,cursor:"pointer"}},"+ Add new Sl No")
@@ -14155,7 +14243,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       h("div",{style:{background:"#fff",borderRadius:8,width:1180,maxWidth:"95vw",maxHeight:"85vh",overflow:"auto",padding:"20px 22px"}},
         h("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,paddingBottom:12,borderBottom:"1px solid "+colors.border}},
           h("span",{style:{fontSize:14,fontWeight:700}},"Cart — "+refFilter),
-          h("button",{onClick:()=>setShowCartScreen(false),style:{border:"1px solid #1c8c75",background:"#eef6f3",color:"#0f6e56",padding:"7px 13px",borderRadius:6,fontSize:12.5,fontWeight:600,cursor:"pointer",display:"flex",alignItems:"center",gap:5}},h("i",{className:"ti ti-arrow-left","aria-hidden":"true",style:{fontSize:13}}),"Back to quote "+refFilter)
+          h("button",{onClick:()=>setShowCartScreen(false),style:{border:"1px solid #1c8c75",background:"#eef6f3",color:"#0f6e56",padding:"7px 13px",borderRadius:6,fontSize:12.5,fontWeight:600,cursor:"pointer",display:"flex",alignItems:"center",gap:5}},h("i",{className:"ti ti-arrow-left","aria-hidden":"true",style:{fontSize:13}}),(mode==="contract"?"Back to Sale Order ":"Back to quote ")+refFilter)
         ),
         h("button",{
           onClick:()=>{ setShowCartScreen(false); setNewSlNoInput(""); setNewSlNoError(""); setNewSlNoStep("input"); setShowNewSlNoModal(true); },
@@ -14169,7 +14257,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             )),
             h("tbody",null,
               refs.filter(r=>r.reference_number===refFilter).length===0
-                ? h("tr",null,h("td",{colSpan:9,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},"No Sl Nos on this quote yet."))
+                ? h("tr",null,h("td",{colSpan:9,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},mode==="contract"?"No Sl Nos on this Sale Order yet.":"No Sl Nos on this quote yet."))
                 : refs.filter(r=>r.reference_number===refFilter).sort((a,b)=>a.item_sl_no-b.item_sl_no).map(r=>{
                     const isEditing = editingCartRow===r.id;
                     return h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
@@ -14532,16 +14620,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     ),
     showDeleteEntireQuoteModal && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
-        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Delete ENTIRE quote — "+refFilter.replace(/-Rev-\d+$/,"")+"?"),
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},(mode==="contract"?"Delete ENTIRE Sale Order — ":"Delete ENTIRE quote — ")+refFilter.replace(/-Rev-\d+$/,"")+"?"),
         h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},
-          "This removes EVERY revision of this quote — Rev 0 and every amendment — with everything under each of them: BOM lines, Commercial Terms, Documents, Notes, Extra Price, Testing, and Outcomes. This cannot be undone."
+          mode==="contract"
+            ? "This removes this Sale Order in full: BOM lines, Commercial Terms, Documents, Notes, Extra Price, Testing, and Outcomes — and unlinks it from its originating Quote, which is untouched. This cannot be undone."
+            : "This removes EVERY revision of this quote — Rev 0 and every amendment — with everything under each of them: BOM lines, Commercial Terms, Documents, Notes, Extra Price, Testing, and Outcomes. This cannot be undone."
         ),
         h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:4}},"Type "+refFilter.replace(/-Rev-\d+$/,"")+" to confirm"),
         h("input",{value:deleteEntireQuoteConfirmText,onChange:e=>setDeleteEntireQuoteConfirmText(e.target.value),placeholder:"Type the reference number",style:{...inputStyle,marginBottom:deleteEntireQuoteConfirmText.trim()&&deleteEntireQuoteConfirmText.trim()!==refFilter.replace(/-Rev-\d+$/,"")?4:14,borderColor:deleteEntireQuoteConfirmText.trim()?(deleteEntireQuoteConfirmText.trim()===refFilter.replace(/-Rev-\d+$/,"")?"#1c8c56":colors.danger):inputStyle.borderColor}}),
         deleteEntireQuoteConfirmText.trim() && deleteEntireQuoteConfirmText.trim()!==refFilter.replace(/-Rev-\d+$/,"") && h("div",{style:{fontSize:11,color:colors.danger,marginBottom:10}},"That doesn't match "+refFilter.replace(/-Rev-\d+$/,"")+". Check the spelling and try again."),
         h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
           h("button",{onClick:()=>setShowDeleteEntireQuoteModal(false),style:btnSecondary},"Cancel"),
-          h("button",{onClick:confirmDeleteEntireQuote,disabled:deletingEntireQuote||deleteEntireQuoteConfirmText.trim()!==refFilter.replace(/-Rev-\d+$/,""),style:{...btnPrimary,background:colors.danger,opacity:(deletingEntireQuote||deleteEntireQuoteConfirmText.trim()!==refFilter.replace(/-Rev-\d+$/,""))?0.5:1}},deletingEntireQuote?"Deleting…":"Delete entire quote")
+          h("button",{onClick:confirmDeleteEntireQuote,disabled:deletingEntireQuote||deleteEntireQuoteConfirmText.trim()!==refFilter.replace(/-Rev-\d+$/,""),style:{...btnPrimary,background:colors.danger,opacity:(deletingEntireQuote||deleteEntireQuoteConfirmText.trim()!==refFilter.replace(/-Rev-\d+$/,""))?0.5:1}},deletingEntireQuote?"Deleting…":(mode==="contract"?"Delete entire Sale Order":"Delete entire quote"))
         )
       )
     ),
@@ -14978,7 +15068,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         ) : null,
         h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,borderTop:"1px solid "+colors.border,paddingTop:14}},
           h("button",{onClick:()=>setShowGlobalTestPicker(false),style:btnSecondary},"Cancel"),
-          h("button",{onClick:applyGlobalTests,style:btnPrimary},"Apply to quote")
+          h("button",{onClick:applyGlobalTests,style:btnPrimary},mode==="contract"?"Apply to Sale Order":"Apply to quote")
         )
       )
     ),
@@ -15125,6 +15215,13 @@ async function deleteQuoteReferenceEverywhere(referenceNumber, performedBy){
   await sb.from("audit_log").delete().eq("record_id",referenceNumber).in("table_name",auditTables);
   await sb.from("audit_log").delete().like("record_id",referenceNumber+"-%").in("table_name",auditTables);
   await sb.from("estimates").delete().eq("reference_number",referenceNumber);
+  // If this reference_number IS a Contract Number, clean up its
+  // sale_order_tbl row too (24 Aug fix) — previously left orphaned,
+  // which permanently blocked ever creating a new Contract for that
+  // Quote again (quote_reference_number has a unique constraint). A
+  // genuine Quote's reference_number never matches a contract_number,
+  // so this is a harmless no-op in that case.
+  await sb.from("sale_order_tbl").delete().eq("contract_number",referenceNumber);
   await logAudit("DELETE","estimates",referenceNumber,"Deleted quote "+referenceNumber+" in full ("+(slRows?.length||0)+" Sl No(s), "+(linesData?.length||0)+" BOM lines, all related records across every table)",performedBy||"unknown",{slRows,lines:linesData},null);
   return {slCount:slRows?.length||0, lineCount:linesData?.length||0};
 }
@@ -15380,7 +15477,10 @@ function SaleOrderHeaderModal({ contractRow, onCancel, onSaved }){
     })();
   },[contractRow.customer_name]);
   const save = async()=>{
-    if(!f.billing_address.trim()){ alert("Billing Address is required."); return; }
+    // Billing Address is no longer required to save here (24 Aug
+    // follow-up) — the ContractStatusBanner owns enforcing/overriding it
+    // now, since Billing Address is the one field a plain user can
+    // override without Admin rights, distinct from the other nine.
     setSaving(true);
     try{
       const { data, error } = await sb.from("sale_order_tbl").update(f).eq("id",contractRow.id).select().single();
@@ -19117,6 +19217,45 @@ function SignatoryOverrideNoticesPopup({ notices, onAcknowledgeOne, onAcknowledg
       h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
         h("button",{onClick:onClose,style:btnSecondary},"Review later"),
         h("button",{onClick:onAcknowledgeAll,style:btnPrimary},"Acknowledge all")
+      )
+    )
+  );
+}
+
+// Billing Address override reminder (24 Aug follow-up) — pops up at
+// login for Admin/Super Admin only, once per session, same shape as
+// DraftOfferReminder. Lists every Contract where Billing Address was
+// overridden (by any role) and never actually filled in since.
+function IncompleteSaleOrderReminder({ user, onDone, onOpenContract }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  useEffect(()=>{
+    (async()=>{
+      const { data } = await sb.from("sale_order_tbl").select("*").eq("billing_address_overridden",true).is("billing_address",null).order("contract_number");
+      setRows(data||[]);
+      setLoading(false);
+    })();
+  },[]);
+  if(loading) return null;
+  if(rows.length===0){ onDone(); return null; }
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.4)",zIndex:1350,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:12,padding:"22px 26px",width:560,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Sale Orders missing a Billing Address"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Billing Address was overridden on these Sale Orders rather than filled in — worth closing out before invoicing."),
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",marginBottom:14}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Contract"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Customer"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"")
+        )),
+        h("tbody",null, rows.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #f0eee6"}},
+          h("td",{style:{padding:"6px 8px",fontWeight:600}},r.contract_number),
+          h("td",{style:{padding:"6px 8px"}},r.customer_name||"—"),
+          h("td",{style:{padding:"6px 8px"}},h("button",{onClick:()=>{ onDone(); onOpenContract(r); },style:{...btnSmall,fontSize:10.5}},"Open"))
+        )))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end"}},
+        h("button",{onClick:onDone,style:btnSecondary},"Dismiss for now")
       )
     )
   );
@@ -26453,6 +26592,16 @@ function App() {
     try{ sessionStorage.setItem("flometriq_overdue_prompt_date",new Date().toISOString().slice(0,10)); }catch(e){}
     if(goToWorklist) setTab("my_worklist");
   };
+  // Billing Address override reminder (24 Aug follow-up) — same
+  // once-per-session pattern as the overdue-calls prompt, Admin/Super
+  // Admin only.
+  const [showBillingOverrideReminder,setShowBillingOverrideReminder]=useState(()=>{
+    try{ return sessionStorage.getItem("flometriq_billing_override_prompt_date")!==new Date().toISOString().slice(0,10); }catch(e){ return true; }
+  });
+  const dismissBillingOverrideReminder = ()=>{
+    setShowBillingOverrideReminder(false);
+    try{ sessionStorage.setItem("flometriq_billing_override_prompt_date",new Date().toISOString().slice(0,10)); }catch(e){}
+  };
   const refreshDraftCount = useCallback(()=>{
     sb.from("estimates").select("id",{count:"exact",head:true}).eq("quote_status","Draft").then(({count})=>setDraftCount(count||0));
   },[]);
@@ -26486,6 +26635,7 @@ function App() {
   return h("div",{style:{minHeight:"100vh"}},
     user.role==="super_admin" && !monthlyArchiveDone && h(MonthlyArchivePrompt,{user,onDone:()=>setMonthlyArchiveDone(true)}),
     showOverduePrompt && h(OverdueCallsPrompt,{user,onDone:dismissOverduePrompt}),
+    (user.role==="admin"||user.role==="super_admin") && showBillingOverrideReminder && h(IncompleteSaleOrderReminder,{user,onDone:dismissBillingOverrideReminder,onOpenContract:openContract}),
     showDraftPanel && h(DraftOfferReminder,{user,onDone:()=>{ setShowDraftPanel(false); refreshDraftCount(); }}),
     showSignatoryNoticesPopup && h(SignatoryOverrideNoticesPopup,{notices:signatoryNotices,onAcknowledgeOne:acknowledgeSignatoryNotice,onAcknowledgeAll:acknowledgeAllSignatoryNotices,onClose:()=>setShowSignatoryNoticesPopup(false)}),
     pendingHeaderPromptFor && h(SaleOrderHeaderModal,{
