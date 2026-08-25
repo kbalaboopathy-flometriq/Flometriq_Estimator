@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-25T02:39:37Z";
+  var APP_BUILD_VERSION = "2026-08-25T02:46:47Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8668,7 +8668,7 @@ function QuoteNotesPanel({ referenceNumber, user }){
 // everything else → Technical Head. Admin/Super Admin can still approve
 // any section too, as a practical override — same as every other
 // role-gated action in this app.
-function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, onEditDetails }){
+function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, onEditDetails, onPoFieldsSaved }){
   const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
   const roleFor = { commercial_approved:"accounts_admin", testing_approved:"qc", technical_approved:"technical_head" };
   const roleLabel = { accounts_admin:"Accounts Admin", qc:"QC", technical_head:"Technical Head" };
@@ -8700,8 +8700,15 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
 
   const savePoFields = async()=>{
     if(!poNumber.trim() || !poDate){ alert("Enter both P.O. Number and P.O. Date."); return; }
-    await sb.from("estimates").update({po_number:poNumber.trim(),po_date:poDate}).eq("reference_number",contractInfo.contract_number);
-    if(onChanged) onChanged();
+    // Fixed (24 Aug) — this was writing to "estimates" correctly, but
+    // only ever refreshing sale_order_tbl afterward (the wrong table;
+    // P.O. Number/Date don't live there). Now patches the screen's own
+    // local state directly, same pattern used everywhere else in this
+    // component after a header save, so the banner and fields update
+    // immediately instead of silently going stale.
+    const { error } = await sb.from("estimates").update({po_number:poNumber.trim(),po_date:poDate}).eq("reference_number",contractInfo.contract_number);
+    if(error){ alert("Save failed: "+error.message); return; }
+    if(onPoFieldsSaved) onPoFieldsSaved(poNumber.trim(), poDate);
   };
   const overrideBillingAddress = async()=>{
     if(!confirm("Proceed without a Billing Address? This will be flagged to Admin/Super Admin at login until it's filled in.")) return;
@@ -13202,7 +13209,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           refFilter && h("button",{onClick:()=>{setRefFilter("");setRefSearchDisplay("");setSlNoFilter("");},style:btnSmall},mode==="contract"?"All Sale Orders":"All quotes")
         )
       ),
-      mode==="contract" && contractInfo && h(ContractStatusBanner,{contractInfo, quoteHeaderRow, user, onChanged:onContractInfoChanged, onEditDetails:()=>setShowEditContractDetails(true)}),
+      mode==="contract" && contractInfo && h(ContractStatusBanner,{contractInfo, quoteHeaderRow, user, onChanged:onContractInfoChanged, onEditDetails:()=>setShowEditContractDetails(true),
+        onPoFieldsSaved:(po_number,po_date)=>{
+          setRefs(rs=>rs.map(r=>r.reference_number===contractInfo.contract_number?{...r,po_number,po_date}:r));
+          if(openRef && openRef.reference_number===contractInfo.contract_number) setOpenRef(r=>({...r,po_number,po_date}));
+        }
+      }),
       mode==="contract" && showEditContractDetails && h(SaleOrderHeaderModal,{
         contractRow: contractInfo,
         onCancel: ()=>setShowEditContractDetails(false),
@@ -15484,12 +15496,25 @@ async function advanceContractNumberSuggestion(usedNumber, username){
 // Dispatch To, Billing Address (defaults from the Customer record,
 // overridable), Shipping Address (always typed fresh, no default).
 function SaleOrderHeaderModal({ contractRow, onCancel, onSaved }){
+  // Fixed (24 Aug) — this always started from hardcoded defaults
+  // regardless of what was already saved on contractRow, so reopening
+  // this editor silently discarded prior edits and re-saving overwrote
+  // real data with the defaults. Now initializes from contractRow's
+  // actual current values, falling back to a sensible default only for
+  // a field that's genuinely never been set.
   const [f,setF] = useState({
-    drawings_required:"Required", qap_conditions:"Required", inspection_by:"",
-    dispatch_through:"", late_delivery:"NA", dispatch_to:"", billing_address:"", shipping_address:""
+    drawings_required: contractRow.drawings_required || "Required",
+    qap_conditions: contractRow.qap_conditions || "Required",
+    inspection_by: contractRow.inspection_by || "",
+    dispatch_through: contractRow.dispatch_through || "",
+    late_delivery: contractRow.late_delivery || "NA",
+    dispatch_to: contractRow.dispatch_to || "",
+    billing_address: contractRow.billing_address || "",
+    shipping_address: contractRow.shipping_address || "",
   });
   const [saving,setSaving] = useState(false);
   useEffect(()=>{
+    if(contractRow.billing_address) return; // already has a real value — don't clobber it with the customer's city/country
     (async()=>{
       const { data } = await sb.from("companies").select("billing_city,billing_country").eq("company_name",contractRow.customer_name).maybeSingle();
       const addr = [data?.billing_city,data?.billing_country].filter(Boolean).join(", ");
