@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-25T02:46:47Z";
+  var APP_BUILD_VERSION = "2026-08-25T03:43:24Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8675,15 +8675,17 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
   const [statusOptions,setStatusOptions] = useState([]);
   const [poNumber,setPoNumber] = useState(quoteHeaderRow?.po_number||"");
   const [poDate,setPoDate] = useState(quoteHeaderRow?.po_date||"");
+  const [poJustSaved,setPoJustSaved] = useState(false);
   useEffect(()=>{ setPoNumber(quoteHeaderRow?.po_number||""); setPoDate(quoteHeaderRow?.po_date||""); },[quoteHeaderRow?.po_number,quoteHeaderRow?.po_date]);
   useEffect(()=>{
     sb.from("sale_order_status_tbl").select("status").order("sort_order").then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
   },[]);
 
-  // Mandatory-before-approval fields (24 Aug follow-up). Ten fields
-  // total; Billing Address is the one exception any role can override
-  // (flagged, not blocked) — the other nine hard-block Approve for
-  // everyone, no override path.
+  // Mandatory-before-approval fields. Dispatch Through / Dispatch To
+  // removed entirely (24 Aug follow-up) — dropped from the schema, so
+  // they're no longer checked here either. Eight fields now; Billing
+  // Address is the one exception any role can override (flagged, not
+  // blocked) — the other seven hard-block Approve for everyone.
   const otherMissing = [
     !quoteHeaderRow?.po_number && "P.O. Number",
     !quoteHeaderRow?.po_date && "P.O. Date",
@@ -8691,9 +8693,7 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     !contractInfo.drawings_required && "Drawings",
     !contractInfo.qap_conditions && "QAP Conditions",
     !contractInfo.inspection_by && "Inspection By",
-    !contractInfo.dispatch_through && "Dispatch Through",
     !contractInfo.late_delivery && "Late Delivery",
-    !contractInfo.dispatch_to && "Dispatch To",
   ].filter(Boolean);
   const billingMissing = !contractInfo.billing_address && !contractInfo.billing_address_overridden;
   const canApproveAtAll = otherMissing.length===0 && !billingMissing;
@@ -8705,10 +8705,14 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     // P.O. Number/Date don't live there). Now patches the screen's own
     // local state directly, same pattern used everywhere else in this
     // component after a header save, so the banner and fields update
-    // immediately instead of silently going stale.
+    // immediately instead of silently going stale. Also now shows a
+    // visible "✓ Saved" flash — this used to save silently with zero
+    // feedback, confusing even when it worked.
     const { error } = await sb.from("estimates").update({po_number:poNumber.trim(),po_date:poDate}).eq("reference_number",contractInfo.contract_number);
     if(error){ alert("Save failed: "+error.message); return; }
     if(onPoFieldsSaved) onPoFieldsSaved(poNumber.trim(), poDate);
+    setPoJustSaved(true);
+    setTimeout(()=>setPoJustSaved(false), 2500);
   };
   const overrideBillingAddress = async()=>{
     if(!confirm("Proceed without a Billing Address? This will be flagged to Admin/Super Admin at login until it's filled in.")) return;
@@ -8760,6 +8764,7 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
         h("input",{value:poNumber,onChange:e=>setPoNumber(e.target.value),placeholder:"P.O. Number",style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:150}}),
         h("input",{type:"date",value:poDate||"",onChange:e=>setPoDate(e.target.value),style:{...inputStyle,padding:"5px 8px",fontSize:11.5}}),
         h("button",{onClick:savePoFields,style:{...btnSmall,fontSize:10.5}},"Save P.O. details"),
+        poJustSaved && h("span",{style:{fontSize:11,color:"#1c8c56",fontWeight:600}},"✓ Saved"),
         onEditDetails && h("button",{onClick:onEditDetails,style:{...btnSmall,fontSize:10.5}},"Edit other Sale Order details")
       ),
       billingMissing && h("div",{style:{display:"flex",alignItems:"center",gap:8,paddingTop:8,borderTop:"1px solid #f0997b"}},
@@ -12482,16 +12487,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       doc.addPage();
       letterhead("ANNEXURE - I  COMMERCIAL TERMS");
       const termsStartPage = doc.internal.getNumberOfPages();
+      // Dispatch Through / Dispatch To removed entirely (24 Aug follow-
+      // up) — dropped from the schema. Drawings and QAP Conditions now
+      // omit their row completely when blank, rather than printing
+      // "—" — filtered out below instead of hardcoded into the list.
       const contractOnlyRows = isContract ? [
-        ["Drawings", contractInfo?.drawings_required||"—"],
-        ["QAP Conditions", contractInfo?.qap_conditions||"—"],
+        ["Drawings", contractInfo?.drawings_required],
+        ["QAP Conditions", contractInfo?.qap_conditions],
         ["Inspection By", contractInfo?.inspection_by||"—"],
-        ["Dispatch Through", contractInfo?.dispatch_through||"—"],
         ["Late Delivery", contractInfo?.late_delivery||"—"],
-        ["Dispatch To", contractInfo?.dispatch_to||"—"],
         ["Billing Address", contractInfo?.billing_address||"—"],
         ["Shipping Address", contractInfo?.shipping_address||"—"],
-      ] : [];
+      ].filter(row=>row[1]) : [];
       doc.autoTable({
         startY:38,
         body:[
@@ -15502,17 +15509,18 @@ function SaleOrderHeaderModal({ contractRow, onCancel, onSaved }){
   // real data with the defaults. Now initializes from contractRow's
   // actual current values, falling back to a sensible default only for
   // a field that's genuinely never been set.
+  // Dispatch Through / Dispatch To removed entirely (24 Aug follow-up) —
+  // dropped from the schema, not just hidden here.
   const [f,setF] = useState({
-    drawings_required: contractRow.drawings_required || "Required",
-    qap_conditions: contractRow.qap_conditions || "Required",
+    drawings_required: contractRow.drawings_required || "",
+    qap_conditions: contractRow.qap_conditions || "",
     inspection_by: contractRow.inspection_by || "",
-    dispatch_through: contractRow.dispatch_through || "",
     late_delivery: contractRow.late_delivery || "NA",
-    dispatch_to: contractRow.dispatch_to || "",
     billing_address: contractRow.billing_address || "",
     shipping_address: contractRow.shipping_address || "",
   });
   const [saving,setSaving] = useState(false);
+  const [justSaved,setJustSaved] = useState(false);
   useEffect(()=>{
     if(contractRow.billing_address) return; // already has a real value — don't clobber it with the customer's city/country
     (async()=>{
@@ -15530,9 +15538,14 @@ function SaleOrderHeaderModal({ contractRow, onCancel, onSaved }){
     try{
       const { data, error } = await sb.from("sale_order_tbl").update(f).eq("id",contractRow.id).select().single();
       if(error) throw error;
-      onSaved(data);
-    } catch(e){ alert("Couldn't save: "+e.message); }
-    finally{ setSaving(false); }
+      // Shows "✓ Saved" for a beat before actually closing/navigating
+      // (24 Aug follow-up) — onSaved previously fired immediately, which
+      // unmounts this modal right away, so there was never actually a
+      // moment where a confirmation could be seen even if one were shown.
+      setSaving(false);
+      setJustSaved(true);
+      setTimeout(()=>onSaved(data), 700);
+    } catch(e){ alert("Couldn't save: "+e.message); setSaving(false); }
   };
   const fld = (key,label,type)=>h("div",{style:{marginBottom:10}},
     h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},label),
@@ -15540,33 +15553,51 @@ function SaleOrderHeaderModal({ contractRow, onCancel, onSaved }){
       ? h("textarea",{value:f[key],onChange:e=>setF(d=>({...d,[key]:e.target.value})),rows:2,style:{...inputStyle,padding:"7px 9px",width:"100%"}})
       : h("input",{value:f[key],onChange:e=>setF(d=>({...d,[key]:e.target.value})),style:{...inputStyle,padding:"7px 9px",width:"100%"}})
   );
+  // Drawings/QAP Conditions (24 Aug follow-up) — a fixed 3-option list
+  // plus "Others", which reveals an inline text field. Whatever's typed
+  // there (including blank) becomes the field's real stored value —
+  // there's no separate "Others" marker kept in the database. So any
+  // stored value that isn't one of the 3 fixed options (including a
+  // pre-24-Aug "Required") is detected as "Others" and shown with that
+  // text pre-filled, rather than needing its own flag.
+  const FIXED_OPTIONS = ["Required - Attached","Required - Will Submit","Not Applicable"];
+  const choiceField = (key,label)=>{
+    const val = f[key];
+    const isFixed = FIXED_OPTIONS.includes(val);
+    const dropdownValue = val==="" ? "" : (isFixed ? val : "Others");
+    return h("div",{style:{marginBottom:10}},
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},label),
+      h("select",{
+        value:dropdownValue,
+        onChange:e=>setF(d=>({...d,[key]: e.target.value==="Others" ? "" : e.target.value})),
+        style:{...inputStyle,padding:"7px 9px",width:"100%"}
+      },
+        h("option",{value:""},"—"),
+        FIXED_OPTIONS.map(o=>h("option",{key:o,value:o},o)),
+        h("option",{value:"Others"},"Others")
+      ),
+      dropdownValue==="Others" && h("input",{
+        value:val, onChange:e=>setF(d=>({...d,[key]:e.target.value})),
+        placeholder:"Type here", style:{...inputStyle,padding:"6px 8px",width:"100%",marginTop:6,fontSize:12.5}
+      })
+    );
+  };
   return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1300,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"22px 26px",width:480,maxWidth:"100%",maxHeight:"88vh",overflowY:"auto"}},
       h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Sale Order Details — "+contractRow.contract_number),
       h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"A few things a Quote doesn't need but a Sale Order does."),
       h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 12px"}},
-        h("div",{style:{marginBottom:10}},
-          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Drawings"),
-          h("select",{value:f.drawings_required,onChange:e=>setF(d=>({...d,drawings_required:e.target.value})),style:{...inputStyle,padding:"7px 9px",width:"100%"}},
-            h("option",{value:"Required"},"Required"), h("option",{value:"Not Required"},"Not Required")
-          )
-        ),
-        h("div",{style:{marginBottom:10}},
-          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"QAP Conditions"),
-          h("select",{value:f.qap_conditions,onChange:e=>setF(d=>({...d,qap_conditions:e.target.value})),style:{...inputStyle,padding:"7px 9px",width:"100%"}},
-            h("option",{value:"Required"},"Required"), h("option",{value:"Not Required"},"Not Required")
-          )
-        ),
+        choiceField("drawings_required","Drawings"),
+        choiceField("qap_conditions","QAP Conditions"),
         fld("inspection_by","Inspection By"),
-        fld("dispatch_through","Dispatch Through"),
         fld("late_delivery","Late Delivery"),
-        fld("dispatch_to","Dispatch To"),
       ),
       fld("billing_address","Billing Address (defaults from Customer)","textarea"),
       fld("shipping_address","Shipping Address","textarea"),
-      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:10}},
-        h("button",{onClick:onCancel,style:btnSecondary},"Fill in later"),
-        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save and open")
+      h("div",{style:{display:"flex",justifyContent:"flex-end",alignItems:"center",gap:8,marginTop:10}},
+        justSaved && h("span",{style:{fontSize:11.5,color:"#1c8c56",fontWeight:600,marginRight:"auto"}},"✓ Saved"),
+        h("button",{onClick:onCancel,disabled:saving||justSaved,style:btnSecondary},"Fill in later"),
+        h("button",{onClick:save,disabled:saving||justSaved,style:{...btnPrimary,opacity:(saving||justSaved)?0.6:1}},saving?"Saving…":(justSaved?"Saved ✓":"Save and open"))
       )
     )
   );
