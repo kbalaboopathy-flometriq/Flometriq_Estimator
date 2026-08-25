@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-25T09:58:23Z";
+  var APP_BUILD_VERSION = "2026-08-25T12:44:05Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -673,6 +673,27 @@ function amountInWordsLine(amount, currency){
   const prefix = currency==="INR" ? "Rupee" : currency;
   return prefix+" "+words+" Only";
 }
+// Internal-document header rows (24 Aug) — BOM Detail, BOM Summary,
+// Cutting Plan, and the standalone Datasheet PDF all use this same
+// mode-aware set instead of a bare Quote# line: Contract mode shows
+// Contract Number/Date/Client Name, Quote mode shows Quote Number/Quote
+// Date/Client Name — Quote# never appears anywhere but this cover page
+// once a Contract exists for it.
+function buildDocHeaderRows(mode, contractInfo, openRef){
+  const clientName = openRef?.customer_name || "";
+  if(mode==="contract"){
+    return [
+      ["Contract Number", contractInfo?.contract_number || openRef?.reference_number || ""],
+      ["Date", new Date().toLocaleDateString("en-GB")],
+      ["Client Name", clientName],
+    ];
+  }
+  return [
+    ["Quote Number", openRef?.reference_number || ""],
+    ["Quote Date", openRef?.quote_date ? new Date(openRef.quote_date).toLocaleDateString("en-GB") : ""],
+    ["Client Name", clientName],
+  ];
+}
 // Real bug found 10 Aug: a raw total and its raw per-unit rate were each
 // being passed through fmtR/roundTo5 SEPARATELY (e.g. fmtR(unit) alongside
 // fmtR(total)) — since the true unrounded unit rarely lands on a multiple
@@ -857,7 +878,7 @@ async function autoAssignNewCompany(payload, createdBy){
 
 
 /* ---- PDF GENERATION ---- */
-function generatePDF({ title, refNumber, description, createdBy, createdAt, headers, rows, footerRows, filename, company }) {
+function generatePDF({ title, refNumber, description, createdBy, createdAt, headers, rows, footerRows, filename, company, extraHeaderRows }) {
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
   const W = doc.internal.pageSize.getWidth();
@@ -882,7 +903,15 @@ function generatePDF({ title, refNumber, description, createdBy, createdAt, head
     doc.setFont(undefined,"bold"); doc.text(label+":", 12, y);
     doc.setFont(undefined,"normal"); doc.text(String(value||""), 42, y); y += 6;
   };
-  if(refNumber) lbl("Ref No", refNumber);
+  // extraHeaderRows (24 Aug, document header rollout) — when given,
+  // replaces the plain "Ref No" line with a fuller set (Contract Number/
+  // Quote Number + Client Name + Date), mode-aware, used by the BOM/
+  // Cutting Plan/Datasheet exports. Every other caller of this shared
+  // helper is untouched — refNumber still works exactly as before when
+  // extraHeaderRows isn't passed.
+  if(extraHeaderRows && extraHeaderRows.length){
+    extraHeaderRows.forEach(([label,value])=>lbl(label,value));
+  } else if(refNumber) lbl("Ref No", refNumber);
   if(description) lbl("Description", description);
   if(createdBy) lbl("Prepared by", createdBy);
   lbl("Date", new Date(createdAt||Date.now()).toLocaleDateString("en-IN", {day:"2-digit",month:"short",year:"numeric"}));
@@ -5039,7 +5068,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     XLSX.writeFile(wb,"estimate_"+selectedModel+".xlsx");
   };
 
-  const exportPDF = ()=>{
+  const exportPDF = async()=>{
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
     const W = doc.internal.pageSize.getWidth();
@@ -5090,6 +5119,18 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     lbl(90,"Date", today);
     lbl(160,"Prepared by", user.username);
     y += 9;
+    // Client/Contract/Quote context (24 Aug, document header rollout) —
+    // this export previously showed no quote context at all. Only
+    // printed when this Sl No is actually linked to a saved
+    // Quote/Contract (refNumber truthy) — a brand-new, not-yet-saved
+    // line in the Estimator has nothing to look up yet.
+    if(refNumber){
+      const { data: contractRow } = await sb.from("sale_order_tbl").select("*").eq("contract_number",refNumber).maybeSingle();
+      const rows = buildDocHeaderRows(contractRow?"contract":"quote", contractRow, {reference_number:refNumber, customer_name:customerName, quote_date:quoteDate});
+      lbl(12, rows[0][0], rows[0][1]);
+      lbl(90, rows[2][0], rows[2][1]); // Client Name
+      y += 9;
+    }
 
     const groups=[]; const map=new Map();
     computedLines.forEach(l=>{
@@ -5148,7 +5189,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     XLSX.writeFile(wb,"summary_"+selectedModel+".xlsx");
   };
 
-  const exportSummaryPDF = ()=>{
+  const exportSummaryPDF = async()=>{
     const today = new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ orientation:"landscape", unit:"mm", format:"a4" });
@@ -5167,7 +5208,10 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     doc.setTextColor(...dark); doc.setFontSize(9); let y=34;
     const lbl=(l,v)=>{ doc.setFont(undefined,"bold"); doc.text(l+":",12,y); doc.setFont(undefined,"normal"); doc.text(String(v||""),42,y); y+=6; };
     lbl("Model",selectedModel);
-    if(refNumber) lbl("Quote#",refNumber+(itemSlNo?" — Sl No "+itemSlNo:""));
+    if(refNumber){
+      const { data: contractRow } = await sb.from("sale_order_tbl").select("*").eq("contract_number",refNumber).maybeSingle();
+      buildDocHeaderRows(contractRow?"contract":"quote", contractRow, {reference_number:refNumber, customer_name:customerName, quote_date:quoteDate}).forEach(([l,v])=>lbl(l,v));
+    }
     if(refDesc) lbl("Description",refDesc);
     lbl("Date",today);
     lbl("Prepared by",user.username);
@@ -5223,7 +5267,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     XLSX.writeFile(wb,"cutting_plan_"+selectedModel+".xlsx");
   };
 
-  const exportCuttingPlanPDF = ()=>{
+  const exportCuttingPlanPDF = async()=>{
     const today = new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ orientation:"landscape", unit:"mm", format:"a4" });
@@ -5240,7 +5284,10 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     doc.setTextColor(...dark); doc.setFontSize(9); let y=34;
     const lbl=(l,v)=>{ doc.setFont(undefined,"bold"); doc.text(l+":",12,y); doc.setFont(undefined,"normal"); doc.text(String(v||""),42,y); y+=6; };
     lbl("Model",selectedModel);
-    if(refNumber) lbl("Quote#",refNumber+(itemSlNo?" — Sl No "+itemSlNo:""));
+    if(refNumber){
+      const { data: contractRow } = await sb.from("sale_order_tbl").select("*").eq("contract_number",refNumber).maybeSingle();
+      buildDocHeaderRows(contractRow?"contract":"quote", contractRow, {reference_number:refNumber, customer_name:customerName, quote_date:quoteDate}).forEach(([l,v])=>lbl(l,v));
+    }
     if(refDesc) lbl("Description",refDesc);
     lbl("Date",today);
     lbl("Prepared by",user.username);
@@ -7287,7 +7334,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
     XLSX.writeFile(wb, openRef.reference_number+"_sl"+openRef.item_sl_no+"_"+itemName.replace(/\s+/g,"_")+"_Datasheet.xlsx");
   };
 
-  const exportPDF = ()=>{
+  const exportPDF = async()=>{
     const today = new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
@@ -7304,9 +7351,10 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
     drawLetterhead();
     doc.setTextColor(...dark); doc.setFontSize(9); let y=34;
     const lbl=(l,v)=>{ doc.setFont(undefined,"bold"); doc.text(l+":",12,y); doc.setFont(undefined,"normal"); doc.text(String(v||""),42,y); y+=6; };
-    lbl("Item",itemName); lbl("Quote#",openRef.reference_number+" — Sl No "+openRef.item_sl_no);
+    lbl("Item",itemName);
+    const { data: contractRow } = await sb.from("sale_order_tbl").select("*").eq("contract_number",openRef.reference_number).maybeSingle();
+    buildDocHeaderRows(contractRow?"contract":"quote", contractRow, openRef).forEach(([l,v])=>lbl(l,v));
     if(openRef.description) lbl("Description",openRef.description);
-    lbl("Date",today);
     y += 1;
     doc.setDrawColor(70,70,70); doc.setLineWidth(0.5);
     doc.line(12, y, W-12, y);
@@ -8670,22 +8718,58 @@ function QuoteNotesPanel({ referenceNumber, user }){
 // role-gated action in this app.
 function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, onEditDetails, onPoFieldsSaved }){
   const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
+  const isSuperAdmin = user.role==="super_admin";
   const roleFor = { commercial_approved:"accounts_admin", testing_approved:"qc", technical_approved:"technical_head" };
   const roleLabel = { accounts_admin:"Accounts Admin", qc:"QC", technical_head:"Technical Head" };
   const [statusOptions,setStatusOptions] = useState([]);
   const [poNumber,setPoNumber] = useState(quoteHeaderRow?.po_number||"");
   const [poDate,setPoDate] = useState(quoteHeaderRow?.po_date||"");
-  const [poJustSaved,setPoJustSaved] = useState(false);
+  // Consolidated (24 Aug follow-up) — every missing mandatory field is
+  // now editable directly in this banner, not just P.O. Number/Date.
+  // Previously only P.O. had inline fields here; everything else needed
+  // the separate "Edit other Sale Order details" popup, which read as
+  // "nothing happened" when someone filled in a field this banner had
+  // no place for.
+  const [draft,setDraft] = useState({
+    shipping_address: contractInfo.shipping_address||"",
+    drawings_required: contractInfo.drawings_required||"",
+    qap_conditions: contractInfo.qap_conditions||"",
+    inspection_by: contractInfo.inspection_by||"",
+    late_delivery: contractInfo.late_delivery||"",
+    signatory_name: contractInfo.signatory_name||"",
+    signatory_designation: contractInfo.signatory_designation||"",
+  });
+  const [savingAll,setSavingAll] = useState(false);
+  const [allJustSaved,setAllJustSaved] = useState(false);
+  // Super Admin code override (24 Aug follow-up) — reuses the existing
+  // Deletion Codes pool. Admin (non-Super) never gets this option at
+  // all. One valid code unlocks all three Approve buttons together, not
+  // per-section.
+  const [showOverrideCode,setShowOverrideCode] = useState(false);
+  const [overrideCodeInput,setOverrideCodeInput] = useState("");
+  const [overrideActive,setOverrideActive] = useState(false);
   useEffect(()=>{ setPoNumber(quoteHeaderRow?.po_number||""); setPoDate(quoteHeaderRow?.po_date||""); },[quoteHeaderRow?.po_number,quoteHeaderRow?.po_date]);
+  useEffect(()=>{
+    setDraft({
+      shipping_address: contractInfo.shipping_address||"",
+      drawings_required: contractInfo.drawings_required||"",
+      qap_conditions: contractInfo.qap_conditions||"",
+      inspection_by: contractInfo.inspection_by||"",
+      late_delivery: contractInfo.late_delivery||"",
+      signatory_name: contractInfo.signatory_name||"",
+      signatory_designation: contractInfo.signatory_designation||"",
+    });
+  },[contractInfo]);
   useEffect(()=>{
     sb.from("sale_order_status_tbl").select("status").order("sort_order").then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
   },[]);
 
   // Mandatory-before-approval fields. Dispatch Through / Dispatch To
   // removed entirely (24 Aug follow-up) — dropped from the schema, so
-  // they're no longer checked here either. Eight fields now; Billing
-  // Address is the one exception any role can override (flagged, not
-  // blocked) — the other seven hard-block Approve for everyone.
+  // they're no longer checked here either. Billing Address is the one
+  // exception any role can override (flagged, not blocked) — everything
+  // else hard-blocks Approve for everyone, including Super Admin, unless
+  // a valid Deletion Code override is active.
   const otherMissing = [
     !quoteHeaderRow?.po_number && "P.O. Number",
     !quoteHeaderRow?.po_date && "P.O. Date",
@@ -8694,31 +8778,44 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     !contractInfo.qap_conditions && "QAP Conditions",
     !contractInfo.inspection_by && "Inspection By",
     !contractInfo.late_delivery && "Late Delivery",
+    !contractInfo.signatory_name && "Signatory Name",
+    !contractInfo.signatory_designation && "Signatory Designation",
   ].filter(Boolean);
   const billingMissing = !contractInfo.billing_address && !contractInfo.billing_address_overridden;
-  const canApproveAtAll = otherMissing.length===0 && !billingMissing;
+  const canApproveAtAll = (otherMissing.length===0 && !billingMissing) || overrideActive;
 
   const savePoFields = async()=>{
     if(!poNumber.trim() || !poDate){ alert("Enter both P.O. Number and P.O. Date."); return; }
-    // Fixed (24 Aug) — this was writing to "estimates" correctly, but
-    // only ever refreshing sale_order_tbl afterward (the wrong table;
-    // P.O. Number/Date don't live there). Now patches the screen's own
-    // local state directly, same pattern used everywhere else in this
-    // component after a header save, so the banner and fields update
-    // immediately instead of silently going stale. Also now shows a
-    // visible "✓ Saved" flash — this used to save silently with zero
-    // feedback, confusing even when it worked.
     const { error } = await sb.from("estimates").update({po_number:poNumber.trim(),po_date:poDate}).eq("reference_number",contractInfo.contract_number);
     if(error){ alert("Save failed: "+error.message); return; }
     if(onPoFieldsSaved) onPoFieldsSaved(poNumber.trim(), poDate);
-    setPoJustSaved(true);
-    setTimeout(()=>setPoJustSaved(false), 2500);
+    return true;
+  };
+  const saveAllFields = async()=>{
+    setSavingAll(true);
+    try{
+      const poOk = (quoteHeaderRow?.po_number && quoteHeaderRow?.po_date) || (poNumber.trim() && poDate);
+      if(poNumber.trim() && poDate) await savePoFields();
+      const { error } = await sb.from("sale_order_tbl").update(draft).eq("id",contractInfo.id);
+      if(error){ alert("Save failed: "+error.message); return; }
+      if(onChanged) onChanged();
+      setAllJustSaved(true);
+      setTimeout(()=>setAllJustSaved(false), 2500);
+    } finally { setSavingAll(false); }
   };
   const overrideBillingAddress = async()=>{
     if(!confirm("Proceed without a Billing Address? This will be flagged to Admin/Super Admin at login until it's filled in.")) return;
     await sb.from("sale_order_tbl").update({billing_address_overridden:true}).eq("id",contractInfo.id);
     await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,"Billing Address overridden by "+(user?.username||"unknown"),user?.username||"unknown",null,null);
     if(onChanged) onChanged();
+  };
+  const submitOverrideCode = async()=>{
+    const res = await verifyAndConsumeDeletionCode(overrideCodeInput, user?.username||"unknown");
+    if(!res.ok){ alert(res.reason); return; }
+    await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,"Super Admin override — approving with missing mandatory fields ("+[...otherMissing, billingMissing?"Billing Address":null].filter(Boolean).join(", ")+")",user?.username||"unknown",null,null);
+    setOverrideActive(true);
+    setShowOverrideCode(false);
+    setOverrideCodeInput("");
   };
 
   const approve = async(field)=>{
@@ -8737,11 +8834,13 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     if(willAllBeApproved && contractInfo.status==="Draft") patch.status = "Approved";
     const { error } = await sb.from("sale_order_tbl").update(patch).eq("id",contractInfo.id);
     if(error){ alert("Approval failed: "+error.message); return; }
-    await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,"Approved "+field.replace("_approved",""),user?.username||"unknown",null,null);
+    await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,"Approved "+field.replace("_approved","")+(overrideActive?" (Super Admin override in effect)":""),user?.username||"unknown",null,null);
     if(onChanged) onChanged();
   };
   const changeStatus = async(newStatus)=>{
-    if(!isAdminOrAbove){ alert("Only an Admin or Super Admin can change Sale Order status."); return; }
+    // Open to every role (25 Aug) — status is plain progress tracking,
+    // separate entirely from the three-section approval workflow above,
+    // which still requires the right role/Admin to sign off.
     await sb.from("sale_order_tbl").update({status:newStatus}).eq("id",contractInfo.id);
     await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,"Status changed to "+newStatus,user?.username||"unknown",null,null);
     if(onChanged) onChanged();
@@ -8756,22 +8855,41 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
         : h("span",{style:{fontSize:10.5,color:colors.mutedLight,cursor: !canApproveAtAll?"help":undefined},title: !canApproveAtAll?"Blocked — missing required fields below":undefined},"Pending")
     );
   };
+  const df = (key,placeholder,width)=>h("input",{value:draft[key],onChange:e=>setDraft(d=>({...d,[key]:e.target.value})),placeholder,style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:width||"100%"}});
   return h("div",{style:{marginTop:10}},
     (otherMissing.length>0 || billingMissing) && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"10px 12px",marginBottom:8}},
       h("div",{style:{fontSize:12,fontWeight:700,color:"#a3312a",marginBottom:6}},"Required before this Sale Order can be approved:"),
       otherMissing.length>0 && h("div",{style:{fontSize:11.5,color:"#a3312a",marginBottom:8}},otherMissing.join(", ")),
-      h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginBottom: (otherMissing.length>0)?8:0}},
-        h("input",{value:poNumber,onChange:e=>setPoNumber(e.target.value),placeholder:"P.O. Number",style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:150}}),
-        h("input",{type:"date",value:poDate||"",onChange:e=>setPoDate(e.target.value),style:{...inputStyle,padding:"5px 8px",fontSize:11.5}}),
-        h("button",{onClick:savePoFields,style:{...btnSmall,fontSize:10.5}},"Save P.O. details"),
-        poJustSaved && h("span",{style:{fontSize:11,color:"#1c8c56",fontWeight:600}},"✓ Saved"),
-        onEditDetails && h("button",{onClick:onEditDetails,style:{...btnSmall,fontSize:10.5}},"Edit other Sale Order details")
+      otherMissing.length>0 && h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}},
+        h("input",{value:poNumber,onChange:e=>setPoNumber(e.target.value),placeholder:"P.O. Number",style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:"100%"}}),
+        h("input",{type:"date",value:poDate||"",onChange:e=>setPoDate(e.target.value),style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:150}}),
+        df("drawings_required","Drawings"),
+        df("qap_conditions","QAP Conditions"),
+        df("inspection_by","Inspection By"),
+        df("late_delivery","Late Delivery"),
+        df("signatory_name","Signatory Name"),
+        df("signatory_designation","Signatory Designation"),
+      ),
+      otherMissing.includes("Shipping Address") && h("textarea",{value:draft.shipping_address,onChange:e=>setDraft(d=>({...d,shipping_address:e.target.value})),placeholder:"Shipping Address",rows:2,style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:"100%",marginBottom:8}}),
+      otherMissing.length>0 && h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom: billingMissing?8:0}},
+        h("button",{onClick:saveAllFields,disabled:savingAll,style:{...btnSmall,fontSize:10.5,opacity:savingAll?0.6:1}},savingAll?"Saving…":"Save all details"),
+        allJustSaved && h("span",{style:{fontSize:11,color:"#1c8c56",fontWeight:600}},"✓ Saved")
       ),
       billingMissing && h("div",{style:{display:"flex",alignItems:"center",gap:8,paddingTop:8,borderTop:"1px solid #f0997b"}},
         h("span",{style:{fontSize:11.5,color:"#a3312a"}},"Billing Address is also missing."),
         h("button",{onClick:overrideBillingAddress,style:{...btnSmall,fontSize:10.5}},"Override and flag for later")
       ),
-      contractInfo.billing_address_overridden && h("div",{style:{fontSize:11,color:"#a3312a",marginTop:6}},"⚠ Billing Address was overridden — flagged to Admin/Super Admin at login until filled in.")
+      contractInfo.billing_address_overridden && h("div",{style:{fontSize:11,color:"#a3312a",marginTop:6}},"⚠ Billing Address was overridden — flagged to Admin/Super Admin at login until filled in."),
+      overrideActive && h("div",{style:{fontSize:11,color:"#a3312a",marginTop:6,fontWeight:600}},"⚠ Super Admin override active — Approve is unlocked despite missing fields above.")
+    ),
+    (otherMissing.length>0 || billingMissing) && !overrideActive && isSuperAdmin && h("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:8,padding:"8px 12px",background:"#fff",border:"1px solid "+colors.border,borderRadius:6}},
+      !showOverrideCode
+        ? h("button",{onClick:()=>setShowOverrideCode(true),style:{...btnSmall,fontSize:10.5}},"Super Admin: enter code to override")
+        : h(React.Fragment,null,
+            h("input",{value:overrideCodeInput,onChange:e=>setOverrideCodeInput(e.target.value),placeholder:"Deletion code",style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:140}}),
+            h("button",{onClick:submitOverrideCode,style:{...btnSmall,fontSize:10.5}},"Submit"),
+            h("button",{onClick:()=>{setShowOverrideCode(false);setOverrideCodeInput("");},style:{...btnSmall,fontSize:10.5}},"Cancel")
+          )
     ),
     h("div",{style:{display:"flex",gap:14,flexWrap:"wrap",alignItems:"center",padding:"8px 12px",background:"#fff",border:"1px solid "+colors.border,borderRadius:6}},
       h("span",{style:{fontSize:12,fontWeight:700}},"Contract "+contractInfo.contract_number),
@@ -8781,11 +8899,9 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
       row("Everything else (Technical Head)","technical_approved"),
       h("div",{style:{display:"flex",alignItems:"center",gap:5,marginLeft:"auto"}},
         h("span",{style:{fontSize:11,color:colors.muted}},"Status:"),
-        isAdminOrAbove
-          ? h("select",{value:contractInfo.status||"Draft",onChange:e=>changeStatus(e.target.value),style:{...inputStyle,padding:"3px 6px",fontSize:11}},
-              statusOptions.map(s=>h("option",{key:s,value:s},s))
-            )
-          : h("span",{style:{fontSize:11,fontWeight:600}},contractInfo.status||"Draft")
+        h("select",{value:contractInfo.status||"Draft",onChange:e=>changeStatus(e.target.value),style:{...inputStyle,padding:"3px 6px",fontSize:11}},
+          statusOptions.map(s=>h("option",{key:s,value:s},s))
+        )
       )
     )
   );
@@ -10057,16 +10173,42 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [docHistoryRows,setDocHistoryRows]=useState([]);
   const [docNewVersionFile,setDocNewVersionFile]=useState(null);
   const [docNewVersionNote,setDocNewVersionNote]=useState("");
+  const [docNewVersionExtraNotes,setDocNewVersionExtraNotes]=useState("");
   const [docNewVersionLink,setDocNewVersionLink]=useState("");
+  // Document-level Notes (25 Aug) — a timestamped, append-only log
+  // separate from the per-revision "What changed?"/Notes pair. Every
+  // entry stays visible forever, same convention as the Activity Log —
+  // nothing here is ever overwritten or deleted.
+  const [docNotesList,setDocNotesList]=useState([]);
+  const [newDocNoteText,setNewDocNoteText]=useState("");
+  const [addingDocNote,setAddingDocNote]=useState(false);
   const openDocHistory = async(docRow)=>{
-    setDocHistoryFor(docRow); setDocNewVersionFile(null); setDocNewVersionNote(""); setDocNewVersionLink(docRow.link||"");
-    const { data } = await sb.from("universal_document_history_tbl").select("*").eq("document_id",docRow.id).order("rev_number",{ascending:false});
-    setDocHistoryRows(data||[]);
+    setDocHistoryFor(docRow); setDocNewVersionFile(null); setDocNewVersionNote(""); setDocNewVersionExtraNotes(""); setDocNewVersionLink(docRow.link||"");
+    const [{data:hist},{data:notes}] = await Promise.all([
+      sb.from("universal_document_history_tbl").select("*").eq("document_id",docRow.id).order("rev_number",{ascending:false}),
+      sb.from("universal_document_notes_tbl").select("*").eq("document_id",docRow.id).order("created_at",{ascending:false}),
+    ]);
+    setDocHistoryRows(hist||[]);
+    setDocNotesList(notes||[]);
+  };
+  const addDocumentNote = async()=>{
+    if(!newDocNoteText.trim()) return;
+    setAddingDocNote(true);
+    try{
+      const { data, error } = await sb.from("universal_document_notes_tbl").insert({
+        document_id:docHistoryFor.id, note_text:newDocNoteText.trim(), created_by:user?.username||"unknown"
+      }).select().single();
+      if(error) throw error;
+      setDocNotesList(list=>[data,...list]);
+      setNewDocNoteText("");
+    } catch(e){ alert("Couldn't add note: "+e.message); }
+    finally { setAddingDocNote(false); }
   };
   const uploadNewDocVersion = async()=>{
     if(!docNewVersionFile){ alert("Choose the new PDF file first."); return; }
     if(docNewVersionFile.type!=="application/pdf"){ alert("Only PDF files can be uploaded here."); return; }
     if(!docNewVersionNote.trim()){ alert("Say what changed in this version."); return; }
+    if(!docNewVersionExtraNotes.trim()){ alert("Notes is required for this version too."); return; }
     if(!docNewVersionLink.trim()){ alert("The link is required for this version too."); return; }
     setDocUploading(true);
     try{
@@ -10077,7 +10219,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const nextRev = (docHistoryFor.rev_number??0)+1;
       const { error:histErr } = await sb.from("universal_document_history_tbl").insert({
         document_id:docHistoryFor.id, doc_number:docHistoryFor.doc_number, rev_number:nextRev, direction:"Out", status:null,
-        link:docNewVersionLink.trim(), file_path:path, lives_in_supabase:true, reason:docNewVersionNote.trim(), changed_by:user?.username||"unknown"
+        link:docNewVersionLink.trim(), file_path:path, lives_in_supabase:true, reason:docNewVersionNote.trim(), notes:docNewVersionExtraNotes.trim(), changed_by:user?.username||"unknown"
       });
       if(histErr) throw histErr;
       await logAudit("UPDATE","universal_documents_tbl",quoteExportRef,"New version of "+docHistoryFor.doc_number+": "+docNewVersionNote.trim(),user?.username||"unknown",{file_path:oldPath},{file_path:path});
@@ -11515,7 +11657,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const exportPDF=()=>{
     const headers=["Sl","Model","Component","Shape","Material Spec","Grade","Cutting Plan","Cut Plan Qty","Cutting UOM","Qty","UOM","Rate","Cost","Sf","Sales Price"];
     const rows=openLines.map(l=>[l.sl_no,l.model||"",l.component||"",l.material_shape||"",l.material_spec||"",l.grade||"",l.cutting_plan_layout_size||"",l.cutting_plan_qty||0,l.cutting_plan_uom||"",l.qty_required,l.uom||"",fmtR(Number(l.rate)||0),fmtR(Number(l.cost)||0),l.sf,fmtR(Number(l.sales_price)||0)]);
-    generatePDF({title:"Estimate",refNumber:openRef.reference_number+" — Sl No "+openRef.item_sl_no,description:openRef.description,createdBy:openRef.created_by,createdAt:openRef.created_at,headers,rows,footerRows:[[...Array(11).fill(""),"Total",fmtR(totalCost),"",fmtR(totalSales)]],filename:"estimate_"+openRef.reference_number+"_sl"+openRef.item_sl_no+".pdf"});
+    generatePDF({title:"Estimate",extraHeaderRows:buildDocHeaderRows(mode,contractInfo,openRef),description:openRef.description,createdBy:openRef.created_by,createdAt:openRef.created_at,headers,rows,footerRows:[[...Array(11).fill(""),"Total",fmtR(totalCost),"",fmtR(totalSales)]],filename:"estimate_"+openRef.reference_number+"_sl"+openRef.item_sl_no+".pdf"});
   };
   const exportSummaryPDFSaved=()=>{
     const today=new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
@@ -11534,9 +11676,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     drawLetterhead();
     doc.setTextColor(...dark); doc.setFontSize(9); let y=34;
     const lbl=(l,v)=>{ doc.setFont(undefined,"bold"); doc.text(l+":",12,y); doc.setFont(undefined,"normal"); doc.text(String(v||""),42,y); y+=6; };
-    lbl("Quote#",openRef.reference_number+" — Sl No "+openRef.item_sl_no);
+    buildDocHeaderRows(mode,contractInfo,openRef).forEach(([l,v])=>lbl(l,v));
     if(openRef.description) lbl("Description",openRef.description);
-    lbl("Date",today); lbl("Prepared by",openRef.created_by||"");
+    lbl("Prepared by",openRef.created_by||"");
     const tableHead=[["#","Material spec","Grade","Total qty","UOM","Rate","Total cost","Total sales price","Lines"]];
     const tableBody=[]; let idx=0; let lastShape="";
     savedSummaryRows.forEach(r=>{
@@ -11601,9 +11743,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     drawLetterhead();
     doc.setTextColor(...dark); doc.setFontSize(9); let y=34;
     const lbl=(l,v)=>{ doc.setFont(undefined,"bold"); doc.text(l+":",12,y); doc.setFont(undefined,"normal"); doc.text(String(v||""),42,y); y+=6; };
-    lbl("Quote#",openRef.reference_number+" — Sl No "+openRef.item_sl_no);
+    buildDocHeaderRows(mode,contractInfo,openRef).forEach(([l,v])=>lbl(l,v));
     if(openRef.description) lbl("Description",openRef.description);
-    lbl("Date",today); lbl("Prepared by",openRef.created_by||"");
+    lbl("Prepared by",openRef.created_by||"");
     const tableHead=[["#","Material spec","Grade","Cutting plan","Total cutting qty","UOM"]];
     if(cuttingPlanIncludeCost){ tableHead[0].push("Rate","Total cost"); }
     let idx=0;
@@ -12031,8 +12173,37 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setPendingTestingMode(testingMode); setPendingWatermark(watermark); setShowNoDocsGenerateConfirm(true); return; }
     generateQuotePdf(testingMode, watermark, summaryMode);
   };
+  // Draft watermark, role-based (25 Aug) — applies only to a Contract
+  // whose status is still "Draft". User always gets the watermark, no
+  // bypass. Admin is prompted for a Deletion Code to remove it, fresh
+  // every generation (not sticky). Super Admin gets a Yes/No first, and
+  // Yes still requires the same code before it actually comes off.
+  const resolveContractDraftWatermark = async()=>{
+    if(user.role==="admin"){
+      const wantsClean = confirm("This Sale Order is still Draft — generate without the DRAFT watermark?\n\nOK = enter a code to remove it\nCancel = generate with the watermark");
+      if(!wantsClean) return true;
+      const code = prompt("Enter a Deletion Code to remove the DRAFT watermark:");
+      if(code===null) return true;
+      const res = await verifyAndConsumeDeletionCode(code, user?.username||"unknown");
+      if(!res.ok){ alert(res.reason); return true; }
+      await logAudit("UPDATE","sale_order_tbl",quoteExportRef,"Admin removed DRAFT watermark via Deletion Code",user?.username||"unknown",null,null);
+      return false;
+    }
+    if(user.role==="super_admin"){
+      const wantsClean = confirm("This Sale Order is still Draft. Remove the DRAFT watermark for this PDF?");
+      if(!wantsClean) return true;
+      const code = prompt("Enter a Deletion Code to confirm removing the DRAFT watermark:");
+      if(code===null) return true;
+      const res = await verifyAndConsumeDeletionCode(code, user?.username||"unknown");
+      if(!res.ok){ alert(res.reason); return true; }
+      await logAudit("UPDATE","sale_order_tbl",quoteExportRef,"Super Admin removed DRAFT watermark via Deletion Code",user?.username||"unknown",null,null);
+      return false;
+    }
+    return true; // plain user, or any other role — always watermarked, no bypass
+  };
   const attemptGenerateQuotePdf = async ()=>{
     if(!quoteExportRef) return;
+    let watermark = false;
     try {
       // Contract approval gate (24 Aug) — a Contract can't generate its
       // PDF until all three sections are approved. Nothing else about
@@ -12047,6 +12218,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           alert("This Contract can't be generated yet — still waiting on approval for:\n\n"+pending.join("\n"));
           return;
         }
+        if(contractInfo.status==="Draft"){
+          watermark = await resolveContractDraftWatermark();
+        }
       }
       const currCurrency = quoteHeaderRow?.currency||"INR";
       const currConvRate = quoteHeaderRow?.conversion_rate;
@@ -12058,12 +12232,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         alert("Can't generate the PDF — this customer has no country on file. Add one in Master Data → Customers before continuing.");
         return;
       }
-      let watermark = false;
+      let missingWatermark = false;
       if(missingHeaderFieldsForPdf.length && !isAdminOrAbove){
         const choice = await askIncompletePdfChoice(missingHeaderFieldsForPdf);
         if(choice===null) return; // cancelled
-        watermark = choice; // true = draft, false = code redeemed
+        missingWatermark = choice; // true = draft, false = code redeemed
       }
+      watermark = watermark || missingWatermark;
       const gate = await checkExtraPriceGate(quoteExportRef);
       if(!gate.hasLines && !gate.declined){
         if(confirm("Does this quote have any Extra Price Additions?\n\nOK = add some now\nCancel = none needed")){
@@ -12209,8 +12384,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const customerAddress = first.customer_address || "";
       const attnName = first.contact_name || "";
       const attnDesignation = first.contact_designation || "";
-      const signatoryName = first.signatory_name || "";
-      const signatoryDesignation = first.signatory_designation || "";
+      // Signatory (24 Aug) — a Contract uses its OWN signatory
+      // (sale_order_tbl), not the Quote's it was cloned from. It starts
+      // blank on the Contract and is mandatory before approval, so it's
+      // never silently defaulted to whatever the Quote happened to have.
+      const signatoryName = mode==="contract" ? (contractInfo?.signatory_name||"") : (first.signatory_name || "");
+      const signatoryDesignation = mode==="contract" ? (contractInfo?.signatory_designation||"") : (first.signatory_designation || "");
       const today = new Date().toLocaleDateString("en-GB");
       // Wrapped so the PDF preview can regenerate it live with small overrides
       // (Customer Name, Delivery, Validity) without re-fetching from the DB.
@@ -12518,7 +12697,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         ["Inspection By", contractInfo?.inspection_by||"—"],
         ["Late Delivery", contractInfo?.late_delivery||"—"],
         ["Billing Address", contractInfo?.billing_address||"—"],
-        ["Shipping Address", contractInfo?.shipping_address||"—"],
+        ["Shipping Address", contractInfo?.shipping_address||"Kindly provide the shipping details as soon as possible to avoid delays at the time of despatch"],
       ].filter(row=>row[1]) : [];
       doc.autoTable({
         startY:38,
@@ -14860,13 +15039,32 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           docHistoryRows.length===0 ? h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:12}},"No prior versions — this is the original upload.") :
           h("div",{style:{marginBottom:12}}, docHistoryRows.map(h2=>h("div",{key:h2.id,style:{fontSize:11.5,padding:"6px 0",borderBottom:"1px solid #eceae0"}},
             h("span",{style:{color:colors.muted}},(h2.changed_at||"").slice(0,10)+" — "+(h2.changed_by||"—")+": "),
-            h2.what_changed
+            h2.what_changed || h2.reason,
+            h2.notes && h("div",{style:{color:colors.mutedLight,marginTop:2}},"Notes: "+h2.notes)
           ))),
           h("div",{style:{fontSize:11.5,fontWeight:600,marginBottom:6}},"Upload a new version"),
           h("input",{type:"file",accept:"application/pdf",onChange:e=>setDocNewVersionFile(e.target.files[0]||null),style:{width:"100%",marginBottom:8}}),
           h("input",{value:docNewVersionLink,onChange:e=>setDocNewVersionLink(e.target.value),placeholder:"Link (OneDrive etc.)",style:{...inputStyle,width:"100%",marginBottom:8}}),
           h("input",{value:docNewVersionNote,onChange:e=>setDocNewVersionNote(e.target.value),placeholder:"What changed? e.g. Updated nozzle orientation",style:{...inputStyle,width:"100%",marginBottom:8}}),
-          h("button",{onClick:uploadNewDocVersion,disabled:docUploading,style:{...btnPrimary,width:"100%",opacity:docUploading?0.6:1}},docUploading?"Uploading…":"Upload new version")
+          h("input",{value:docNewVersionExtraNotes,onChange:e=>setDocNewVersionExtraNotes(e.target.value),placeholder:"Notes (required)",style:{...inputStyle,width:"100%",marginBottom:8}}),
+          h("button",{onClick:uploadNewDocVersion,disabled:docUploading,style:{...btnPrimary,width:"100%",opacity:docUploading?0.6:1}},docUploading?"Uploading…":"Upload new version"),
+
+          // Document-level Notes (25 Aug) — a separate, timestamped,
+          // append-only log distinct from the per-revision Notes above.
+          // General commentary about the document as a whole, not tied
+          // to any one version.
+          h("div",{style:{marginTop:18,borderTop:"1px solid "+colors.border,paddingTop:14}},
+            h("div",{style:{fontSize:11.5,fontWeight:600,marginBottom:8}},"Notes on this document"),
+            docNotesList.length===0 ? h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:10}},"No notes yet.") :
+            h("div",{style:{marginBottom:10,maxHeight:160,overflowY:"auto"}}, docNotesList.map(n=>h("div",{key:n.id,style:{fontSize:11.5,padding:"6px 0",borderBottom:"1px solid #eceae0"}},
+              h("div",{style:{color:colors.muted,fontSize:10.5}},(n.created_at||"").slice(0,16).replace("T"," ")+" — "+(n.created_by||"—")),
+              h("div",null,n.note_text)
+            ))),
+            h("div",{style:{display:"flex",gap:6}},
+              h("input",{value:newDocNoteText,onChange:e=>setNewDocNoteText(e.target.value),placeholder:"Add a note…",style:{...inputStyle,flex:1,padding:"6px 8px",fontSize:12}}),
+              h("button",{onClick:addDocumentNote,disabled:addingDocNote,style:{...btnSmall,opacity:addingDocNote?0.6:1}},addingDocNote?"Adding…":"+ Add note")
+            )
+          )
         )
       )
     ),
@@ -15539,6 +15737,11 @@ function SaleOrderHeaderModal({ contractRow, onCancel, onSaved }){
     late_delivery: contractRow.late_delivery || "NA",
     billing_address: contractRow.billing_address || "",
     shipping_address: contractRow.shipping_address || "",
+    // Signatory (24 Aug) — this Sale Order's own, deliberately NOT
+    // inherited from the Quote's signatory. Starts blank unless already
+    // saved on this Contract before.
+    signatory_name: contractRow.signatory_name || "",
+    signatory_designation: contractRow.signatory_designation || "",
   });
   const [saving,setSaving] = useState(false);
   const [justSaved,setJustSaved] = useState(false);
@@ -15615,6 +15818,12 @@ function SaleOrderHeaderModal({ contractRow, onCancel, onSaved }){
       ),
       fld("billing_address","Billing Address (defaults from Customer)","textarea"),
       fld("shipping_address","Shipping Address","textarea"),
+      // Signatory (24 Aug) — this Sale Order's own, separate from the
+      // Quote's, deliberately starts blank rather than pre-filled.
+      h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 12px"}},
+        fld("signatory_name","Signatory Name"),
+        fld("signatory_designation","Signatory Designation"),
+      ),
       h("div",{style:{display:"flex",justifyContent:"flex-end",alignItems:"center",gap:8,marginTop:10}},
         justSaved && h("span",{style:{fontSize:11.5,color:"#1c8c56",fontWeight:600,marginRight:"auto"}},"✓ Saved"),
         h("button",{onClick:onCancel,disabled:saving||justSaved,style:btnSecondary},"Fill in later"),
