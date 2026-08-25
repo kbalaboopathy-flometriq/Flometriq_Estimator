@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-24T14:33:46Z";
+  var APP_BUILD_VERSION = "2026-08-25T01:54:35Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -359,6 +359,7 @@ const MASTER_TABLES = [
   { key: "employee_tbl", label: "Employees", columns: ["employee_code","employee_name","nickname","department","designation","crm_role","phone_primary","email","status"], addLabel:"New employee", cascade:[{col:"department",from:"department_tbl",field:"department"},{col:"designation",from:"designation_tbl",field:"value"},{col:"crm_role",from:"crm_role_tbl",field:"value"},{col:"status",from:"employee_status_tbl",field:"value"}], freeText:["employee_code","employee_name","nickname","phone_primary","email"], exportEnabled:true },
   { key: "territory_rule_state_tbl", label: "Territory Rules — States", columns: ["employee_name","state"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"state",from:"state_zone_tbl",field:"state"}], groupBy:["employee_name"], editAllEnabled:true },
   { key: "territory_rule_country_tbl", label: "Territory Rules — Countries", columns: ["employee_name","country"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"country",from:"country_zone_tbl",field:"country"}], groupBy:["employee_name"], editAllEnabled:true },
+  { key: "sale_order_status_tbl", label: "Sale Order Status", columns: ["status","sort_order"], addLabel:"New status", freeText:["status","sort_order"] },
 ];
 
 // HR module (24 Aug) — pulled out of Admin into its own top-level tab, now
@@ -644,6 +645,34 @@ function fmt(n) {
 // through this — they keep using fmt() as before.
 function roundTo5(n){ if(typeof n!=="number"||isNaN(n)) return 0; return Math.round(n/5)*5; }
 function fmtR(n){ return fmt(roundTo5(Number(n)||0)); }
+
+// Number-to-words (24 Aug, Contract PDF's "Net Amount in words" line) —
+// Indian numbering system (lakh/crore), matching the real Invoice/OA
+// examples ("Rupee Seven Thousand Two Hundred and Ninety Two Only").
+// Whole rupees/units only — amounts here are already rounded.
+function numberToWordsIndian(num){
+  const ones = ["","One","Two","Three","Four","Five","Six","Seven","Eight","Nine","Ten","Eleven","Twelve","Thirteen","Fourteen","Fifteen","Sixteen","Seventeen","Eighteen","Nineteen"];
+  const tens = ["","","Twenty","Thirty","Forty","Fifty","Sixty","Seventy","Eighty","Ninety"];
+  const twoDigits = n => n<20 ? ones[n] : tens[Math.floor(n/10)]+(n%10?" "+ones[n%10]:"");
+  const threeDigits = n => (n>=100 ? ones[Math.floor(n/100)]+" Hundred"+(n%100?" and "+twoDigits(n%100):"") : twoDigits(n));
+  let n = Math.floor(Math.abs(Number(num)||0));
+  if(n===0) return "Zero";
+  const crore = Math.floor(n/10000000); n%=10000000;
+  const lakh = Math.floor(n/100000); n%=100000;
+  const thousand = Math.floor(n/1000); n%=1000;
+  const rest = n;
+  let parts = [];
+  if(crore) parts.push(threeDigits(crore)+" Crore");
+  if(lakh) parts.push(threeDigits(lakh)+" Lakh");
+  if(thousand) parts.push(threeDigits(thousand)+" Thousand");
+  if(rest) parts.push(threeDigits(rest));
+  return parts.join(" ");
+}
+function amountInWordsLine(amount, currency){
+  const words = numberToWordsIndian(amount);
+  const prefix = currency==="INR" ? "Rupee" : currency;
+  return prefix+" "+words+" Only";
+}
 // Real bug found 10 Aug: a raw total and its raw per-unit rate were each
 // being passed through fmtR/roundTo5 SEPARATELY (e.g. fmtR(unit) alongside
 // fmtR(total)) — since the true unrounded unit rarely lands on a multiple
@@ -1166,6 +1195,12 @@ function MenuTabs({ user, active, onChange }) {
   const isAdmin = user.role==="admin" || user.role==="super_admin";
   const isSuperAdmin = user.role==="super_admin";
   const isHrAdmin = user.role==="hr_admin";
+  // Contract approval roles (24 Aug follow-up) — Accounts Admin, QC, and
+  // Technical Head each approve exactly one section of a Sale Order (see
+  // ContractStatusBanner). Narrow-scoped the same way hr_admin is: sees
+  // only Sale Order, nothing else — Admin/Super Admin can still approve
+  // any section too, as a practical override, same as everywhere else.
+  const isApprovalRole = user.role==="accounts_admin" || user.role==="qc" || user.role==="technical_head";
   const [openGroup,setOpenGroup] = useState(null);
   const rootRef = useRef(null);
 
@@ -1180,16 +1215,16 @@ function MenuTabs({ user, active, onChange }) {
   const ctKeys = ["quote_status_tbl","payment_terms_tbl","delivery_terms_tbl","packing_forwarding_tbl","insurance_terms_tbl","price_basis_tbl","guarantee_terms_tbl","dispatch_through_tbl","incoterms_tbl","freight_terms_tbl","tax_terms_tbl","warranty_coverage_tbl"];
   const byKeys = keys => MASTER_TABLES.filter(t=>keys.includes(t.key)).map(t=>({key:t.key,label:t.label}));
 
+  const salesSubgroups = (isApprovalRole && !isAdmin && !isHrAdmin) ? [
+    { label:"Sale Order", tabs:[{key:"sale_order_entry",label:"Sale Order"}] },
+  ] : [
+    { label:"Quotes", tabs:[{key:"saved",label:"Quotes"}] },
+    { label:"Sale Order", tabs:[{key:"sale_order_entry",label:"Sale Order"}] },
+    ...(isAdmin?[{ label:"Commercial terms", tabs: byKeys(ctKeys) }]:[]),
+  ];
+
   const groups = [
-    { label:"Sales", subgroups:[
-      { label:"Quotes", tabs:[
-        {key:"saved",label:"Quotes"},
-      ]},
-      { label:"Sale Order", tabs:[
-        {key:"sale_order_entry",label:"Sale Order"},
-      ]},
-      ...(isAdmin?[{ label:"Commercial terms", tabs: byKeys(ctKeys) }]:[]),
-    ]},
+    { label:"Sales", subgroups: salesSubgroups },
     { label:"Engineering Calc", subgroups:[
       { label:"Engineering Calc", tabs:[
         {key:"calcs",label:"ASME VIII Thickness"},
@@ -1301,7 +1336,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Rules", tabs:[{key:"item_moc_rules",label:"Datasheet MOC"},{key:"description_master",label:"Description"}] }
     ]});
     groups.push({ label:"Admin", subgroups:[
-      { label:"Company", tabs:[{key:"company_master",label:"Company Master"},{key:"gst_structures",label:"GST Structures"},{key:"gst_variance_report",label:"GST Variance Report"},{key:"contract_number_setup",label:"Contract Numbering"}] },
+      { label:"Company", tabs:[{key:"company_master",label:"Company Master"},{key:"gst_structures",label:"GST Structures"},{key:"gst_variance_report",label:"GST Variance Report"},{key:"contract_number_setup",label:"Contract Numbering"},{key:"sale_order_status_tbl",label:"Sale Order Status"}] },
       { label:"Access control", tabs:[
         {key:"users",label:"Users"},
         {key:"permissions",label:"Permissions"},
@@ -1324,6 +1359,14 @@ function MenuTabs({ user, active, onChange }) {
   const groupIsActive = g => allTabsOf(g).some(t=>t.key===active);
   const pick = key => { if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false); onChange(key); setOpenGroup(null); };
 
+  // Contract approval roles (24 Aug follow-up) — see isApprovalRole above.
+  // Overrides the whole nav to just Sale Order, same narrow-scope
+  // approach as hr_admin, applied here rather than threading a
+  // conditional through the entire groups literal above.
+  const visibleGroups = (isApprovalRole && !isAdmin && !isHrAdmin)
+    ? [{ label:"Sales", subgroups:[{ label:"Sale Order", tabs:[{key:"sale_order_entry",label:"Sale Order"}] }] }]
+    : groups;
+
   const itemStyle = t => ({
     padding:"5px 8px", fontSize:11.5, borderRadius:4, cursor:"pointer", textAlign:"left", border:"none",
     background: active===t.key ? "#b7ebc6" : "transparent",
@@ -1333,7 +1376,7 @@ function MenuTabs({ user, active, onChange }) {
 
   return h("div",{ref:rootRef, className:"menu-tabs", style:{background:"#fff",borderBottom:"1px solid "+colors.border,padding:"6px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"relative",flexWrap:"wrap",rowGap:4}},
     h("div",{style:{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap",rowGap:4}},
-      groups.map((g,gi)=>{
+      visibleGroups.map((g,gi)=>{
         const isOpen = openGroup===gi;
         const flat = !!g.tabs;
         return h("div",{key:gi,style:{position:"relative"}},
@@ -4158,6 +4201,9 @@ function EmployeeLoginModal({ employee, user, onClose, onLinked }){
                 h("select",{value:role,onChange:e=>setRole(e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}},
                   h("option",{value:"user"},"User"),h("option",{value:"admin"},"Admin"),
                   user?.role==="super_admin" && h("option",{value:"hr_admin"},"HR Admin"),
+                  user?.role==="super_admin" && h("option",{value:"accounts_admin"},"Accounts Admin"),
+                  user?.role==="super_admin" && h("option",{value:"qc"},"QC"),
+                  user?.role==="super_admin" && h("option",{value:"technical_head"},"Technical Head"),
                   user?.role==="super_admin" && h("option",{value:"super_admin"},"Super Admin")
                 )
               ),
@@ -4243,7 +4289,10 @@ function UsersEditor({ user }) {
       h("input",{placeholder:"Password",value:draft.password,onChange:e=>setDraft(d=>({...d,password:e.target.value})),style:{...inputStyle,width:160}}),
       h("select",{value:draft.role,onChange:e=>setDraft(d=>({...d,role:e.target.value})),style:{...inputStyle,width:120}},
         h("option",{value:"user"},"user"),h("option",{value:"admin"},"admin"),
-        isSuperAdmin && h("option",{value:"hr_admin"},"hr_admin")
+        isSuperAdmin && h("option",{value:"hr_admin"},"hr_admin"),
+        isSuperAdmin && h("option",{value:"accounts_admin"},"accounts_admin"),
+        isSuperAdmin && h("option",{value:"qc"},"qc"),
+        isSuperAdmin && h("option",{value:"technical_head"},"technical_head")
       ),
       h("select",{value:draft.employee_name,onChange:e=>setDraft(d=>({...d,employee_name:e.target.value})),style:{...inputStyle,width:180}},
         h("option",{value:""},"— Employee —"),
@@ -8614,31 +8663,51 @@ function QuoteNotesPanel({ referenceNumber, user }){
   );
 }
 
-// Contract's three-way section approval (24 Aug) — Commercial Terms,
-// NDE/Testing, and everything else each need their own sign-off before
-// the Contract PDF can generate (see the gate in attemptGenerateQuotePdf
-// above). NOTE — honestly flagged, not silently faked: this app has no
-// dedicated Accounts Admin / QC / Technical Head login roles yet (only
-// user/admin/super_admin/hr_admin exist) — any Admin or Super Admin can
-// approve any of the three sections for now. Restricting each section to
-// its own real role is a separate, undone piece of work, same shape as
-// the hr_admin role added earlier this session.
+// Contract's three-way section approval (24 Aug, role-restricted 24 Aug
+// follow-up) — Commercial Terms → Accounts Admin, NDE/Testing → QC,
+// everything else → Technical Head. Admin/Super Admin can still approve
+// any section too, as a practical override — same as every other
+// role-gated action in this app.
 function ContractStatusBanner({ contractInfo, user, onChanged }){
   const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
+  const roleFor = { commercial_approved:"accounts_admin", testing_approved:"qc", technical_approved:"technical_head" };
+  const roleLabel = { accounts_admin:"Accounts Admin", qc:"QC", technical_head:"Technical Head" };
+  const [statusOptions,setStatusOptions] = useState([]);
+  useEffect(()=>{
+    sb.from("sale_order_status_tbl").select("status").order("sort_order").then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
+  },[]);
   const approve = async(field)=>{
-    if(!isAdminOrAbove){ alert("Only an Admin or Super Admin can approve a Contract section right now."); return; }
+    if(!isAdminOrAbove && user.role!==roleFor[field]){
+      alert("Only "+roleLabel[roleFor[field]]+" (or an Admin/Super Admin) can approve this section.");
+      return;
+    }
     const patch = {}; patch[field+"_by"] = user?.username||"unknown"; patch[field+"_at"] = new Date().toISOString();
+    // Auto-advance Draft -> Approved (24 Aug) once all three sections are
+    // signed off — the status itself never needs a manual "mark
+    // approved" step; production-tracking statuses beyond this stay
+    // manual.
+    const willAllBeApproved = ["commercial_approved","testing_approved","technical_approved"]
+      .every(f => f===field || contractInfo[f+"_by"]);
+    if(willAllBeApproved && contractInfo.status==="Draft") patch.status = "Approved";
     const { error } = await sb.from("sale_order_tbl").update(patch).eq("id",contractInfo.id);
     if(error){ alert("Approval failed: "+error.message); return; }
     await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,"Approved "+field.replace("_approved",""),user?.username||"unknown",null,null);
     if(onChanged) onChanged();
   };
+  const changeStatus = async(newStatus)=>{
+    if(!isAdminOrAbove){ alert("Only an Admin or Super Admin can change Sale Order status."); return; }
+    await sb.from("sale_order_tbl").update({status:newStatus}).eq("id",contractInfo.id);
+    await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,"Status changed to "+newStatus,user?.username||"unknown",null,null);
+    if(onChanged) onChanged();
+  };
   const row = (label,field)=>{
     const by = contractInfo[field+"_by"];
+    const canApprove = isAdminOrAbove || user.role===roleFor[field];
     return h("div",{style:{display:"flex",alignItems:"center",gap:6}},
       h("span",{style:{fontSize:11,color:colors.muted}},label+":"),
       by ? h("span",{style:{fontSize:11,fontWeight:600,color:"#085041"}},"✓ "+by)
-        : h("button",{onClick:()=>approve(field),style:{...btnSmall,fontSize:10,padding:"2px 8px"}},"Approve")
+        : canApprove ? h("button",{onClick:()=>approve(field),style:{...btnSmall,fontSize:10,padding:"2px 8px"}},"Approve")
+        : h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"Pending")
     );
   };
   return h("div",{style:{display:"flex",gap:14,flexWrap:"wrap",alignItems:"center",marginTop:10,padding:"8px 12px",background:"#fff",border:"1px solid "+colors.border,borderRadius:6}},
@@ -8646,7 +8715,15 @@ function ContractStatusBanner({ contractInfo, user, onChanged }){
     h("span",{style:{fontSize:11,color:colors.muted}},"from Quote "+contractInfo.quote_reference_number),
     row("Commercial Terms (Accounts Admin)","commercial_approved"),
     row("NDE/Testing (QC)","testing_approved"),
-    row("Everything else (Technical Head)","technical_approved")
+    row("Everything else (Technical Head)","technical_approved"),
+    h("div",{style:{display:"flex",alignItems:"center",gap:5,marginLeft:"auto"}},
+      h("span",{style:{fontSize:11,color:colors.muted}},"Status:"),
+      isAdminOrAbove
+        ? h("select",{value:contractInfo.status||"Draft",onChange:e=>changeStatus(e.target.value),style:{...inputStyle,padding:"3px 6px",fontSize:11}},
+            statusOptions.map(s=>h("option",{key:s,value:s},s))
+          )
+        : h("span",{style:{fontSize:11,fontWeight:600}},contractInfo.status||"Draft")
+    )
   );
 }
 
@@ -9743,6 +9820,22 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const setQuoteCuttingPlanIncludeCost=(v)=>{ setQuoteCuttingPlanIncludeCostState(v); setCuttingPlanIncludeCostPref(v); };
   const [showCommercialTerms,setShowCommercialTerms]=useState(false);
   const [ctData,setCtData]=useState(null);
+  // GST Structure picker (24 Aug) — Contract mode only, lives in
+  // Commercial Terms next to Tax per explicit instruction. Loaded once;
+  // selecting a structure snapshots its components immediately (rate +
+  // label at time of selection, never a live reference to the master —
+  // see the GST Variance Report for catching a later rate change).
+  const [gstStructureOptions,setGstStructureOptions] = useState([]);
+  useEffect(()=>{
+    if(mode!=="contract") return;
+    sb.from("gst_structure_tbl").select("*").order("structure_name").then(({data})=>setGstStructureOptions(data||[]));
+  },[mode]);
+  const pickGstStructure = async(structureId)=>{
+    if(!structureId){ setCtData(d=>({...d,gst_structure_id:null,gst_structure_name:null,gst_components_snapshot:null})); return; }
+    const structure = gstStructureOptions.find(s=>String(s.id)===String(structureId));
+    const { data: components } = await sb.from("gst_structure_component_tbl").select("label,rate_percent").eq("structure_id",structureId).order("sort_order");
+    setCtData(d=>({...d, gst_structure_id:structureId, gst_structure_name:structure?.structure_name||null, gst_components_snapshot:components||[]}));
+  };
   const [ctOriginalData,setCtOriginalData]=useState(null); // snapshot at load time, for revision diff-logging
   const [ctLoading,setCtLoading]=useState(false);
   const [ctSaving,setCtSaving]=useState(false);
@@ -12076,7 +12169,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       };
 
       // ---- Page 1: Cover letter ----
-      letterhead("QUOTATION");
+      // Contract mode (24 Aug) — "ORDER ACCEPTANCE" heading, references the
+      // customer's own PO instead of the enquiry, and leads with the
+      // Contract Number rather than the Quote Number, matching the real
+      // Order Acceptance template. quoteExportRef IS the Contract Number
+      // here, since Contract data is keyed by it as reference_number.
+      const isContract = mode==="contract";
+      letterhead(isContract ? "ORDER ACCEPTANCE" : "QUOTATION");
       let y=39;
       doc.setFontSize(8.5); doc.setTextColor(...dark);
       doc.setFont("times","bold"); doc.text("Customer Name:",12,y); doc.setFont("times","normal"); doc.text(String(effCustomerName),50,y); y+=6;
@@ -12088,28 +12187,45 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       }
       if(attnName){ doc.setFont("times","bold"); doc.text("Kind Attention:",12,y); doc.setFont("times","normal"); doc.text(attnName+(attnDesignation?", "+attnDesignation:""),50,y); y+=6; }
       y+=2;
-      doc.setFont("times","bold"); doc.text("Quote No:",12,y); doc.setFont("times","normal"); doc.text(quoteExportRef,50,y);
-      doc.setFont("times","bold"); doc.text("Quote Date:",120,y); doc.setFont("times","normal"); doc.text(today,150,y); y+=6;
+      if(isContract){
+        doc.setFont("times","bold"); doc.text("Quote No:",12,y); doc.setFont("times","normal"); doc.text(contractInfo?.quote_reference_number||"—",50,y);
+        doc.setFont("times","bold"); doc.text("Quote Date:",120,y); doc.setFont("times","normal"); doc.text(today,150,y); y+=6;
+        doc.setFont("times","bold"); doc.text("Contract No. For Future Reference:",12,y); doc.setFont("times","bold"); doc.setTextColor(180,60,20); doc.text(quoteExportRef,80,y); doc.setTextColor(...dark); y+=6;
+      } else {
+        doc.setFont("times","bold"); doc.text("Quote No:",12,y); doc.setFont("times","normal"); doc.text(quoteExportRef,50,y);
+        doc.setFont("times","bold"); doc.text("Quote Date:",120,y); doc.setFont("times","normal"); doc.text(today,150,y); y+=6;
+      }
       const revMatch = quoteExportRef.match(/-Rev-(\d+)$/);
-      if(revMatch){
+      if(revMatch && !isContract){
         doc.setFont("times","bold"); doc.setTextColor(180,60,20);
         doc.text("Revision "+revMatch[1],12,y);
         doc.setTextColor(...dark); y+=6;
       }
-      y+=(revMatch?22:28);
+      y+=((revMatch && !isContract)?22:28);
       doc.setFont("times","normal"); doc.text("Dear Sir,",12,y); y+=8;
       const enquiryNo = first.enquiry_number || "";
       const enquiryDt = first.enquiry_date ? new Date(first.enquiry_date).toLocaleDateString("en-GB") : "";
-      if(enquiryNo){
+      if(isContract){
+        const poNo = first.po_number || "—";
+        const poDt = first.po_date ? new Date(first.po_date).toLocaleDateString("en-GB") : "";
         doc.setFont("times","bold"); doc.text("Ref:",12,y); doc.setFont("times","normal");
-        doc.text("Enquiry No. "+enquiryNo+(enquiryDt?" dated "+enquiryDt:""),24,y); y+=8;
+        doc.text("P.O. Number: "+poNo+(poDt?" dated "+poDt:""),24,y); y+=8;
+        doc.setFont("times","bold"); doc.text("Sub:",12,y); doc.setFont("times","normal");
+        doc.text("Our Detailed order acceptance for the above",24,y); y+=14;
+      } else {
+        if(enquiryNo){
+          doc.setFont("times","bold"); doc.text("Ref:",12,y); doc.setFont("times","normal");
+          doc.text("Enquiry No. "+enquiryNo+(enquiryDt?" dated "+enquiryDt:""),24,y); y+=8;
+        }
+        doc.setFont("times","bold"); doc.text("Sub:",12,y); doc.setFont("times","normal");
+        doc.text("Our Techno Commercial offer for the above",24,y); y+=14;
       }
-      doc.setFont("times","bold"); doc.text("Sub:",12,y); doc.setFont("times","normal");
-      doc.text("Our Techno Commercial offer for the above",24,y); y+=14;
       const quoteCurrency = first.currency||"INR";
       const quoteIsInr = quoteCurrency==="INR";
       const quoteFx = Number(first.conversion_rate)||1;
-      const coverLetterBody = [
+      const coverLetterBody = isContract ? [
+        ["We thank you for the above Purchase order and are enclosing herewith our Techno-commercial acceptance in Annexure - I, II and III respectively.", ""],
+      ] : [
         ["Delivery", effDelivery],
         ["Validity", effValidity],
         ["Total Basic Price", quoteCurrency+" "+fmtR(quoteIsInr?grandTotalInr:(grandTotalInr/quoteFx))]
@@ -12258,9 +12374,26 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const indexPage = doc.internal.getNumberOfPages();
 
       // ---- Commercial Terms ----
+      // Contract mode (24 Aug, corrected same day) — heading and layout
+      // stay exactly the same as the Quote's own Commercial Terms; the
+      // only addition is the eight new Sale Order-only fields (Drawings,
+      // QAP Conditions, Inspection By, Dispatch Through, Late Delivery,
+      // Dispatch To, Billing Address, Shipping Address) appended as
+      // extra rows, sourced from contractInfo (sale_order_tbl) since
+      // Quotes don't carry these fields at all.
       doc.addPage();
       letterhead("ANNEXURE - I  COMMERCIAL TERMS");
       const termsStartPage = doc.internal.getNumberOfPages();
+      const contractOnlyRows = isContract ? [
+        ["Drawings", contractInfo?.drawings_required||"—"],
+        ["QAP Conditions", contractInfo?.qap_conditions||"—"],
+        ["Inspection By", contractInfo?.inspection_by||"—"],
+        ["Dispatch Through", contractInfo?.dispatch_through||"—"],
+        ["Late Delivery", contractInfo?.late_delivery||"—"],
+        ["Dispatch To", contractInfo?.dispatch_to||"—"],
+        ["Billing Address", contractInfo?.billing_address||"—"],
+        ["Shipping Address", contractInfo?.shipping_address||"—"],
+      ] : [];
       doc.autoTable({
         startY:38,
         body:[
@@ -12275,10 +12408,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           ["Warranty Coverage", terms.warranty_coverage||"—"],
           ["Transport Through", terms.dispatch_through||"—"],
           ["Freight", terms.freight||"—"],
-          ["Tax", terms.tax||"—"],
+          ["Tax", (terms.tax||"—")+(isContract && terms.gst_structure_name ? " ("+terms.gst_structure_name+")" : "")],
           ["Jurisdiction", terms.jurisdiction||CT_DEFAULTS.jurisdiction],
           ["Force Majeure", forceMaj],
           ["Order Cancellation Charges", cancelCharges],
+          ...contractOnlyRows,
         ],
         theme:"plain",
         styles:{fontSize:8.4,textColor:dark,cellPadding:{top:2.5,bottom:2.5,left:2,right:4}},
@@ -12330,8 +12464,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       }
 
       // ---- Price Summary — one row per Sl No ----
+      // Contract mode (24 Aug, corrected same day) — identical to the
+      // Quote's own Price Summary (NDE/Testing, Other Options, Notes
+      // logic all untouched) per explicit instruction. The only
+      // difference is quoteExportRef already being the Contract Number
+      // wherever it prints, since Contract data is keyed by it.
       doc.addPage();
       const summaryStartPage = doc.internal.getNumberOfPages();
+      const grandTotalDisplay = quoteIsInr ? grandTotalInr : (grandTotalInr/quoteFx);
+      let summaryEndPage;
+      const annexureIITitle = "ANNEXURE II - PRICE SUMMARY";
       const summaryRows = estimatesRows.map(est=>{
         const qty = est.order_qty||1;
         const totalInr = slNoFoldedTotalInr(est);
@@ -12348,7 +12490,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // grandTotalInr, extraPriceTotal, testingSeparateTotal already computed
       // once, early — shared with the Cover Letter's Total Basic Price so
       // the two documents can never disagree.
-      const grandTotalDisplay = quoteIsInr ? grandTotalInr : (grandTotalInr/quoteFx);
       const summaryHead = ["S.No","Item","Description","Unit price ("+quoteCurrency+")","Qty","Total ("+quoteCurrency+")"];
       const summaryAmountCols = [3,4,5];
       const summaryColumnStyles = {};
@@ -12426,7 +12567,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           didDrawPage:priceSummaryPageFooter
         });
       }
-      const summaryEndPage = doc.internal.getNumberOfPages();
+      summaryEndPage = doc.internal.getNumberOfPages();
 
       // ---- Datasheets, one per Sl No ----
       const dsList = await buildQuoteDatasheetsBySlNo(estimatesRows, linesRows, datasheetsRows);
@@ -13224,7 +13365,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{marginBottom:12}},
           h("div",{style:{border:"2px solid "+colors.dark,borderRadius:6,padding:"8px 10px",background:"#fff"}},
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
-              h("div",{style:{fontSize:10,fontWeight:700,color:colors.dark,textTransform:"uppercase"}},"Generate Quote PDF"),
+              h("div",{style:{fontSize:10,fontWeight:700,color:colors.dark,textTransform:"uppercase"}},mode==="contract"?"Generate Sale Order":"Generate Quote PDF"),
               quoteExportRef && quoteExportRef===refFilter && !readiness.loading && !readiness.ready && h("span",{style:{fontSize:9.5,fontWeight:700,color:"#854f0b"}},readiness.missing.reduce((s,m)=>s+m.items.length,0)+" items missing")
             ),
             h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:6}},"Cover + index + summary + terms + datasheets"),
@@ -13233,7 +13374,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 h("input",{type:"checkbox",checked:summaryMode,onChange:e=>setSummaryMode(e.target.checked)}),
                 "Summarised datasheets"
               ),
-              h("div",{style:{flex:1}}, renderReadinessBar(readiness.categories, {height:34, doneLabel: generatingQuotePdf?"Generating…":"✓ Generate Quote PDF", onClick: (quoteExportRef&&!generatingQuotePdf)?attemptGenerateQuotePdf:undefined}))
+              h("div",{style:{flex:1}}, renderReadinessBar(readiness.categories, {height:34, doneLabel: generatingQuotePdf?"Generating…":(mode==="contract"?"✓ Generate Sale Order":"✓ Generate Quote PDF"), onClick: (quoteExportRef&&!generatingQuotePdf)?attemptGenerateQuotePdf:undefined}))
             ),
             pdfGenCounts.total>0 && h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginTop:8,paddingTop:8,borderTop:"1px solid #eceae0"}},
               h("div",{style:{fontSize:11,color:colors.text}},h("strong",null,pdfGenCounts.total),h("span",{style:{color:colors.mutedLight}}," generated")),
@@ -14665,7 +14806,14 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           ),
           h("div",{style:{display:"flex",gap:12,marginBottom:16,flexWrap:"wrap"}},
             fld("Freight",null,h(MasterSelect,{value:ctData.freight,onChange:v=>setCtData(d=>({...d,freight:v})),options:ctMasters.freight,table:"freight_terms_tbl",fieldLabel:"Freight",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
-            fld("Tax",null,h(MasterSelect,{value:ctData.tax,onChange:v=>setCtData(d=>({...d,tax:v})),options:ctMasters.tax,table:"tax_terms_tbl",fieldLabel:"Tax",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}}))
+            fld("Tax",null,h(MasterSelect,{value:ctData.tax,onChange:v=>setCtData(d=>({...d,tax:v})),options:ctMasters.tax,table:"tax_terms_tbl",fieldLabel:"Tax",refreshOptions:loadCtMasters,placeholder:"Select…",style:{fontSize:12,padding:"7px 9px"}})),
+            mode==="contract" && fld("GST Structure",null,h("div",null,
+              h("select",{value:ctData.gst_structure_id||"",onChange:e=>pickGstStructure(e.target.value||null),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:180}},
+                h("option",{value:""},"Not set"),
+                gstStructureOptions.map(s=>h("option",{key:s.id,value:s.id},s.structure_name))
+              ),
+              !ctData.gst_structure_id && h("div",{style:{fontSize:10,color:colors.danger,marginTop:3}},"⚠ Not set — flagged until picked")
+            ))
           ),
           h("div",{style:{marginBottom:14}},
             h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}},
@@ -15213,6 +15361,72 @@ async function advanceContractNumberSuggestion(usedNumber, username){
 // before the auto-suggestion goes live, since real contracts already
 // exist outside the app (first real one seen was 260010, 6 digits;
 // user confirmed 7-digit YY+00001 e.g. 2600001 is correct going forward).
+// Sale Order Header prompt (24 Aug) — fires automatically the moment a
+// Contract is created, collecting the fields a Quote never has: Drawings,
+// QAP Conditions, Inspection By, Dispatch Through, Late Delivery,
+// Dispatch To, Billing Address (defaults from the Customer record,
+// overridable), Shipping Address (always typed fresh, no default).
+function SaleOrderHeaderModal({ contractRow, onCancel, onSaved }){
+  const [f,setF] = useState({
+    drawings_required:"Required", qap_conditions:"Required", inspection_by:"",
+    dispatch_through:"", late_delivery:"NA", dispatch_to:"", billing_address:"", shipping_address:""
+  });
+  const [saving,setSaving] = useState(false);
+  useEffect(()=>{
+    (async()=>{
+      const { data } = await sb.from("companies").select("billing_city,billing_country").eq("company_name",contractRow.customer_name).maybeSingle();
+      const addr = [data?.billing_city,data?.billing_country].filter(Boolean).join(", ");
+      if(addr) setF(d=>({...d, billing_address:addr}));
+    })();
+  },[contractRow.customer_name]);
+  const save = async()=>{
+    if(!f.billing_address.trim()){ alert("Billing Address is required."); return; }
+    setSaving(true);
+    try{
+      const { data, error } = await sb.from("sale_order_tbl").update(f).eq("id",contractRow.id).select().single();
+      if(error) throw error;
+      onSaved(data);
+    } catch(e){ alert("Couldn't save: "+e.message); }
+    finally{ setSaving(false); }
+  };
+  const fld = (key,label,type)=>h("div",{style:{marginBottom:10}},
+    h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},label),
+    type==="textarea"
+      ? h("textarea",{value:f[key],onChange:e=>setF(d=>({...d,[key]:e.target.value})),rows:2,style:{...inputStyle,padding:"7px 9px",width:"100%"}})
+      : h("input",{value:f[key],onChange:e=>setF(d=>({...d,[key]:e.target.value})),style:{...inputStyle,padding:"7px 9px",width:"100%"}})
+  );
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1300,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"22px 26px",width:480,maxWidth:"100%",maxHeight:"88vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Sale Order Details — "+contractRow.contract_number),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:16}},"A few things a Quote doesn't need but a Sale Order does."),
+      h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 12px"}},
+        h("div",{style:{marginBottom:10}},
+          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Drawings"),
+          h("select",{value:f.drawings_required,onChange:e=>setF(d=>({...d,drawings_required:e.target.value})),style:{...inputStyle,padding:"7px 9px",width:"100%"}},
+            h("option",{value:"Required"},"Required"), h("option",{value:"Not Required"},"Not Required")
+          )
+        ),
+        h("div",{style:{marginBottom:10}},
+          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"QAP Conditions"),
+          h("select",{value:f.qap_conditions,onChange:e=>setF(d=>({...d,qap_conditions:e.target.value})),style:{...inputStyle,padding:"7px 9px",width:"100%"}},
+            h("option",{value:"Required"},"Required"), h("option",{value:"Not Required"},"Not Required")
+          )
+        ),
+        fld("inspection_by","Inspection By"),
+        fld("dispatch_through","Dispatch Through"),
+        fld("late_delivery","Late Delivery"),
+        fld("dispatch_to","Dispatch To"),
+      ),
+      fld("billing_address","Billing Address (defaults from Customer)","textarea"),
+      fld("shipping_address","Shipping Address","textarea"),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:10}},
+        h("button",{onClick:onCancel,style:btnSecondary},"Fill in later"),
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Save and open")
+      )
+    )
+  );
+}
+
 function ContractNumberSetupScreen({ user }){
   const [current,setCurrent] = useState(null);
   const [value,setValue] = useState("2600001");
@@ -26146,10 +26360,23 @@ function App() {
   // is the sale_order_tbl row driving the approval banner.
   const [saleOrderTarget,setSaleOrderTarget]=useState(null);
   const [saleOrderContractInfo,setSaleOrderContractInfo]=useState(null);
-  const openContract = (contractRow)=>{
+  // Sale Order Header prompt (24 Aug) — fires automatically the moment a
+  // Contract is created, before the screen even opens. Detected by
+  // billing_address still being null, which only happens on a freshly
+  // cloned Contract (the modal is what sets it) — an already-opened
+  // Contract never re-triggers this.
+  const [pendingHeaderPromptFor,setPendingHeaderPromptFor]=useState(null);
+  const finishOpenContract = (contractRow)=>{
     setSaleOrderContractInfo(contractRow);
     setSaleOrderTarget({reference_number:contractRow.contract_number, item_sl_no:1});
     setTab("sale_order");
+  };
+  const openContract = (contractRow)=>{
+    if(!contractRow.billing_address && !contractRow.shipping_address && !contractRow.drawings_required){
+      setPendingHeaderPromptFor(contractRow);
+      return;
+    }
+    finishOpenContract(contractRow);
   };
   const refreshSaleOrderContractInfo = async()=>{
     if(!saleOrderContractInfo) return;
@@ -26261,6 +26488,11 @@ function App() {
     showOverduePrompt && h(OverdueCallsPrompt,{user,onDone:dismissOverduePrompt}),
     showDraftPanel && h(DraftOfferReminder,{user,onDone:()=>{ setShowDraftPanel(false); refreshDraftCount(); }}),
     showSignatoryNoticesPopup && h(SignatoryOverrideNoticesPopup,{notices:signatoryNotices,onAcknowledgeOne:acknowledgeSignatoryNotice,onAcknowledgeAll:acknowledgeAllSignatoryNotices,onClose:()=>setShowSignatoryNoticesPopup(false)}),
+    pendingHeaderPromptFor && h(SaleOrderHeaderModal,{
+      contractRow: pendingHeaderPromptFor,
+      onCancel: ()=>{ const c=pendingHeaderPromptFor; setPendingHeaderPromptFor(null); finishOpenContract(c); },
+      onSaved: (updated)=>{ setPendingHeaderPromptFor(null); finishOpenContract(updated); }
+    }),
     h("div",{id:"app-sticky-header",style:{position:"sticky",top:0,zIndex:60}},
       h(TopBar,{user,sessionCompanyId,sessionCompany,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyIdPersisted(null)):null,onLogout:()=>{setUserPersisted(null);setSessionCompanyIdPersisted(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
       h(MenuTabs,{user,active:tab,onChange:setTab})
