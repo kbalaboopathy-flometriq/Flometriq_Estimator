@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-25T12:44:05Z";
+  var APP_BUILD_VERSION = "2026-08-26T01:13:37Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -10055,7 +10055,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       return {
         id:p.id, category:p.category, doc_number:p.doc_number, title:p.doc_name, is_archived:p.is_archived,
         link:latest.link||"", file_path:latest.file_path||null, file_name:latest.file_path, lives_in_supabase:!!latest.lives_in_supabase,
-        uploaded_at:latest.changed_at||p.created_at, uploaded_by:latest.changed_by||p.created_by, rev_number:latest.rev_number??0
+        uploaded_at:latest.changed_at||p.created_at, uploaded_by:latest.changed_by||p.created_by, rev_number:latest.rev_number??0,
+        direction:latest.direction||null, status:latest.status||null,
+        sequence_flagged:p.sequence_flagged||false, sequence_flag_note:p.sequence_flag_note||null
       };
     }).sort((a,b)=> new Date(b.uploaded_at)-new Date(a.uploaded_at));
     setQuoteDocuments(merged);
@@ -10103,24 +10105,48 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     sb.from("quote_commercial_terms").select("id").eq("reference_number",quoteExportRef).maybeSingle().then(({data})=>setQuoteHasTerms(!!data));
   },[quoteExportRef,showCommercialTerms]);
   const [showDocumentsPanel,setShowDocumentsPanel]=useState(false);
-  const [docUploadStep,setDocUploadStep]=useState("list"); // "list" | "mode" | "form"
+  const [docUploadStep,setDocUploadStep]=useState("list"); // "list" | "choice" | "mode" | "form" | "continue"
   const [docUploadMode,setDocUploadMode]=useState(""); // "combined" | "separate"
-  const [docDrafts,setDocDrafts]=useState([]); // [{category,docNumber,title,file}] — one entry when combined, several when separate
+  const [docDrafts,setDocDrafts]=useState([]); // [{category,docNumber,title,file,direction,status}] — one entry when combined, several when separate
   const [docUploading,setDocUploading]=useState(false);
+  const [docStatusOptions,setDocStatusOptions]=useState([]);
+  useEffect(()=>{
+    sb.from("doc_status_tbl").select("*").order("status").then(({data})=>setDocStatusOptions(data||[]));
+  },[]);
+  const docStatusColor = (statusLabel)=>{
+    const row = docStatusOptions.find(s=>s.status===statusLabel);
+    const bucket = row?.action_type;
+    if(bucket==="our_action") return {background:"#fdecea",color:"#a3312a"};
+    if(bucket==="third_party_action") return {background:"#fff4d6",color:"#854f0b"};
+    return {background:"#eaf9f4",color:"#085041"};
+  };
+  // Sequence rule (25 Aug) — a brand-new document's first entry can be
+  // either Rev0-Out or Rev0-In, but from there it must strictly
+  // alternate: Out, In, Out, In..., the rev number advancing only once
+  // an Out/In pair completes. Computed from the document's own last
+  // history entry — never asked as a free choice on the "continuing"
+  // path.
+  const computeExpectedNext = (historyRows)=>{
+    if(!historyRows || historyRows.length===0) return {rev:0, direction:null}; // first entry — either direction allowed
+    const last = historyRows[0]; // caller passes rows ordered newest first
+    return last.direction==="Out"
+      ? {rev:last.rev_number, direction:"In"}
+      : {rev:last.rev_number+1, direction:"Out"};
+  };
   const suggestedDocNumber = (category, seq)=> (DOC_PREFIX[category]||"DOC")+"-"+(quoteExportRef||"QUOTE")+"-"+String(seq).padStart(3,"0");
   const openDocumentsPanel = ()=>{ setShowDocumentsPanel(true); setDocUploadStep("list"); };
   const startDocUpload = ()=>{
-    setDocUploadStep("mode"); setDocUploadMode(""); setDocDrafts([]);
+    setDocUploadStep("choice");
   };
   const pickDocMode = (mode)=>{
     setDocUploadMode(mode);
     const nextSeq = quoteDocuments.filter(d=>!d.is_archived).length+1;
-    setDocDrafts([{category:"G.A Drawing",docNumber:suggestedDocNumber("G.A Drawing",nextSeq),title:"",link:"",file:null}]);
+    setDocDrafts([{category:"G.A Drawing",docNumber:suggestedDocNumber("G.A Drawing",nextSeq),title:"",link:"",file:null,direction:"Out",status:""}]);
     setDocUploadStep("form");
   };
   const addAnotherDocDraft = ()=>{
     const nextSeq = quoteDocuments.filter(d=>!d.is_archived).length+docDrafts.length+1;
-    setDocDrafts(ds=>ds.concat([{category:"G.A Drawing",docNumber:suggestedDocNumber("G.A Drawing",nextSeq),title:"",link:"",file:null}]));
+    setDocDrafts(ds=>ds.concat([{category:"G.A Drawing",docNumber:suggestedDocNumber("G.A Drawing",nextSeq),title:"",link:"",file:null,direction:"Out",status:""}]));
   };
   const updateDocDraft = (idx,patch)=>{
     setDocDrafts(ds=>ds.map((d,i)=>{
@@ -10141,6 +10167,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       if(!d.docNumber.trim()){ alert("Every document needs a doc number."); return; }
       if(!d.link.trim()){ alert("Every document needs its permanent link (e.g. OneDrive) before uploading — the file in Supabase is only temporary and gets removed once this quote leaves Draft; the link is what stays."); return; }
       if(d.file.type!=="application/pdf"){ alert("\""+d.file.name+"\" isn't a PDF. Only PDF files are accepted here."); return; }
+      if(!d.status){ alert("Pick a status for every document before uploading."); return; }
     }
     setDocUploading(true);
     try{
@@ -10157,16 +10184,84 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         }).select().single();
         if(parentErr) throw parentErr;
         const { error:histErr } = await sb.from("universal_document_history_tbl").insert({
-          document_id:parentRow.id, doc_number:d.docNumber.trim(), rev_number:0, direction:"Out", status:null,
+          document_id:parentRow.id, doc_number:d.docNumber.trim(), rev_number:0, direction:d.direction, status:d.status,
           link:d.link.trim(), file_path:path, lives_in_supabase:true, reason:"Initial upload", changed_by:user?.username||"unknown"
         });
         if(histErr) throw histErr;
-        await logAudit("INSERT","universal_documents_tbl",quoteExportRef,"Uploaded document "+d.docNumber+" ("+d.category+") to Quote# "+quoteExportRef,user?.username||"unknown",null,{doc_number:d.docNumber,category:d.category});
+        await logAudit("INSERT","universal_documents_tbl",quoteExportRef,"Uploaded document "+d.docNumber+" ("+d.category+") to Quote# "+quoteExportRef+" — Rev0-"+d.direction,user?.username||"unknown",null,{doc_number:d.docNumber,category:d.category});
       }
       await loadQuoteDocuments(quoteExportRef);
       setDocUploadStep("list");
       alert("Uploaded "+docDrafts.length+" document(s).");
     } catch(e){ alert("Upload failed: "+(e.message||e)); }
+    finally { setDocUploading(false); }
+  };
+  // "Continuing an existing document" (25 Aug) — the doc-number typo
+  // problem (a stray space silently forking a "new" document) is closed
+  // structurally here: picking from this limit-to-list combo is the only
+  // way to add to an existing document's sequence, so a value that isn't
+  // already there simply can't be selected.
+  const [continueDocPick,setContinueDocPick]=useState(null); // the parent document row picked
+  const [continueDocHistory,setContinueDocHistory]=useState([]);
+  const [continueOverrideUnlocked,setContinueOverrideUnlocked]=useState(false);
+  const [continueOverrideRev,setContinueOverrideRev]=useState(0);
+  const [continueOverrideDirection,setContinueOverrideDirection]=useState("Out");
+  const [continueFile,setContinueFile]=useState(null);
+  const [continueLink,setContinueLink]=useState("");
+  const [continueStatus,setContinueStatus]=useState("");
+  const [continueWhatChanged,setContinueWhatChanged]=useState("");
+  const [continueNotes,setContinueNotes]=useState("");
+  const pickContinueDoc = async(docId)=>{
+    const docRow = quoteDocuments.find(d=>d.id===Number(docId));
+    setContinueDocPick(docRow||null);
+    setContinueOverrideUnlocked(false);
+    if(!docRow){ setContinueDocHistory([]); return; }
+    const { data } = await sb.from("universal_document_history_tbl").select("*").eq("document_id",docRow.id).order("rev_number",{ascending:false});
+    setContinueDocHistory(data||[]);
+    setContinueLink(docRow.link||"");
+  };
+  const requestSequenceOverride = async()=>{
+    if(user.role!=="super_admin"){ alert("Only Super Admin can override the Out/In sequence."); return; }
+    const code = prompt("Enter a Deletion Code to override the document sequence:");
+    if(code===null) return;
+    const res = await verifyAndConsumeDeletionCode(code, user?.username||"unknown");
+    if(!res.ok){ alert(res.reason); return; }
+    setContinueOverrideUnlocked(true);
+    const expected = computeExpectedNext(continueDocHistory);
+    setContinueOverrideRev(expected.rev); setContinueOverrideDirection(expected.direction||"Out");
+  };
+  const submitContinueDoc = async()=>{
+    if(!continueDocPick) return;
+    if(!continueFile){ alert("Choose the PDF file."); return; }
+    if(continueFile.type!=="application/pdf"){ alert("Only PDF files are accepted here."); return; }
+    if(!continueLink.trim()){ alert("The link is required."); return; }
+    if(!continueStatus){ alert("Pick a status."); return; }
+    if(!continueWhatChanged.trim()){ alert("Say what changed in this version."); return; }
+    if(!continueNotes.trim()){ alert("Notes is required for this version too."); return; }
+    const expected = computeExpectedNext(continueDocHistory);
+    const finalRev = continueOverrideUnlocked ? continueOverrideRev : expected.rev;
+    const finalDirection = continueOverrideUnlocked ? continueOverrideDirection : expected.direction;
+    setDocUploading(true);
+    try{
+      const path = "quote_"+quoteExportRef+"_"+Date.now()+"_"+continueFile.name.replace(/[^a-zA-Z0-9._-]/g,"_");
+      const { error:err } = await sb.storage.from("quote-documents").upload(path,continueFile);
+      if(err) throw err;
+      const { error:histErr } = await sb.from("universal_document_history_tbl").insert({
+        document_id:continueDocPick.id, doc_number:continueDocPick.doc_number, rev_number:finalRev, direction:finalDirection, status:continueStatus,
+        link:continueLink.trim(), file_path:path, lives_in_supabase:true, reason:continueWhatChanged.trim(), notes:continueNotes.trim(), changed_by:user?.username||"unknown"
+      });
+      if(histErr) throw histErr;
+      if(continueOverrideUnlocked){
+        const note = "Sequence overridden by Super Admin "+(user?.username||"unknown")+" — logged Rev"+finalRev+"-"+finalDirection+" instead of the expected Rev"+expected.rev+"-"+expected.direction+".";
+        await sb.from("universal_documents_tbl").update({sequence_flagged:true, sequence_flag_note:note}).eq("id",continueDocPick.id);
+        await logAudit("UPDATE","universal_documents_tbl",quoteExportRef,note,user?.username||"unknown",null,null);
+      } else {
+        await logAudit("UPDATE","universal_documents_tbl",quoteExportRef,"New version of "+continueDocPick.doc_number+" — Rev"+finalRev+"-"+finalDirection+": "+continueWhatChanged.trim(),user?.username||"unknown",null,null);
+      }
+      await loadQuoteDocuments(quoteExportRef);
+      setDocUploadStep("list");
+      setContinueDocPick(null); setContinueFile(null); setContinueLink(""); setContinueStatus(""); setContinueWhatChanged(""); setContinueNotes(""); setContinueOverrideUnlocked(false);
+    } catch(e){ alert("Failed: "+(e.message||e)); }
     finally { setDocUploading(false); }
   };
   const [docHistoryFor,setDocHistoryFor]=useState(null); // document row being viewed/versioned
@@ -10190,6 +10285,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     ]);
     setDocHistoryRows(hist||[]);
     setDocNotesList(notes||[]);
+  };
+  // Independent status change (25 Aug) — a history entry's status can be
+  // updated on its own, without uploading anything new (e.g. marking
+  // "All cleared" once a verbal confirmation comes in).
+  const changeHistoryStatus = async(historyRow,newStatus)=>{
+    await sb.from("universal_document_history_tbl").update({status:newStatus}).eq("id",historyRow.id);
+    await logAudit("UPDATE","universal_document_history_tbl",quoteExportRef,"Status of "+historyRow.doc_number+" Rev"+historyRow.rev_number+"-"+historyRow.direction+" changed to "+newStatus,user?.username||"unknown",null,null);
+    setDocHistoryRows(rows=>rows.map(r=>r.id===historyRow.id?{...r,status:newStatus}:r));
+    await loadQuoteDocuments(quoteExportRef);
   };
   const addDocumentNote = async()=>{
     if(!newDocNoteText.trim()) return;
@@ -14977,9 +15081,14 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",letterSpacing:"0.03em",marginBottom:6}},cat),
               rows.map(d=>h("div",{key:d.id,style:{border:"1px solid "+colors.border,borderRadius:8,padding:"9px 12px",marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center"}},
                 h("div",null,
-                  h("div",{style:{fontSize:12.5,fontWeight:600}},d.doc_number+(d.title?" — "+d.title:"")),
+                  h("div",{style:{display:"flex",alignItems:"center",gap:6,marginBottom:2}},
+                    h("span",{style:{fontSize:12.5,fontWeight:600}},d.doc_number+(d.title?" — "+d.title:"")),
+                    d.direction && h("span",{style:{fontSize:9.5,padding:"1px 6px",borderRadius:9,background:d.direction==="Out"?"#fff4d6":"#e6f1fb",color:d.direction==="Out"?"#854f0b":"#0c447c"}},d.direction),
+                    d.status && h("span",{style:{fontSize:9.5,padding:"1px 6px",borderRadius:9,...docStatusColor(d.status)}},d.status),
+                    d.sequence_flagged && h("span",{style:{fontSize:9.5,padding:"1px 6px",borderRadius:9,background:"#fdecea",color:"#a3312a"}},"⚠ Sequence flagged")
+                  ),
                   h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:2}},
-                    "Uploaded "+(d.uploaded_at||"").slice(0,10)+" by "+(d.uploaded_by||"—")+" · ",
+                    "Rev "+d.rev_number+" · Uploaded "+(d.uploaded_at||"").slice(0,10)+" by "+(d.uploaded_by||"—")+" · ",
                     d.lives_in_supabase
                       ? h("span",{style:{color:"#0f6e3f"}},"file still in Supabase")
                       : h("span",{style:{color:colors.mutedLight}},"file purged — link only")
@@ -14994,7 +15103,51 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             );
           }),
           quoteDocuments.filter(d=>!d.is_archived).length===0 && h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},"No documents uploaded yet."),
-          h("button",{onClick:startDocUpload,style:{...btnPrimary,width:"100%"}},"+ Upload document")
+          h("button",{onClick:startDocUpload,style:{...btnPrimary,width:"100%"}},"+ Log document")
+        ),
+
+        docUploadStep==="choice" && h(React.Fragment,null,
+          h("div",{style:{fontSize:13,fontWeight:600,marginBottom:10}},"New document, or continuing one that already exists?"),
+          h("div",{style:{display:"flex",gap:8,marginBottom:14}},
+            h("button",{onClick:()=>{setDocUploadStep("mode"); setDocUploadMode(""); setDocDrafts([]);},style:{flex:1,padding:"12px",border:"1px solid "+colors.border,borderRadius:8,background:"#fff",cursor:"pointer"}},"New document"),
+            h("button",{onClick:()=>{setDocUploadStep("continue"); setContinueDocPick(null); setContinueDocHistory([]);},style:{flex:1,padding:"12px",border:"1px solid "+colors.border,borderRadius:8,background:"#faf9f4",cursor:"pointer"}},"Continuing an existing document")
+          ),
+          h("button",{onClick:()=>setDocUploadStep("list"),style:btnSecondary},"Cancel")
+        ),
+
+        docUploadStep==="continue" && h(React.Fragment,null,
+          h("div",{style:{fontSize:13,fontWeight:600,marginBottom:10}},"Which document?"),
+          h("select",{value:continueDocPick?.id||"",onChange:e=>pickContinueDoc(e.target.value),style:{...inputStyle,width:"100%",marginBottom:12}},
+            h("option",{value:""},"Select a document…"),
+            quoteDocuments.filter(d=>!d.is_archived).map(d=>h("option",{key:d.id,value:d.id},d.doc_number+(d.title?" — "+d.title:"")))
+          ),
+          continueDocPick && (()=>{
+            const expected = computeExpectedNext(continueDocHistory);
+            const finalRev = continueOverrideUnlocked ? continueOverrideRev : expected.rev;
+            const finalDirection = continueOverrideUnlocked ? continueOverrideDirection : expected.direction;
+            return h(React.Fragment,null,
+              h("div",{style:{background:"#faf9f4",borderRadius:6,padding:"8px 10px",marginBottom:10,fontSize:12}},
+                "Logging: ", h("b",null,"Rev "+finalRev+" — "+finalDirection),
+                !continueOverrideUnlocked && continueDocHistory.length===0 && h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:3}},"First entry for this document — you'll pick the direction below."),
+                continueOverrideUnlocked && h("div",{style:{fontSize:10.5,color:"#a3312a",marginTop:3}},"⚠ Override active — this document will be flagged.")
+              ),
+              !continueDocHistory.length && !continueOverrideUnlocked && h("div",{style:{display:"flex",gap:8,marginBottom:10}},
+                h("button",{onClick:()=>setContinueOverrideDirection("Out"),style:{flex:1,padding:"6px",border:"1px solid "+(continueOverrideDirection==="Out"?"#185FA5":colors.border),borderRadius:6,background:"#fff",cursor:"pointer",fontSize:11.5}},"Out"),
+                h("button",{onClick:()=>setContinueOverrideDirection("In"),style:{flex:1,padding:"6px",border:"1px solid "+(continueOverrideDirection==="In"?"#185FA5":colors.border),borderRadius:6,background:"#fff",cursor:"pointer",fontSize:11.5}},"In")
+              ),
+              h(MasterSelect,{value:continueStatus,onChange:setContinueStatus,options:docStatusOptions.map(s=>s.status),table:"doc_status_tbl",valueCol:"status",fieldLabel:"Document Status",placeholder:"Select status…",style:{marginBottom:8}}),
+              h("input",{type:"file",accept:"application/pdf",onChange:e=>setContinueFile(e.target.files[0]||null),style:{width:"100%",marginBottom:8}}),
+              h("input",{value:continueLink,onChange:e=>setContinueLink(e.target.value),placeholder:"Link (OneDrive etc.)",style:{...inputStyle,width:"100%",marginBottom:8}}),
+              h("input",{value:continueWhatChanged,onChange:e=>setContinueWhatChanged(e.target.value),placeholder:"What changed? e.g. Updated nozzle orientation",style:{...inputStyle,width:"100%",marginBottom:8}}),
+              h("input",{value:continueNotes,onChange:e=>setContinueNotes(e.target.value),placeholder:"Notes (required)",style:{...inputStyle,width:"100%",marginBottom:10}}),
+              !continueOverrideUnlocked && user.role==="super_admin" && h("button",{onClick:requestSequenceOverride,style:{...btnSmall,fontSize:10.5,marginBottom:10}},"Override sequence (requires code)"),
+              h("div",{style:{display:"flex",gap:8}},
+                h("button",{onClick:submitContinueDoc,disabled:docUploading,style:{...btnPrimary,flex:1,opacity:docUploading?0.6:1}},docUploading?"Uploading…":"Log this entry"),
+                h("button",{onClick:()=>setDocUploadStep("list"),disabled:docUploading,style:btnSecondary},"Cancel")
+              )
+            );
+          })(),
+          !continueDocPick && h("button",{onClick:()=>setDocUploadStep("list"),style:btnSecondary},"Cancel")
         ),
 
         docUploadStep==="mode" && h(React.Fragment,null,
@@ -15018,6 +15171,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("input",{value:d.docNumber,onChange:e=>updateDocDraft(idx,{docNumber:e.target.value}),style:{...inputStyle,width:"100%",marginBottom:8}}),
             h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Title / description"),
             h("input",{value:d.title,onChange:e=>updateDocDraft(idx,{title:e.target.value}),placeholder:"e.g. GA drawing — strainer assembly",style:{...inputStyle,width:"100%",marginBottom:8}}),
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"This first entry — Rev 0 — is it Out or In?"),
+            h("div",{style:{display:"flex",gap:8,marginBottom:8}},
+              h("button",{type:"button",onClick:()=>updateDocDraft(idx,{direction:"Out"}),style:{flex:1,padding:"6px",border:"1px solid "+(d.direction==="Out"?"#185FA5":colors.border),borderRadius:6,background:"#fff",cursor:"pointer",fontSize:11.5}},"Out — we're sending"),
+              h("button",{type:"button",onClick:()=>updateDocDraft(idx,{direction:"In"}),style:{flex:1,padding:"6px",border:"1px solid "+(d.direction==="In"?"#185FA5":colors.border),borderRadius:6,background:"#fff",cursor:"pointer",fontSize:11.5}},"In — came back to us")
+            ),
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Status"),
+            h(MasterSelect,{value:d.status,onChange:v=>updateDocDraft(idx,{status:v}),options:docStatusOptions.map(s=>s.status),table:"doc_status_tbl",valueCol:"status",fieldLabel:"Document Status",placeholder:"Select status…",style:{marginBottom:8}}),
             h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Link (OneDrive etc.) ",h("span",{style:{color:colors.danger}},"*required")),
             h("input",{value:d.link,onChange:e=>updateDocDraft(idx,{link:e.target.value}),placeholder:"https://…",style:{...inputStyle,width:"100%",marginBottom:4}}),
             h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginBottom:8}},"The uploaded PDF here is temporary — it's removed once this quote leaves Draft. This link is what stays."),
@@ -15036,18 +15196,22 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h("div",{style:{fontSize:13,fontWeight:600}},"History — "+docHistoryFor.doc_number),
             h("button",{onClick:()=>setDocHistoryFor(null),style:{background:"none",border:"none",cursor:"pointer",color:colors.mutedLight}},"✕")
           ),
+          docHistoryFor.sequence_flagged && h("div",{style:{background:"#fdecea",color:"#a3312a",borderRadius:6,padding:"7px 10px",fontSize:11.5,marginBottom:10}},"⚠ "+(docHistoryFor.sequence_flag_note||"Sequence was overridden for this document.")),
           docHistoryRows.length===0 ? h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:12}},"No prior versions — this is the original upload.") :
           h("div",{style:{marginBottom:12}}, docHistoryRows.map(h2=>h("div",{key:h2.id,style:{fontSize:11.5,padding:"6px 0",borderBottom:"1px solid #eceae0"}},
+            h("div",{style:{display:"flex",alignItems:"center",gap:6,marginBottom:2}},
+              h("span",{style:{fontWeight:600}},"Rev "+h2.rev_number),
+              h2.direction && h("span",{style:{fontSize:9.5,padding:"1px 6px",borderRadius:9,background:h2.direction==="Out"?"#fff4d6":"#e6f1fb",color:h2.direction==="Out"?"#854f0b":"#0c447c"}},h2.direction),
+              h("select",{value:h2.status||"",onChange:e=>changeHistoryStatus(h2,e.target.value),style:{...docStatusColor(h2.status),fontSize:9.5,padding:"1px 4px",borderRadius:9,border:"none"}},
+                h("option",{value:""},"— status —"),
+                docStatusOptions.map(s=>h("option",{key:s.status,value:s.status},s.status))
+              )
+            ),
             h("span",{style:{color:colors.muted}},(h2.changed_at||"").slice(0,10)+" — "+(h2.changed_by||"—")+": "),
             h2.what_changed || h2.reason,
             h2.notes && h("div",{style:{color:colors.mutedLight,marginTop:2}},"Notes: "+h2.notes)
           ))),
-          h("div",{style:{fontSize:11.5,fontWeight:600,marginBottom:6}},"Upload a new version"),
-          h("input",{type:"file",accept:"application/pdf",onChange:e=>setDocNewVersionFile(e.target.files[0]||null),style:{width:"100%",marginBottom:8}}),
-          h("input",{value:docNewVersionLink,onChange:e=>setDocNewVersionLink(e.target.value),placeholder:"Link (OneDrive etc.)",style:{...inputStyle,width:"100%",marginBottom:8}}),
-          h("input",{value:docNewVersionNote,onChange:e=>setDocNewVersionNote(e.target.value),placeholder:"What changed? e.g. Updated nozzle orientation",style:{...inputStyle,width:"100%",marginBottom:8}}),
-          h("input",{value:docNewVersionExtraNotes,onChange:e=>setDocNewVersionExtraNotes(e.target.value),placeholder:"Notes (required)",style:{...inputStyle,width:"100%",marginBottom:8}}),
-          h("button",{onClick:uploadNewDocVersion,disabled:docUploading,style:{...btnPrimary,width:"100%",opacity:docUploading?0.6:1}},docUploading?"Uploading…":"Upload new version"),
+          h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:10}},"To log the next version, close this and use \"+ Log document\" → \"Continuing an existing document\" — that path enforces the Out/In sequence, this one no longer takes new uploads."),
 
           // Document-level Notes (25 Aug) — a separate, timestamped,
           // append-only log distinct from the per-revision Notes above.
@@ -19532,6 +19696,47 @@ function SignatoryOverrideNoticesPopup({ notices, onAcknowledgeOne, onAcknowledg
 // login for Admin/Super Admin only, once per session, same shape as
 // DraftOfferReminder. Lists every Contract where Billing Address was
 // overridden (by any role) and never actually filled in since.
+// Document sequence-flag reminder (25 Aug) — pops up at login for Admin/
+// Super Admin only, once per session, same pattern as the Billing
+// Address reminder. Lists every document where the Out/In sequence was
+// deliberately overridden. Doesn't deep-link to the exact quote/
+// contract screen (documents can belong to either) — just names it, so
+// this stays a simple, low-risk reminder rather than more routing.
+function DocumentSequenceReminder({ onDone }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  useEffect(()=>{
+    (async()=>{
+      const { data } = await sb.from("universal_documents_tbl").select("*").eq("sequence_flagged",true).order("doc_number");
+      setRows(data||[]);
+      setLoading(false);
+    })();
+  },[]);
+  if(loading) return null;
+  if(rows.length===0){ onDone(); return null; }
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.4)",zIndex:1350,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:12,padding:"22px 26px",width:560,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Documents with a broken Out/In sequence"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"These were deliberately overridden past a missing step — worth going back to close the gap."),
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",marginBottom:14}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Doc Number"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Quote/Contract"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Note")
+        )),
+        h("tbody",null, rows.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #f0eee6"}},
+          h("td",{style:{padding:"6px 8px",fontWeight:600}},r.doc_number),
+          h("td",{style:{padding:"6px 8px"}},r.entity_id),
+          h("td",{style:{padding:"6px 8px",color:colors.muted,fontSize:11}},r.sequence_flag_note||"—")
+        )))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end"}},
+        h("button",{onClick:onDone,style:btnSecondary},"Dismiss for now")
+      )
+    )
+  );
+}
+
 function IncompleteSaleOrderReminder({ user, onDone, onOpenContract }){
   const [rows,setRows] = useState([]);
   const [loading,setLoading] = useState(true);
@@ -26908,6 +27113,14 @@ function App() {
     setShowBillingOverrideReminder(false);
     try{ sessionStorage.setItem("flometriq_billing_override_prompt_date",new Date().toISOString().slice(0,10)); }catch(e){}
   };
+  // Document sequence-flag reminder (25 Aug) — same pattern.
+  const [showDocSequenceReminder,setShowDocSequenceReminder]=useState(()=>{
+    try{ return sessionStorage.getItem("flometriq_doc_sequence_prompt_date")!==new Date().toISOString().slice(0,10); }catch(e){ return true; }
+  });
+  const dismissDocSequenceReminder = ()=>{
+    setShowDocSequenceReminder(false);
+    try{ sessionStorage.setItem("flometriq_doc_sequence_prompt_date",new Date().toISOString().slice(0,10)); }catch(e){}
+  };
   const refreshDraftCount = useCallback(()=>{
     sb.from("estimates").select("id",{count:"exact",head:true}).eq("quote_status","Draft").then(({count})=>setDraftCount(count||0));
   },[]);
@@ -26942,6 +27155,7 @@ function App() {
     user.role==="super_admin" && !monthlyArchiveDone && h(MonthlyArchivePrompt,{user,onDone:()=>setMonthlyArchiveDone(true)}),
     showOverduePrompt && h(OverdueCallsPrompt,{user,onDone:dismissOverduePrompt}),
     (user.role==="admin"||user.role==="super_admin") && showBillingOverrideReminder && h(IncompleteSaleOrderReminder,{user,onDone:dismissBillingOverrideReminder,onOpenContract:openContract}),
+    (user.role==="admin"||user.role==="super_admin") && showDocSequenceReminder && h(DocumentSequenceReminder,{onDone:dismissDocSequenceReminder}),
     showDraftPanel && h(DraftOfferReminder,{user,onDone:()=>{ setShowDraftPanel(false); refreshDraftCount(); }}),
     showSignatoryNoticesPopup && h(SignatoryOverrideNoticesPopup,{notices:signatoryNotices,onAcknowledgeOne:acknowledgeSignatoryNotice,onAcknowledgeAll:acknowledgeAllSignatoryNotices,onClose:()=>setShowSignatoryNoticesPopup(false)}),
     pendingHeaderPromptFor && h(SaleOrderHeaderModal,{
