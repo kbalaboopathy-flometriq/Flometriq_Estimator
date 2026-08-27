@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-26T01:13:37Z";
+  var APP_BUILD_VERSION = "2026-08-27T01:30:17Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1249,7 +1249,7 @@ function MenuTabs({ user, active, onChange }) {
   ] : [
     { label:"Quotes", tabs:[{key:"saved",label:"Quotes"}] },
     { label:"Sale Order", tabs:[{key:"sale_order_entry",label:"Sale Order"}] },
-    ...(isAdmin?[{ label:"Commercial terms", tabs: byKeys(ctKeys) }]:[]),
+    ...(isAdmin?[{ label:"Commercials Master", tabs: byKeys(ctKeys).concat([{key:"gst_structures",label:"GST Structures"}]) }]:[]),
   ];
 
   const groups = [
@@ -1365,7 +1365,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Rules", tabs:[{key:"item_moc_rules",label:"Datasheet MOC"},{key:"description_master",label:"Description"}] }
     ]});
     groups.push({ label:"Admin", subgroups:[
-      { label:"Company", tabs:[{key:"company_master",label:"Company Master"},{key:"gst_structures",label:"GST Structures"},{key:"gst_variance_report",label:"GST Variance Report"},{key:"contract_number_setup",label:"Contract Numbering"},{key:"sale_order_status_tbl",label:"Sale Order Status"}] },
+      { label:"Company", tabs:[{key:"company_master",label:"Company Master"},{key:"gst_structures",label:"GST Structures"},{key:"gst_variance_report",label:"GST Variance Report"},{key:"contract_number_setup",label:"Contract Numbering"},{key:"sale_order_status_tbl",label:"Sale Order Status"},{key:"doc_status_master",label:"Document Status Master"}] },
       { label:"Access control", tabs:[
         {key:"users",label:"Users"},
         {key:"permissions",label:"Permissions"},
@@ -10042,6 +10042,32 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   useEffect(()=>{ loadDocCategories(); },[loadDocCategories]);
   const DOC_PREFIX = {"G.A Drawing":"DWG","Order Acceptance":"OA","Purchase Order":"PO","ITP / QAP":"ITP","PMI Procedure":"PMI","R.T. Procedure":"RT","U.T. Procedure":"UT","M.P.T Procedure":"MPT","IGT Procedure":"IGT","Painting Procedure":"PAINT","Other Documents":"DOC","Pickling & Passivation Procedure":"PICK","Hydrotest Procedure":"HYDRO","Catalog / Brochure":"CAT","P.T.R":"PTR","G.S.T Details":"GST","Statutory Details":"STAT","Packing Procedure":"PACKPROC","Packing List":"PACKLIST","Quote":"QTE"};
   const [quoteDocuments,setQuoteDocuments]=useState([]);
+  // Documents Requested by Customer (25 Aug) — purely informational,
+  // never blocks Generate Quote PDF / Generate Sale Order. Deliberately
+  // does NOT carry forward from Quote to Sale Order — a Contract starts
+  // its own fresh list. entity_id is the Contract Number in mode=
+  // "contract", the Quote's own reference_number otherwise — same
+  // convention as universal_documents_tbl.
+  const [documentRequests,setDocumentRequests]=useState([]);
+  const [newRequestCategory,setNewRequestCategory]=useState("");
+  const loadDocumentRequests = useCallback(async(ref)=>{
+    if(!ref) return;
+    const { data } = await sb.from("document_requests_tbl").select("*").eq("entity_id",ref).order("requested_at");
+    setDocumentRequests(data||[]);
+  },[]);
+  useEffect(()=>{ if(quoteExportRef) loadDocumentRequests(quoteExportRef); },[quoteExportRef,loadDocumentRequests]);
+  const addDocumentRequest = async()=>{
+    if(!newRequestCategory){ alert("Pick a category first."); return; }
+    const { error } = await sb.from("document_requests_tbl").insert({entity_type:"quote", entity_id:quoteExportRef, category:newRequestCategory, requested_by:user?.username||"unknown"});
+    if(error){ alert("Failed: "+error.message); return; }
+    setNewRequestCategory("");
+    await loadDocumentRequests(quoteExportRef);
+  };
+  const deleteDocumentRequest = async(reqRow)=>{
+    if(!confirm("Remove this request for \""+reqRow.category+"\"?")) return;
+    await sb.from("document_requests_tbl").delete().eq("id",reqRow.id);
+    await loadDocumentRequests(quoteExportRef);
+  };
   const loadQuoteDocuments = useCallback(async(ref)=>{
     if(!ref) return;
     const { data: parents } = await sb.from("universal_documents_tbl").select("*").eq("entity_type","quote").eq("entity_id",ref);
@@ -10141,12 +10167,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const pickDocMode = (mode)=>{
     setDocUploadMode(mode);
     const nextSeq = quoteDocuments.filter(d=>!d.is_archived).length+1;
-    setDocDrafts([{category:"G.A Drawing",docNumber:suggestedDocNumber("G.A Drawing",nextSeq),title:"",link:"",file:null,direction:"Out",status:""}]);
+    setDocDrafts([{category:"G.A Drawing",docNumber:suggestedDocNumber("G.A Drawing",nextSeq),title:"",link:"",file:null,direction:"Out",status:"",fulfillsRequestId:""}]);
     setDocUploadStep("form");
   };
   const addAnotherDocDraft = ()=>{
     const nextSeq = quoteDocuments.filter(d=>!d.is_archived).length+docDrafts.length+1;
-    setDocDrafts(ds=>ds.concat([{category:"G.A Drawing",docNumber:suggestedDocNumber("G.A Drawing",nextSeq),title:"",link:"",file:null,direction:"Out",status:""}]));
+    setDocDrafts(ds=>ds.concat([{category:"G.A Drawing",docNumber:suggestedDocNumber("G.A Drawing",nextSeq),title:"",link:"",file:null,direction:"Out",status:"",fulfillsRequestId:""}]));
   };
   const updateDocDraft = (idx,patch)=>{
     setDocDrafts(ds=>ds.map((d,i)=>{
@@ -10188,9 +10214,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           link:d.link.trim(), file_path:path, lives_in_supabase:true, reason:"Initial upload", changed_by:user?.username||"unknown"
         });
         if(histErr) throw histErr;
+        if(d.fulfillsRequestId){
+          await sb.from("document_requests_tbl").update({fulfilled_document_id:parentRow.id}).eq("id",d.fulfillsRequestId);
+        }
         await logAudit("INSERT","universal_documents_tbl",quoteExportRef,"Uploaded document "+d.docNumber+" ("+d.category+") to Quote# "+quoteExportRef+" — Rev0-"+d.direction,user?.username||"unknown",null,{doc_number:d.docNumber,category:d.category});
       }
       await loadQuoteDocuments(quoteExportRef);
+      await loadDocumentRequests(quoteExportRef);
       setDocUploadStep("list");
       alert("Uploaded "+docDrafts.length+" document(s).");
     } catch(e){ alert("Upload failed: "+(e.message||e)); }
@@ -10211,6 +10241,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [continueStatus,setContinueStatus]=useState("");
   const [continueWhatChanged,setContinueWhatChanged]=useState("");
   const [continueNotes,setContinueNotes]=useState("");
+  const [continueFulfillsRequestId,setContinueFulfillsRequestId]=useState("");
   const pickContinueDoc = async(docId)=>{
     const docRow = quoteDocuments.find(d=>d.id===Number(docId));
     setContinueDocPick(docRow||null);
@@ -10251,6 +10282,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         link:continueLink.trim(), file_path:path, lives_in_supabase:true, reason:continueWhatChanged.trim(), notes:continueNotes.trim(), changed_by:user?.username||"unknown"
       });
       if(histErr) throw histErr;
+      if(continueFulfillsRequestId){
+        await sb.from("document_requests_tbl").update({fulfilled_document_id:continueDocPick.id}).eq("id",continueFulfillsRequestId);
+      }
       if(continueOverrideUnlocked){
         const note = "Sequence overridden by Super Admin "+(user?.username||"unknown")+" — logged Rev"+finalRev+"-"+finalDirection+" instead of the expected Rev"+expected.rev+"-"+expected.direction+".";
         await sb.from("universal_documents_tbl").update({sequence_flagged:true, sequence_flag_note:note}).eq("id",continueDocPick.id);
@@ -10259,8 +10293,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         await logAudit("UPDATE","universal_documents_tbl",quoteExportRef,"New version of "+continueDocPick.doc_number+" — Rev"+finalRev+"-"+finalDirection+": "+continueWhatChanged.trim(),user?.username||"unknown",null,null);
       }
       await loadQuoteDocuments(quoteExportRef);
+      await loadDocumentRequests(quoteExportRef);
       setDocUploadStep("list");
-      setContinueDocPick(null); setContinueFile(null); setContinueLink(""); setContinueStatus(""); setContinueWhatChanged(""); setContinueNotes(""); setContinueOverrideUnlocked(false);
+      setContinueDocPick(null); setContinueFile(null); setContinueLink(""); setContinueStatus(""); setContinueWhatChanged(""); setContinueNotes(""); setContinueOverrideUnlocked(false); setContinueFulfillsRequestId("");
     } catch(e){ alert("Failed: "+(e.message||e)); }
     finally { setDocUploading(false); }
   };
@@ -15073,6 +15108,25 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         ),
         h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:16}},"Drawings, procedures, ITP — PDF only, with a required link (e.g. OneDrive). The uploaded file here is temporary and is removed once this quote leaves Draft; the link is what stays."),
 
+        // Documents Requested by Customer (25 Aug) — purely informational,
+        // shown regardless of docUploadStep so it's always visible
+        // alongside the actual documents list.
+        h("div",{style:{background:"#faf9f4",borderRadius:8,padding:"10px 12px",marginBottom:16}},
+          h("div",{style:{fontSize:11.5,fontWeight:700,marginBottom:8}},"Documents requested by customer"),
+          documentRequests.length===0 ? h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8}},"Nothing on file yet.") :
+          h("div",{style:{marginBottom:8}}, documentRequests.map(r=>h("div",{key:r.id,style:{display:"flex",alignItems:"center",gap:8,padding:"5px 0",borderBottom:"1px solid #eceae0"}},
+            r.fulfilled_document_id
+              ? h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:9,background:"#eaf9f4",color:"#085041"}},"Sent")
+              : h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:9,background:"#fdecea",color:"#a3312a"}},"Initial submission pending"),
+            h("span",{style:{fontSize:12,flex:1}},r.category),
+            !r.fulfilled_document_id && h("button",{onClick:()=>deleteDocumentRequest(r),style:{background:"none",border:"none",cursor:"pointer",color:colors.mutedLight,fontSize:11}},"✕")
+          ))),
+          h("div",{style:{display:"flex",gap:6}},
+            h(MasterSelect,{value:newRequestCategory,onChange:setNewRequestCategory,options:docCategoryOptions,table:"doc_category_tbl",valueCol:"value",fieldLabel:"Document Category",placeholder:"Select category to request…",style:{flex:1}}),
+            h("button",{onClick:addDocumentRequest,style:{...btnSmall,fontSize:11}},"+ Add")
+          )
+        ),
+
         docUploadStep==="list" && h(React.Fragment,null,
           docCategoryOptions.map(cat=>{
             const rows = quoteDocuments.filter(d=>!d.is_archived && d.category===cat);
@@ -15136,6 +15190,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 h("button",{onClick:()=>setContinueOverrideDirection("In"),style:{flex:1,padding:"6px",border:"1px solid "+(continueOverrideDirection==="In"?"#185FA5":colors.border),borderRadius:6,background:"#fff",cursor:"pointer",fontSize:11.5}},"In")
               ),
               h(MasterSelect,{value:continueStatus,onChange:setContinueStatus,options:docStatusOptions.map(s=>s.status),table:"doc_status_tbl",valueCol:"status",fieldLabel:"Document Status",placeholder:"Select status…",style:{marginBottom:8}}),
+              documentRequests.filter(r=>!r.fulfilled_document_id).length>0 && h(React.Fragment,null,
+                h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Does this fulfill a customer's requested document?"),
+                h("select",{value:continueFulfillsRequestId,onChange:e=>setContinueFulfillsRequestId(e.target.value),style:{...inputStyle,width:"100%",marginBottom:8}},
+                  h("option",{value:""},"No — this is an additional document"),
+                  documentRequests.filter(r=>!r.fulfilled_document_id).map(r=>h("option",{key:r.id,value:r.id},r.category))
+                )
+              ),
               h("input",{type:"file",accept:"application/pdf",onChange:e=>setContinueFile(e.target.files[0]||null),style:{width:"100%",marginBottom:8}}),
               h("input",{value:continueLink,onChange:e=>setContinueLink(e.target.value),placeholder:"Link (OneDrive etc.)",style:{...inputStyle,width:"100%",marginBottom:8}}),
               h("input",{value:continueWhatChanged,onChange:e=>setContinueWhatChanged(e.target.value),placeholder:"What changed? e.g. Updated nozzle orientation",style:{...inputStyle,width:"100%",marginBottom:8}}),
@@ -15178,6 +15239,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             ),
             h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Status"),
             h(MasterSelect,{value:d.status,onChange:v=>updateDocDraft(idx,{status:v}),options:docStatusOptions.map(s=>s.status),table:"doc_status_tbl",valueCol:"status",fieldLabel:"Document Status",placeholder:"Select status…",style:{marginBottom:8}}),
+            documentRequests.filter(r=>!r.fulfilled_document_id).length>0 && h(React.Fragment,null,
+              h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Does this fulfill a customer's requested document?"),
+              h("select",{value:d.fulfillsRequestId,onChange:e=>updateDocDraft(idx,{fulfillsRequestId:e.target.value}),style:{...inputStyle,width:"100%",marginBottom:8}},
+                h("option",{value:""},"No — this is an additional document"),
+                documentRequests.filter(r=>!r.fulfilled_document_id).map(r=>h("option",{key:r.id,value:r.id},r.category))
+              )
+            ),
             h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Link (OneDrive etc.) ",h("span",{style:{color:colors.danger}},"*required")),
             h("input",{value:d.link,onChange:e=>updateDocDraft(idx,{link:e.target.value}),placeholder:"https://…",style:{...inputStyle,width:"100%",marginBottom:4}}),
             h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginBottom:8}},"The uploaded PDF here is temporary — it's removed once this quote leaves Draft. This link is what stays."),
@@ -18479,6 +18547,76 @@ function VersionHistoryScreen(){
 // A Contract snapshots the resolved components at selection time — see
 // sale_order_tbl.gst_components_snapshot — so this master can be edited
 // freely without silently altering an already-issued Contract.
+// Document Status Master (25 Aug) — the actual gap: doc_status_tbl had
+// no admin screen at all, only the inline "+ Add" on the Status dropdown
+// itself, which only ever captured the label — never the action_type
+// bucket that drives the badge color. A status added that way silently
+// fell through to green ("no action pending"), which is backwards for
+// something like a brand-new "Our Action Pending" label. This screen is
+// the fix: label and bucket are always set together.
+function DocStatusEditor({ user }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [newLabel,setNewLabel] = useState("");
+  const [newBucket,setNewBucket] = useState("our_action");
+  const BUCKETS = [
+    {value:"our_action", label:"Red — Our action pending", swatch:{background:"#fdecea",color:"#a3312a"}},
+    {value:"third_party_action", label:"Yellow — Third party action pending", swatch:{background:"#fff4d6",color:"#854f0b"}},
+    {value:"no_action", label:"Green — No action pending", swatch:{background:"#eaf9f4",color:"#085041"}},
+  ];
+  const bucketMeta = (b)=> BUCKETS.find(x=>x.value===b) || BUCKETS[2];
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const { data } = await sb.from("doc_status_tbl").select("*").order("status");
+    setRows(data||[]);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+  const addStatus = async()=>{
+    if(!newLabel.trim()){ alert("Status label is required."); return; }
+    const { error } = await sb.from("doc_status_tbl").insert({status:newLabel.trim(), action_type:newBucket});
+    if(error){ alert("Failed: "+error.message); return; }
+    setNewLabel(""); setNewBucket("our_action"); load();
+  };
+  const changeBucket = async(row,bucket)=>{
+    setRows(rs=>rs.map(r=>r.status===row.status?{...r,action_type:bucket}:r));
+    await sb.from("doc_status_tbl").update({action_type:bucket}).eq("status",row.status);
+  };
+  const deleteStatus = async(row)=>{
+    if(!confirm("Delete status \""+row.status+"\"? Documents already using it keep the label, just lose the color mapping.")) return;
+    await sb.from("doc_status_tbl").delete().eq("status",row.status);
+    load();
+  };
+  return h("div",{style:{padding:"20px 24px",maxWidth:640}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:6}},"Document Status Master"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:16}},
+      "Every status a document can carry, and which of the three buckets it belongs to — that bucket, not a separate color field, is what paints the badge red, yellow, or green everywhere in the Documents module."
+    ),
+    loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
+    h("div",{style:{display:"flex",flexDirection:"column",gap:6,marginBottom:16}},
+      rows.map(r=>h("div",{key:r.status,style:{display:"flex",alignItems:"center",gap:10,background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"9px 12px"}},
+        h("span",{style:{fontSize:11,padding:"2px 9px",borderRadius:10,...bucketMeta(r.action_type).swatch,whiteSpace:"nowrap"}},r.action_type?bucketMeta(r.action_type).label.split(" — ")[0]:"Unset"),
+        h("span",{style:{flex:1,fontSize:12.5}},r.status),
+        h("select",{value:r.action_type||"",onChange:e=>changeBucket(r,e.target.value),style:{...inputStyle,padding:"4px 8px",fontSize:11.5}},
+          h("option",{value:""},"— pick bucket —"),
+          BUCKETS.map(b=>h("option",{key:b.value,value:b.value},b.label))
+        ),
+        h("button",{onClick:()=>deleteStatus(r),style:{...btnSmall,fontSize:10,padding:"2px 8px",color:colors.danger,borderColor:colors.danger}},"Delete")
+      ))
+    ),
+    h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"12px 14px"}},
+      h("div",{style:{fontSize:11.5,fontWeight:600,marginBottom:8}},"+ Add status"),
+      h("div",{style:{display:"flex",gap:8}},
+        h("input",{value:newLabel,onChange:e=>setNewLabel(e.target.value),placeholder:"Status label",style:{...inputStyle,padding:"6px 8px",fontSize:12,flex:1}}),
+        h("select",{value:newBucket,onChange:e=>setNewBucket(e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+          BUCKETS.map(b=>h("option",{key:b.value,value:b.value},b.label))
+        ),
+        h("button",{onClick:addStatus,style:btnPrimary},"Add")
+      )
+    )
+  );
+}
+
 function GstStructureEditor({ user }){
   const [structures,setStructures] = useState([]);
   const [componentsByStructure,setComponentsByStructure] = useState({});
@@ -27239,6 +27377,7 @@ function App() {
     tab==="item_moc_rules"?h(ItemMocRulesEditor,{user}):
     tab==="company_master"?h(CompanyMasterEditor,{user}):
     tab==="gst_structures"?h(GstStructureEditor,{user}):
+    tab==="doc_status_master"?h(DocStatusEditor,{user}):
     tab==="gst_variance_report"?h(GstVarianceReport,{user}):
     tab==="description_master"?h(DescriptionMasterEditor,{user}):
     tab==="users"?h(UsersEditor,{user}):
