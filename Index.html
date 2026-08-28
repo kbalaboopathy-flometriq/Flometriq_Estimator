@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-27T01:30:17Z";
+  var APP_BUILD_VERSION = "2026-08-28T09:39:41Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1294,6 +1294,7 @@ function MenuTabs({ user, active, onChange }) {
       ]},
       { label:"Daily", tabs:[
         {key:"my_worklist",label:"My Worklist"},
+        {key:"followup_entry",label:"Log Follow-ups"},
       ]},
       ...(isAdmin?[{ label:"Master", tabs:[
         {key:"crm_helper_masters",label:"Package & Type Masters"},
@@ -8825,13 +8826,11 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
       return;
     }
     const patch = {}; patch[field+"_by"] = user?.username||"unknown"; patch[field+"_at"] = new Date().toISOString();
-    // Auto-advance Draft -> Approved (24 Aug) once all three sections are
-    // signed off — the status itself never needs a manual "mark
-    // approved" step; production-tracking statuses beyond this stay
-    // manual.
-    const willAllBeApproved = ["commercial_approved","testing_approved","technical_approved"]
-      .every(f => f===field || contractInfo[f+"_by"]);
-    if(willAllBeApproved && contractInfo.status==="Draft") patch.status = "Approved";
+    // Approval and Stage are deliberately independent (27-28 Aug) —
+    // approval no longer auto-advances Stage at all (it used to move
+    // Draft -> "Approved", a value that doesn't exist anymore). All
+    // three approvals completing only UNLOCKS the Stage dropdown below
+    // for manual use — it never moves Stage on its own.
     const { error } = await sb.from("sale_order_tbl").update(patch).eq("id",contractInfo.id);
     if(error){ alert("Approval failed: "+error.message); return; }
     await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,"Approved "+field.replace("_approved","")+(overrideActive?" (Super Admin override in effect)":""),user?.username||"unknown",null,null);
@@ -8898,10 +8897,18 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
       row("NDE/Testing (QC)","testing_approved"),
       row("Everything else (Technical Head)","technical_approved"),
       h("div",{style:{display:"flex",alignItems:"center",gap:5,marginLeft:"auto"}},
-        h("span",{style:{fontSize:11,color:colors.muted}},"Status:"),
-        h("select",{value:contractInfo.status||"Draft",onChange:e=>changeStatus(e.target.value),style:{...inputStyle,padding:"3px 6px",fontSize:11}},
-          statusOptions.map(s=>h("option",{key:s,value:s},s))
-        )
+        h("span",{style:{fontSize:11,color:colors.muted}},"Stage:"),
+        // Locked until all three sections are approved (27-28 Aug) —
+        // approval is a GATE on whether Stage can move at all, never a
+        // trigger for what it moves to. Once unlocked, it's fully
+        // manual — nothing advances it automatically, including
+        // generating the PDF (that only offers to, via a separate
+        // prompt, never forces it).
+        (contractInfo.commercial_approved_by && contractInfo.testing_approved_by && contractInfo.technical_approved_by)
+          ? h("select",{value:contractInfo.status||"Draft",onChange:e=>changeStatus(e.target.value),style:{...inputStyle,padding:"3px 6px",fontSize:11}},
+              statusOptions.map(s=>h("option",{key:s,value:s},s))
+            )
+          : h("span",{style:{fontSize:11,fontWeight:600,color:colors.mutedLight},title:"Locked until Commercial Terms, NDE/Testing, and Technical are all approved"},"🔒 "+(contractInfo.status||"Draft"))
       )
     )
   );
@@ -12359,6 +12366,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         }
         if(contractInfo.status==="Draft"){
           watermark = await resolveContractDraftWatermark();
+          // Flag for O.A Sent (27-28 Aug) — offered right alongside the
+          // Draft watermark decision, same moment: generating this PDF
+          // IS the real-world trigger for "the Order Acceptance went
+          // out," so ask here rather than leaving Stage to drift
+          // silently out of sync with what actually happened. Never
+          // forced — Stage stays fully manual either way.
+          if(confirm("This is the Order Acceptance — mark Stage as \"O.A Sent\"?")){
+            await sb.from("sale_order_tbl").update({status:"O.A Sent"}).eq("id",contractInfo.id);
+            await logAudit("UPDATE","sale_order_tbl",quoteExportRef,"Stage advanced to O.A Sent (generated via PDF)",user?.username||"unknown",null,null);
+            if(onContractInfoChanged) onContractInfoChanged();
+          }
         }
       }
       const currCurrency = quoteHeaderRow?.currency||"INR";
@@ -13591,21 +13609,29 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:1}},quoteHeaderRow.customer_name||"—")
             ),
             h("div",{style:{border:"2px solid "+(readiness.ready?"#1c8c56":"#e0b325"),borderRadius:10,padding:"6px 14px",background:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#eafaf1":"#eaf2fb"):"#fffbea",display:"flex",alignItems:"center",gap:8}},
-              h("span",{style:{fontSize:9.5,color:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c"):"#7a5000",fontWeight:600}},mode==="contract"?"SO STATUS":"QUOTE STATUS"),
+              h("span",{style:{fontSize:9.5,color:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c"):"#7a5000",fontWeight:600}},mode==="contract"?"SO STAGE":"QUOTE STATUS"),
               mode==="contract"
-                // The real Sale Order status lives on sale_order_tbl (see
+                // The real Sale Order Stage lives on sale_order_tbl (see
                 // ContractStatusBanner, which owns changing it) — this
                 // badge is a read-only display of that same value, not
                 // the cloned Quote's own Won/Lost status underneath it.
                 ? h("span",{style:{fontSize:14,fontWeight:800,color:(contractInfo?.status==="Draft")?"#0f6e3f":"#0c447c"}},(contractInfo?.status||"Draft").toUpperCase())
               : !readiness.ready
                 ? h("span",{style:{fontSize:14,fontWeight:800,color:"#7a5000"}},"🔒 "+(quoteHeaderRow.quote_status||"Draft").toUpperCase())
+                // Directly settable here only up to Offer Sent (27-28 Aug)
+                // — everything past that (Budgetary, Under Tech
+                // Evaluation, Purchase Requirement, Deferred, Lost, Won)
+                // is driven entirely by the Log Follow-ups screen's
+                // Outcome field, and shows read-only here so a quote
+                // can't quietly advance through the funnel without an
+                // actual logged follow-up behind it.
+                : !["Draft","Offer Sent"].includes(quoteHeaderRow.quote_status||"Draft")
+                ? h("span",{style:{fontSize:14,fontWeight:800,color:"#0c447c"}},"🔒 "+(quoteHeaderRow.quote_status||"Draft").toUpperCase())
                 : h("select",{
                     value:quoteHeaderRow.quote_status||"Draft",
                     onChange:e=>{
                       const newStatus=e.target.value;
                       const doChange=async()=>{
-                        if(newStatus==="Won"||newStatus==="Lost"){ setOutcomeTarget({referenceNumber:refFilter,newStatus}); return; }
                         const result = await updateQuoteStatusForQuote(refFilter,newStatus,user.username,"Quote form");
                         if(result && result.blocked) return;
                         setOpenRef(r=>({...r,quote_status:newStatus}));
@@ -13615,7 +13641,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                       doChange();
                     },
                     style:{fontSize:13,fontWeight:800,color:quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c",background:"transparent",border:"none",fontFamily:"inherit"}
-                  },quoteStatuses.map(s=>h("option",{key:s,value:s},s)))
+                  },["Draft","Offer Sent"].map(s=>h("option",{key:s,value:s},s)))
             ),
             h("div",{style:{width:220}},
               renderReadinessBar(readiness.categories, {height:32, onClick: readiness.ready?undefined:()=>alert(readiness.missing.map(m=>m.section+": "+m.items.join(", ")).join("\n"))})
@@ -19905,6 +19931,193 @@ function IncompleteSaleOrderReminder({ user, onDone, onOpenContract }){
       ),
       h("div",{style:{display:"flex",justifyContent:"flex-end"}},
         h("button",{onClick:onDone,style:btnSecondary},"Dismiss for now")
+      )
+    )
+  );
+}
+
+// Continuous Follow-up Entry (27 Aug) — a single tabular screen for a
+// Telecaller/FSE to log every call made in one sitting: one Date of
+// Entry for the whole session, one row per call (potentially across
+// several different customers), "+ Add row" to keep going, one "Close
+// for the day" action saving everything at once. Reuses activity_log_tbl
+// (chase_what/chase_reference/contacted_whom/discussed_what are the only
+// genuinely new columns — mode reuses activity_type, outcome/notes/dates
+// already existed). Marking Outcome = Won reuses the exact same
+// WonLostOutcomeModal the Quotes screen and Funnel board already use —
+// same PO Number/Date/Value capture, not a separate path.
+function ContinuousFollowupEntry({ user }){
+  const blankRow = ()=>({
+    _key: Math.random().toString(36).slice(2),
+    companyName:"", mode:"Phone", chaseWhat:"Offer", chaseReference:"", referenceOptions:[],
+    contactedWhom:"", contactOptions:[], discussedWhat:"", nextFollowupDate:"", outcome:"", notes:"",
+    showNewContact:false,
+  });
+  const [entryDate,setEntryDate] = useState(new Date().toISOString().slice(0,10));
+  const [rows,setRows] = useState([blankRow()]);
+  const [quoteStatusOptions,setQuoteStatusOptions] = useState([]);
+  const [soStatusOptions,setSoStatusOptions] = useState([]);
+  const [saving,setSaving] = useState(false);
+  const [wonLostQueue,setWonLostQueue] = useState([]); // [{referenceNumber,newStatus}]
+  const [outcomeTarget,setOutcomeTarget] = useState(null);
+
+  useEffect(()=>{
+    sb.from("quote_status_tbl").select("status").then(({data})=>setQuoteStatusOptions((data||[]).map(r=>r.status)));
+    sb.from("sale_order_status_tbl").select("status").order("sort_order").then(({data})=>setSoStatusOptions((data||[]).map(r=>r.status)));
+  },[]);
+
+  const addRow = ()=> setRows(rs=>rs.concat([blankRow()]));
+  const removeRow = (key)=> setRows(rs=>rs.length>1 ? rs.filter(r=>r._key!==key) : rs);
+  const updateRow = (key,patch)=> setRows(rs=>rs.map(r=>r._key===key?{...r,...patch}:r));
+
+  const onCompanyChange = async(key,companyName)=>{
+    updateRow(key,{companyName, chaseReference:"", contactedWhom:"", referenceOptions:[], contactOptions:[]});
+    if(!companyName) return;
+    const { data: contactRows } = await sb.from("contacts").select("contact_name").eq("company_name",companyName);
+    updateRow(key,{contactOptions:(contactRows||[]).map(c=>c.contact_name)});
+    await refreshReferenceOptions(key,companyName,rows.find(r=>r._key===key)?.chaseWhat||"Offer");
+  };
+  const refreshReferenceOptions = async(key,companyName,chaseWhat)=>{
+    if(!companyName || chaseWhat==="Cold" || chaseWhat==="Payment"){ updateRow(key,{referenceOptions:[],chaseReference:""}); return; }
+    if(chaseWhat==="Offer"){
+      const { data } = await sb.from("estimates").select("reference_number,quote_status").eq("customer_name",companyName);
+      const open = Array.from(new Map((data||[]).filter(r=>r.quote_status!=="Won"&&r.quote_status!=="Lost").map(r=>[r.reference_number,r])).values());
+      updateRow(key,{referenceOptions:open.map(r=>r.reference_number+" — "+r.quote_status)});
+    } else if(chaseWhat==="Order"){
+      const { data } = await sb.from("sale_order_tbl").select("contract_number,status").eq("customer_name",companyName).neq("status","Despatched");
+      updateRow(key,{referenceOptions:(data||[]).map(r=>r.contract_number+" — "+r.status)});
+    }
+  };
+  const onChaseWhatChange = async(key,chaseWhat)=>{
+    updateRow(key,{chaseWhat, chaseReference:"", outcome:""});
+    const row = rows.find(r=>r._key===key);
+    if(row) await refreshReferenceOptions(key,row.companyName,chaseWhat);
+  };
+  const saveNewContact = async(key,contact)=>{
+    const row = rows.find(r=>r._key===key);
+    if(!contact.contact_name.trim()){ alert("Name is required."); return; }
+    const { error } = await sb.from("contacts").insert({...contact, company_name:row.companyName, created_by:user?.username||"unknown"});
+    if(error){ alert("Couldn't save contact: "+error.message); return; }
+    updateRow(key,{contactedWhom:contact.contact_name.trim(), contactOptions:row.contactOptions.concat([contact.contact_name.trim()]), showNewContact:false});
+  };
+
+  const closeForTheDay = async()=>{
+    for(const r of rows){
+      if(!r.companyName.trim()){ alert("Every row needs a Customer."); return; }
+      if((r.chaseWhat==="Offer"||r.chaseWhat==="Order") && !r.chaseReference){ alert("Pick a Reference for every Offer/Order row."); return; }
+      if(!r.discussedWhat.trim()){ alert("Say what was discussed on every row."); return; }
+      if(!r.nextFollowupDate){ alert("Every row needs a Next Followup Date."); return; }
+    }
+    setSaving(true);
+    try{
+      const queue = [];
+      for(const r of rows){
+        const refNumber = r.chaseReference ? r.chaseReference.split(" — ")[0] : null;
+        const { data: recent } = await sb.from("activity_log_tbl").select("id").eq("company_name",r.companyName).order("created_at",{ascending:false}).limit(1);
+        await sb.from("activity_log_tbl").insert({
+          company_name:r.companyName, activity_type:r.mode, chase_what:r.chaseWhat, chase_reference:refNumber,
+          contacted_whom:r.contactedWhom||null, discussed_what:r.discussedWhat.trim(), outcome:r.outcome||"",
+          notes:r.notes||"", activity_date:entryDate, next_followup_date:r.nextFollowupDate,
+          is_followup_of: recent&&recent[0]?recent[0].id:null, logged_by:user?.username||"unknown"
+        });
+        if(r.chaseWhat==="Offer" && r.outcome && refNumber){
+          if(r.outcome==="Won"||r.outcome==="Lost") queue.push({referenceNumber:refNumber,newStatus:r.outcome});
+          else await updateQuoteStatusForQuote(refNumber, r.outcome, user.username, "Follow-up log");
+        } else if(r.chaseWhat==="Order" && r.outcome && refNumber){
+          await sb.from("sale_order_tbl").update({status:r.outcome}).eq("contract_number",refNumber);
+        }
+      }
+      if(queue.length){ setWonLostQueue(queue.slice(1)); setOutcomeTarget(queue[0]); }
+      else { alert("Saved "+rows.length+" follow-up(s)."); setRows([blankRow()]); }
+    } finally { setSaving(false); }
+  };
+  const advanceWonLostQueue = ()=>{
+    setOutcomeTarget(null);
+    if(wonLostQueue.length){ setOutcomeTarget(wonLostQueue[0]); setWonLostQueue(q=>q.slice(1)); }
+    else { alert("Saved "+rows.length+" follow-up(s)."); setRows([blankRow()]); }
+  };
+
+  const cell = {border:"1px solid "+colors.border,padding:3};
+  return h("div",{style:{padding:"20px 24px"}},
+    h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:14}},
+      h("h2",{style:{margin:0}},"Log Follow-ups"),
+      h("span",{style:{fontSize:12,color:colors.muted}},"Date of Entry"),
+      h("input",{type:"date",value:entryDate,onChange:e=>setEntryDate(e.target.value),style:{...inputStyle,padding:"5px 8px",fontSize:12}}),
+      h("span",{style:{fontSize:11.5,color:colors.mutedLight}},"Applies to every row below — add every call you made, then close out.")
+    ),
+    h("div",{style:{overflowX:"auto"}},
+      h("table",{style:{borderCollapse:"collapse",fontSize:11.5,minWidth:1200}},
+        h("thead",null,h("tr",{style:{background:colors.bg}},
+          ["Customer","Mode","Chase What","Reference","Contacted Whom","Discussed What","Next Followup","Outcome","Notes",""].map(hdr=>
+            h("th",{key:hdr,style:{...cell,textAlign:"left",padding:"5px 6px"}},hdr))
+        )),
+        h("tbody",null, rows.map(r=>h("tr",{key:r._key},
+          h("td",{style:cell},h("input",{value:r.companyName,onChange:e=>updateRow(r._key,{companyName:e.target.value}),onBlur:e=>onCompanyChange(r._key,e.target.value),style:{...inputStyle,width:120,padding:"3px 5px",fontSize:11.5}})),
+          h("td",{style:cell},h("select",{value:r.mode,onChange:e=>updateRow(r._key,{mode:e.target.value}),style:{fontSize:11.5}},
+            ["In Person","Phone","Email","Others"].map(m=>h("option",{key:m,value:m},m))
+          )),
+          h("td",{style:cell},h("select",{value:r.chaseWhat,onChange:e=>onChaseWhatChange(r._key,e.target.value),style:{fontSize:11.5}},
+            h("option",{value:"Offer"},"Offer"), h("option",{value:"Order"},"Order"),
+            h("option",{value:"Payment",disabled:true},"Payment (not available yet)"), h("option",{value:"Cold"},"Cold")
+          )),
+          h("td",{style:cell}, (r.chaseWhat==="Cold"||r.chaseWhat==="Payment") ? h("span",{style:{color:colors.mutedLight}},"—") :
+            h("select",{value:r.chaseReference,onChange:e=>updateRow(r._key,{chaseReference:e.target.value}),style:{fontSize:11.5,width:140}},
+              h("option",{value:""},"Select…"), r.referenceOptions.map(o=>h("option",{key:o,value:o},o))
+            )
+          ),
+          h("td",{style:cell}, h("select",{value:r.contactedWhom,onChange:e=>{ if(e.target.value==="__add__") updateRow(r._key,{showNewContact:true}); else updateRow(r._key,{contactedWhom:e.target.value}); },style:{fontSize:11.5,width:130}},
+            h("option",{value:""},"Select…"), r.contactOptions.map(c=>h("option",{key:c,value:c},c)),
+            h("option",{value:"__add__"},"+ Add contact")
+          )),
+          h("td",{style:cell},h("input",{value:r.discussedWhat,onChange:e=>updateRow(r._key,{discussedWhat:e.target.value}),style:{...inputStyle,width:140,padding:"3px 5px",fontSize:11.5}})),
+          h("td",{style:cell},h("input",{type:"date",value:r.nextFollowupDate,onChange:e=>updateRow(r._key,{nextFollowupDate:e.target.value}),style:{...inputStyle,padding:"3px 5px",fontSize:11.5,width:120}})),
+          h("td",{style:cell}, (r.chaseWhat==="Cold"||r.chaseWhat==="Payment") ? h("span",{style:{color:colors.mutedLight}},"—") :
+            h("select",{value:r.outcome,onChange:e=>updateRow(r._key,{outcome:e.target.value}),style:{fontSize:11.5,width:130}},
+              h("option",{value:""},"— no change —"),
+              (r.chaseWhat==="Offer"?quoteStatusOptions:soStatusOptions).map(s=>h("option",{key:s,value:s},s))
+            )
+          ),
+          h("td",{style:cell},h("input",{value:r.notes,onChange:e=>updateRow(r._key,{notes:e.target.value}),style:{...inputStyle,width:100,padding:"3px 5px",fontSize:11.5}})),
+          h("td",{style:{...cell,textAlign:"center"}},h("button",{onClick:()=>removeRow(r._key),style:{background:"none",border:"none",cursor:"pointer",color:colors.mutedLight}},"✕"))
+        ))),
+        h("tfoot",null,h("tr",null,h("td",{colSpan:10,style:{padding:"8px",textAlign:"center"}},
+          h("button",{onClick:addRow,style:{...btnSmall,fontSize:11.5}},"+ Add row")
+        )))
+      )
+    ),
+    h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:14}},
+      h("button",{onClick:closeForTheDay,disabled:saving,style:{...btnPrimary,opacity:saving?0.6:1}},saving?"Saving…":"Close for the day — save all entries")
+    ),
+    rows.filter(r=>r.showNewContact).map(r=>h(NewContactQuickModal,{
+      key:r._key+"_modal", companyName:r.companyName,
+      onCancel:()=>updateRow(r._key,{showNewContact:false}),
+      onSaved:(contact)=>saveNewContact(r._key,contact)
+    })),
+    outcomeTarget && h(WonLostOutcomeModal,{
+      referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user,
+      onDone:advanceWonLostQueue, onCancel:advanceWonLostQueue
+    })
+  );
+}
+
+// Small forced-entry modal (27 Aug) — picking "+ Add contact" in the
+// Continuous Follow-up Entry table can't just leave a typed value in the
+// cell; it forces at least a Name before returning to the row, and saves
+// straight into the real per-company Contacts list, not a free-text
+// stand-in.
+function NewContactQuickModal({ companyName, onCancel, onSaved }){
+  const [name,setName] = useState(""); const [designation,setDesignation] = useState("");
+  const [phone,setPhone] = useState(""); const [email,setEmail] = useState("");
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1300,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:340}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:10}},"New Contact — "+(companyName||"—")),
+      h("input",{value:name,onChange:e=>setName(e.target.value),placeholder:"Name *",style:{...inputStyle,width:"100%",marginBottom:8}}),
+      h("input",{value:designation,onChange:e=>setDesignation(e.target.value),placeholder:"Designation",style:{...inputStyle,width:"100%",marginBottom:8}}),
+      h("input",{value:phone,onChange:e=>setPhone(e.target.value),placeholder:"Phone",style:{...inputStyle,width:"100%",marginBottom:8}}),
+      h("input",{value:email,onChange:e=>setEmail(e.target.value),placeholder:"Email",style:{...inputStyle,width:"100%",marginBottom:12}}),
+      h("div",{style:{display:"flex",gap:8}},
+        h("button",{onClick:onCancel,style:{...btnSecondary,flex:1}},"Cancel row entry"),
+        h("button",{onClick:()=>onSaved({contact_name:name,designation,phone,email}),style:{...btnPrimary,flex:1}},"Save contact & return")
       )
     )
   );
@@ -27328,6 +27541,7 @@ function App() {
     tab==="reports_quote_status"?h(QuoteStatusReport,null):
     tab==="reports_quote_status_review"?h(QuoteStatusReview,{user}):
     tab==="my_worklist"?h(MyWorklistScreen,{user}):
+    tab==="followup_entry"?h(ContinuousFollowupEntry,{user}):
     tab==="reports_won_by_owner"?h(WonByOwnerReport,null):
     tab==="reports_overdue_calls"?h(OverdueCallsReport,null):
     tab==="reports_missed_entries"?h(MissedEntriesReport,{user}):
