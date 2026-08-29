@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-29T16:29:34Z";
+  var APP_BUILD_VERSION = "2026-08-29T16:36:48Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1291,6 +1291,7 @@ function MenuTabs({ user, active, onChange }) {
       ]},
       { label:"Funnel", tabs:[
         {key:"crm_funnel",label:"Funnel"},
+        {key:"quotes_report",label:"Quotes Report"},
       ]},
       { label:"Daily", tabs:[
         {key:"my_worklist",label:"My Worklist"},
@@ -22991,6 +22992,153 @@ function MajorProjectsBulkImport({ user }){
   );
 }
 
+// Quotes Report (29 Aug) — the filterable list/report screen requested
+// from the real ERP screenshot. Field mapping confirmed earlier: Region
+// = Zone, City/State = existing Customer address fields, Status = the
+// new 8-value quote funnel, Follow-up = last logged Activity Log entry
+// for that customer, Approval Status and Customer Code dropped entirely
+// (never had a real equivalent in this app). Reference No and Quote No
+// collapse into one field here — Flometriq has no separate concept for
+// the two, unlike the source screen.
+function QuotesReportScreen({ user }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [zoneOptions,setZoneOptions] = useState([]);
+  const [statusOptions,setStatusOptions] = useState([]);
+  const [filters,setFilters] = useState({
+    dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"",
+    zone:"", status:"", followUp:"", projectLike:""
+  });
+  const setF = (k,v)=> setFilters(f=>({...f,[k]:v}));
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    try{
+      const { data: estRows } = await sb.from("estimates")
+        .select("reference_number,customer_name,quote_date,created_at,quote_status,linked_project_id")
+        .order("created_at",{ascending:false});
+      const byRef = new Map();
+      (estRows||[]).forEach(r=>{ if(!byRef.has(r.reference_number)) byRef.set(r.reference_number,r); });
+      const headers = Array.from(byRef.values());
+
+      const customerNames = Array.from(new Set(headers.map(h=>h.customer_name).filter(Boolean)));
+      const { data: cos } = customerNames.length
+        ? await sb.from("companies").select("company_name,zone,billing_city,billing_state").in("company_name",customerNames)
+        : { data: [] };
+      const coByName = new Map((cos||[]).map(c=>[c.company_name,c]));
+
+      const { data: acts } = customerNames.length
+        ? await sb.from("activity_log_tbl").select("company_name,outcome,next_followup_date,created_at").in("company_name",customerNames).order("created_at",{ascending:false})
+        : { data: [] };
+      const latestActByCompany = new Map();
+      (acts||[]).forEach(a=>{ if(!latestActByCompany.has(a.company_name)) latestActByCompany.set(a.company_name,a); });
+
+      const projectIds = Array.from(new Set(headers.map(h=>h.linked_project_id).filter(Boolean)));
+      const { data: projs } = projectIds.length
+        ? await sb.from("major_project_tbl").select("id,project_name").in("id",projectIds)
+        : { data: [] };
+      const projById = new Map((projs||[]).map(p=>[p.id,p.project_name]));
+
+      const merged = headers.map(h=>{
+        const co = coByName.get(h.customer_name)||{};
+        const act = latestActByCompany.get(h.customer_name);
+        return {
+          reference_number: h.reference_number,
+          reference_date: (h.quote_date||h.created_at||"").slice(0,10),
+          customer_name: h.customer_name||"—",
+          region: co.zone||"—",
+          city: co.billing_city||"—",
+          state: co.billing_state||"—",
+          status: h.quote_status||"Draft",
+          project_reference: h.linked_project_id ? (projById.get(h.linked_project_id)||"—") : "—",
+          followup_stage: act?.outcome||"—",
+          next_followup: act?.next_followup_date||"—",
+        };
+      });
+      setRows(merged);
+    } finally { setLoading(false); }
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+  useEffect(()=>{
+    sb.from("zone_tbl").select("value").then(({data})=>setZoneOptions((data||[]).map(r=>r.value)));
+    sb.from("quote_status_tbl").select("status").then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
+  },[]);
+
+  // Follow-up Status is computed, not stored — Overdue/Due today/
+  // Upcoming/None, same bucket logic as the overdue-calls tracking
+  // already built elsewhere (My Worklist, the login reminder).
+  const followUpBucket = (r)=>{
+    if(!r.next_followup || r.next_followup==="—") return "None";
+    const today = new Date().toISOString().slice(0,10);
+    if(r.next_followup < today) return "Overdue";
+    if(r.next_followup === today) return "Due today";
+    return "Upcoming";
+  };
+
+  const filtered = rows.filter(r=>{
+    if(filters.dateFrom && r.reference_date < filters.dateFrom) return false;
+    if(filters.dateTo && r.reference_date > filters.dateTo) return false;
+    if(filters.refLike && !r.reference_number.toLowerCase().includes(filters.refLike.toLowerCase())) return false;
+    if(filters.customerLike && !r.customer_name.toLowerCase().includes(filters.customerLike.toLowerCase())) return false;
+    if(filters.cityLike && !r.city.toLowerCase().includes(filters.cityLike.toLowerCase())) return false;
+    if(filters.stateLike && !r.state.toLowerCase().includes(filters.stateLike.toLowerCase())) return false;
+    if(filters.zone && r.region!==filters.zone) return false;
+    if(filters.status && r.status!==filters.status) return false;
+    if(filters.followUp && followUpBucket(r)!==filters.followUp) return false;
+    if(filters.projectLike && !r.project_reference.toLowerCase().includes(filters.projectLike.toLowerCase())) return false;
+    return true;
+  });
+
+  const fld = (label, child)=> h("div",null, h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},label), child);
+  const inp = (key,extra)=> h("input",{value:filters[key],onChange:e=>setF(key,e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12,...extra}});
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("h2",{style:{marginTop:0}},"Quotes Report"),
+    h("div",{style:{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:16,background:"#faf9f4",padding:14,borderRadius:8}},
+      fld("Reference Date >=", h("input",{type:"date",value:filters.dateFrom,onChange:e=>setF("dateFrom",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
+      fld("Reference Date <=", h("input",{type:"date",value:filters.dateTo,onChange:e=>setF("dateTo",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
+      fld("Reference No / Quote No", inp("refLike")),
+      fld("Customer Name", inp("customerLike")),
+      fld("Project Reference", inp("projectLike")),
+      fld("City", inp("cityLike")),
+      fld("State", inp("stateLike")),
+      fld("Region (Zone)", h("select",{value:filters.zone,onChange:e=>setF("zone",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+        h("option",{value:""},"All"), zoneOptions.map(z=>h("option",{key:z,value:z},z))
+      )),
+      fld("Status", h("select",{value:filters.status,onChange:e=>setF("status",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+        h("option",{value:""},"All"), statusOptions.map(s=>h("option",{key:s,value:s},s))
+      )),
+      fld("Follow-up Status", h("select",{value:filters.followUp,onChange:e=>setF("followUp",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+        h("option",{value:""},"All"),["Overdue","Due today","Upcoming","None"].map(s=>h("option",{key:s,value:s},s))
+      ))
+    ),
+    loading ? h("div",{style:{color:colors.mutedLight}},"Loading…") :
+    h("div",{style:{overflowX:"auto"}},
+      h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:12.5}},
+        h("thead",null,h("tr",{style:{background:colors.bg,textAlign:"left"}},
+          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Status","Project Reference","Follow-up Stage","Next Follow-up"].map(c=>
+            h("th",{key:c,style:{padding:"7px 9px",borderBottom:"2px solid "+colors.dark,whiteSpace:"nowrap"}},c))
+        )),
+        h("tbody",null, filtered.map((r,i)=>h("tr",{key:r.reference_number,style:{borderBottom:"1px solid "+colors.border}},
+          h("td",{style:{padding:"6px 9px"}},i+1),
+          h("td",{style:{padding:"6px 9px",fontWeight:600}},r.reference_number),
+          h("td",{style:{padding:"6px 9px"}},r.reference_date),
+          h("td",{style:{padding:"6px 9px"}},r.customer_name),
+          h("td",{style:{padding:"6px 9px"}},r.region),
+          h("td",{style:{padding:"6px 9px"}},r.city),
+          h("td",{style:{padding:"6px 9px"}},r.state),
+          h("td",{style:{padding:"6px 9px"}},h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#e6f1fb",color:"#0c447c"}},r.status)),
+          h("td",{style:{padding:"6px 9px"}},r.project_reference),
+          h("td",{style:{padding:"6px 9px"}},r.followup_stage),
+          h("td",{style:{padding:"6px 9px"}},r.next_followup)
+        )))
+      ),
+      filtered.length===0 && h("div",{style:{padding:20,color:colors.mutedLight,textAlign:"center"}},"No quotes match these filters."),
+      h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:8}},filtered.length+" of "+rows.length+" quotes shown")
+    )
+  );
+}
+
 function CrmFunnelKanban({ user }){
   const [statuses,setStatuses] = useState([]);
   const [cards,setCards] = useState([]); // [{id, reference_number, item_sl_no, customer_name, description, quote_status, totalValue, status_changed_by, status_changed_at}]
@@ -27645,6 +27793,7 @@ function App() {
     tab==="enquiry_review"?h(EnquiryReviewScreen,{user}):
     tab==="gaps_dashboard"?h(GapsChaseDashboard,{user,onGoTo:goToEntityLookup}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
+    tab==="quotes_report"?h(QuotesReportScreen,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
     tab==="customers"?h(CustomersScreen,{user}):
