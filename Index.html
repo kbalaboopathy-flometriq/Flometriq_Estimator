@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-29T16:46:01Z";
+  var APP_BUILD_VERSION = "2026-08-29T16:55:18Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -16360,13 +16360,24 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
   useEffect(()=>{ sb.from("state_zone_tbl").select("state").order("state").then(({data})=>setIndiaStates((data||[]).map(r=>r.state).filter(Boolean))); },[]);
   const [billingCities,setBillingCities] = useState([]);
   const [shippingCities,setShippingCities] = useState([]);
+  // Country->City cascade (29 Aug) — India stays State->City as before;
+  // every other country now cascades Country->City directly (no state
+  // level), scoped by the new city_tbl.country column.
   useEffect(()=>{
-    if(f.billing_country!=="India" || !f.billing_state){ setBillingCities([]); return; }
-    sb.from("city_tbl").select("city").eq("state",f.billing_state).order("city").then(({data})=>setBillingCities((data||[]).map(r=>r.city)));
+    if(f.billing_country==="India"){
+      if(!f.billing_state){ setBillingCities([]); return; }
+      sb.from("city_tbl").select("city").eq("state",f.billing_state).order("city").then(({data})=>setBillingCities((data||[]).map(r=>r.city)));
+    } else if(f.billing_country){
+      sb.from("city_tbl").select("city").eq("country",f.billing_country).is("state",null).order("city").then(({data})=>setBillingCities((data||[]).map(r=>r.city)));
+    } else setBillingCities([]);
   },[f.billing_country,f.billing_state]);
   useEffect(()=>{
-    if(f.shipping_country!=="India" || !f.shipping_state){ setShippingCities([]); return; }
-    sb.from("city_tbl").select("city").eq("state",f.shipping_state).order("city").then(({data})=>setShippingCities((data||[]).map(r=>r.city)));
+    if(f.shipping_country==="India"){
+      if(!f.shipping_state){ setShippingCities([]); return; }
+      sb.from("city_tbl").select("city").eq("state",f.shipping_state).order("city").then(({data})=>setShippingCities((data||[]).map(r=>r.city)));
+    } else if(f.shipping_country){
+      sb.from("city_tbl").select("city").eq("country",f.shipping_country).is("state",null).order("city").then(({data})=>setShippingCities((data||[]).map(r=>r.city)));
+    } else setShippingCities([]);
   },[f.shipping_country,f.shipping_state]);
 
   // Optional "add a contact too" sub-form — only offered when creating a
@@ -16437,9 +16448,10 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
         )
       : h("input",{value:f[stateKey]||"",onChange:e=>set(stateKey,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})
   );
-  // City: dropdown from city_tbl, scoped to the picked State, only for
-  // India — free text otherwise. Disabled until a State is picked (India)
-  // so the list is never confusingly empty/unscoped.
+  // City: dropdown from city_tbl. India cascades State->City; every
+  // other country now cascades Country->City directly (29 Aug) — no
+  // more free text there. Disabled until the field it depends on
+  // (State for India, Country otherwise) is actually picked.
   const cityField = (label,countryKey,stateKey,cityKey,citiesForBlock)=> h("div",{style:{flex:1}},
     h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},label),
     f[countryKey]==="India"
@@ -16447,7 +16459,10 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
           h("option",{value:""},f[stateKey]?"Select city…":"Pick a state first"),
           citiesForBlock.map(c=>h("option",{key:c,value:c},c))
         )
-      : h("input",{value:f[cityKey]||"",onChange:e=>set(cityKey,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12}})
+      : h("select",{value:f[cityKey]||"",disabled:!f[countryKey],onChange:e=>set(cityKey,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,opacity:f[countryKey]?1:0.6}},
+          h("option",{value:""},f[countryKey]?"Select city…":"Pick a country first"),
+          citiesForBlock.map(c=>h("option",{key:c,value:c},c))
+        )
   );
   return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
@@ -23006,7 +23021,7 @@ function QuotesReportScreen({ user, onOpenQuote }){
   const [zoneOptions,setZoneOptions] = useState([]);
   const [statusOptions,setStatusOptions] = useState([]);
   const [filters,setFilters] = useState({
-    dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"",
+    dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"", countryLike:"",
     zone:"", status:"", followUp:"", projectLike:""
   });
   const setF = (k,v)=> setFilters(f=>({...f,[k]:v}));
@@ -23023,7 +23038,7 @@ function QuotesReportScreen({ user, onOpenQuote }){
 
       const customerNames = Array.from(new Set(headers.map(h=>h.customer_name).filter(Boolean)));
       const { data: cos } = customerNames.length
-        ? await sb.from("companies").select("company_name,zone,billing_city,billing_state").in("company_name",customerNames)
+        ? await sb.from("companies").select("company_name,zone,billing_city,billing_state,billing_country").in("company_name",customerNames)
         : { data: [] };
       const coByName = new Map((cos||[]).map(c=>[c.company_name,c]));
 
@@ -23049,6 +23064,7 @@ function QuotesReportScreen({ user, onOpenQuote }){
           region: co.zone||"—",
           city: co.billing_city||"—",
           state: co.billing_state||"—",
+          country: co.billing_country||"—",
           status: h.quote_status||"Draft",
           project_reference: h.linked_project_id ? (projById.get(h.linked_project_id)||"—") : "—",
           followup_stage: act?.outcome||"—",
@@ -23082,6 +23098,7 @@ function QuotesReportScreen({ user, onOpenQuote }){
     if(filters.customerLike && r.customer_name!==filters.customerLike) return false;
     if(filters.cityLike && r.city!==filters.cityLike) return false;
     if(filters.stateLike && r.state!==filters.stateLike) return false;
+    if(filters.countryLike && r.country!==filters.countryLike) return false;
     if(filters.zone && r.region!==filters.zone) return false;
     if(filters.status && r.status!==filters.status) return false;
     if(filters.followUp && followUpBucket(r)!==filters.followUp) return false;
@@ -23091,16 +23108,20 @@ function QuotesReportScreen({ user, onOpenQuote }){
 
   // Limit-to-list options (29 Aug) — derived from the unfiltered dataset
   // itself, not a separate master fetch, so the dropdowns only ever
-  // offer values that genuinely exist in this report.
+  // offer values that genuinely exist in this report. Country->State->
+  // City cascade: picking a Country narrows State/City to just that
+  // country's own rows.
   const distinct = (arr)=> Array.from(new Set(arr.filter(v=>v && v!=="—"))).sort();
+  const rowsForCountry = filters.countryLike ? rows.filter(r=>r.country===filters.countryLike) : rows;
   const refOptions = distinct(rows.map(r=>r.reference_number));
   const customerOptions = distinct(rows.map(r=>r.customer_name));
-  const cityOptions = distinct(rows.map(r=>r.city));
-  const stateOptions = distinct(rows.map(r=>r.state));
+  const countryOptions = distinct(rows.map(r=>r.country));
+  const cityOptions = distinct(rowsForCountry.map(r=>r.city));
+  const stateOptions = distinct(rowsForCountry.map(r=>r.state));
   const projectOptions = distinct(rows.map(r=>r.project_reference));
 
   const fld = (label, child)=> h("div",null, h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},label), child);
-  const combo = (key,options)=> h(LimitToListCombo,{value:filters[key],onChange:v=>setF(key,v),options,placeholder:"All",style:{...inputStyle,padding:"6px 8px",fontSize:12}});
+  const combo = (key,options)=> h(LimitToListCombo,{value:filters[key],onChange:v=>{ setF(key,v); if(key==="countryLike"){ setF("stateLike",""); setF("cityLike",""); } },options,placeholder:"All",style:{...inputStyle,padding:"6px 8px",fontSize:12}});
 
   return h("div",{style:{padding:"20px 24px"}},
     h("h2",{style:{marginTop:0}},"Quotes Report"),
@@ -23110,8 +23131,9 @@ function QuotesReportScreen({ user, onOpenQuote }){
       fld("Reference No / Quote No", combo("refLike",refOptions)),
       fld("Customer Name", combo("customerLike",customerOptions)),
       fld("Project Reference", combo("projectLike",projectOptions)),
-      fld("City", combo("cityLike",cityOptions)),
+      fld("Country", combo("countryLike",countryOptions)),
       fld("State", combo("stateLike",stateOptions)),
+      fld("City", combo("cityLike",cityOptions)),
       fld("Region (Zone)", h("select",{value:filters.zone,onChange:e=>setF("zone",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), zoneOptions.map(z=>h("option",{key:z,value:z},z))
       )),
