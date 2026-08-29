@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-29T16:55:18Z";
+  var APP_BUILD_VERSION = "2026-08-29T17:08:23Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8915,7 +8915,7 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
   );
 }
 
-function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, onGoToTab, onNewSlNo, mode, contractInfo, onContractInfoChanged, onOpenContract }) {
+function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, onGoToTab, onNewSlNo, mode, contractInfo, onContractInfoChanged, onOpenContract, cameFromQuotesReport, onBackToQuotesReport }) {
   // mode: "quote" (default) | "contract". When "contract", this exact
   // same screen is a Sale Order — the underlying data lives in the same
   // estimates/estimate_lines/quote_commercial_terms/etc. tables, keyed
@@ -13602,6 +13602,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       )
     ),
     h("div",{style:{padding:"14px 24px 20px"}},
+      cameFromQuotesReport && mode!=="contract" && h("button",{onClick:onBackToQuotesReport,style:{...btnSmall,marginBottom:10,display:"flex",alignItems:"center",gap:5}},"← Back to Quotes Report"),
       refFilter && quoteHeaderRow && h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,background:"#fff",padding:"14px 16px",marginBottom:14}},
         h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12,marginBottom:12}},
           h("div",{style:{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}},
@@ -23025,6 +23026,24 @@ function QuotesReportScreen({ user, onOpenQuote }){
     zone:"", status:"", followUp:"", projectLike:""
   });
   const setF = (k,v)=> setFilters(f=>({...f,[k]:v}));
+  // Country->State->City (29 Aug fix) — pulls from the real master
+  // tables (WORLD_COUNTRIES, state_zone_tbl, city_tbl), same as the
+  // Customer form, not just whatever happens to already exist in this
+  // report's own data. With few real quotes on file that scoped
+  // version looked broken/empty — this is the actual fix, not a
+  // cosmetic one. City is deliberately not limit-to-list, since a
+  // real city can be missing from the seeded master.
+  const [indiaStateOptions,setIndiaStateOptions] = useState([]);
+  const [cityOptionsLive,setCityOptionsLive] = useState([]);
+  useEffect(()=>{ sb.from("state_zone_tbl").select("state").order("state").then(({data})=>setIndiaStateOptions((data||[]).map(r=>r.state).filter(Boolean))); },[]);
+  useEffect(()=>{
+    if(filters.countryLike==="India"){
+      if(!filters.stateLike){ setCityOptionsLive([]); return; }
+      sb.from("city_tbl").select("city").eq("state",filters.stateLike).order("city").then(({data})=>setCityOptionsLive((data||[]).map(r=>r.city)));
+    } else if(filters.countryLike){
+      sb.from("city_tbl").select("city").eq("country",filters.countryLike).is("state",null).order("city").then(({data})=>setCityOptionsLive((data||[]).map(r=>r.city)));
+    } else setCityOptionsLive([]);
+  },[filters.countryLike,filters.stateLike]);
 
   const load = useCallback(async()=>{
     setLoading(true);
@@ -23096,7 +23115,7 @@ function QuotesReportScreen({ user, onOpenQuote }){
     if(filters.dateTo && r.reference_date > filters.dateTo) return false;
     if(filters.refLike && r.reference_number!==filters.refLike) return false;
     if(filters.customerLike && r.customer_name!==filters.customerLike) return false;
-    if(filters.cityLike && r.city!==filters.cityLike) return false;
+    if(filters.cityLike && !r.city.toLowerCase().includes(filters.cityLike.toLowerCase())) return false;
     if(filters.stateLike && r.state!==filters.stateLike) return false;
     if(filters.countryLike && r.country!==filters.countryLike) return false;
     if(filters.zone && r.region!==filters.zone) return false;
@@ -23108,20 +23127,18 @@ function QuotesReportScreen({ user, onOpenQuote }){
 
   // Limit-to-list options (29 Aug) — derived from the unfiltered dataset
   // itself, not a separate master fetch, so the dropdowns only ever
-  // offer values that genuinely exist in this report. Country->State->
-  // City cascade: picking a Country narrows State/City to just that
-  // country's own rows.
+  // offer values that genuinely exist in this report — except Country/
+  // State/City, which use the real master lists (see above) since a
+  // report scoped to existing data looked broken with few real quotes
+  // on file.
   const distinct = (arr)=> Array.from(new Set(arr.filter(v=>v && v!=="—"))).sort();
-  const rowsForCountry = filters.countryLike ? rows.filter(r=>r.country===filters.countryLike) : rows;
   const refOptions = distinct(rows.map(r=>r.reference_number));
   const customerOptions = distinct(rows.map(r=>r.customer_name));
-  const countryOptions = distinct(rows.map(r=>r.country));
-  const cityOptions = distinct(rowsForCountry.map(r=>r.city));
-  const stateOptions = distinct(rowsForCountry.map(r=>r.state));
   const projectOptions = distinct(rows.map(r=>r.project_reference));
+  const stateOptions = filters.countryLike==="India" ? indiaStateOptions : [];
 
   const fld = (label, child)=> h("div",null, h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},label), child);
-  const combo = (key,options)=> h(LimitToListCombo,{value:filters[key],onChange:v=>{ setF(key,v); if(key==="countryLike"){ setF("stateLike",""); setF("cityLike",""); } },options,placeholder:"All",style:{...inputStyle,padding:"6px 8px",fontSize:12}});
+  const combo = (key,options,opts)=> h(LimitToListCombo,{value:filters[key],onChange:v=>{ setF(key,v); if(key==="countryLike"){ setF("stateLike",""); setF("cityLike",""); } if(key==="stateLike"){ setF("cityLike",""); } },options,placeholder:"All",style:{...inputStyle,padding:"6px 8px",fontSize:12},...opts});
 
   return h("div",{style:{padding:"20px 24px"}},
     h("h2",{style:{marginTop:0}},"Quotes Report"),
@@ -23131,9 +23148,12 @@ function QuotesReportScreen({ user, onOpenQuote }){
       fld("Reference No / Quote No", combo("refLike",refOptions)),
       fld("Customer Name", combo("customerLike",customerOptions)),
       fld("Project Reference", combo("projectLike",projectOptions)),
-      fld("Country", combo("countryLike",countryOptions)),
-      fld("State", combo("stateLike",stateOptions)),
-      fld("City", combo("cityLike",cityOptions)),
+      fld("Country", combo("countryLike",WORLD_COUNTRIES)),
+      fld("State", combo("stateLike",stateOptions,{disabled:filters.countryLike!=="India"})),
+      // City: real master list, but NOT limit-to-list — a genuine city
+      // can be missing from the seeded master, and this shouldn't block
+      // filtering by it.
+      fld("City", combo("cityLike",cityOptionsLive,{limitToList:false,disabled:!filters.countryLike})),
       fld("Region (Zone)", h("select",{value:filters.zone,onChange:e=>setF("zone",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), zoneOptions.map(z=>h("option",{key:z,value:z},z))
       )),
@@ -27606,6 +27626,11 @@ function App() {
   };
   const [masterData,setMasterData]=useState({models:[],customModelName:null,itemOptions:[],modelCatalog:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],uoms:[],allComponents:[],subAssembliesByComponent:new Map(),loadingMaster:true});
   const [quoteToOpen,setQuoteToOpen]=useState(null); // {reference_number,item_sl_no} bridge from Estimator's save popup to Quotes
+  // Back-to-Quotes-Report flag (29 Aug) — set when a quote is opened
+  // from that report specifically, so the Quotes screen can show a
+  // "Back to Quotes Report" button instead of always landing with no
+  // way back except the main nav.
+  const [cameFromQuotesReport,setCameFromQuotesReport]=useState(false);
   // Sale Order / Contract (24 Aug) — its own top-level tab, reusing the
   // exact SavedEstimates screen in mode="contract". saleOrderTarget is the
   // {reference_number,item_sl_no} to open (same shape as quoteToOpen,
@@ -27777,7 +27802,7 @@ function App() {
       "⚠ "+abandonedCount+" abandoned incomplete quote"+(abandonedCount===1?"":"s")+" — click to review"
     ),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,sessionCompany,onRefresh:refresh,onOpenQuote:(ref,slNo,openDatasheet)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo,openDatasheet:!!openDatasheet});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null),pendingNewSlNo,onConsumedPendingNewSlNo:()=>setPendingNewSlNo(null),onGoToTab:setTab})),
-    tab==="saved"?h(SavedEstimates,{user,sessionCompany,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo,headerFields)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo,headerFields:headerFields||null});setTab("estimator");},onOpenContract:openContract}):
+    tab==="saved"?h(SavedEstimates,{user,sessionCompany,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo,headerFields)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo,headerFields:headerFields||null});setTab("estimator");},onOpenContract:openContract,cameFromQuotesReport,onBackToQuotesReport:()=>{setCameFromQuotesReport(false); setTab("quotes_report");}}):
     tab==="sale_order_entry"?h(SaleOrderOfferPicker,{user,onOpenContract:openContract}):
     tab==="sale_order"?h(SavedEstimates,{user,sessionCompany,openTarget:saleOrderTarget,onConsumedTarget:()=>setSaleOrderTarget(null),onGoToTab:setTab,onNewSlNo:(ref,slNo,headerFields)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo,headerFields:headerFields||null});setTab("estimator");},mode:"contract",contractInfo:saleOrderContractInfo,onContractInfoChanged:refreshSaleOrderContractInfo,onOpenContract:openContract}):
     tab==="contract_number_setup"?h(ContractNumberSetupScreen,{user}):
@@ -27828,7 +27853,7 @@ function App() {
     tab==="enquiry_review"?h(EnquiryReviewScreen,{user}):
     tab==="gaps_dashboard"?h(GapsChaseDashboard,{user,onGoTo:goToEntityLookup}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
-    tab==="quotes_report"?h(QuotesReportScreen,{user,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}}):
+    tab==="quotes_report"?h(QuotesReportScreen,{user,onOpenQuote:(ref,slNo)=>{setCameFromQuotesReport(true); setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
     tab==="customers"?h(CustomersScreen,{user}):
