@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-29T16:36:48Z";
+  var APP_BUILD_VERSION = "2026-08-29T16:46:01Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -23000,7 +23000,7 @@ function MajorProjectsBulkImport({ user }){
 // (never had a real equivalent in this app). Reference No and Quote No
 // collapse into one field here — Flometriq has no separate concept for
 // the two, unlike the source screen.
-function QuotesReportScreen({ user }){
+function QuotesReportScreen({ user, onOpenQuote }){
   const [rows,setRows] = useState([]);
   const [loading,setLoading] = useState(true);
   const [zoneOptions,setZoneOptions] = useState([]);
@@ -23078,30 +23078,40 @@ function QuotesReportScreen({ user }){
   const filtered = rows.filter(r=>{
     if(filters.dateFrom && r.reference_date < filters.dateFrom) return false;
     if(filters.dateTo && r.reference_date > filters.dateTo) return false;
-    if(filters.refLike && !r.reference_number.toLowerCase().includes(filters.refLike.toLowerCase())) return false;
-    if(filters.customerLike && !r.customer_name.toLowerCase().includes(filters.customerLike.toLowerCase())) return false;
-    if(filters.cityLike && !r.city.toLowerCase().includes(filters.cityLike.toLowerCase())) return false;
-    if(filters.stateLike && !r.state.toLowerCase().includes(filters.stateLike.toLowerCase())) return false;
+    if(filters.refLike && r.reference_number!==filters.refLike) return false;
+    if(filters.customerLike && r.customer_name!==filters.customerLike) return false;
+    if(filters.cityLike && r.city!==filters.cityLike) return false;
+    if(filters.stateLike && r.state!==filters.stateLike) return false;
     if(filters.zone && r.region!==filters.zone) return false;
     if(filters.status && r.status!==filters.status) return false;
     if(filters.followUp && followUpBucket(r)!==filters.followUp) return false;
-    if(filters.projectLike && !r.project_reference.toLowerCase().includes(filters.projectLike.toLowerCase())) return false;
+    if(filters.projectLike && r.project_reference!==filters.projectLike) return false;
     return true;
   });
 
+  // Limit-to-list options (29 Aug) — derived from the unfiltered dataset
+  // itself, not a separate master fetch, so the dropdowns only ever
+  // offer values that genuinely exist in this report.
+  const distinct = (arr)=> Array.from(new Set(arr.filter(v=>v && v!=="—"))).sort();
+  const refOptions = distinct(rows.map(r=>r.reference_number));
+  const customerOptions = distinct(rows.map(r=>r.customer_name));
+  const cityOptions = distinct(rows.map(r=>r.city));
+  const stateOptions = distinct(rows.map(r=>r.state));
+  const projectOptions = distinct(rows.map(r=>r.project_reference));
+
   const fld = (label, child)=> h("div",null, h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},label), child);
-  const inp = (key,extra)=> h("input",{value:filters[key],onChange:e=>setF(key,e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12,...extra}});
+  const combo = (key,options)=> h(LimitToListCombo,{value:filters[key],onChange:v=>setF(key,v),options,placeholder:"All",style:{...inputStyle,padding:"6px 8px",fontSize:12}});
 
   return h("div",{style:{padding:"20px 24px"}},
     h("h2",{style:{marginTop:0}},"Quotes Report"),
     h("div",{style:{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:16,background:"#faf9f4",padding:14,borderRadius:8}},
       fld("Reference Date >=", h("input",{type:"date",value:filters.dateFrom,onChange:e=>setF("dateFrom",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
       fld("Reference Date <=", h("input",{type:"date",value:filters.dateTo,onChange:e=>setF("dateTo",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
-      fld("Reference No / Quote No", inp("refLike")),
-      fld("Customer Name", inp("customerLike")),
-      fld("Project Reference", inp("projectLike")),
-      fld("City", inp("cityLike")),
-      fld("State", inp("stateLike")),
+      fld("Reference No / Quote No", combo("refLike",refOptions)),
+      fld("Customer Name", combo("customerLike",customerOptions)),
+      fld("Project Reference", combo("projectLike",projectOptions)),
+      fld("City", combo("cityLike",cityOptions)),
+      fld("State", combo("stateLike",stateOptions)),
       fld("Region (Zone)", h("select",{value:filters.zone,onChange:e=>setF("zone",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), zoneOptions.map(z=>h("option",{key:z,value:z},z))
       )),
@@ -23116,12 +23126,14 @@ function QuotesReportScreen({ user }){
     h("div",{style:{overflowX:"auto"}},
       h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:12.5}},
         h("thead",null,h("tr",{style:{background:colors.bg,textAlign:"left"}},
-          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Status","Project Reference","Follow-up Stage","Next Follow-up"].map(c=>
+          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Status","Project Reference","Follow-up Stage","Next Follow-up",""].map(c=>
             h("th",{key:c,style:{padding:"7px 9px",borderBottom:"2px solid "+colors.dark,whiteSpace:"nowrap"}},c))
         )),
         h("tbody",null, filtered.map((r,i)=>h("tr",{key:r.reference_number,style:{borderBottom:"1px solid "+colors.border}},
           h("td",{style:{padding:"6px 9px"}},i+1),
-          h("td",{style:{padding:"6px 9px",fontWeight:600}},r.reference_number),
+          h("td",{style:{padding:"6px 9px",fontWeight:600}},
+            h("a",{href:"#",onClick:e=>{e.preventDefault(); onOpenQuote(r.reference_number,1);},style:{color:"#0c447c",textDecoration:"underline",cursor:"pointer"}},r.reference_number)
+          ),
           h("td",{style:{padding:"6px 9px"}},r.reference_date),
           h("td",{style:{padding:"6px 9px"}},r.customer_name),
           h("td",{style:{padding:"6px 9px"}},r.region),
@@ -23130,7 +23142,8 @@ function QuotesReportScreen({ user }){
           h("td",{style:{padding:"6px 9px"}},h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#e6f1fb",color:"#0c447c"}},r.status)),
           h("td",{style:{padding:"6px 9px"}},r.project_reference),
           h("td",{style:{padding:"6px 9px"}},r.followup_stage),
-          h("td",{style:{padding:"6px 9px"}},r.next_followup)
+          h("td",{style:{padding:"6px 9px"}},r.next_followup),
+          h("td",{style:{padding:"6px 9px"}},h("button",{onClick:()=>onOpenQuote(r.reference_number,1),style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Open"))
         )))
       ),
       filtered.length===0 && h("div",{style:{padding:20,color:colors.mutedLight,textAlign:"center"}},"No quotes match these filters."),
@@ -27793,7 +27806,7 @@ function App() {
     tab==="enquiry_review"?h(EnquiryReviewScreen,{user}):
     tab==="gaps_dashboard"?h(GapsChaseDashboard,{user,onGoTo:goToEntityLookup}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
-    tab==="quotes_report"?h(QuotesReportScreen,{user}):
+    tab==="quotes_report"?h(QuotesReportScreen,{user,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
     tab==="customers"?h(CustomersScreen,{user}):
