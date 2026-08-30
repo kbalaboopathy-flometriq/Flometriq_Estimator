@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-30T09:42:40Z";
+  var APP_BUILD_VERSION = "2026-08-30T10:01:30Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -151,7 +151,7 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
       const { data: existing } = await sb.from("quote_outcomes").select("id").eq("reference_number",referenceNumber).maybeSingle();
       if(existing) await sb.from("quote_outcomes").update(payload).eq("id",existing.id);
       else await sb.from("quote_outcomes").insert(payload);
-      const result = await updateQuoteStatusForQuote(referenceNumber,newStatus,user?.username||"unknown","status change",needsReason?draft.lost_reason:null);
+      const result = await applyOutcomeStatus(referenceNumber,newStatus,user?.username||"unknown","status change",needsReason?draft.lost_reason:null);
       if(result && result.blocked){ return; }
       await logAudit("UPDATE","quote_outcomes",referenceNumber,"Captured "+newStatus+" outcome details for Quote# "+referenceNumber,user?.username||"unknown",null,payload);
       onDone(newStatus);
@@ -15928,6 +15928,29 @@ async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, 
   }
   return { oldStatus };
 }
+// Legacy-aware Outcome dispatch (30 Aug) — a legacy quote has no BOM, no
+// Extra Price, no testing mode, none of the live-quote machinery above
+// makes sense for one. Checks which table the reference actually lives
+// in and takes the simple direct-update path for legacy, the full path
+// for live. The only entry point that can ever pass a legacy reference
+// is Log Follow-ups (legacy quotes never appear anywhere else), but
+// this stays generic rather than assuming that.
+async function applyOutcomeStatus(referenceNumber, newStatus, changedBy, source, reason){
+  const { data: liveRow } = await sb.from("estimates").select("id").eq("reference_number",referenceNumber).limit(1).maybeSingle();
+  if(liveRow) return await updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source, reason);
+  const { data: legacyRow } = await sb.from("legacy_quotes_tbl").select("id,quote_status").eq("reference_number",referenceNumber).maybeSingle();
+  if(legacyRow){
+    await sb.from("legacy_quotes_tbl").update({quote_status:newStatus, status_reason:reason||null}).eq("id",legacyRow.id);
+    await logAudit("UPDATE","legacy_quotes_tbl",referenceNumber,"Status changed from "+(legacyRow.quote_status||"Draft")+" to "+newStatus+" via "+source,changedBy,{quote_status:legacyRow.quote_status},{quote_status:newStatus});
+    return { oldStatus: legacyRow.quote_status };
+  }
+  return { oldStatus:null, notFound:true };
+}
+async function applyOutcomeNature(referenceNumber, nature){
+  const { data: liveRow } = await sb.from("estimates").select("id").eq("reference_number",referenceNumber).limit(1).maybeSingle();
+  if(liveRow){ await sb.from("estimates").update({quote_nature:nature}).eq("reference_number",referenceNumber); return; }
+  await sb.from("legacy_quotes_tbl").update({quote_nature:nature}).eq("reference_number",referenceNumber);
+}
 
 // Documents live in Supabase only while the quote is being actively worked
 // on. The moment every Sl No is out of Draft, the real files get deleted —
@@ -20421,6 +20444,9 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
   const [reviewOwner,setReviewOwner] = useState(user?.employee_name||user?.username||"");
   const [employeeOptions,setEmployeeOptions] = useState([]);
   const [reviewRows,setReviewRows] = useState([]);
+  // Notes-in-footer for Review too (30 Aug), matching Log Entries —
+  // tracks the real DB id of whichever row currently has focus.
+  const [reviewActiveId,setReviewActiveId] = useState(null);
   const [reviewLoading,setReviewLoading] = useState(false);
   useEffect(()=>{
     if(isAdminOrAbove) sb.from("employee_tbl").select("employee_name").order("employee_name").then(({data})=>setEmployeeOptions((data||[]).map(r=>r.employee_name)));
@@ -20570,9 +20596,19 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
   const refreshReferenceOptions = async(key,companyName,chaseWhat)=>{
     if(!companyName || chaseWhat==="Cold" || chaseWhat==="Payment"){ updateRow(key,{referenceOptions:[],chaseReference:""}); return; }
     if(chaseWhat==="Offer"){
+      const CLOSED = ["Won","Lost","Deferred","Went Cold"];
       const { data } = await sb.from("estimates").select("reference_number,quote_status").eq("customer_name",companyName);
-      const open = Array.from(new Map((data||[]).filter(r=>r.quote_status!=="Won"&&r.quote_status!=="Lost").map(r=>[r.reference_number,r])).values());
-      updateRow(key,{referenceOptions:open.map(r=>r.reference_number+" — "+r.quote_status)});
+      const open = Array.from(new Map((data||[]).filter(r=>!CLOSED.includes(r.quote_status)).map(r=>[r.reference_number,r])).values());
+      // Legacy quotes (30 Aug) — same customer, same open-status filter,
+      // shown alongside live quotes and tagged so it's clear which is
+      // which. Outcome on one of these is legacy-aware from here on —
+      // see applyOutcomeStatus.
+      const { data: legacy } = await sb.from("legacy_quotes_tbl").select("reference_number,quote_status").eq("customer_name",companyName);
+      const openLegacy = (legacy||[]).filter(r=>!CLOSED.includes(r.quote_status));
+      updateRow(key,{referenceOptions:
+        open.map(r=>r.reference_number+" — "+r.quote_status)
+          .concat(openLegacy.map(r=>r.reference_number+" — "+r.quote_status+" [Legacy]"))
+      });
     } else if(chaseWhat==="Order"){
       const { data } = await sb.from("sale_order_tbl").select("contract_number,status").eq("customer_name",companyName).neq("status","Despatched");
       updateRow(key,{referenceOptions:(data||[]).map(r=>r.contract_number+" — "+r.status)});
@@ -20658,15 +20694,16 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
         if(r._dirty || !r._savedId) await saveOneRowSilently(r);
         if(r.chaseWhat==="Offer" && r.outcome && refNumber){
           if(["Won","Lost","Deferred","Went Cold"].includes(r.outcome)) queue.push({referenceNumber:refNumber,newStatus:r.outcome});
-          else await updateQuoteStatusForQuote(refNumber, r.outcome, user.username, "Follow-up log");
+          else await applyOutcomeStatus(refNumber, r.outcome, user.username, "Follow-up log");
         } else if(r.chaseWhat==="Order" && r.outcome && refNumber){
           await sb.from("sale_order_tbl").update({status:r.outcome}).eq("contract_number",refNumber);
         }
         // Nature of Quote (29 Aug) — independent of Status Funnel, only
         // applies when Chase What is Offer; can also be set directly on
-        // the Quote screen itself, unlike Status Funnel.
+        // the Quote screen itself, unlike Status Funnel. Legacy-aware
+        // (30 Aug) — see applyOutcomeNature.
         if(r.chaseWhat==="Offer" && r.nature && refNumber){
-          await sb.from("estimates").update({quote_nature:r.nature}).eq("reference_number",refNumber);
+          await applyOutcomeNature(refNumber, r.nature);
         }
       }
       if(queue.length){ setWonLostQueue(queue.slice(1)); setOutcomeTarget(queue[0]); }
@@ -20849,8 +20886,14 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
         for(let d=new Date(reviewFrom+"T00:00:00"); d<=new Date(reviewTo+"T00:00:00"); d.setDate(d.getDate()+1)){
           days.push(d.toISOString().slice(0,10));
         }
-        const reviewTd = {padding:"4px 6px",border:"1px solid #e2ede9",fontSize:11};
-        return h("div",{style:{border:"1px solid "+T.border,borderRadius:8,overflow:"hidden"}},
+        // Same widths/columns as Log Entries, plus a locked Date column
+        // up front — never editable by anyone, any role, matching what
+        // was explicitly asked. Notes lives only in the footer here too,
+        // same as Log Entries, not as its own column.
+        const REVIEW_COLW = [80,280,100,90,150,130,320,90,180];
+        const activeReviewRow = reviewRows.find(r=>r.id===reviewActiveId);
+        return h(React.Fragment,null,
+        h("div",{style:{border:"1px solid "+T.border,borderRadius:8,overflow:"hidden",marginBottom:10}},
           days.map(dateStr=>{
             const entries = byDate.get(dateStr)||[];
             return h("div",{key:dateStr},
@@ -20858,40 +20901,59 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
                 h("span",null, new Date(dateStr+"T00:00:00").toDateString()+" — "+entries.length+" entr"+(entries.length===1?"y":"ies")),
                 entries.length===0 && !reviewIsReadOnly && h("button",{onClick:()=>jumpToDateForLogging(dateStr),style:{fontFamily:F,fontSize:10.5,padding:"4px 10px",background:T.accent,color:"#fff",border:"none",borderRadius:4,cursor:"pointer"}},"+ Log for this date")
               ),
-              entries.length>0 && h("table",{style:{borderCollapse:"collapse",width:"100%"}},
-                h("thead",null,h("tr",{style:{background:"#faf9f4"}},
-                  ["Customer","Mode","Chase","Reference","Contact","Discussed What","Next FU","Outcome","Notes",""].map(c=>h("th",{key:c,style:{...reviewTd,textAlign:"left",fontWeight:700}},c))
+              entries.length>0 && h("table",{style:{borderCollapse:"collapse",tableLayout:"fixed",width:"100%"}},
+                h("colgroup",null, REVIEW_COLW.map((w,i)=>h("col",{key:i,style:{width:w}}))),
+                h("thead",null,h("tr",{style:{background:"#eef6f3",height:43}},
+                  ["Date","Customer","Mode","Chase What","Reference","Contacted Whom","Discussed What","Next Follow up","Outcome"].map(c=>
+                    h("th",{key:c,style:{padding:"4px 6px",textAlign:"left",borderBottom:"1px solid "+T.border,borderRight:"1px solid #e2ede9"}},c))
                 )),
-                h("tbody",null, entries.map(e=>h("tr",{key:e.id},
-                  h("td",{style:reviewTd},e.company_name),
-                  h("td",{style:reviewTd}, reviewIsReadOnly ? e.activity_type :
-                    h("select",{value:e.activity_type||"",onChange:ev=>updateReviewField(e.id,"activity_type",ev.target.value),style:{fontSize:11,fontFamily:F}},
-                      ["In Person","Phone","Email","Others"].map(m=>h("option",{key:m,value:m},m))
+                h("tbody",null, entries.map((e,idx)=>{
+                  const oc = T.outcome ? T.outcome(e.outcome) : {bg:"#e6f1fb",fg:"#0c447c"};
+                  const zebra = idx%2===0 ? "#fff" : "#e6efec";
+                  const rowBg = e.id===reviewActiveId ? "#e3f3ec" : zebra;
+                  const onFocusReview = ()=>setReviewActiveId(e.id);
+                  const td = {padding:"2px 4px",border:"1px solid #e2ede9",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"};
+                  return h("tr",{key:e.id,style:{background:rowBg,height:33}},
+                    h("td",{style:{...td,color:T.muted}},
+                      new Date(e.activity_date+"T00:00:00").toLocaleDateString("en-GB",{day:"2-digit",month:"2-digit"}),
+                      isLateEntry(e) && h("span",{style:{marginLeft:4,fontSize:8.5,padding:"1px 5px",borderRadius:6,background:"#fdecea",color:"#a3312a"}},"late")
+                    ),
+                    h("td",{style:td,onFocus:onFocusReview,tabIndex:-1},e.company_name),
+                    h("td",{style:td}, reviewIsReadOnly ? e.activity_type :
+                      h("select",{value:e.activity_type||"",onFocus:onFocusReview,onChange:ev=>updateReviewField(e.id,"activity_type",ev.target.value),style:boxStyle({})},
+                        ["In Person","Phone","Email","Others"].map(m=>h("option",{key:m,value:m},m))
+                      )
+                    ),
+                    h("td",{style:td},e.chase_what),
+                    h("td",{style:td},e.chase_reference||"—"),
+                    h("td",{style:td},e.contacted_whom||"—"),
+                    h("td",{style:td}, reviewIsReadOnly ? e.discussed_what :
+                      h("input",{value:e.discussed_what||"",onFocus:onFocusReview,onChange:ev=>updateReviewField(e.id,"discussed_what",ev.target.value),style:boxStyle({})})
+                    ),
+                    h("td",{style:td}, reviewIsReadOnly ? (e.next_followup_date||"—") :
+                      h("input",{type:"date",value:e.next_followup_date||"",onFocus:onFocusReview,onChange:ev=>updateReviewField(e.id,"next_followup_date",ev.target.value),style:boxStyle({})})
+                    ),
+                    h("td",{style:{...td,background:oc.bg,color:oc.fg}}, reviewIsReadOnly ? (e.outcome||"—") :
+                      h("select",{value:e.outcome||"",onFocus:onFocusReview,onChange:ev=>updateReviewField(e.id,"outcome",ev.target.value),style:boxStyle({background:oc.bg,color:oc.fg})},
+                        h("option",{value:""},"— no change —"),
+                        (e.chase_what==="Offer"?quoteStatusOptions:soStatusOptions).map(s=>h("option",{key:s,value:s},s))
+                      )
                     )
-                  ),
-                  h("td",{style:reviewTd},e.chase_what),
-                  h("td",{style:reviewTd},e.chase_reference||"—"),
-                  h("td",{style:reviewTd},e.contacted_whom||"—"),
-                  h("td",{style:reviewTd}, reviewIsReadOnly ? e.discussed_what :
-                    h("input",{value:e.discussed_what||"",onChange:ev=>updateReviewField(e.id,"discussed_what",ev.target.value),style:{fontSize:11,fontFamily:F,width:140}})
-                  ),
-                  h("td",{style:reviewTd}, reviewIsReadOnly ? (e.next_followup_date||"—") :
-                    h("input",{type:"date",value:e.next_followup_date||"",onChange:ev=>updateReviewField(e.id,"next_followup_date",ev.target.value),style:{fontSize:11,fontFamily:F}})
-                  ),
-                  h("td",{style:reviewTd}, reviewIsReadOnly ? (e.outcome||"—") :
-                    h("select",{value:e.outcome||"",onChange:ev=>updateReviewField(e.id,"outcome",ev.target.value),style:{fontSize:11,fontFamily:F}},
-                      h("option",{value:""},"—"),
-                      (e.chase_what==="Offer"?quoteStatusOptions:soStatusOptions).map(s=>h("option",{key:s,value:s},s))
-                    )
-                  ),
-                  h("td",{style:reviewTd}, reviewIsReadOnly ? (e.notes||"—") :
-                    h("input",{value:e.notes||"",onChange:ev=>updateReviewField(e.id,"notes",ev.target.value),style:{fontSize:11,fontFamily:F,width:120}})
-                  ),
-                  h("td",{style:reviewTd}, isLateEntry(e) && h("span",{style:{fontSize:9.5,padding:"2px 8px",borderRadius:8,background:"#fdecea",color:"#a3312a"}},"⚠ late"))
-                )))
+                  );
+                }))
               )
             );
           })
+        ),
+        // Notes footer — same as Log Entries, bound to whichever row
+        // currently has focus, not its own column.
+        h("div",{style:{background:T.card,border:"1px solid "+T.border,borderTop:"3px solid "+T.accent,borderRadius:6,padding:"8px 10px"}},
+          h("p",{style:{margin:"0 0 4px",fontSize:14,fontWeight:"bold",color:T.ink}},
+            "Notes — ",h("span",{style:{color:T.accent}},activeReviewRow?.company_name||"(click a row)")," ",
+            h("span",{style:{fontWeight:"normal",color:T.muted,fontSize:11}},"(row in focus)")
+          ),
+          h("textarea",{rows:4,disabled:reviewIsReadOnly,value:activeReviewRow?.notes||"",onChange:e=>activeReviewRow&&updateReviewField(activeReviewRow.id,"notes",e.target.value),style:boxStyle({height:"auto",background:"#fffbe0"})})
+        )
         );
       })()
     ),
@@ -23749,7 +23811,7 @@ function MajorProjectsBulkImport({ user }){
 // (never had a real equivalent in this app). Reference No and Quote No
 // collapse into one field here — Flometriq has no separate concept for
 // the two, unlike the source screen.
-function QuotesReportScreen({ user, onOpenQuote }){
+function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   const [rows,setRows] = useState([]);
   const [loading,setLoading] = useState(true);
   const [zoneOptions,setZoneOptions] = useState([]);
@@ -23757,7 +23819,8 @@ function QuotesReportScreen({ user, onOpenQuote }){
   const [reportNatureOptions,setReportNatureOptions] = useState([]);
   const [filters,setFilters] = useState({
     dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"", countryLike:"",
-    zone:"", status:"", nature:"", followUp:"", projectLike:""
+    zone:"", status:"", nature:"", followUp:"", projectLike:"",
+    ...(initialFilters||{})
   });
   const setF = (k,v)=> setFilters(f=>({...f,[k]:v}));
   // Country->State->City (29 Aug fix) — pulls from the real master
@@ -23991,13 +24054,14 @@ function periodBounds(mode, customFrom, customTo){
   return {from:now.getFullYear()+"-01-01", to:now.getFullYear()+"-12-31"};
 }
 
-function CrmDashboardsScreen({ user }){
+function CrmDashboardsScreen({ user, onDrillToQuotesReport, onOpenQuote, onGoToTab }){
   const [periodMode,setPeriodMode] = useState("quarterly");
   const [customFrom,setCustomFrom] = useState(new Date(Date.now()-30*86400000).toISOString().slice(0,10));
   const [customTo,setCustomTo] = useState(new Date().toISOString().slice(0,10));
   const { from, to } = periodBounds(periodMode, customFrom, customTo);
   const [loading,setLoading] = useState(true);
   const [data,setData] = useState(null);
+  const [expandedCard,setExpandedCard] = useState(null); // toggles an inline detail list for cards with no real Quotes Report filter to drill into
 
   const load = useCallback(async()=>{
     setLoading(true);
@@ -24023,19 +24087,47 @@ function CrmDashboardsScreen({ user }){
 
       const { data: legacyRows } = await sb.from("legacy_quotes_tbl").select("reference_number,reference_date,quote_status");
 
-      setData({ quotes, activities, outcomes: outcomes||[], coByName, legacyRows: legacyRows||[] });
+      // Real ₹ values (30 Aug) — from the value snapshot table built
+      // earlier this session. A quote with no snapshot yet (never
+      // opened since that feature shipped) just shows no value rather
+      // than a wrong/guessed one.
+      const { data: snaps } = await sb.from("quote_value_snapshot_tbl").select("reference_number,total_value");
+      const valueByRef = new Map((snaps||[]).map(s=>[s.reference_number,Number(s.total_value)||0]));
+
+      setData({ quotes, activities, outcomes: outcomes||[], coByName, legacyRows: legacyRows||[], valueByRef });
     } finally { setLoading(false); }
   },[from,to]);
   useEffect(()=>{ load(); },[load]);
 
-  const card = (title, child)=> h("div",{style:{border:"1px solid #cfe3dd",borderRadius:8,padding:12}},
-    h("p",{style:{fontWeight:700,fontSize:12,margin:"0 0 8px"}},title), child
+  const fmtCr = (v)=>{
+    if(v>=10000000) return "₹"+(v/10000000).toFixed(2)+"Cr";
+    if(v>=100000) return "₹"+(v/100000).toFixed(1)+"L";
+    return "₹"+Math.round(v).toLocaleString("en-IN");
+  };
+  const card = (title, child, key)=> h("div",{style:{border:"1px solid #cfe3dd",borderRadius:8,padding:12}},
+    h("p",{style:{fontWeight:700,fontSize:12,margin:"0 0 8px"}},title), child,
+    key && h("button",{onClick:()=>setExpandedCard(c=>c===key?null:key),style:{fontSize:10,color:"#0f7a5c",background:"none",border:"none",cursor:"pointer",padding:0,marginTop:6}},expandedCard===key?"Hide detail ▲":"Show detail ▼")
   );
   const category = (title, cards)=> h("div",{style:{marginBottom:18}},
     h("p",{style:{fontSize:11,fontWeight:700,color:"#6b8e83",textTransform:"uppercase",letterSpacing:0.5,margin:"0 0 8px"}},title),
     h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:10}},cards)
   );
-  const line = (text, danger)=> h("p",{style:{fontSize:11,margin:"0 0 4px",color:danger?"#a3312a":"#333"}},text);
+  const line = (text, danger, onClick)=> h("p",{style:{fontSize:11,margin:"0 0 4px",color:danger?"#a3312a":"#333",cursor:onClick?"pointer":undefined,textDecoration:onClick?"underline":undefined},onClick},text);
+  const detailList = (items, render)=> h("div",{style:{marginTop:8,paddingTop:8,borderTop:"1px solid #eee",maxHeight:180,overflowY:"auto"}},
+    items.length===0 ? h("p",{style:{fontSize:10.5,color:"#8a9d97"}},"None.") : items.map((it,i)=>h("p",{key:i,style:{fontSize:10.5,margin:"0 0 3px"}},render(it)))
+  );
+  // Simple CSS bar chart — no charting library loaded in this app, and
+  // pulling one in for three charts wasn't worth the added dependency.
+  const barChart = (entries, valueFmt, onBarClick)=>{
+    const max = Math.max(1,...entries.map(([,v])=>v));
+    return h("div",{style:{display:"flex",alignItems:"end",gap:8,height:90,marginTop:4}},
+      entries.map(([label,v])=>h("div",{key:label,style:{flex:1,textAlign:"center",cursor:onBarClick?"pointer":undefined},onClick:onBarClick?()=>onBarClick(label):undefined},
+        h("div",{style:{fontSize:9.5,marginBottom:2}},valueFmt?valueFmt(v):v),
+        h("div",{style:{background:"#0f7a5c",height:Math.max(4,90*v/max),borderRadius:"2px 2px 0 0"}}),
+        h("div",{style:{fontSize:9,marginTop:3,color:"#6b8e83",wordBreak:"break-word"}},label)
+      ))
+    );
+  };
 
   return h("div",{style:{padding:"20px 24px"}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},
@@ -24050,41 +24142,43 @@ function CrmDashboardsScreen({ user }){
     ),
     h("p",{style:{fontSize:11,color:"#8a9d97",marginTop:-8,marginBottom:16}},"Showing "+from+" to "+to),
     loading || !data ? h("div",{style:{color:"#8a9d97"}},"Loading…") : (()=>{
-      const { quotes, activities, outcomes, coByName, legacyRows } = data;
+      const { quotes, activities, outcomes, coByName, legacyRows, valueByRef } = data;
       const CLOSED = ["Won","Lost","Deferred","Went Cold"];
       const isOpen = q=>!CLOSED.includes(q.quote_status);
       const changedInPeriod = q=>q.status_changed_at && q.status_changed_at.slice(0,10)>=from && q.status_changed_at.slice(0,10)<=to;
       const outcomeByRef = new Map(outcomes.map(o=>[o.reference_number,o]));
       const latestActByRef = new Map();
       activities.forEach(a=>{ if(a.chase_reference && !latestActByRef.has(a.chase_reference)) latestActByRef.set(a.chase_reference,a); });
+      const drillStatus = (status)=> onDrillToQuotesReport && onDrillToQuotesReport({status});
+      const drillZone = (zone)=> onDrillToQuotesReport && onDrillToQuotesReport({zone:zone==="Unknown"?"":zone});
 
-      // 1. Funnel with drop-off
-      const funnelCounts = {};
-      quotes.forEach(q=>{ funnelCounts[q.quote_status]=(funnelCounts[q.quote_status]||0)+1; });
+      // 1. Funnel with drop-off — count + real ₹ value, clickable stage
+      const funnelCounts = {}, funnelValue = {};
+      quotes.forEach(q=>{ funnelCounts[q.quote_status]=(funnelCounts[q.quote_status]||0)+1; funnelValue[q.quote_status]=(funnelValue[q.quote_status]||0)+(valueByRef.get(q.reference_number)||0); });
 
-      // 2. Stalled deals — open, no status change or activity in 21+ days
+      // 2. Stalled deals
       const staleCutoff = new Date(Date.now()-21*86400000);
       const stalled = quotes.filter(q=>isOpen(q) && (!q.status_changed_at || new Date(q.status_changed_at)<staleCutoff) &&
         !activities.some(a=>a.chase_reference===q.reference_number));
 
-      // 3. Orphaned quotes — zero activity ever chasing them (checked within loaded window)
+      // 3. Orphaned quotes
       const chasedRefs = new Set(activities.map(a=>a.chase_reference).filter(Boolean));
       const orphaned = quotes.filter(q=>isOpen(q) && !chasedRefs.has(q.reference_number) && !latestActByRef.has(q.reference_number));
 
-      // 4. Loss reason breakdown (status changed to Lost within period)
+      // 4. Loss reason breakdown
       const lostInPeriod = quotes.filter(q=>q.quote_status==="Lost" && changedInPeriod(q));
       const reasonCounts = {};
       lostInPeriod.forEach(q=>{ const r=q.status_reason||"(no reason given)"; reasonCounts[r]=(reasonCounts[r]||0)+1; });
 
       // 5. Competitor tracker
-      const competitorCounts = {};
-      lostInPeriod.forEach(q=>{ const o=outcomeByRef.get(q.reference_number); if(o?.competitor_name){ if(!competitorCounts[o.competitor_name]) competitorCounts[o.competitor_name]={count:0}; competitorCounts[o.competitor_name].count++; } });
+      const competitorCounts = {}, competitorQuotes = {};
+      lostInPeriod.forEach(q=>{ const o=outcomeByRef.get(q.reference_number); if(o?.competitor_name){ if(!competitorCounts[o.competitor_name]){ competitorCounts[o.competitor_name]={count:0}; competitorQuotes[o.competitor_name]=[]; } competitorCounts[o.competitor_name].count++; competitorQuotes[o.competitor_name].push(q); } });
 
-      // 6. Owner workload balance — most recent activity's logged_by, quote still open
-      const ownerLoad = {};
-      quotes.filter(isOpen).forEach(q=>{ const a=latestActByRef.get(q.reference_number); if(a?.logged_by){ ownerLoad[a.logged_by]=(ownerLoad[a.logged_by]||0)+1; } });
+      // 6. Owner workload balance
+      const ownerLoad = {}, ownerLoadQuotes = {};
+      quotes.filter(isOpen).forEach(q=>{ const a=latestActByRef.get(q.reference_number); if(a?.logged_by){ ownerLoad[a.logged_by]=(ownerLoad[a.logged_by]||0)+1; (ownerLoadQuotes[a.logged_by]=ownerLoadQuotes[a.logged_by]||[]).push(q); } });
 
-      // 7. Mode effectiveness — win rate by activity mode (latest activity on Won/Lost quotes changed in period)
+      // 7. Mode effectiveness
       const modeStats = {};
       quotes.filter(q=>(q.quote_status==="Won"||q.quote_status==="Lost")&&changedInPeriod(q)).forEach(q=>{
         const a=latestActByRef.get(q.reference_number); if(!a) return;
@@ -24092,28 +24186,37 @@ function CrmDashboardsScreen({ user }){
         modeStats[a.activity_type].total++; if(q.quote_status==="Won") modeStats[a.activity_type].won++;
       });
 
-      // 8. Zone/Country performance
+      // 8. Zone/Country performance — win rate + real ₹ won value
       const zoneStats = {};
       quotes.filter(q=>(q.quote_status==="Won"||q.quote_status==="Lost")&&changedInPeriod(q)).forEach(q=>{
         const zone = coByName.get(q.customer_name)?.zone||"Unknown";
-        if(!zoneStats[zone]) zoneStats[zone]={won:0,total:0};
-        zoneStats[zone].total++; if(q.quote_status==="Won") zoneStats[zone].won++;
+        if(!zoneStats[zone]) zoneStats[zone]={won:0,total:0,value:0};
+        zoneStats[zone].total++; if(q.quote_status==="Won"){ zoneStats[zone].won++; zoneStats[zone].value+=(valueByRef.get(q.reference_number)||0); }
       });
 
       // 9. Prospecting vs nurturing
       const coldCount = activities.filter(a=>a.chase_what==="Cold").length;
       const chaseCount = activities.filter(a=>a.chase_what==="Offer"||a.chase_what==="Order").length;
 
-      // 10. Deferred reactivation list
+      // 10. Deferred reactivation list — each row opens that quote directly
       const deferred = quotes.filter(q=>q.quote_status==="Deferred");
 
-      // 11. Legacy + Live trend — count created within period, both sources
-      const liveInPeriod = quotes.filter(q=>{ const d=(q.quote_date||q.created_at||"").slice(0,10); return d>=from && d<=to; }).length;
-      const legacyInPeriod = legacyRows.filter(l=>l.reference_date>=from && l.reference_date<=to).length;
+      // 11. Legacy + Live trend — real bucketed chart, not just 2 numbers
+      const spanDays = (new Date(to)-new Date(from))/86400000;
+      const byMonth = spanDays>45;
+      const buckets = [];
+      if(byMonth){ let d=new Date(from+"T00:00:00"); d.setDate(1); const end=new Date(to+"T00:00:00");
+        while(d<=end){ buckets.push(d.toISOString().slice(0,7)); d.setMonth(d.getMonth()+1); } }
+      else { for(let d=new Date(from+"T00:00:00"); d<=new Date(to+"T00:00:00"); d.setDate(d.getDate()+1)){ buckets.push(d.toISOString().slice(0,10)); } }
+      const bucketKey = (dateStr)=> byMonth ? dateStr.slice(0,7) : dateStr.slice(0,10);
+      const trendCounts = {};
+      buckets.forEach(b=>trendCounts[b]=0);
+      quotes.forEach(q=>{ const d=(q.quote_date||q.created_at||"").slice(0,10); if(d>=from&&d<=to){ const k=bucketKey(d); if(trendCounts[k]!=null) trendCounts[k]++; } });
+      legacyRows.forEach(l=>{ if(l.reference_date>=from&&l.reference_date<=to){ const k=bucketKey(l.reference_date); if(trendCounts[k]!=null) trendCounts[k]++; } });
 
-      // 12. Owner KPI Scorecard
+      // 12. Owner KPI Scorecard — with real Won ₹ value column
       const kpiByOwner = {};
-      activities.forEach(a=>{ const o=a.logged_by||"Unknown"; if(!kpiByOwner[o]) kpiByOwner[o]={calls:0,won:0,lost:0,late:0,closeDays:[]}; kpiByOwner[o].calls++; });
+      activities.forEach(a=>{ const o=a.logged_by||"Unknown"; if(!kpiByOwner[o]) kpiByOwner[o]={calls:0,won:0,lost:0,late:0,closeDays:[],wonValue:0}; kpiByOwner[o].calls++; });
       const isLateEntryRow = (row)=>{
         if(!row.created_at || !row.activity_date) return false;
         const loggedDate = new Date(row.created_at); loggedDate.setHours(0,0,0,0);
@@ -24123,50 +24226,67 @@ function CrmDashboardsScreen({ user }){
       activities.forEach(a=>{ if(isLateEntryRow(a) && kpiByOwner[a.logged_by]) kpiByOwner[a.logged_by].late++; });
       quotes.filter(q=>(q.quote_status==="Won"||q.quote_status==="Lost")&&changedInPeriod(q)).forEach(q=>{
         const o=q.status_changed_by; if(!o) return;
-        if(!kpiByOwner[o]) kpiByOwner[o]={calls:0,won:0,lost:0,late:0,closeDays:[]};
-        if(q.quote_status==="Won") kpiByOwner[o].won++; else kpiByOwner[o].lost++;
+        if(!kpiByOwner[o]) kpiByOwner[o]={calls:0,won:0,lost:0,late:0,closeDays:[],wonValue:0};
+        if(q.quote_status==="Won"){ kpiByOwner[o].won++; kpiByOwner[o].wonValue+=(valueByRef.get(q.reference_number)||0); } else kpiByOwner[o].lost++;
         const created = new Date(q.quote_date||q.created_at); const closed = new Date(q.status_changed_at);
         kpiByOwner[o].closeDays.push(Math.round((closed-created)/86400000));
       });
 
       return h(React.Fragment,null,
         category("Pipeline Health",[
-          card("Funnel with drop-off", Object.entries(funnelCounts).map(([s,c])=>line(s+" — "+c))),
-          card("Stalled deals (21+ days untouched)", stalled.length===0?line("None."):line(stalled.length+" quote(s) open with no recent activity",true)),
-          card("Orphaned quotes (never chased)", orphaned.length===0?line("None."):line(orphaned.length+" quote(s), zero follow-ups logged",true)),
+          card("Funnel with drop-off", h(React.Fragment,null,
+              barChart(Object.entries(funnelCounts), (v)=>v, drillStatus),
+              Object.entries(funnelCounts).map(([s,c])=>line(s+" — "+c+" ("+fmtCr(funnelValue[s]||0)+")",false,()=>drillStatus(s)))
+            )
+          ),
+          card("Stalled deals (21+ days untouched)", h(React.Fragment,null,
+            stalled.length===0?line("None."):line(stalled.length+" quote(s) open with no recent activity",true),
+            expandedCard==="stalled" && detailList(stalled, q=>q.reference_number+" — "+q.customer_name)
+          ), stalled.length>0 ? "stalled" : null),
+          card("Orphaned quotes (never chased)", h(React.Fragment,null,
+            orphaned.length===0?line("None."):line(orphaned.length+" quote(s), zero follow-ups logged",true),
+            expandedCard==="orphaned" && detailList(orphaned, q=>q.reference_number+" — "+q.customer_name)
+          ), orphaned.length>0 ? "orphaned" : null),
         ]),
         category("Competitive Intelligence",[
-          card("Loss reason breakdown", Object.keys(reasonCounts).length===0?line("No losses this period."):Object.entries(reasonCounts).map(([r,c])=>line(r+" — "+c))),
-          card("Competitor tracker", Object.keys(competitorCounts).length===0?line("No competitor data this period."):Object.entries(competitorCounts).map(([n,d])=>line(n+" — beat us "+d.count+"x"))),
+          card("Loss reason breakdown", Object.keys(reasonCounts).length===0?line("No losses this period."):barChart(Object.entries(reasonCounts))),
+          card("Competitor tracker", h(React.Fragment,null,
+            Object.keys(competitorCounts).length===0?line("No competitor data this period."):Object.entries(competitorCounts).map(([n,d])=>line(n+" — beat us "+d.count+"x")),
+            expandedCard==="competitor" && detailList(Object.entries(competitorQuotes).flatMap(([,qs])=>qs), q=>q.reference_number+" — "+q.customer_name)
+          ), Object.keys(competitorCounts).length>0 ? "competitor" : null),
         ]),
         category("People",[
-          card("Owner workload balance", Object.keys(ownerLoad).length===0?line("No data."):Object.entries(ownerLoad).sort((a,b)=>b[1]-a[1]).map(([o,c])=>line(o+" — "+c+" open account(s)"))),
+          card("Owner workload balance", h(React.Fragment,null,
+            Object.keys(ownerLoad).length===0?line("No data."):Object.entries(ownerLoad).sort((a,b)=>b[1]-a[1]).map(([o,c])=>line(o+" — "+c+" open account(s)")),
+            expandedCard==="ownerload" && detailList(Object.entries(ownerLoadQuotes).flatMap(([,qs])=>qs), q=>q.reference_number+" — "+q.customer_name)
+          ), Object.keys(ownerLoad).length>0 ? "ownerload" : null),
           card("Mode effectiveness", Object.keys(modeStats).length===0?line("No closed deals this period."):Object.entries(modeStats).map(([m,s])=>line(m+" — "+Math.round(100*s.won/s.total)+"% win rate ("+s.total+" closed)"))),
         ]),
         category("Geography and Segment",[
-          card("Zone / Region performance", Object.keys(zoneStats).length===0?line("No closed deals this period."):Object.entries(zoneStats).map(([z,s])=>line(z+" — "+Math.round(100*s.won/s.total)+"% win rate ("+s.total+" closed)"))),
+          card("Zone / Region performance", Object.keys(zoneStats).length===0?line("No closed deals this period."):Object.entries(zoneStats).map(([z,s])=>line(z+" — "+Math.round(100*s.won/s.total)+"% win rate ("+s.total+" closed, "+fmtCr(s.value)+" won)",false,()=>drillZone(z)))),
           card("Prospecting vs nurturing", h(React.Fragment,null, line("Cold — "+coldCount+" ("+((coldCount+chaseCount)?Math.round(100*coldCount/(coldCount+chaseCount)):0)+"%)"), line("Offer/Order follow-up — "+chaseCount))),
         ]),
         category("Time-based Trends",[
-          card("Deferred reactivation list", deferred.length===0?line("None currently deferred."):deferred.map(q=>line(q.reference_number+" — "+q.customer_name+" — "+(q.status_reason||"no reason logged")))),
-          card("Legacy + Live trend (this period)", h(React.Fragment,null, line("Live quotes — "+liveInPeriod), line("Legacy quotes — "+legacyInPeriod))),
+          card("Deferred reactivation list", deferred.length===0?line("None currently deferred."):deferred.map(q=>line(q.reference_number+" — "+q.customer_name+" — "+(q.status_reason||"no reason logged"),false,()=>onOpenQuote&&onOpenQuote(q.reference_number,1)))),
+          card("Legacy + Live trend (this period)", barChart(Object.entries(trendCounts))),
         ]),
         category("Owner KPI Scorecard",[
           h("div",{style:{gridColumn:"1 / -1",overflowX:"auto"}},
             h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:11.5}},
               h("thead",null,h("tr",{style:{background:"#eef6f3",textAlign:"left"}},
-                ["Owner","Calls logged","Win rate","Won","Avg. time to close","Late-entry rate"].map(c=>h("th",{key:c,style:{padding:"7px 9px"}},c))
+                ["Owner","Calls logged","Win rate","Won","Won value","Avg. time to close","Late-entry rate"].map(c=>h("th",{key:c,style:{padding:"7px 9px"}},c))
               )),
               h("tbody",null, Object.entries(kpiByOwner).map(([owner,k])=>{
                 const totalClosed = k.won+k.lost;
                 const winRate = totalClosed? Math.round(100*k.won/totalClosed)+"%" : "—";
                 const avgDays = k.closeDays.length? Math.round(k.closeDays.reduce((a,b)=>a+b,0)/k.closeDays.length)+" days" : "—";
                 const lateRate = k.calls? Math.round(100*k.late/k.calls)+"%" : "0%";
-                return h("tr",{key:owner,style:{borderTop:"1px solid #eee"}},
-                  h("td",{style:{padding:"7px 9px",fontWeight:600}},owner),
+                return h("tr",{key:owner,style:{borderTop:"1px solid #eee",cursor:onGoToTab?"pointer":undefined},onClick:()=>onGoToTab&&onGoToTab("followup_entry")},
+                  h("td",{style:{padding:"7px 9px",fontWeight:600,textDecoration:"underline",color:"#0c447c"}},owner),
                   h("td",{style:{padding:"7px 9px"}},k.calls),
                   h("td",{style:{padding:"7px 9px"}},winRate),
                   h("td",{style:{padding:"7px 9px"}},k.won),
+                  h("td",{style:{padding:"7px 9px"}},fmtCr(k.wonValue)),
                   h("td",{style:{padding:"7px 9px"}},avgDays),
                   h("td",{style:{padding:"7px 9px",color:k.late>0?"#a3312a":undefined}},lateRate)
                 );
@@ -28616,6 +28736,9 @@ function App() {
   // "Back to Quotes Report" button instead of always landing with no
   // way back except the main nav.
   const [cameFromQuotesReport,setCameFromQuotesReport]=useState(false);
+  // Dashboard drill-through (30 Aug) — clicking a Funnel stage or Zone
+  // line seeds Quotes Report's filters before navigating there.
+  const [dashboardDrillFilters,setDashboardDrillFilters]=useState(null);
   // Sale Order / Contract (24 Aug) — its own top-level tab, reusing the
   // exact SavedEstimates screen in mode="contract". saleOrderTarget is the
   // {reference_number,item_sl_no} to open (same shape as quoteToOpen,
@@ -28865,8 +28988,8 @@ function App() {
     tab==="enquiry_review"?h(EnquiryReviewScreen,{user}):
     tab==="gaps_dashboard"?h(GapsChaseDashboard,{user,onGoTo:goToEntityLookup}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
-    tab==="quotes_report"?h(QuotesReportScreen,{user,onOpenQuote:(ref,slNo)=>{setCameFromQuotesReport(true); setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}}):
-    tab==="crm_dashboards"?h(CrmDashboardsScreen,{user}):
+    tab==="quotes_report"?h(QuotesReportScreen,{user,initialFilters:dashboardDrillFilters,onOpenQuote:(ref,slNo)=>{setCameFromQuotesReport(true); setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}}):
+    tab==="crm_dashboards"?h(CrmDashboardsScreen,{user,onDrillToQuotesReport:(f)=>{setDashboardDrillFilters(f); setTab("quotes_report");},onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");},onGoToTab:setTab}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
     tab==="customers"?h(CustomersScreen,{user}):
