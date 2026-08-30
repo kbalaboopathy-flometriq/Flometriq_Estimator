@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-30T09:22:40Z";
+  var APP_BUILD_VERSION = "2026-08-30T09:42:40Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -20392,8 +20392,14 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
     contactedWhom:"", contactOptions:[], discussedWhat:"", nextFollowupDate:"", outcome:"", nature:"", notes:"",
     showNewContact:false, _savedId:null, _dirty:false,
   });
-  const [entryDate,setEntryDate] = useState(new Date().toISOString().slice(0,10));
+  const [entryDate,setEntryDate] = useState(""); // empty until the prompt is answered
   const [rows,setRows] = useState([blankRow()]);
+  // Date prompt (30 Aug) — replaces the silent inline date field.
+  // Starts open on mount so a date must be chosen before anything else.
+  const [showDatePrompt,setShowDatePrompt] = useState(true);
+  const [datePromptValue,setDatePromptValue] = useState(new Date().toISOString().slice(0,10));
+  const [datePromptError,setDatePromptError] = useState("");
+  const [loadingDate,setLoadingDate] = useState(false);
   const [quoteStatusOptions,setQuoteStatusOptions] = useState([]);
   const [soStatusOptions,setSoStatusOptions] = useState([]);
   const [natureOptions,setNatureOptions] = useState([]);
@@ -20440,8 +20446,42 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
     return loggedDate >= graceEnd;
   };
   const jumpToDateForLogging = (dateStr)=>{
+    setRows([blankRow()]);
     setEntryDate(dateStr);
+    setShowDatePrompt(false);
     setView("entry");
+  };
+  // Review inline editing (30 Aug) — immediate write on change, gated by
+  // reviewIsReadOnly. Deliberately does NOT re-trigger the Won/Lost/
+  // Deferred/Went Cold reason capture or the Nature-on-estimates update
+  // that Log Entries does — this edits the log entry itself, not the
+  // quote/order it was chasing. A real, separate step if that's needed
+  // later, not something to guess at silently here.
+  const updateReviewField = async(rowId, field, value)=>{
+    if(reviewIsReadOnly) return;
+    setReviewRows(rs=>rs.map(r=>r.id===rowId?{...r,[field]:value}:r));
+    const { error } = await sb.from("activity_log_tbl").update({[field]:value}).eq("id",rowId);
+    if(error) alert("Couldn't save that change: "+error.message);
+  };
+  const exportReviewExcel = ()=>{
+    const rowsOut = [["Date","Customer","Mode","Chase What","Reference","Contacted Whom","Discussed What","Next Follow up","Outcome","Notes","Owner"]];
+    reviewRows.forEach(r=>rowsOut.push([r.activity_date,r.company_name,r.activity_type,r.chase_what,r.chase_reference||"",r.contacted_whom||"",r.discussed_what||"",r.next_followup_date||"",r.outcome||"",r.notes||"",r.logged_by||""]));
+    const ws = XLSX.utils.aoa_to_sheet(rowsOut);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,"Follow-ups");
+    XLSX.writeFile(wb,"follow_ups_"+reviewFrom+"_to_"+reviewTo+".xlsx");
+  };
+  const exportReviewPdf = ()=>{
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation:"landscape", unit:"mm", format:"a4" });
+    doc.text("Follow-ups: "+reviewFrom+" to "+reviewTo,14,14);
+    doc.autoTable({
+      startY:20,
+      head:[["Date","Customer","Mode","Chase","Reference","Contact","Discussed What","Next FU","Outcome","Owner"]],
+      body:reviewRows.map(r=>[r.activity_date,r.company_name,r.activity_type,r.chase_what,r.chase_reference||"",r.contacted_whom||"",r.discussed_what||"",r.next_followup_date||"",r.outcome||"",r.logged_by||""]),
+      styles:{fontSize:8}
+    });
+    doc.save("follow_ups_"+reviewFrom+"_to_"+reviewTo+".pdf");
   };
 
   useEffect(()=>{
@@ -20551,6 +20591,55 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
     updateRow(key,{contactedWhom:contact.contact_name.trim(), contactOptions:row.contactOptions.concat([contact.contact_name.trim()]), showNewContact:false});
   };
 
+  // Date prompt confirmation (30 Aug) — replaces the silent inline
+  // field. If entries already exist for that date (this user's own),
+  // they're loaded fully editable — auto-save on row-blur applies to
+  // them exactly like a fresh entry. Otherwise starts a clean blank row.
+  const confirmDatePrompt = async()=>{
+    if(!datePromptValue){ setDatePromptError("Pick a date."); return; }
+    const today = new Date().toISOString().slice(0,10);
+    if(datePromptValue>today){ setDatePromptError("Can't be a future date."); return; }
+    setDatePromptError("");
+    setLoadingDate(true);
+    try{
+      const myName = user?.employee_name||user?.username;
+      const { data: existing } = await sb.from("activity_log_tbl").select("*").eq("activity_date",datePromptValue).eq("logged_by",myName).order("created_at",{ascending:true});
+      if(existing && existing.length){
+        const loaded = existing.map(dbRow=>({
+          _key: Math.random().toString(36).slice(2),
+          companyName: dbRow.company_name||"", mode: dbRow.activity_type||"Phone",
+          chaseWhat: dbRow.chase_what||"Offer", chaseReference: dbRow.chase_reference||"", referenceOptions:[],
+          contactedWhom: dbRow.contacted_whom||"", contactOptions:[], discussedWhat: dbRow.discussed_what||"",
+          nextFollowupDate: dbRow.next_followup_date||"", outcome: dbRow.outcome||"", nature:"", notes: dbRow.notes||"",
+          showNewContact:false, _savedId:dbRow.id, _dirty:false,
+        }));
+        setRows(loaded);
+        // Populate each loaded row's Reference/Contact dropdowns, and
+        // reconcile chaseReference to the matching "REF — STATUS"
+        // option string so the <select> shows the right value —
+        // falls back to the bare ref if that option no longer exists
+        // (e.g. the quote's status has since moved on).
+        for(const r of loaded){
+          if(!r.companyName) continue;
+          const { data: contactRows } = await sb.from("contacts").select("contact_name").eq("company_name",r.companyName);
+          updateRow(r._key,{contactOptions:(contactRows||[]).map(c=>c.contact_name), _dirty:false});
+          await refreshReferenceOptions(r._key,r.companyName,r.chaseWhat);
+          const bareRef = r.chaseReference;
+          setRows(rs=>rs.map(row=>{
+            if(row._key!==r._key) return row;
+            const match = (row.referenceOptions||[]).find(o=>o.split(" — ")[0]===bareRef);
+            return {...row, chaseReference: match||bareRef, _dirty:false};
+          }));
+        }
+      } else {
+        setRows([blankRow()]);
+      }
+      setEntryDate(datePromptValue);
+      setShowDatePrompt(false);
+      setActiveRowKey(null);
+    } finally { setLoadingDate(false); }
+  };
+
   const closeForTheDay = async()=>{
     for(const r of rows){
       if(!r.companyName.trim()){ alert("Every row needs a Customer."); return; }
@@ -20639,7 +20728,10 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
         h("button",{onClick:globalDelete,style:{fontFamily:F,fontSize:11,padding:"6px 12px",background:"#fff",color:"#a3312a",border:"1px solid #a3312a",borderRadius:5,cursor:"pointer"}},"Clear all"),
         h("div",null,
           h("p",{style:{margin:0,fontSize:8.5,color:T.muted}},"Date of Entry"),
-          h("input",{type:"date",value:entryDate,onChange:e=>setEntryDate(e.target.value),style:boxStyle({width:"auto"})})
+          h("div",{style:{display:"flex",alignItems:"center",gap:6}},
+            h("span",{style:{fontFamily:F,fontSize:14,fontWeight:"bold",color:T.ink}},entryDate||"—"),
+            h("button",{onClick:()=>{setDatePromptValue(entryDate||new Date().toISOString().slice(0,10)); setDatePromptError(""); setShowDatePrompt(true);},style:{fontFamily:F,fontSize:10,padding:"2px 8px",background:"#fff",border:"1px solid "+T.accent,color:T.accent,borderRadius:3,cursor:"pointer"}},"Change date")
+          )
         )
       )
     ),
@@ -20650,7 +20742,8 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
       h("button",{onClick:()=>setView("review"),style:{fontFamily:F,fontSize:12,padding:"6px 14px",background:view==="review"?T.accent:"#fff",color:view==="review"?"#fff":T.ink,border:"1px solid "+T.accent,borderRadius:4,cursor:"pointer"}},"Review")
     ),
 
-    view==="entry" && h(React.Fragment,null,
+    view==="entry" && !entryDate && h("div",{style:{textAlign:"center",color:T.muted,padding:40}},"Pick a date to begin."),
+    view==="entry" && entryDate && h(React.Fragment,null,
     // Tabular grid — single row per entry, fixed pixel column widths,
     // zebra striping, Outcome cell colored by value, Notes removed
     // entirely from the row (lives only in the footer below).
@@ -20733,7 +20826,7 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
     // jump back and log a day that got missed entirely. Late-entry
     // badge shown per row (logged more than 1 day after the visit).
     view==="review" && h("div",null,
-      h("div",{style:{display:"flex",gap:10,alignItems:"end",background:"#faf9f4",padding:12,borderRadius:8,marginBottom:14}},
+      h("div",{style:{display:"flex",gap:10,alignItems:"end",background:"#faf9f4",padding:12,borderRadius:8,marginBottom:14,flexWrap:"wrap"}},
         h("div",null, h("p",{style:{margin:"0 0 3px",fontSize:9,color:T.sub}},"From"), h("input",{type:"date",value:reviewFrom,onChange:e=>setReviewFrom(e.target.value),style:boxStyle({width:"auto"})})),
         h("div",null, h("p",{style:{margin:"0 0 3px",fontSize:9,color:T.sub}},"To"), h("input",{type:"date",value:reviewTo,onChange:e=>setReviewTo(e.target.value),style:boxStyle({width:"auto"})})),
         isAdminOrAbove && h("div",null, h("p",{style:{margin:"0 0 3px",fontSize:9,color:T.sub}},"Owner"),
@@ -20742,7 +20835,11 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
             employeeOptions.map(n=>h("option",{key:n,value:n},n))
           )
         ),
-        reviewIsReadOnly && h("span",{style:{fontSize:11,color:"#a3312a",fontWeight:600}},"Read-only — viewing another user's data")
+        h("div",{style:{marginLeft:"auto",display:"flex",gap:6}},
+          h("button",{onClick:exportReviewExcel,style:{fontFamily:F,fontSize:11,padding:"6px 12px",background:"#fff",border:"1px solid "+T.accent,color:T.accent,borderRadius:4,cursor:"pointer"}},"⬇ Excel"),
+          h("button",{onClick:exportReviewPdf,style:{fontFamily:F,fontSize:11,padding:"6px 12px",background:"#fff",border:"1px solid "+T.accent,color:T.accent,borderRadius:4,cursor:"pointer"}},"⬇ PDF")
+        ),
+        reviewIsReadOnly && h("span",{style:{fontSize:11,color:"#a3312a",fontWeight:600,width:"100%"}},"Read-only — viewing another user's data")
       ),
       reviewLoading ? h("div",{style:{color:T.muted}},"Loading…") :
       (()=>{
@@ -20752,6 +20849,7 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
         for(let d=new Date(reviewFrom+"T00:00:00"); d<=new Date(reviewTo+"T00:00:00"); d.setDate(d.getDate()+1)){
           days.push(d.toISOString().slice(0,10));
         }
+        const reviewTd = {padding:"4px 6px",border:"1px solid #e2ede9",fontSize:11};
         return h("div",{style:{border:"1px solid "+T.border,borderRadius:8,overflow:"hidden"}},
           days.map(dateStr=>{
             const entries = byDate.get(dateStr)||[];
@@ -20760,16 +20858,55 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
                 h("span",null, new Date(dateStr+"T00:00:00").toDateString()+" — "+entries.length+" entr"+(entries.length===1?"y":"ies")),
                 entries.length===0 && !reviewIsReadOnly && h("button",{onClick:()=>jumpToDateForLogging(dateStr),style:{fontFamily:F,fontSize:10.5,padding:"4px 10px",background:T.accent,color:"#fff",border:"none",borderRadius:4,cursor:"pointer"}},"+ Log for this date")
               ),
-              entries.map(e=>h("div",{key:e.id,style:{padding:"8px 12px",borderTop:"1px solid #eee",display:"flex",justifyContent:"space-between",alignItems:"center"}},
-                h("span",null, e.company_name+" — "+e.activity_type+" — "+(e.outcome||e.chase_what)),
-                isLateEntry(e) && h("span",{style:{fontSize:9.5,padding:"2px 8px",borderRadius:8,background:"#fdecea",color:"#a3312a"}},"⚠ Logged late")
-              ))
+              entries.length>0 && h("table",{style:{borderCollapse:"collapse",width:"100%"}},
+                h("thead",null,h("tr",{style:{background:"#faf9f4"}},
+                  ["Customer","Mode","Chase","Reference","Contact","Discussed What","Next FU","Outcome","Notes",""].map(c=>h("th",{key:c,style:{...reviewTd,textAlign:"left",fontWeight:700}},c))
+                )),
+                h("tbody",null, entries.map(e=>h("tr",{key:e.id},
+                  h("td",{style:reviewTd},e.company_name),
+                  h("td",{style:reviewTd}, reviewIsReadOnly ? e.activity_type :
+                    h("select",{value:e.activity_type||"",onChange:ev=>updateReviewField(e.id,"activity_type",ev.target.value),style:{fontSize:11,fontFamily:F}},
+                      ["In Person","Phone","Email","Others"].map(m=>h("option",{key:m,value:m},m))
+                    )
+                  ),
+                  h("td",{style:reviewTd},e.chase_what),
+                  h("td",{style:reviewTd},e.chase_reference||"—"),
+                  h("td",{style:reviewTd},e.contacted_whom||"—"),
+                  h("td",{style:reviewTd}, reviewIsReadOnly ? e.discussed_what :
+                    h("input",{value:e.discussed_what||"",onChange:ev=>updateReviewField(e.id,"discussed_what",ev.target.value),style:{fontSize:11,fontFamily:F,width:140}})
+                  ),
+                  h("td",{style:reviewTd}, reviewIsReadOnly ? (e.next_followup_date||"—") :
+                    h("input",{type:"date",value:e.next_followup_date||"",onChange:ev=>updateReviewField(e.id,"next_followup_date",ev.target.value),style:{fontSize:11,fontFamily:F}})
+                  ),
+                  h("td",{style:reviewTd}, reviewIsReadOnly ? (e.outcome||"—") :
+                    h("select",{value:e.outcome||"",onChange:ev=>updateReviewField(e.id,"outcome",ev.target.value),style:{fontSize:11,fontFamily:F}},
+                      h("option",{value:""},"—"),
+                      (e.chase_what==="Offer"?quoteStatusOptions:soStatusOptions).map(s=>h("option",{key:s,value:s},s))
+                    )
+                  ),
+                  h("td",{style:reviewTd}, reviewIsReadOnly ? (e.notes||"—") :
+                    h("input",{value:e.notes||"",onChange:ev=>updateReviewField(e.id,"notes",ev.target.value),style:{fontSize:11,fontFamily:F,width:120}})
+                  ),
+                  h("td",{style:reviewTd}, isLateEntry(e) && h("span",{style:{fontSize:9.5,padding:"2px 8px",borderRadius:8,background:"#fdecea",color:"#a3312a"}},"⚠ late"))
+                )))
+              )
             );
           })
         );
       })()
     ),
 
+    showDatePrompt && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1400,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 24px",width:320,fontFamily:F}},
+        h("p",{style:{fontWeight:"bold",fontSize:14,margin:"0 0 10px"}},"Which date are you logging?"),
+        h("input",{type:"date",value:datePromptValue,max:new Date().toISOString().slice(0,10),onChange:e=>{setDatePromptValue(e.target.value); setDatePromptError("");},style:{...boxStyle({width:"100%"}),fontSize:13,height:32}}),
+        datePromptError && h("p",{style:{fontSize:11,color:"#a3312a",margin:"6px 0 0"}},"⚠ "+datePromptError),
+        h("div",{style:{display:"flex",gap:8,marginTop:14}},
+          entryDate && h("button",{onClick:()=>setShowDatePrompt(false),disabled:loadingDate,style:{flex:1,fontFamily:F,fontSize:12,padding:7,background:"#fff",border:"1px solid #ccc",borderRadius:4,cursor:"pointer"}},"Cancel"),
+          h("button",{onClick:confirmDatePrompt,disabled:loadingDate,style:{flex:1,fontFamily:F,fontSize:12,padding:7,background:T.accent,color:"#fff",border:"none",borderRadius:4,cursor:"pointer",opacity:loadingDate?0.6:1}},loadingDate?"Loading…":"Enter date")
+        )
+      )
+    ),
     rows.filter(r=>r.showNewContact).map(r=>h(NewContactQuickModal,{
       key:r._key+"_modal", companyName:r.companyName,
       onCancel:()=>updateRow(r._key,{showNewContact:false}),
