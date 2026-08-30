@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-30T02:39:30Z";
+  var APP_BUILD_VERSION = "2026-08-30T03:08:25Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1375,7 +1375,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Rules", tabs:[{key:"item_moc_rules",label:"Datasheet MOC"},{key:"description_master",label:"Description"}] }
     ]});
     groups.push({ label:"Admin", subgroups:[
-      { label:"Company", tabs:[{key:"company_master",label:"Company Master"},{key:"gst_structures",label:"GST Structures"},{key:"gst_variance_report",label:"GST Variance Report"},{key:"contract_number_setup",label:"Contract Numbering"},{key:"sale_order_status_tbl",label:"Sale Order Status"},{key:"doc_status_master",label:"Document Status Master"}] },
+      { label:"Company", tabs:[{key:"company_master",label:"Company Master"},{key:"gst_structures",label:"GST Structures"},{key:"gst_variance_report",label:"GST Variance Report"},{key:"contract_number_setup",label:"Contract Numbering"},{key:"sale_order_status_tbl",label:"Sale Order Status"},{key:"doc_status_master",label:"Document Status Master"},{key:"data_quality_flags",label:"Data Quality Flags"}] },
       { label:"Access control", tabs:[
         {key:"users",label:"Users"},
         {key:"permissions",label:"Permissions"},
@@ -18623,6 +18623,62 @@ function VersionHistoryScreen(){
 // fell through to green ("no action pending"), which is backwards for
 // something like a brand-new "Our Action Pending" label. This screen is
 // the fix: label and bucket are always set together.
+// Data Quality Flags (30 Aug) — consolidates every "something needs
+// attention" flag built across this app into one Super Admin screen,
+// instead of four scattered reminders each requiring its own hunt:
+// Draft quotes, Billing Address overrides, Document sequence breaks,
+// and now late-logged follow-up entries.
+function DataQualityFlagsScreen({ user }){
+  if(user.role!=="super_admin") return h("div",{style:{padding:"20px 24px",color:colors.mutedLight}},"Super Admin only.");
+  const [draftQuotes,setDraftQuotes] = useState([]);
+  const [billingOverrides,setBillingOverrides] = useState([]);
+  const [sequenceFlags,setSequenceFlags] = useState([]);
+  const [lateEntries,setLateEntries] = useState([]);
+  const [loading,setLoading] = useState(true);
+  useEffect(()=>{
+    (async()=>{
+      setLoading(true);
+      const [{data:drafts},{data:overrides},{data:seq},{data:acts}] = await Promise.all([
+        sb.from("estimates").select("reference_number,customer_name,created_at").eq("quote_status","Draft").order("created_at",{ascending:false}).limit(100),
+        sb.from("sale_order_tbl").select("contract_number,customer_name").eq("billing_address_overridden",true).is("billing_address",null),
+        sb.from("universal_documents_tbl").select("doc_number,entity_id,sequence_flag_note").eq("sequence_flagged",true),
+        sb.from("activity_log_tbl").select("id,company_name,logged_by,activity_date,created_at").order("created_at",{ascending:false}).limit(500),
+      ]);
+      const byRef = new Map();
+      (drafts||[]).forEach(d=>{ if(!byRef.has(d.reference_number)) byRef.set(d.reference_number,d); });
+      setDraftQuotes(Array.from(byRef.values()));
+      setBillingOverrides(overrides||[]);
+      setSequenceFlags(seq||[]);
+      const isLate = (row)=>{
+        if(!row.created_at || !row.activity_date) return false;
+        const loggedDate = new Date(row.created_at); loggedDate.setHours(0,0,0,0);
+        const visitDate = new Date(row.activity_date+"T00:00:00");
+        return loggedDate >= new Date(visitDate.getTime()+2*86400000);
+      };
+      setLateEntries((acts||[]).filter(isLate));
+      setLoading(false);
+    })();
+  },[]);
+  const section = (title, count, rows, renderRow)=> h("div",{style:{marginBottom:20}},
+    h("div",{style:{fontSize:13,fontWeight:700,marginBottom:8,display:"flex",alignItems:"center",gap:8}},
+      title, h("span",{style:{fontSize:11,padding:"2px 8px",borderRadius:8,background:count>0?"#fdecea":"#eaf9f4",color:count>0?"#a3312a":"#085041"}},count)
+    ),
+    count===0 ? h("div",{style:{fontSize:11.5,color:colors.mutedLight}},"Nothing flagged.") :
+    h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+      rows.map((r,i)=>h("div",{key:i,style:{padding:"7px 12px",borderTop:i?"1px solid #eee":"none",fontSize:12}},renderRow(r)))
+    )
+  );
+  return h("div",{style:{padding:"20px 24px"}},
+    h("h2",{style:{marginTop:0}},"Data Quality Flags"),
+    loading ? h("div",{style:{color:colors.mutedLight}},"Loading…") : h(React.Fragment,null,
+      section("Draft Quotes", draftQuotes.length, draftQuotes, d=>d.reference_number+" — "+(d.customer_name||"—")),
+      section("Billing Address Overrides", billingOverrides.length, billingOverrides, b=>b.contract_number+" — "+(b.customer_name||"—")),
+      section("Document Sequence Breaks", sequenceFlags.length, sequenceFlags, s=>s.doc_number+" ("+s.entity_id+") — "+(s.sequence_flag_note||"—")),
+      section("Late Follow-up Entries", lateEntries.length, lateEntries, e=>e.company_name+" — logged by "+e.logged_by+" — visit date "+e.activity_date)
+    )
+  );
+}
+
 function DocStatusEditor({ user }){
   const [rows,setRows] = useState([]);
   const [loading,setLoading] = useState(true);
@@ -19994,7 +20050,7 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
     _key: Math.random().toString(36).slice(2),
     companyName:"", mode:"Phone", chaseWhat:"Offer", chaseReference:"", referenceOptions:[],
     contactedWhom:"", contactOptions:[], discussedWhat:"", nextFollowupDate:"", outcome:"", nature:"", notes:"",
-    showNewContact:false,
+    showNewContact:false, _savedId:null, _dirty:false,
   });
   const [entryDate,setEntryDate] = useState(new Date().toISOString().slice(0,10));
   const [rows,setRows] = useState([blankRow()]);
@@ -20007,6 +20063,46 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
   // Notes lives only in the page footer now (29 Aug), bound to whichever
   // row currently has focus — set on any field's onFocus within a row.
   const [activeRowKey,setActiveRowKey] = useState(null);
+  const rowsRef = useRef(rows); rowsRef.current = rows;
+  const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
+  // Review tab (30 Aug) — separate from the entry form entirely. Date
+  // range + Owner filter (Admin/Super Admin only, since a plain user
+  // only ever needs their own history). Admin viewing someone else's
+  // data is read-only; Super Admin gets full edit rights either way.
+  const [view,setView] = useState("entry"); // "entry" | "review"
+  const [reviewFrom,setReviewFrom] = useState(new Date(Date.now()-6*86400000).toISOString().slice(0,10));
+  const [reviewTo,setReviewTo] = useState(new Date().toISOString().slice(0,10));
+  const [reviewOwner,setReviewOwner] = useState(user?.employee_name||user?.username||"");
+  const [employeeOptions,setEmployeeOptions] = useState([]);
+  const [reviewRows,setReviewRows] = useState([]);
+  const [reviewLoading,setReviewLoading] = useState(false);
+  useEffect(()=>{
+    if(isAdminOrAbove) sb.from("employee_tbl").select("employee_name").order("employee_name").then(({data})=>setEmployeeOptions((data||[]).map(r=>r.employee_name)));
+  },[isAdminOrAbove]);
+  const reviewIsReadOnly = isAdminOrAbove && user.role==="admin" && reviewOwner!==(user?.employee_name||user?.username);
+  const loadReview = useCallback(async()=>{
+    setReviewLoading(true);
+    try{
+      let q = sb.from("activity_log_tbl").select("*").gte("activity_date",reviewFrom).lte("activity_date",reviewTo).order("activity_date",{ascending:true});
+      if(reviewOwner) q = q.eq("logged_by",reviewOwner);
+      const { data } = await q;
+      setReviewRows(data||[]);
+    } finally { setReviewLoading(false); }
+  },[reviewFrom,reviewTo,reviewOwner]);
+  useEffect(()=>{ if(view==="review") loadReview(); },[view,loadReview]);
+  // Late entry: logged more than 1 day after the date it represents —
+  // one full day of grace, matching "same day or next day is fine."
+  const isLateEntry = (row)=>{
+    if(!row.created_at || !row.activity_date) return false;
+    const loggedDate = new Date(row.created_at); loggedDate.setHours(0,0,0,0);
+    const visitDate = new Date(row.activity_date+"T00:00:00");
+    const graceEnd = new Date(visitDate.getTime()+2*86400000); // visit date + 2 days = 1 day of grace past next-day
+    return loggedDate >= graceEnd;
+  };
+  const jumpToDateForLogging = (dateStr)=>{
+    setEntryDate(dateStr);
+    setView("entry");
+  };
 
   useEffect(()=>{
     sb.from("quote_status_tbl").select("status").then(({data})=>setQuoteStatusOptions((data||[]).map(r=>r.status)));
@@ -20016,7 +20112,56 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
 
   const addRow = ()=> setRows(rs=>rs.concat([blankRow()]));
   const removeRow = (key)=> setRows(rs=>rs.length>1 ? rs.filter(r=>r._key!==key) : rs);
-  const updateRow = (key,patch)=> setRows(rs=>rs.map(r=>r._key===key?{...r,...patch}:r));
+  const updateRow = (key,patch)=> setRows(rs=>rs.map(r=>r._key===key?{...r,...patch,_dirty:true}:r));
+  // Global Delete (30 Aug) — clears today's in-progress session on
+  // screen, not any historical data. A fresh confirm since it discards
+  // anything not yet auto-saved.
+  const globalDelete = ()=>{
+    if(!confirm("Clear every row on screen? Anything not yet saved will be lost.")) return;
+    setRows([blankRow()]);
+    setActiveRowKey(null);
+  };
+  const rowHasMinimumFields = (r)=> r.companyName.trim() && r.discussedWhat.trim() && r.nextFollowupDate &&
+    !((r.chaseWhat==="Offer"||r.chaseWhat==="Order") && !r.chaseReference);
+  // Silent auto-save (30 Aug) — fires when focus leaves a row that's
+  // dirty and has the minimum fields to be worth saving. No prompt, no
+  // confirmation. A row not yet complete enough just stays unsaved
+  // until it is — this never nags about an in-progress row.
+  const saveOneRowSilently = async(row)=>{
+    if(!row || !row._dirty || !rowHasMinimumFields(row)) return;
+    const refNumber = row.chaseReference ? row.chaseReference.split(" — ")[0] : null;
+    const payload = {
+      company_name:row.companyName, activity_type:row.mode, chase_what:row.chaseWhat, chase_reference:refNumber,
+      contacted_whom:row.contactedWhom||null, discussed_what:row.discussedWhat.trim(), outcome:row.outcome||"",
+      notes:row.notes||"", activity_date:entryDate, next_followup_date:row.nextFollowupDate,
+      logged_by:user?.username||"unknown"
+    };
+    if(row._savedId){
+      await sb.from("activity_log_tbl").update(payload).eq("id",row._savedId);
+    } else {
+      const { data: recent } = await sb.from("activity_log_tbl").select("id").eq("company_name",row.companyName).order("created_at",{ascending:false}).limit(1);
+      const { data: inserted } = await sb.from("activity_log_tbl").insert({...payload, is_followup_of: recent&&recent[0]?recent[0].id:null}).select("id").single();
+      if(inserted) updateRow(row._key,{_savedId:inserted.id});
+    }
+    setRows(rs=>rs.map(r=>r._key===row._key?{...r,_dirty:false}:r));
+  };
+  const setActiveRowKeyWithAutoSave = (newKey)=>{
+    const prev = rowsRef.current.find(r=>r._key===activeRowKey);
+    if(prev && prev._key!==newKey) saveOneRowSilently(prev);
+    setActiveRowKey(newKey);
+  };
+  // Unsaved-changes guard (30 Aug) — only for rows that could never
+  // auto-save (missing minimum fields), since anything complete enough
+  // already saved itself the moment focus left it.
+  useEffect(()=>{
+    const handler = (e)=>{
+      if(rowsRef.current.some(r=>r._dirty && !rowHasMinimumFields(r) && (r.companyName||r.discussedWhat||r.notes))){
+        e.preventDefault(); e.returnValue="";
+      }
+    };
+    window.addEventListener("beforeunload",handler);
+    return ()=>window.removeEventListener("beforeunload",handler);
+  },[]);
 
   const onCompanyChange = async(key,companyName)=>{
     updateRow(key,{companyName, chaseReference:"", contactedWhom:"", referenceOptions:[], contactOptions:[]});
@@ -20061,13 +20206,10 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
       const queue = [];
       for(const r of rows){
         const refNumber = r.chaseReference ? r.chaseReference.split(" — ")[0] : null;
-        const { data: recent } = await sb.from("activity_log_tbl").select("id").eq("company_name",r.companyName).order("created_at",{ascending:false}).limit(1);
-        await sb.from("activity_log_tbl").insert({
-          company_name:r.companyName, activity_type:r.mode, chase_what:r.chaseWhat, chase_reference:refNumber,
-          contacted_whom:r.contactedWhom||null, discussed_what:r.discussedWhat.trim(), outcome:r.outcome||"",
-          notes:r.notes||"", activity_date:entryDate, next_followup_date:r.nextFollowupDate,
-          is_followup_of: recent&&recent[0]?recent[0].id:null, logged_by:user?.username||"unknown"
-        });
+        // Row-level fields (Won/Lost/Deferred/Went Cold, Nature) still
+        // need applying here even for rows that already auto-saved —
+        // auto-save only wrote the activity_log_tbl entry itself.
+        if(r._dirty || !r._savedId) await saveOneRowSilently(r);
         if(r.chaseWhat==="Offer" && r.outcome && refNumber){
           if(["Won","Lost","Deferred","Went Cold"].includes(r.outcome)) queue.push({referenceNumber:refNumber,newStatus:r.outcome});
           else await updateQuoteStatusForQuote(refNumber, r.outcome, user.username, "Follow-up log");
@@ -20130,6 +20272,14 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
           h("p",{style:{margin:0,fontSize:8.5,color:T.muted}},"Account Owner"),
           h("p",{style:{margin:0,fontSize:10.5,fontWeight:"bold",color:T.ink}},user?.employee_name||user?.username||"—")
         ),
+        // Header-level Save (30 Aug) — big, right where the user's eye
+        // already is, next to their own name. Most rows will already be
+        // auto-saved by the time this is clicked, but this is the
+        // explicit "I'm confident this is right" action, and still
+        // finalizes Nature/Outcome side-effects that auto-save alone
+        // doesn't apply.
+        h("button",{onClick:closeForTheDay,disabled:saving,style:{fontFamily:F,fontSize:13,fontWeight:"bold",padding:"8px 18px",background:T.accent,color:"#fff",border:"none",borderRadius:5,cursor:"pointer",opacity:saving?0.6:1}},saving?"Saving…":"Save"),
+        h("button",{onClick:globalDelete,style:{fontFamily:F,fontSize:11,padding:"6px 12px",background:"#fff",color:"#a3312a",border:"1px solid #a3312a",borderRadius:5,cursor:"pointer"}},"Clear all"),
         h("div",null,
           h("p",{style:{margin:0,fontSize:8.5,color:T.muted}},"Date of Entry"),
           h("input",{type:"date",value:entryDate,onChange:e=>setEntryDate(e.target.value),style:boxStyle({width:"auto"})})
@@ -20137,6 +20287,13 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
       )
     ),
 
+    // View toggle — Log Entries vs Review
+    h("div",{style:{display:"flex",gap:8,marginBottom:12}},
+      h("button",{onClick:()=>setView("entry"),style:{fontFamily:F,fontSize:12,padding:"6px 14px",background:view==="entry"?T.accent:"#fff",color:view==="entry"?"#fff":T.ink,border:"1px solid "+T.accent,borderRadius:4,cursor:"pointer"}},"Log Entries"),
+      h("button",{onClick:()=>setView("review"),style:{fontFamily:F,fontSize:12,padding:"6px 14px",background:view==="review"?T.accent:"#fff",color:view==="review"?"#fff":T.ink,border:"1px solid "+T.accent,borderRadius:4,cursor:"pointer"}},"Review")
+    ),
+
+    view==="entry" && h(React.Fragment,null,
     // Tabular grid — single row per entry, fixed pixel column widths,
     // zebra striping, Outcome cell colored by value, Notes removed
     // entirely from the row (lives only in the footer below).
@@ -20154,7 +20311,7 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
           const isActive = r._key===activeRowKey || (activeRowKey===null && idx===0);
           const zebra = idx%2===0 ? "#fff" : "#e6efec";
           const rowBg = isActive ? "#e3f3ec" : zebra;
-          const onFocusRow = ()=>setActiveRowKey(r._key);
+          const onFocusRow = ()=>setActiveRowKeyWithAutoSave(r._key);
           return h("tr",{key:r._key,style:{background:rowBg,height:38}},
             h("td",{style:td, onFocus:onFocusRow},
               h(CustomerSelect,{value:r.companyName,user,compact:true,onSelect:(c)=>onCompanyChange(r._key,c.company_name)})
@@ -20212,6 +20369,48 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
 
     h("div",{style:{textAlign:"right"}},
       h("button",{onClick:closeForTheDay,disabled:saving,style:{fontFamily:F,fontSize:11,padding:"6px 14px",background:T.accent,color:"#fff",border:"none",borderRadius:4,cursor:"pointer",opacity:saving?0.6:1}},saving?"Saving…":"Close for the day — save all entries")
+    )
+    ),
+
+    // Review — date range + Owner filter, grouped by day, with a way to
+    // jump back and log a day that got missed entirely. Late-entry
+    // badge shown per row (logged more than 1 day after the visit).
+    view==="review" && h("div",null,
+      h("div",{style:{display:"flex",gap:10,alignItems:"end",background:"#faf9f4",padding:12,borderRadius:8,marginBottom:14}},
+        h("div",null, h("p",{style:{margin:"0 0 3px",fontSize:9,color:T.sub}},"From"), h("input",{type:"date",value:reviewFrom,onChange:e=>setReviewFrom(e.target.value),style:boxStyle({width:"auto"})})),
+        h("div",null, h("p",{style:{margin:"0 0 3px",fontSize:9,color:T.sub}},"To"), h("input",{type:"date",value:reviewTo,onChange:e=>setReviewTo(e.target.value),style:boxStyle({width:"auto"})})),
+        isAdminOrAbove && h("div",null, h("p",{style:{margin:"0 0 3px",fontSize:9,color:T.sub}},"Owner"),
+          h("select",{value:reviewOwner,onChange:e=>setReviewOwner(e.target.value),style:boxStyle({width:"auto"})},
+            h("option",{value:""},"Everyone"),
+            employeeOptions.map(n=>h("option",{key:n,value:n},n))
+          )
+        ),
+        reviewIsReadOnly && h("span",{style:{fontSize:11,color:"#a3312a",fontWeight:600}},"Read-only — viewing another user's data")
+      ),
+      reviewLoading ? h("div",{style:{color:T.muted}},"Loading…") :
+      (()=>{
+        const byDate = new Map();
+        reviewRows.forEach(r=>{ if(!byDate.has(r.activity_date)) byDate.set(r.activity_date,[]); byDate.get(r.activity_date).push(r); });
+        const days = [];
+        for(let d=new Date(reviewFrom+"T00:00:00"); d<=new Date(reviewTo+"T00:00:00"); d.setDate(d.getDate()+1)){
+          days.push(d.toISOString().slice(0,10));
+        }
+        return h("div",{style:{border:"1px solid "+T.border,borderRadius:8,overflow:"hidden"}},
+          days.map(dateStr=>{
+            const entries = byDate.get(dateStr)||[];
+            return h("div",{key:dateStr},
+              h("div",{style:{background:"#f0eee6",padding:"8px 12px",fontWeight:"bold",fontSize:12,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+                h("span",null, new Date(dateStr+"T00:00:00").toDateString()+" — "+entries.length+" entr"+(entries.length===1?"y":"ies")),
+                entries.length===0 && !reviewIsReadOnly && h("button",{onClick:()=>jumpToDateForLogging(dateStr),style:{fontFamily:F,fontSize:10.5,padding:"4px 10px",background:T.accent,color:"#fff",border:"none",borderRadius:4,cursor:"pointer"}},"+ Log for this date")
+              ),
+              entries.map(e=>h("div",{key:e.id,style:{padding:"8px 12px",borderTop:"1px solid #eee",display:"flex",justifyContent:"space-between",alignItems:"center"}},
+                h("span",null, e.company_name+" — "+e.activity_type+" — "+(e.outcome||e.chase_what)),
+                isLateEntry(e) && h("span",{style:{fontSize:9.5,padding:"2px 8px",borderRadius:8,background:"#fdecea",color:"#a3312a"}},"⚠ Logged late")
+              ))
+            );
+          })
+        );
+      })()
     ),
 
     rows.filter(r=>r.showNewContact).map(r=>h(NewContactQuickModal,{
@@ -27773,6 +27972,26 @@ function App() {
   const [pendingNewSlNo,setPendingNewSlNo]=useState(null); // {reference_number,item_sl_no} bridge from Quotes' "+ New Sl No" to Estimator
   const [monthlyArchiveDone,setMonthlyArchiveDone]=useState(true); // suppressed on open — no form should show before the toolbar
   const [draftCount,setDraftCount]=useState(0); // fetched silently — surfaced as a toolbar badge, not a popup
+  // Late follow-up entries (30 Aug) — logged more than 1 day after the
+  // date they represent. Two separate counts: this user's own (shown to
+  // them personally), and team-wide (Admin/Super Admin only).
+  const [myLateCount,setMyLateCount]=useState(0);
+  const [teamLateCount,setTeamLateCount]=useState(0);
+  const isLateEntryRow = (row)=>{
+    if(!row.created_at || !row.activity_date) return false;
+    const loggedDate = new Date(row.created_at); loggedDate.setHours(0,0,0,0);
+    const visitDate = new Date(row.activity_date+"T00:00:00");
+    return loggedDate >= new Date(visitDate.getTime()+2*86400000);
+  };
+  const refreshLateCounts = useCallback(async()=>{
+    const myName = user?.employee_name||user?.username;
+    const { data: mine } = await sb.from("activity_log_tbl").select("created_at,activity_date").eq("logged_by",myName).order("created_at",{ascending:false}).limit(200);
+    setMyLateCount((mine||[]).filter(isLateEntryRow).length);
+    if(user?.role==="admin"||user?.role==="super_admin"){
+      const { data: all } = await sb.from("activity_log_tbl").select("created_at,activity_date").order("created_at",{ascending:false}).limit(500);
+      setTeamLateCount((all||[]).filter(isLateEntryRow).length);
+    }
+  },[user]);
   const [abandonedCount,setAbandonedCount]=useState(0); // Super Admin only — separate banner from the Draft one
   const refreshAbandonedCount = useCallback(()=>{
     sb.from("estimates").select("id",{count:"exact",head:true}).eq("abandoned_flag",true).then(({count})=>setAbandonedCount(count||0));
@@ -27845,6 +28064,7 @@ function App() {
 
   useEffect(()=>{ if(user) loadMasterData(setMasterData); },[user]);
   useEffect(()=>{ if(user) refreshDraftCount(); },[user,refreshDraftCount]);
+  useEffect(()=>{ if(user) refreshLateCounts(); },[user,refreshLateCounts]);
   useEffect(()=>{ if(user && user.role==="super_admin") refreshAbandonedCount(); },[user,refreshAbandonedCount]);
   const refresh=useCallback(()=>{ setMasterData(m=>({...m,loadingMaster:true})); loadMasterData(setMasterData); },[]);
 
@@ -27875,6 +28095,12 @@ function App() {
     ),
     draftCount>0 && h("div",{onClick:()=>setShowDraftPanel(true),style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
       "⚠ "+draftCount+" quote"+(draftCount===1?"":"s")+" still in Draft — click to review and update status"
+    ),
+    myLateCount>0 && h("div",{onClick:()=>{setTab("followup_entry");},style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
+      "⚠ You logged "+myLateCount+" follow-up"+(myLateCount===1?"":"s")+" more than a day after the visit date — click to review"
+    ),
+    (user.role==="admin"||user.role==="super_admin") && teamLateCount>0 && h("div",{onClick:()=>{setTab("followup_entry");},style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
+      "⚠ "+teamLateCount+" follow-up entr"+(teamLateCount===1?"y":"ies")+" logged late across the team — click to review"
     ),
     user.role==="super_admin" && abandonedCount>0 && h("div",{onClick:()=>setTab("abandoned_quotes_cleanup"),style:{cursor:"pointer",background:"#fdecea",borderBottom:"1px solid #f0997b",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#a3312a"}},
       "⚠ "+abandonedCount+" abandoned incomplete quote"+(abandonedCount===1?"":"s")+" — click to review"
@@ -27948,6 +28174,7 @@ function App() {
     tab==="company_master"?h(CompanyMasterEditor,{user}):
     tab==="gst_structures"?h(GstStructureEditor,{user}):
     tab==="doc_status_master"?h(DocStatusEditor,{user}):
+    tab==="data_quality_flags"?h(DataQualityFlagsScreen,{user}):
     tab==="gst_variance_report"?h(GstVarianceReport,{user}):
     tab==="description_master"?h(DescriptionMasterEditor,{user}):
     tab==="users"?h(UsersEditor,{user}):
