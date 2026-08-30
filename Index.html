@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-29T17:08:23Z";
+  var APP_BUILD_VERSION = "2026-08-30T02:39:30Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -115,6 +115,17 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
   const [draft,setDraft]=useState({lost_reason:"",competitor_name:"",competitor_price:"",po_number:"",po_date:"",po_value:""});
   const [loading,setLoading]=useState(true);
   const [saving,setSaving]=useState(false);
+  // Deferred and Went Cold (29 Aug) reuse this same modal and the same
+  // lost_reason field/table — semantically it's "why this landed on a
+  // negative/stalled outcome," not something specific to Lost. Each
+  // gets its own reason-option list and heading, same required-before-
+  // save rule.
+  const needsReason = newStatus==="Lost" || newStatus==="Deferred" || newStatus==="Went Cold";
+  const REASON_OPTIONS = {
+    Lost: ["Price","Delivery time","Technical fit","Relationship / competitor incumbent","Project cancelled","Other"],
+    Deferred: ["Budget on hold","Awaiting internal approval","Project timeline pushed","Other"],
+    "Went Cold": ["No response from customer","Requirement no longer active","Lost contact","Other"],
+  };
   useEffect(()=>{
     let cancelled=false;
     sb.from("quote_outcomes").select("*").eq("reference_number",referenceNumber).maybeSingle().then(({data})=>{
@@ -123,12 +134,12 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
     return ()=>{ cancelled=true; };
   },[referenceNumber]);
   const save = async()=>{
-    if(newStatus==="Lost" && !draft.lost_reason){ alert("Pick a reason before saving."); return; }
+    if(needsReason && !draft.lost_reason){ alert("Pick a reason before saving."); return; }
     setSaving(true);
     try{
       const payload = {
         reference_number: referenceNumber,
-        lost_reason: newStatus==="Lost" ? draft.lost_reason : null,
+        lost_reason: needsReason ? draft.lost_reason : null,
         competitor_name: newStatus==="Lost" ? (draft.competitor_name||null) : null,
         competitor_price: newStatus==="Lost" && draft.competitor_price ? Number(draft.competitor_price) : null,
         po_number: newStatus==="Won" ? (draft.po_number||null) : null,
@@ -140,7 +151,7 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
       const { data: existing } = await sb.from("quote_outcomes").select("id").eq("reference_number",referenceNumber).maybeSingle();
       if(existing) await sb.from("quote_outcomes").update(payload).eq("id",existing.id);
       else await sb.from("quote_outcomes").insert(payload);
-      const result = await updateQuoteStatusForQuote(referenceNumber,newStatus,user?.username||"unknown","status change");
+      const result = await updateQuoteStatusForQuote(referenceNumber,newStatus,user?.username||"unknown","status change",needsReason?draft.lost_reason:null);
       if(result && result.blocked){ return; }
       await logAudit("UPDATE","quote_outcomes",referenceNumber,"Captured "+newStatus+" outcome details for Quote# "+referenceNumber,user?.username||"unknown",null,payload);
       onDone(newStatus);
@@ -159,20 +170,17 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
         h("input",{type:"number",value:draft.po_value,onChange:e=>setDraft(d=>({...d,po_value:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:4}}),
         h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:12}},"Attach the PO document itself under the Documents card once saved.")
       ) : h(React.Fragment,null,
-        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:10}},"Why was "+referenceNumber+" lost?"),
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:10}},"Why was "+referenceNumber+" marked "+newStatus+"?"),
         h("select",{value:draft.lost_reason,onChange:e=>setDraft(d=>({...d,lost_reason:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:8}},
           h("option",{value:""},"Select a reason…"),
-          h("option",{value:"Price"},"Price"),
-          h("option",{value:"Delivery time"},"Delivery time"),
-          h("option",{value:"Technical fit"},"Technical fit"),
-          h("option",{value:"Relationship / competitor incumbent"},"Relationship / competitor incumbent"),
-          h("option",{value:"Project cancelled"},"Project cancelled"),
-          h("option",{value:"Other"},"Other")
+          (REASON_OPTIONS[newStatus]||REASON_OPTIONS.Lost).map(r=>h("option",{key:r,value:r},r))
         ),
-        h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Competitor name (if known)"),
-        h("input",{value:draft.competitor_name,onChange:e=>setDraft(d=>({...d,competitor_name:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:8}}),
-        h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Competitor price (if known)"),
-        h("input",{type:"number",value:draft.competitor_price,onChange:e=>setDraft(d=>({...d,competitor_price:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:4}})
+        newStatus==="Lost" && h(React.Fragment,null,
+          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Competitor name (if known)"),
+          h("input",{value:draft.competitor_name,onChange:e=>setDraft(d=>({...d,competitor_name:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:8}}),
+          h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Competitor price (if known)"),
+          h("input",{type:"number",value:draft.competitor_price,onChange:e=>setDraft(d=>({...d,competitor_price:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:4}})
+        )
       ),
       !loading && h("div",{style:{display:"flex",gap:8,marginTop:10}},
         h("button",{onClick:save,disabled:saving,style:{...btnPrimary,flex:1,opacity:saving?0.6:1}},saving?"Saving…":"Save and set "+newStatus),
@@ -11193,6 +11201,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [headerModel,setHeaderModel]=useState("");
   const [fixingModel,setFixingModel]=useState(false);
   const [quoteStatuses,setQuoteStatuses]=useState([]);
+  const [quoteNatureOptions,setQuoteNatureOptions]=useState([]);
+  useEffect(()=>{ sb.from("quote_nature_tbl").select("nature").then(({data})=>setQuoteNatureOptions((data||[]).map(r=>r.nature))); },[]);
   const CT_MASTER_TABLES = {
     payment_term:"payment_terms_tbl", delivery_term:"delivery_terms_tbl", packing_forwarding:"packing_forwarding_tbl",
     insurance:"insurance_terms_tbl", price_basis:"price_basis_tbl", guarantee:"guarantee_terms_tbl",
@@ -13643,7 +13653,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                       doChange();
                     },
                     style:{fontSize:13,fontWeight:800,color:quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c",background:"transparent",border:"none",fontFamily:"inherit"}
-                  },["Draft","Offer Sent"].map(s=>h("option",{key:s,value:s},s)))
+                  },["Draft"].map(s=>h("option",{key:s,value:s},s)))
+            ),
+            // Nature of Quote (29 Aug) — independent of Status Funnel;
+            // unlike Status, this one IS directly settable here, not
+            // just via Log Follow-ups.
+            h("div",{style:{border:"2px solid "+colors.border,borderRadius:10,padding:"6px 14px",background:"#faf9f4",display:"flex",alignItems:"center",gap:8}},
+              h("span",{style:{fontSize:9.5,color:colors.muted,fontWeight:600}},"NATURE"),
+              h("select",{
+                value:quoteHeaderRow.quote_nature||"Unknown",
+                onChange:async e=>{
+                  const v=e.target.value;
+                  await sb.from("estimates").update({quote_nature:v}).eq("reference_number",refFilter);
+                  setOpenRef(r=>({...r,quote_nature:v}));
+                  setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,quote_nature:v}:r));
+                },
+                style:{fontSize:13,fontWeight:800,color:colors.dark,background:"transparent",border:"none",fontFamily:"inherit"}
+              },(quoteNatureOptions.length?quoteNatureOptions:["Unknown","Budgetary","Purchase Requirement"]).map(n=>h("option",{key:n,value:n},n)))
             ),
             h("div",{style:{width:220}},
               renderReadinessBar(readiness.categories, {height:32, onClick: readiness.ready?undefined:()=>alert(readiness.missing.map(m=>m.section+": "+m.items.join(", ")).join("\n"))})
@@ -15793,7 +15819,7 @@ async function verifyAndConsumeGatedPin(actionType, enteredPin, username, entity
   await sb.from("gated_action_pin_log_tbl").insert({action_type:actionType, used_by:username||"unknown", entity_type:entityType||null, entity_id:entityId||null, context:context||null});
   return {ok:true};
 }
-async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source){
+async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source, reason){
   if(newStatus!=="Draft"){
     const [{count},{data:declined}] = await Promise.all([
       sb.from("quote_extra_price_tbl").select("id",{count:"exact",head:true}).eq("reference_number",referenceNumber),
@@ -15813,7 +15839,7 @@ async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, 
   const now = new Date().toISOString();
   const { data: allRows } = await sb.from("estimates").select("id,item_sl_no,quote_status").eq("reference_number",referenceNumber);
   const oldStatus = allRows && allRows[0] ? allRows[0].quote_status : null;
-  await sb.from("estimates").update({quote_status:newStatus,status_changed_by:changedBy,status_changed_at:now}).eq("reference_number",referenceNumber);
+  await sb.from("estimates").update({quote_status:newStatus,status_changed_by:changedBy,status_changed_at:now,status_reason:reason||null}).eq("reference_number",referenceNumber);
   await logAudit("UPDATE","estimates",referenceNumber,"Status changed from "+(oldStatus||"Draft")+" to "+newStatus+" via "+source+" (applies to all "+(allRows?allRows.length:0)+" Sl No(s) on this quote)",changedBy,{quote_status:oldStatus},{quote_status:newStatus});
   if(newStatus!=="Draft"){
     // Clear the abandoned-incomplete flag too, if set — leaving Draft
@@ -19967,13 +19993,14 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
   const blankRow = ()=>({
     _key: Math.random().toString(36).slice(2),
     companyName:"", mode:"Phone", chaseWhat:"Offer", chaseReference:"", referenceOptions:[],
-    contactedWhom:"", contactOptions:[], discussedWhat:"", nextFollowupDate:"", outcome:"", notes:"",
+    contactedWhom:"", contactOptions:[], discussedWhat:"", nextFollowupDate:"", outcome:"", nature:"", notes:"",
     showNewContact:false,
   });
   const [entryDate,setEntryDate] = useState(new Date().toISOString().slice(0,10));
   const [rows,setRows] = useState([blankRow()]);
   const [quoteStatusOptions,setQuoteStatusOptions] = useState([]);
   const [soStatusOptions,setSoStatusOptions] = useState([]);
+  const [natureOptions,setNatureOptions] = useState([]);
   const [saving,setSaving] = useState(false);
   const [wonLostQueue,setWonLostQueue] = useState([]); // [{referenceNumber,newStatus}]
   const [outcomeTarget,setOutcomeTarget] = useState(null);
@@ -19984,6 +20011,7 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
   useEffect(()=>{
     sb.from("quote_status_tbl").select("status").then(({data})=>setQuoteStatusOptions((data||[]).map(r=>r.status)));
     sb.from("sale_order_status_tbl").select("status").order("sort_order").then(({data})=>setSoStatusOptions((data||[]).map(r=>r.status)));
+    sb.from("quote_nature_tbl").select("nature").then(({data})=>setNatureOptions((data||[]).map(r=>r.nature)));
   },[]);
 
   const addRow = ()=> setRows(rs=>rs.concat([blankRow()]));
@@ -20041,10 +20069,16 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
           is_followup_of: recent&&recent[0]?recent[0].id:null, logged_by:user?.username||"unknown"
         });
         if(r.chaseWhat==="Offer" && r.outcome && refNumber){
-          if(r.outcome==="Won"||r.outcome==="Lost") queue.push({referenceNumber:refNumber,newStatus:r.outcome});
+          if(["Won","Lost","Deferred","Went Cold"].includes(r.outcome)) queue.push({referenceNumber:refNumber,newStatus:r.outcome});
           else await updateQuoteStatusForQuote(refNumber, r.outcome, user.username, "Follow-up log");
         } else if(r.chaseWhat==="Order" && r.outcome && refNumber){
           await sb.from("sale_order_tbl").update({status:r.outcome}).eq("contract_number",refNumber);
+        }
+        // Nature of Quote (29 Aug) — independent of Status Funnel, only
+        // applies when Chase What is Offer; can also be set directly on
+        // the Quote screen itself, unlike Status Funnel.
+        if(r.chaseWhat==="Offer" && r.nature && refNumber){
+          await sb.from("estimates").update({quote_nature:r.nature}).eq("reference_number",refNumber);
         }
       }
       if(queue.length){ setWonLostQueue(queue.slice(1)); setOutcomeTarget(queue[0]); }
@@ -20076,7 +20110,7 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
   const boxStyle = (extra)=>({fontFamily:F,fontSize:14,padding:"2px 4px",border:"1px solid "+T.border,borderRadius:2,width:"100%",height:30,boxSizing:"border-box",...extra});
   // Column widths — the user's exact adjusted values (converted back
   // from the Excel character-width units they left them in).
-  const COLW = [280,100,90,150,130,320,90,180,20];
+  const COLW = [280,100,90,150,130,320,90,180,120,20];
   const activeRow = rows.find(r=>r._key===activeRowKey) || rows[0];
 
   return h("div",{style:{fontFamily:F,fontSize:14,background:T.bg,padding:16,borderRadius:4}},
@@ -20111,7 +20145,7 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
         h("colgroup",null, COLW.map((w,i)=>h("col",{key:i,style:{width:w}}))),
         h("thead",null,
           h("tr",{style:{background:"#eef6f3",height:43}},
-            ["Customer","Mode","Chase What","Reference","Contacted Whom","Discussed What","Next Follow up","Outcome",""].map(hdr=>
+            ["Customer","Mode","Chase What","Reference","Contacted Whom","Discussed What","Next Follow up","Outcome","Nature",""].map(hdr=>
               h("th",{key:hdr,style:{padding:"4px 6px",textAlign:"left",borderBottom:"1px solid "+T.border,borderRight:"1px solid #e2ede9"}},hdr))
           )
         ),
@@ -20149,6 +20183,12 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
               h("select",{value:r.outcome,onChange:e=>updateRow(r._key,{outcome:e.target.value}),onFocus:onFocusRow,style:boxStyle({background:oc.bg,color:oc.fg})},
                 h("option",{value:""},"— no change —"),
                 (r.chaseWhat==="Offer"?quoteStatusOptions:soStatusOptions).map(s=>h("option",{key:s,value:s},s))
+              )
+            ),
+            h("td",{style:td}, r.chaseWhat!=="Offer" ? h("span",{style:{color:T.muted}},"—") :
+              h("select",{value:r.nature,onChange:e=>updateRow(r._key,{nature:e.target.value}),onFocus:onFocusRow,style:boxStyle({})},
+                h("option",{value:""},"— no change —"),
+                natureOptions.map(n=>h("option",{key:n,value:n},n))
               )
             ),
             h("td",{style:{...td,textAlign:"center",color:T.muted,cursor:"pointer"},onClick:()=>removeRow(r._key)},"✕")
@@ -23021,9 +23061,10 @@ function QuotesReportScreen({ user, onOpenQuote }){
   const [loading,setLoading] = useState(true);
   const [zoneOptions,setZoneOptions] = useState([]);
   const [statusOptions,setStatusOptions] = useState([]);
+  const [reportNatureOptions,setReportNatureOptions] = useState([]);
   const [filters,setFilters] = useState({
     dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"", countryLike:"",
-    zone:"", status:"", followUp:"", projectLike:""
+    zone:"", status:"", nature:"", followUp:"", projectLike:""
   });
   const setF = (k,v)=> setFilters(f=>({...f,[k]:v}));
   // Country->State->City (29 Aug fix) — pulls from the real master
@@ -23049,7 +23090,7 @@ function QuotesReportScreen({ user, onOpenQuote }){
     setLoading(true);
     try{
       const { data: estRows } = await sb.from("estimates")
-        .select("reference_number,customer_name,quote_date,created_at,quote_status,linked_project_id")
+        .select("reference_number,customer_name,quote_date,created_at,quote_status,quote_nature,linked_project_id")
         .order("created_at",{ascending:false});
       const byRef = new Map();
       (estRows||[]).forEach(r=>{ if(!byRef.has(r.reference_number)) byRef.set(r.reference_number,r); });
@@ -23085,18 +23126,42 @@ function QuotesReportScreen({ user, onOpenQuote }){
           state: co.billing_state||"—",
           country: co.billing_country||"—",
           status: h.quote_status||"Draft",
+          nature: h.quote_nature||"Unknown",
           project_reference: h.linked_project_id ? (projById.get(h.linked_project_id)||"—") : "—",
           followup_stage: act?.outcome||"—",
           next_followup: act?.next_followup_date||"—",
+          is_legacy: false,
         };
       });
-      setRows(merged);
+
+      // Blend in Legacy Quotes (29 Aug) — the whole point of aligning
+      // the status/nature vocabulary was so this could be one combined
+      // list, not a separate screen requiring translation.
+      const { data: legacyRows } = await sb.from("legacy_quotes_tbl").select("*");
+      const legacyMerged = (legacyRows||[]).map(l=>({
+        reference_number: l.reference_number,
+        reference_date: l.reference_date||"—",
+        customer_name: l.customer_name||"—",
+        region: l.region||"—",
+        city: l.city||"—",
+        state: l.state||"—",
+        country: l.country||"—",
+        status: l.quote_status||"Draft",
+        nature: l.quote_nature||"Unknown",
+        project_reference: l.project_reference||"—",
+        followup_stage: l.followup_note||"—",
+        next_followup: l.next_followup_date||"—",
+        is_legacy: true,
+      }));
+
+      setRows(merged.concat(legacyMerged));
     } finally { setLoading(false); }
   },[]);
   useEffect(()=>{ load(); },[load]);
   useEffect(()=>{
     sb.from("zone_tbl").select("value").then(({data})=>setZoneOptions((data||[]).map(r=>r.value)));
     sb.from("quote_status_tbl").select("status").then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
+    sb.from("quote_nature_tbl").select("nature").then(({data})=>setReportNatureOptions((data||[]).map(r=>r.nature)));
   },[]);
 
   // Follow-up Status is computed, not stored — Overdue/Due today/
@@ -23120,6 +23185,7 @@ function QuotesReportScreen({ user, onOpenQuote }){
     if(filters.countryLike && r.country!==filters.countryLike) return false;
     if(filters.zone && r.region!==filters.zone) return false;
     if(filters.status && r.status!==filters.status) return false;
+    if(filters.nature && r.nature!==filters.nature) return false;
     if(filters.followUp && followUpBucket(r)!==filters.followUp) return false;
     if(filters.projectLike && r.project_reference!==filters.projectLike) return false;
     return true;
@@ -23160,6 +23226,9 @@ function QuotesReportScreen({ user, onOpenQuote }){
       fld("Status", h("select",{value:filters.status,onChange:e=>setF("status",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), statusOptions.map(s=>h("option",{key:s,value:s},s))
       )),
+      fld("Nature", h("select",{value:filters.nature,onChange:e=>setF("nature",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+        h("option",{value:""},"All"), reportNatureOptions.map(n=>h("option",{key:n,value:n},n))
+      )),
       fld("Follow-up Status", h("select",{value:filters.followUp,onChange:e=>setF("followUp",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"),["Overdue","Due today","Upcoming","None"].map(s=>h("option",{key:s,value:s},s))
       ))
@@ -23168,13 +23237,18 @@ function QuotesReportScreen({ user, onOpenQuote }){
     h("div",{style:{overflowX:"auto"}},
       h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:12.5}},
         h("thead",null,h("tr",{style:{background:colors.bg,textAlign:"left"}},
-          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Status","Project Reference","Follow-up Stage","Next Follow-up",""].map(c=>
+          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Status","Nature","Project Reference","Follow-up Stage","Next Follow-up",""].map(c=>
             h("th",{key:c,style:{padding:"7px 9px",borderBottom:"2px solid "+colors.dark,whiteSpace:"nowrap"}},c))
         )),
         h("tbody",null, filtered.map((r,i)=>h("tr",{key:r.reference_number,style:{borderBottom:"1px solid "+colors.border}},
           h("td",{style:{padding:"6px 9px"}},i+1),
           h("td",{style:{padding:"6px 9px",fontWeight:600}},
-            h("a",{href:"#",onClick:e=>{e.preventDefault(); onOpenQuote(r.reference_number,1);},style:{color:"#0c447c",textDecoration:"underline",cursor:"pointer"}},r.reference_number)
+            // Legacy rows have no real quote/BOM behind them — clicking
+            // through would land on a broken, empty screen. Shown as
+            // plain text with a badge instead of a link for those.
+            r.is_legacy
+              ? h(React.Fragment,null, r.reference_number, h("span",{style:{marginLeft:6,fontSize:9.5,padding:"1px 6px",borderRadius:8,background:"#f0eee6",color:colors.mutedLight}},"Legacy"))
+              : h("a",{href:"#",onClick:e=>{e.preventDefault(); onOpenQuote(r.reference_number,1);},style:{color:"#0c447c",textDecoration:"underline",cursor:"pointer"}},r.reference_number)
           ),
           h("td",{style:{padding:"6px 9px"}},r.reference_date),
           h("td",{style:{padding:"6px 9px"}},r.customer_name),
@@ -23182,10 +23256,14 @@ function QuotesReportScreen({ user, onOpenQuote }){
           h("td",{style:{padding:"6px 9px"}},r.city),
           h("td",{style:{padding:"6px 9px"}},r.state),
           h("td",{style:{padding:"6px 9px"}},h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#e6f1fb",color:"#0c447c"}},r.status)),
+          h("td",{style:{padding:"6px 9px"}},h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#faf3e6",color:"#8a5a0c"}},r.nature)),
           h("td",{style:{padding:"6px 9px"}},r.project_reference),
           h("td",{style:{padding:"6px 9px"}},r.followup_stage),
           h("td",{style:{padding:"6px 9px"}},r.next_followup),
-          h("td",{style:{padding:"6px 9px"}},h("button",{onClick:()=>onOpenQuote(r.reference_number,1),style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Open"))
+          h("td",{style:{padding:"6px 9px"}}, r.is_legacy
+            ? h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"—")
+            : h("button",{onClick:()=>onOpenQuote(r.reference_number,1),style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Open")
+          )
         )))
       ),
       filtered.length===0 && h("div",{style:{padding:20,color:colors.mutedLight,textAlign:"center"}},"No quotes match these filters."),
@@ -23249,7 +23327,7 @@ function CrmFunnelKanban({ user }){
     moveCardChecked(card,newStatus);
   };
   const moveCardChecked = (card, newStatus)=>{
-    if(newStatus==="Won"||newStatus==="Lost"){ setOutcomeTarget({card,newStatus}); return; }
+    if(newStatus==="Won"||newStatus==="Lost"||newStatus==="Deferred"||newStatus==="Went Cold"){ setOutcomeTarget({card,newStatus}); return; }
     doMoveCard(card,newStatus);
   };
 
@@ -23508,7 +23586,7 @@ function QuoteStatusReview({ user }){
     changeStatusChecked(row,newStatus);
   };
   const changeStatusChecked = (row,newStatus)=>{
-    if(newStatus==="Won"||newStatus==="Lost"){ setOutcomeTarget({referenceNumber:row.reference_number,newStatus}); return; }
+    if(newStatus==="Won"||newStatus==="Lost"||newStatus==="Deferred"||newStatus==="Went Cold"){ setOutcomeTarget({referenceNumber:row.reference_number,newStatus}); return; }
     doChangeStatus(row,newStatus);
   };
 
