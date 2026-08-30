@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-30T03:08:25Z";
+  var APP_BUILD_VERSION = "2026-08-30T09:22:40Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -536,6 +536,39 @@ async function computeSlNoFoldedSalesTotal(referenceNumber, itemSlNo, orderQty){
   }
   return baseGrandTotal + slExtraTotal + (testingMode==="prorata" ? slTestingTotal + globalFoldShare : 0);
 }
+// Value snapshot (30 Aug) — captured on leaving a Quote or Sale Order
+// screen (React unmount), upserted per reference_number. Header total
+// reuses computeSlNoFoldedSalesTotal, the same live formula the BOM
+// footer itself uses, summed across every Sl No. Lines are captured
+// alongside for later "what sells most, who sold what" analysis, even
+// though nothing reads them yet — best-effort: a failure here never
+// blocks navigation, it just means that visit's snapshot didn't update.
+async function saveQuoteValueSnapshot(referenceNumber, entityType, user){
+  if(!referenceNumber) return;
+  try{
+    const { data: ests } = await sb.from("estimates").select("item_sl_no,order_qty,currency").eq("reference_number",referenceNumber);
+    if(!ests || !ests.length) return;
+    let total = 0;
+    for(const est of ests){ total += await computeSlNoFoldedSalesTotal(referenceNumber, est.item_sl_no, est.order_qty); }
+    const orderQtyBySl = new Map(ests.map(e=>[e.item_sl_no,e.order_qty||1]));
+
+    const { data: existing } = await sb.from("quote_value_snapshot_tbl").select("id").eq("reference_number",referenceNumber).maybeSingle();
+    const headerPayload = { reference_number:referenceNumber, entity_type:entityType, total_value:total, currency:ests[0].currency||"INR", computed_at:new Date().toISOString(), computed_by:user?.username||"unknown" };
+    let snapshotId;
+    if(existing){ await sb.from("quote_value_snapshot_tbl").update(headerPayload).eq("id",existing.id); snapshotId = existing.id; }
+    else { const { data: inserted } = await sb.from("quote_value_snapshot_tbl").insert(headerPayload).select("id").single(); snapshotId = inserted?.id; }
+    if(!snapshotId) return;
+
+    const { data: lines } = await sb.from("estimate_lines").select("item_sl_no,material_shape,material_spec,material_grade,qty_required,rate,sf,is_direct_price,sales_price").eq("reference_number",referenceNumber);
+    await sb.from("quote_value_snapshot_lines_tbl").delete().eq("snapshot_id",snapshotId);
+    const lineRows = (lines||[]).map(l=>{
+      const q = (Number(l.qty_required)||0) * (orderQtyBySl.get(l.item_sl_no)||1);
+      const lineValue = l.is_direct_price ? q*(Number(l.sales_price)||0) : q*(Number(l.rate)||0)*(Number(l.sf)||3.1);
+      return { snapshot_id:snapshotId, item_sl_no:l.item_sl_no, material_shape:l.material_shape||null, material_spec:l.material_spec||null, material_grade:l.material_grade||null, qty:q, rate:Number(l.rate)||0, line_value:lineValue };
+    });
+    if(lineRows.length) await sb.from("quote_value_snapshot_lines_tbl").insert(lineRows);
+  } catch(e){ console.error("Value snapshot failed for "+referenceNumber, e); }
+}
 // Inserts a blank spacer row between every row in an array (not around the
 // whole array) — used to put breathing room between every BOM/datasheet line
 // in both Excel and PDF exports.
@@ -749,10 +782,16 @@ function detectIncotermCode(text){
 // can be marked ready.
 const CT_REQUIRED_FIELDS = [
   ["validity","Validity"], ["payment_term","Payment Term"], ["delivery_term","Delivery Term"],
-  ["packing_forwarding","Packing and Forwarding"], ["insurance","Insurance"], ["price_basis","Price Basis"],
+  ["insurance","Insurance"], ["price_basis","Price Basis"],
   ["incoterms","Inco Terms"], ["guarantee","Guarantee"], ["warranty_coverage","Warranty Coverage"],
   ["dispatch_through","Transport Through"], ["freight","Freight"], ["tax","Tax"],
   ["jurisdiction","Jurisdiction"], ["force_majeure","Force Majeure"], ["order_cancellation_charges","Order Cancellation Charges"],
+  // Packing and Forwarding deliberately handled separately, not in this
+  // generic list (30 Aug fix) — it was still checking the old
+  // free-text "packing_forwarding" column, which the 24 Aug Basis+Value
+  // redesign stopped populating entirely. Any quote using the new
+  // fields correctly could never pass this check, no matter how
+  // completely it was actually filled in.
 ];
 
 // Shared browser-level preference (not per-user, not per-quote) for whether
@@ -1300,6 +1339,9 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Funnel", tabs:[
         {key:"crm_funnel",label:"Funnel"},
         {key:"quotes_report",label:"Quotes Report"},
+      ]},
+      { label:"Dashboards", tabs:[
+        {key:"crm_dashboards",label:"Dashboards"},
       ]},
       { label:"Daily", tabs:[
         {key:"my_worklist",label:"My Worklist"},
@@ -3711,7 +3753,7 @@ function MasterEditor({ tableKey, user }) {
     const draft = genericEditAllDrafts[row.id]||row;
     return h("tr",{key:row.id,style:{background:"#eef6f3",borderBottom:"1px solid #eceae0"}},
       h("td",{style:{padding:"4px 6px"}}),
-      tableDef.columns.map(c=>h("td",{key:c,style:{padding:"4px 6px"}},
+      tableDef.columns.map(c=>h("td",{key:c,style:{padding:"4px 6px",maxWidth:220,wordBreak:"break-word",overflowWrap:"anywhere"}},
         (tableKey==="model_tbl" && c==="model")
           ? h("div",null,
               h("div",{style:{padding:"5px 7px",background:"#f4f2ea",borderRadius:5,fontSize:12,color:colors.muted}},row.model),
@@ -3727,7 +3769,7 @@ function MasterEditor({ tableKey, user }) {
   const isProtectedStatusRow = (row)=> (tableKey==="quote_status_tbl" && String(row.status||"").trim()==="Draft") || (tableKey==="model_tbl" && row.is_custom===true);
   const renderRow = (row)=>h("tr",{key:row.id,style:{borderBottom:"1px solid #eceae0"}},
     h("td",{style:{padding:"7px 9px"}},h("input",{type:"checkbox",checked:selectedIds.has(row.id),disabled:isProtectedStatusRow(row),onChange:e=>setSelectedIds(prev=>{ const next=new Set(prev); if(e.target.checked) next.add(row.id); else next.delete(row.id); return next; })})),
-    tableDef.columns.map(c=>h("td",{key:c,style:{padding:"7px 9px"}},
+    tableDef.columns.map(c=>h("td",{key:c,style:{padding:"7px 9px",maxWidth:220,wordBreak:"break-word",overflowWrap:"anywhere"}},
       (editingId===row.id && tableKey==="model_tbl" && c==="model")
         ? h("div",null,
             h("div",{style:{padding:"5px 7px",background:"#f4f2ea",borderRadius:5,fontSize:12,color:colors.muted}},row.model),
@@ -8942,6 +8984,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       .then(({data})=>setActiveSignatoryEmployees((data||[]).filter(e=>e.employee_name)));
   },[]);
   const [refFilter,setRefFilter]=useState(""); const [slNoFilter,setSlNoFilter]=useState(""); const [descSearch,setDescSearch]=useState(""); const [openRef,setOpenRef]=useState(null);
+  // Value snapshot trigger (30 Aug) — fires when refFilter changes away
+  // from a given quote/contract (switching to another one within this
+  // same screen) and on final unmount (navigating away entirely). The
+  // cleanup closes over THIS render's refFilter/mode, so it always
+  // snapshots the one actually being left, not whatever's current by
+  // the time it runs.
+  useEffect(()=>{
+    if(!refFilter) return;
+    const capturedRef = refFilter, capturedMode = mode;
+    return ()=>{ saveQuoteValueSnapshot(capturedRef, capturedMode==="contract"?"sale_order":"quote", user); };
+  },[refFilter,mode]);
   // Entry gate: New offer / Existing offer, shown every time this screen is
   // reached directly. Skipped when arriving via a deep link (e.g. returning
   // from the Estimator's save flow, or a bridge from another report) —
@@ -10630,6 +10683,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const ctMismatch = !!(ctPriceBasisCode && ctIncotermsCode && ctPriceBasisCode!==ctIncotermsCode);
   const attemptSaveCommercialTerms=()=>{
     const missing = CT_REQUIRED_FIELDS.filter(([key])=>!String(ctData?.[key]||"").trim()).map(([,label])=>label);
+    // Packing and Forwarding — checks the real fields it's actually
+    // stored in now (Basis+Value), falling back to the old free-text
+    // value only for a pre-24-Aug quote that never got migrated.
+    const pfFilled = (ctData?.packing_forwarding_basis && String(ctData?.packing_forwarding_value||"").trim()) || ctData?.packing_forwarding;
+    if(!pfFilled) missing.push("Packing and Forwarding");
     if(missing.length){ setCtMissingFields(missing); setShowCtMissingModal(true); return; }
     if(ctMismatch && !(isAdmin && ctAllowMismatch)){ setCtMismatchBlocked(true); return; }
     setCtMismatchBlocked(false);
@@ -12482,11 +12540,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // from a stale stored figure. Informational only — NOT added into
       // grandTotalInr below, deliberately.
       const pfBasicPriceTotal = estimatesRows.reduce((s,est)=>s+slNoBaseTotalInr(est),0);
+      // Lumpsum P&F is always entered in INR (30 Aug), regardless of the
+      // quote's own currency — converted here for display, same as
+      // everywhere else money crosses currencies in this app. Computed
+      // locally rather than reusing quoteIsInr/quoteFx below, since
+      // those aren't declared yet at this point in the function.
+      const pfQuoteIsInr = (first.currency||"INR")==="INR";
+      const pfQuoteFx = Number(first.conversion_rate)||1;
       const pfComputedAmount = terms.packing_forwarding_basis==="Flat"
-        ? (Number(terms.packing_forwarding_value)||0)
+        ? (pfQuoteIsInr ? (Number(terms.packing_forwarding_value)||0) : (Number(terms.packing_forwarding_value)||0)/pfQuoteFx)
         : pfBasicPriceTotal*(Number(terms.packing_forwarding_value)||0)/100;
       const pfDisplay = !terms.packing_forwarding_basis ? (terms.packing_forwarding||"—") // pre-24-Aug quotes with only the old free-text value
-        : terms.packing_forwarding_basis==="Flat" ? fmtR(pfComputedAmount)
+        : terms.packing_forwarding_basis==="Flat" ? fmtR(pfComputedAmount)+" (Lumpsum, entered in ₹"+fmtR(Number(terms.packing_forwarding_value)||0)+")"
         : (Number(terms.packing_forwarding_value)||0)+"% ("+fmtR(pfComputedAmount)+")";
       // Global testing redistribution: each test's combined total (across
       // all items it was applied to — always "all items" per the confirmed
@@ -15408,14 +15473,25 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             fld("Packing and forwarding",null,h("div",null,
               h("div",{style:{display:"flex",gap:6}},
                 h("select",{value:ctData.packing_forwarding_basis||"Percentage",onChange:e=>setCtData(d=>({...d,packing_forwarding_basis:e.target.value})),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:110}},
-                  h("option",{value:"Percentage"},"Percentage"), h("option",{value:"Flat"},"Flat")
+                  h("option",{value:"Percentage"},"Percentage"), h("option",{value:"Flat"},"Lumpsum (₹)")
                 ),
-                h("input",{type:"number",value:ctData.packing_forwarding_value||"",onChange:e=>setCtData(d=>({...d,packing_forwarding_value:e.target.value})),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:100},placeholder:ctData.packing_forwarding_basis==="Flat"?"Amount":"%"})
+                h("input",{type:"number",value:ctData.packing_forwarding_value||"",onChange:e=>setCtData(d=>({...d,packing_forwarding_value:e.target.value})),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:100},placeholder:ctData.packing_forwarding_basis==="Flat"?"Amount in ₹":"%"})
               ),
+              // Lumpsum is always entered in INR (30 Aug), regardless of
+              // the quote's own currency — converted here for the
+              // preview so what's shown while editing matches the PDF.
+              // The customer only ever sees the converted figure in
+              // their own quote currency.
               h("div",{style:{fontSize:10.5,color:colors.muted,marginTop:4}},
                 (()=>{ const v=Number(ctData.packing_forwarding_value)||0;
-                  const amt = ctData.packing_forwarding_basis==="Flat" ? v : ctBasicPrice*v/100;
-                  return "Computed: "+fmtR(amt)+(ctData.packing_forwarding_basis==="Flat"?"":" ("+v+"% of "+fmtR(ctBasicPrice)+" basic)");
+                  const quoteCcy = quoteHeaderRow.currency||"INR";
+                  const quoteFxRate = Number(quoteHeaderRow.conversion_rate)||1;
+                  if(ctData.packing_forwarding_basis==="Flat"){
+                    const converted = quoteCcy==="INR" ? v : v/quoteFxRate;
+                    return "Computed: "+quoteCcy+" "+fmtR(converted)+(quoteCcy==="INR"?"":" (entered as ₹"+fmtR(v)+", converted)");
+                  }
+                  const amt = ctBasicPrice*v/100;
+                  return "Computed: "+fmtR(amt)+" ("+v+"% of "+fmtR(ctBasicPrice)+" basic)";
                 })()
               )
             )),
@@ -17900,6 +17976,24 @@ const MANUAL_SECTIONS = [
             "text": "On/after the 2nd of each month, Super Admin gets a prompt at login to archive last month's deletes as a PDF and optionally clear them from the live log, to keep it from growing indefinitely."
           }
         ]
+      },
+      {
+        "key": "quotes_report",
+        "title": "Quotes Report",
+        "tag": "CRM \u2192 Funnel \u2192 Quotes Report",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A filterable list of every quote \u2014 Reference Date range, Reference No/Quote No, Customer, Project Reference, City/State/Country/Region (limit-to-list, cascading), Status, Nature of Quote, and Follow-up Status (Overdue/Due today/Upcoming/None, computed from the customer's latest Log Follow-ups entry)."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "Live quotes and imported Legacy Quotes show together in one list \u2014 a Legacy row carries a \u201cLegacy\u201d badge and has no Open button, since there's no real BOM behind it to open.",
+              "The Reference No is a direct hyperlink into that quote."
+            ]
+          }
+        ]
       }
     ]
   },
@@ -18143,6 +18237,36 @@ const MANUAL_SECTIONS = [
             "text": "Only a Super Admin can change the \"Company\" dropdown next to each user \u2014 this is what determines which Company Master entry appears on the PDFs of any quote that user creates. Regular users see their own assignment as read-only."
           }
         ]
+      },
+      {
+        "key": "data_quality_flags",
+        "title": "Data Quality Flags",
+        "tag": "Admin \u2192 Company \u2192 Data Quality Flags",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Super Admin only. One dashboard combining everything the app flags as needing attention: Draft Quotes, Billing Address Overrides, Document Sequence Breaks, and Late Follow-up Entries \u2014 replacing four separate scattered reminders with one place to check."
+          }
+        ]
+      },
+      {
+        "key": "quote_status_and_nature",
+        "title": "Quote Status Funnel and Nature of Quote",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Two separate fields on every Quote, tracking two different things. Status Funnel is progress: Draft \u2192 Offer Sent \u2192 Under Tech Evaluation \u2192 Commercial Discussion \u2192 Finalised \u2192 Won/Lost/Deferred/Went Cold. Nature of Quote is a classification: Unknown, Budgetary, or Purchase Requirement \u2014 it can move in either direction, unlike Status."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "On the Quote screen itself, only Draft is directly settable for Status \u2014 everything past that only changes through Log Follow-ups' Outcome field.",
+              "Nature of Quote can be set both directly on the Quote screen and through Log Follow-ups.",
+              "Marking Won, Lost, Deferred, or Went Cold always requires a reason before it's accepted."
+            ]
+          }
+        ]
       }
     ]
   },
@@ -18193,6 +18317,53 @@ const MANUAL_SECTIONS = [
           {
             "type": "p",
             "text": "Phase 3 completed the ownership engine and added two reports: Reports \u2192 Quote Status Review (filters: Owner, Zone, State, City, Status, value range, status-changed date range; stale flag past 20 days; status editable inline; 25 rows per page) and Reports \u2192 Won by Owner (pick which status(es) count as \"won\"; totals plus a per-owner breakdown \u2014 attribution follows the CURRENT owner, which can differ from who owned the account when it was actually won). Ownership auto-shifts to the Territory-mapped FSE the moment a brand-new Quote# is first saved for a customer (this counts as \"a Lead was generated\") \u2014 but only if the current owner isn't already an FSE; if they are, nothing changes, no prompt. Logging an Activity as an FSE against a still-Cold company claims ownership immediately, even before any Lead exists, overriding a Telecaller's provisional hold. Phase 4 added a real login-to-employee link \u2014 Master Data \u2192 HR \u2192 Employees now has a per-row \"+ Create login\" / \"Login: linked\" button, letting HR create a username/password/role right there (or link an existing one) without a separate trip to Admin \u2192 Users. The FSE-touch-wins rule above now checks this real link instead of matching login username against Employee name. Phase 5 added the daily transactional layer: My Worklist (By date / By customer / All views, scoped to accounts you own, FSEs see live deal context inline), \"Mark not relevant\" / Restore on Customers (archived accounts drop out of My Worklist without being deleted), and duplicate-name warnings plus a Source field on the quick-add form. Phase 6 closed out the remaining CRM gaps: a notification bell in the TopBar (unread badge, mark-read, refreshes every 60s); a login-time overdue prompt, once per browser-day, color-coded by whether a follow-up is chained from an earlier call or a fresh touch, with a shortcut into My Worklist; and Reports \u2192 Admin only \u2192 Overdue Calls, a cross-team view filterable by Owner/Zone. Along the way, a real bug got fixed \u2014 an old, already-actioned follow-up date could otherwise keep showing as outstanding forever once a newer activity was logged against the same company; My Worklist, the login prompt, and this report all now only look at each company's MOST RECENT activity. With Phase 6, the CRM itself (funnel, ownership, activity tracking, worklists, notifications, reporting) is functionally complete. My Worklist itself lives under CRM \u2192 Daily (moved out of Transaction \u2192 Sales, where it was findable but not where anyone thinking \"CRM\" first would look) \u2014 Quote Status Review, Won by Owner, and Overdue Calls stay under Reports on purpose, keeping the CRM menu short and focused on daily-use screens. The Employee HR record (photo, DOB, blood group, Aadhaar, dual address with change log, tagged phones, restricted payroll, HR events, salary history) remains deliberately separate \u2014 HR/payroll scope, not CRM, with its own open decisions still to settle."
+          }
+        ]
+      },
+      {
+        "key": "log_followups",
+        "title": "Log Follow-ups \u2014 daily entry",
+        "tag": "CRM \u2192 Daily",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A dense, spreadsheet-style screen for logging every call in one sitting \u2014 one Date of Entry for the whole session, one row per call, across as many customers as you actually worked that day."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "Customer is a real search-and-pick combo, with \"+ Add new\" for a genuinely new prospect.",
+              "Chase What (Offer/Order/Cold) drives what Reference shows \u2014 that customer's own open Quotes or Sale Orders, filtered to only the live/open ones.",
+              "Contacted Whom pulls from that customer's real Contacts \u2014 \"+ Add contact\" forces a small form (Name required) rather than accepting free text.",
+              "Notes lives only in a footer panel, not in the row \u2014 it follows whichever row currently has focus."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "A row saves itself silently the moment you move to another row, as long as it has the minimum fields filled in \u2014 no prompt, nothing to click. The header Save button and \"Close for the day\" are there for when you're done, not the only way anything gets saved."
+          },
+          {
+            "type": "warn",
+            "text": "Marking Outcome as Won, Lost, Deferred, or Went Cold always asks for a reason before it's accepted \u2014 Won also asks for the PO Number/Date/Value, the same as marking a Quote Won anywhere else in the app."
+          }
+        ]
+      },
+      {
+        "key": "log_followups_review",
+        "title": "Reviewing past follow-ups",
+        "tag": "CRM \u2192 Daily",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The Review tab (next to Log Entries) shows past entries by date range, grouped by day. Admin and Super Admin can filter by Owner to see anyone's history \u2014 a plain user only ever sees their own."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "Any day in range with zero entries shows a \"+ Log for this date\" button \u2014 useful for a visit you only remembered days later.",
+              "An entry logged more than a day after the date it represents shows a \u201cLogged late\u201d badge.",
+              "Admin viewing someone else's data here is read-only; Super Admin can view and edit anyone's."
+            ]
           }
         ]
       }
@@ -18342,6 +18513,175 @@ const MANUAL_SECTIONS = [
               "Reports \u2192 PO Register \u2014 date-range report of every PO, with each line's description and value stacked, plus a Total Value per PO and a grand total.",
               "Reports \u2192 GRN Status Report \u2014 counts and full lists of every GRN grouped by Draft / Open / Cleared, each with its own Excel/PDF export. This is also where to check what's still incomplete (Draft) or ready to clear (Open)."
             ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "group": "Sale Order",
+    "articles": [
+      {
+        "key": "so_creating",
+        "title": "Creating a Sale Order from a Won Quote",
+        "tag": "Sale Order",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A Sale Order (called a Contract internally) is created from a Quote once it's marked Won \u2014 one Won Quote makes exactly one Contract, and creating it blocks any further amendment on that Quote so the two can never drift apart."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "From the Quote screen, use \"Create Sale Order\" once the Quote is Won \u2014 or from the Sale Order tab, pick an existing Won Quote that doesn't have one yet.",
+              "A Contract Number is suggested automatically (7 digits, e.g. 2600001) \u2014 overridable if needed.",
+              "Everything clones from the Quote: BOM, Commercial Terms, Notes, Extra Price, Testing, Datasheets \u2014 nothing is shared live, so editing the Contract afterward never touches the original Quote."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "The moment a Contract is created, the Sale Order Details prompt appears automatically \u2014 Drawings, QAP Conditions, Inspection By, Late Delivery, Billing/Shipping Address, and Signatory. You can pick \"Fill in later,\" but it'll come back until it's done."
+          }
+        ]
+      },
+      {
+        "key": "so_mandatory_fields",
+        "title": "Sale Order mandatory fields and Billing Address",
+        "tag": "Sale Order",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Before any of the three approvals can happen, a Sale Order needs: P.O. Number, P.O. Date, Shipping Address, Drawings, QAP Conditions, Inspection By, Late Delivery, and Signatory Name/Designation \u2014 all shown, and editable inline, in a red banner on the Sale Order screen whenever something's missing."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "Billing Address is the one exception \u2014 any role can override it with a confirm, which flags it instead of blocking approval.",
+              "Admin and Super Admin see every Contract with an overridden-but-still-unfilled Billing Address in a reminder at login, once per session.",
+              "P.O. Number and P.O. Date are editable directly in this same banner \u2014 no need to go back to the original Quote."
+            ]
+          },
+          {
+            "type": "warn",
+            "text": "Even Super Admin can't approve past a missing mandatory field for free \u2014 a Deletion Code is required to override, and doing so is logged and flagged."
+          }
+        ]
+      },
+      {
+        "key": "so_approval_and_stage",
+        "title": "Three-way approval and Stage",
+        "tag": "Sale Order",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Every Sale Order needs sign-off from three separate roles before it's considered ready: Commercial Terms (Accounts Admin), NDE/Testing (QC), and everything else (Technical Head). Admin and Super Admin can approve any section too."
+          },
+          {
+            "type": "p",
+            "text": "Stage (Draft \u2192 O.A Sent \u2192 W.O Released, with more added as Production is built) is a separate field from approval \u2014 approval only unlocks Stage for editing, it never moves it automatically. Someone still has to manually pick O.A Sent once the Order Acceptance actually goes out."
+          },
+          {
+            "type": "tip",
+            "text": "Generating the Sale Order PDF while Stage is still Draft offers to advance it to O.A Sent right then \u2014 since that's usually the real moment it happens. It's a prompt, never forced."
+          }
+        ]
+      },
+      {
+        "key": "so_pdf_watermark",
+        "title": "Generating the Sale Order PDF and the Draft watermark",
+        "tag": "Sale Order",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "While Stage is Draft, the PDF carries a DRAFT watermark. What happens next depends on your role:"
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "A regular user always gets the watermark \u2014 no way to remove it.",
+              "Admin is prompted for a Deletion Code to remove it \u2014 needed fresh every single time, never remembered.",
+              "Super Admin gets a Yes/No first (\"Remove the watermark?\"), and Yes still needs the same code before it actually comes off."
+            ]
+          }
+        ]
+      },
+      {
+        "key": "so_gst_pf",
+        "title": "GST Structure and Packing & Forwarding",
+        "tag": "Sale Order",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "GST Structure (Commercial Terms, next to Tax) snapshots the resolved rate at the moment it's picked \u2014 it doesn't silently update if the master rate changes later. The GST Variance Report (Admin \u2192 Company) flags any Contract whose snapshotted rate no longer matches today's master."
+          },
+          {
+            "type": "p",
+            "text": "Packing & Forwarding can be Percentage (of Basic Price) or Lumpsum. A Lumpsum amount is always entered in \u20b9, regardless of the quote's own currency \u2014 for a non-INR quote, both the live preview and the final PDF show the converted figure. The customer only ever sees their own currency, never the raw \u20b9 number."
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "group": "Documents",
+    "articles": [
+      {
+        "key": "docs_uploading",
+        "title": "Uploading and tracking documents",
+        "tag": "Documents",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "\"+ Log document\" always starts by asking: New document, or continuing one that already exists?"
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "New \u2014 free-text Doc Number (trimmed automatically), starts at Rev 0, and you pick whether this first entry is Out or In.",
+              "Continuing \u2014 a limit-to-list pick of that Quote or Sale Order's existing documents. This is deliberate: picking from the list instead of retyping the number means a stray space or typo can never accidentally fork a duplicate document."
+            ]
+          }
+        ]
+      },
+      {
+        "key": "docs_sequence",
+        "title": "Out/In sequence and Status",
+        "tag": "Documents",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A document's real history must alternate strictly: Rev0-Out, Rev0-In, Rev1-Out, Rev1-In, and so on \u2014 the very first entry can be either Out or In, but every entry after that has to be the opposite of the one before it. Continuing a document computes the correct next Rev and Direction automatically \u2014 it's never asked as a free choice."
+          },
+          {
+            "type": "p",
+            "text": "Each entry also carries a Status (Our Action Pending, Third Party Action Pending, All Cleared, and similar) \u2014 shown as a red/yellow/green badge. Status is purely informational; it never blocks anything, unlike the mandatory-document checks below."
+          },
+          {
+            "type": "warn",
+            "text": "Only Super Admin can break the sequence, and even then only with a Deletion Code \u2014 doing so flags the document, and it stays flagged (shown to Admin/Super Admin at login) until someone goes back and closes the real gap."
+          }
+        ]
+      },
+      {
+        "key": "docs_requested",
+        "title": "Documents Requested by Customer",
+        "tag": "Documents",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A separate panel above the documents list tracks what the customer actually asked for \u2014 add a category, it shows red \"Initial submission pending\" until something's actually submitted against it."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "When logging a document (New or Continuing), you're asked whether it fulfills one of these open requests.",
+              "Picking one links it and flips that request to green \"Sent.\"",
+              "Picking \"No \u2014 additional document\" logs it normally, with no link to any request."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "This is purely informational too \u2014 it never blocks generating the Quote or Sale Order PDF, and a Sale Order always starts with its own empty list rather than inheriting the Quote's."
           }
         ]
       }
@@ -20121,26 +20461,43 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
     setRows([blankRow()]);
     setActiveRowKey(null);
   };
-  const rowHasMinimumFields = (r)=> r.companyName.trim() && r.discussedWhat.trim() && r.nextFollowupDate &&
+  // Silent auto-save (30 Aug) — fires when focus leaves a row that's
+  // dirty and has the minimum fields to be worth saving. No prompt, no
+  // confirmation. A row not yet complete enough just stays unsaved
+  // until it is — this never nags about an in-progress row.
+  // Next Follow-up Date is only mandatory for an active/open case — a
+  // closed outcome (Won/Lost/Deferred/Went Cold) genuinely has nothing
+  // left to follow up on. Same four outcomes that already require a
+  // reason via WonLostOutcomeModal — deliberately the same set, not a
+  // second judgment call.
+  const CLOSED_OUTCOMES = ["Won","Lost","Deferred","Went Cold"];
+  const nextFollowupRequired = (r)=> !CLOSED_OUTCOMES.includes(r.outcome);
+  const rowHasMinimumFields = (r)=> r.companyName.trim() && r.discussedWhat.trim() && (r.nextFollowupDate || !nextFollowupRequired(r)) &&
     !((r.chaseWhat==="Offer"||r.chaseWhat==="Order") && !r.chaseReference);
   // Silent auto-save (30 Aug) — fires when focus leaves a row that's
   // dirty and has the minimum fields to be worth saving. No prompt, no
   // confirmation. A row not yet complete enough just stays unsaved
   // until it is — this never nags about an in-progress row.
+  // FIXED (30 Aug): neither branch below ever checked {error} — a
+  // failed insert/update (e.g. a migration that was never actually run)
+  // would still mark the row as saved, with nothing shown to the user.
+  // Same silent-save-failure pattern this app has hit before elsewhere.
   const saveOneRowSilently = async(row)=>{
     if(!row || !row._dirty || !rowHasMinimumFields(row)) return;
     const refNumber = row.chaseReference ? row.chaseReference.split(" — ")[0] : null;
     const payload = {
       company_name:row.companyName, activity_type:row.mode, chase_what:row.chaseWhat, chase_reference:refNumber,
       contacted_whom:row.contactedWhom||null, discussed_what:row.discussedWhat.trim(), outcome:row.outcome||"",
-      notes:row.notes||"", activity_date:entryDate, next_followup_date:row.nextFollowupDate,
+      notes:row.notes||"", activity_date:entryDate, next_followup_date:row.nextFollowupDate||null,
       logged_by:user?.username||"unknown"
     };
     if(row._savedId){
-      await sb.from("activity_log_tbl").update(payload).eq("id",row._savedId);
+      const { error } = await sb.from("activity_log_tbl").update(payload).eq("id",row._savedId);
+      if(error){ alert("Couldn't save "+row.companyName+"'s follow-up: "+error.message); return; }
     } else {
       const { data: recent } = await sb.from("activity_log_tbl").select("id").eq("company_name",row.companyName).order("created_at",{ascending:false}).limit(1);
-      const { data: inserted } = await sb.from("activity_log_tbl").insert({...payload, is_followup_of: recent&&recent[0]?recent[0].id:null}).select("id").single();
+      const { data: inserted, error } = await sb.from("activity_log_tbl").insert({...payload, is_followup_of: recent&&recent[0]?recent[0].id:null}).select("id").single();
+      if(error){ alert("Couldn't save "+row.companyName+"'s follow-up: "+error.message); return; }
       if(inserted) updateRow(row._key,{_savedId:inserted.id});
     }
     setRows(rs=>rs.map(r=>r._key===row._key?{...r,_dirty:false}:r));
@@ -20199,7 +20556,7 @@ function ContinuousFollowupEntry({ user, sessionCompany }){
       if(!r.companyName.trim()){ alert("Every row needs a Customer."); return; }
       if((r.chaseWhat==="Offer"||r.chaseWhat==="Order") && !r.chaseReference){ alert("Pick a Reference for every Offer/Order row."); return; }
       if(!r.discussedWhat.trim()){ alert("Say what was discussed on every row."); return; }
-      if(!r.nextFollowupDate){ alert("Every row needs a Next Followup Date."); return; }
+      if(!r.nextFollowupDate && nextFollowupRequired(r)){ alert("Every row needs a Next Followup Date, unless the Outcome is Won, Lost, Deferred, or Went Cold."); return; }
     }
     setSaving(true);
     try{
@@ -23468,6 +23825,220 @@ function QuotesReportScreen({ user, onOpenQuote }){
       filtered.length===0 && h("div",{style:{padding:20,color:colors.mutedLight,textAlign:"center"}},"No quotes match these filters."),
       h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:8}},filtered.length+" of "+rows.length+" quotes shown")
     )
+  );
+}
+
+// CRM Dashboards (30 Aug) — twelve cards across five categories, one
+// shared Weekly(Mon-Sun)/Quarterly(calendar)/Yearly/Custom period toggle.
+// Value-based metrics (Won value, pipeline value) are deliberately left
+// out — there's no stored/cached total on a live quote anywhere in this
+// app, and live-computing full BOM totals for hundreds of quotes on
+// every dashboard load would be far too slow to be practical. Counts
+// only, until a stored total exists to build that properly on top of.
+function periodBounds(mode, customFrom, customTo){
+  const now = new Date();
+  if(mode==="custom") return {from:customFrom, to:customTo};
+  if(mode==="weekly"){
+    const day = now.getDay();
+    const diffToMonday = (day===0?-6:1-day);
+    const monday = new Date(now); monday.setDate(now.getDate()+diffToMonday); monday.setHours(0,0,0,0);
+    const sunday = new Date(monday); sunday.setDate(monday.getDate()+6);
+    return {from:monday.toISOString().slice(0,10), to:sunday.toISOString().slice(0,10)};
+  }
+  if(mode==="quarterly"){
+    const q = Math.floor(now.getMonth()/3);
+    const from = new Date(now.getFullYear(), q*3, 1);
+    const to = new Date(now.getFullYear(), q*3+3, 0);
+    return {from:from.toISOString().slice(0,10), to:to.toISOString().slice(0,10)};
+  }
+  return {from:now.getFullYear()+"-01-01", to:now.getFullYear()+"-12-31"};
+}
+
+function CrmDashboardsScreen({ user }){
+  const [periodMode,setPeriodMode] = useState("quarterly");
+  const [customFrom,setCustomFrom] = useState(new Date(Date.now()-30*86400000).toISOString().slice(0,10));
+  const [customTo,setCustomTo] = useState(new Date().toISOString().slice(0,10));
+  const { from, to } = periodBounds(periodMode, customFrom, customTo);
+  const [loading,setLoading] = useState(true);
+  const [data,setData] = useState(null);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    try{
+      const { data: estRows } = await sb.from("estimates")
+        .select("reference_number,customer_name,quote_status,quote_date,created_at,status_changed_by,status_changed_at,status_reason")
+        .order("created_at",{ascending:false}).limit(3000);
+      const byRef = new Map();
+      (estRows||[]).forEach(r=>{ if(!byRef.has(r.reference_number)) byRef.set(r.reference_number,r); });
+      const quotes = Array.from(byRef.values());
+
+      const { data: acts } = await sb.from("activity_log_tbl").select("*")
+        .gte("created_at",from+"T00:00:00").lte("created_at",to+"T23:59:59").order("created_at",{ascending:false}).limit(5000);
+      const activities = acts||[];
+
+      const { data: outcomes } = await sb.from("quote_outcomes").select("*").limit(2000);
+
+      const customerNames = Array.from(new Set(quotes.map(q=>q.customer_name).filter(Boolean)));
+      const { data: cos } = customerNames.length
+        ? await sb.from("companies").select("company_name,zone,billing_country").in("company_name",customerNames)
+        : { data: [] };
+      const coByName = new Map((cos||[]).map(c=>[c.company_name,c]));
+
+      const { data: legacyRows } = await sb.from("legacy_quotes_tbl").select("reference_number,reference_date,quote_status");
+
+      setData({ quotes, activities, outcomes: outcomes||[], coByName, legacyRows: legacyRows||[] });
+    } finally { setLoading(false); }
+  },[from,to]);
+  useEffect(()=>{ load(); },[load]);
+
+  const card = (title, child)=> h("div",{style:{border:"1px solid #cfe3dd",borderRadius:8,padding:12}},
+    h("p",{style:{fontWeight:700,fontSize:12,margin:"0 0 8px"}},title), child
+  );
+  const category = (title, cards)=> h("div",{style:{marginBottom:18}},
+    h("p",{style:{fontSize:11,fontWeight:700,color:"#6b8e83",textTransform:"uppercase",letterSpacing:0.5,margin:"0 0 8px"}},title),
+    h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:10}},cards)
+  );
+  const line = (text, danger)=> h("p",{style:{fontSize:11,margin:"0 0 4px",color:danger?"#a3312a":"#333"}},text);
+
+  return h("div",{style:{padding:"20px 24px"}},
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},
+      h("h2",{style:{margin:0}},"CRM Dashboards"),
+      h("div",{style:{display:"flex",gap:6}},
+        ["weekly","quarterly","yearly","custom"].map(m=>h("button",{key:m,onClick:()=>setPeriodMode(m),style:{fontSize:11,padding:"5px 12px",background:periodMode===m?"#0f7a5c":"#fff",color:periodMode===m?"#fff":"#333",border:"1px solid #0f7a5c",borderRadius:4,cursor:"pointer",textTransform:"capitalize"}},m))
+      )
+    ),
+    periodMode==="custom" && h("div",{style:{display:"flex",gap:10,marginBottom:16}},
+      h("input",{type:"date",value:customFrom,onChange:e=>setCustomFrom(e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"auto"}}),
+      h("input",{type:"date",value:customTo,onChange:e=>setCustomTo(e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:"auto"}})
+    ),
+    h("p",{style:{fontSize:11,color:"#8a9d97",marginTop:-8,marginBottom:16}},"Showing "+from+" to "+to),
+    loading || !data ? h("div",{style:{color:"#8a9d97"}},"Loading…") : (()=>{
+      const { quotes, activities, outcomes, coByName, legacyRows } = data;
+      const CLOSED = ["Won","Lost","Deferred","Went Cold"];
+      const isOpen = q=>!CLOSED.includes(q.quote_status);
+      const changedInPeriod = q=>q.status_changed_at && q.status_changed_at.slice(0,10)>=from && q.status_changed_at.slice(0,10)<=to;
+      const outcomeByRef = new Map(outcomes.map(o=>[o.reference_number,o]));
+      const latestActByRef = new Map();
+      activities.forEach(a=>{ if(a.chase_reference && !latestActByRef.has(a.chase_reference)) latestActByRef.set(a.chase_reference,a); });
+
+      // 1. Funnel with drop-off
+      const funnelCounts = {};
+      quotes.forEach(q=>{ funnelCounts[q.quote_status]=(funnelCounts[q.quote_status]||0)+1; });
+
+      // 2. Stalled deals — open, no status change or activity in 21+ days
+      const staleCutoff = new Date(Date.now()-21*86400000);
+      const stalled = quotes.filter(q=>isOpen(q) && (!q.status_changed_at || new Date(q.status_changed_at)<staleCutoff) &&
+        !activities.some(a=>a.chase_reference===q.reference_number));
+
+      // 3. Orphaned quotes — zero activity ever chasing them (checked within loaded window)
+      const chasedRefs = new Set(activities.map(a=>a.chase_reference).filter(Boolean));
+      const orphaned = quotes.filter(q=>isOpen(q) && !chasedRefs.has(q.reference_number) && !latestActByRef.has(q.reference_number));
+
+      // 4. Loss reason breakdown (status changed to Lost within period)
+      const lostInPeriod = quotes.filter(q=>q.quote_status==="Lost" && changedInPeriod(q));
+      const reasonCounts = {};
+      lostInPeriod.forEach(q=>{ const r=q.status_reason||"(no reason given)"; reasonCounts[r]=(reasonCounts[r]||0)+1; });
+
+      // 5. Competitor tracker
+      const competitorCounts = {};
+      lostInPeriod.forEach(q=>{ const o=outcomeByRef.get(q.reference_number); if(o?.competitor_name){ if(!competitorCounts[o.competitor_name]) competitorCounts[o.competitor_name]={count:0}; competitorCounts[o.competitor_name].count++; } });
+
+      // 6. Owner workload balance — most recent activity's logged_by, quote still open
+      const ownerLoad = {};
+      quotes.filter(isOpen).forEach(q=>{ const a=latestActByRef.get(q.reference_number); if(a?.logged_by){ ownerLoad[a.logged_by]=(ownerLoad[a.logged_by]||0)+1; } });
+
+      // 7. Mode effectiveness — win rate by activity mode (latest activity on Won/Lost quotes changed in period)
+      const modeStats = {};
+      quotes.filter(q=>(q.quote_status==="Won"||q.quote_status==="Lost")&&changedInPeriod(q)).forEach(q=>{
+        const a=latestActByRef.get(q.reference_number); if(!a) return;
+        if(!modeStats[a.activity_type]) modeStats[a.activity_type]={won:0,total:0};
+        modeStats[a.activity_type].total++; if(q.quote_status==="Won") modeStats[a.activity_type].won++;
+      });
+
+      // 8. Zone/Country performance
+      const zoneStats = {};
+      quotes.filter(q=>(q.quote_status==="Won"||q.quote_status==="Lost")&&changedInPeriod(q)).forEach(q=>{
+        const zone = coByName.get(q.customer_name)?.zone||"Unknown";
+        if(!zoneStats[zone]) zoneStats[zone]={won:0,total:0};
+        zoneStats[zone].total++; if(q.quote_status==="Won") zoneStats[zone].won++;
+      });
+
+      // 9. Prospecting vs nurturing
+      const coldCount = activities.filter(a=>a.chase_what==="Cold").length;
+      const chaseCount = activities.filter(a=>a.chase_what==="Offer"||a.chase_what==="Order").length;
+
+      // 10. Deferred reactivation list
+      const deferred = quotes.filter(q=>q.quote_status==="Deferred");
+
+      // 11. Legacy + Live trend — count created within period, both sources
+      const liveInPeriod = quotes.filter(q=>{ const d=(q.quote_date||q.created_at||"").slice(0,10); return d>=from && d<=to; }).length;
+      const legacyInPeriod = legacyRows.filter(l=>l.reference_date>=from && l.reference_date<=to).length;
+
+      // 12. Owner KPI Scorecard
+      const kpiByOwner = {};
+      activities.forEach(a=>{ const o=a.logged_by||"Unknown"; if(!kpiByOwner[o]) kpiByOwner[o]={calls:0,won:0,lost:0,late:0,closeDays:[]}; kpiByOwner[o].calls++; });
+      const isLateEntryRow = (row)=>{
+        if(!row.created_at || !row.activity_date) return false;
+        const loggedDate = new Date(row.created_at); loggedDate.setHours(0,0,0,0);
+        const visitDate = new Date(row.activity_date+"T00:00:00");
+        return loggedDate >= new Date(visitDate.getTime()+2*86400000);
+      };
+      activities.forEach(a=>{ if(isLateEntryRow(a) && kpiByOwner[a.logged_by]) kpiByOwner[a.logged_by].late++; });
+      quotes.filter(q=>(q.quote_status==="Won"||q.quote_status==="Lost")&&changedInPeriod(q)).forEach(q=>{
+        const o=q.status_changed_by; if(!o) return;
+        if(!kpiByOwner[o]) kpiByOwner[o]={calls:0,won:0,lost:0,late:0,closeDays:[]};
+        if(q.quote_status==="Won") kpiByOwner[o].won++; else kpiByOwner[o].lost++;
+        const created = new Date(q.quote_date||q.created_at); const closed = new Date(q.status_changed_at);
+        kpiByOwner[o].closeDays.push(Math.round((closed-created)/86400000));
+      });
+
+      return h(React.Fragment,null,
+        category("Pipeline Health",[
+          card("Funnel with drop-off", Object.entries(funnelCounts).map(([s,c])=>line(s+" — "+c))),
+          card("Stalled deals (21+ days untouched)", stalled.length===0?line("None."):line(stalled.length+" quote(s) open with no recent activity",true)),
+          card("Orphaned quotes (never chased)", orphaned.length===0?line("None."):line(orphaned.length+" quote(s), zero follow-ups logged",true)),
+        ]),
+        category("Competitive Intelligence",[
+          card("Loss reason breakdown", Object.keys(reasonCounts).length===0?line("No losses this period."):Object.entries(reasonCounts).map(([r,c])=>line(r+" — "+c))),
+          card("Competitor tracker", Object.keys(competitorCounts).length===0?line("No competitor data this period."):Object.entries(competitorCounts).map(([n,d])=>line(n+" — beat us "+d.count+"x"))),
+        ]),
+        category("People",[
+          card("Owner workload balance", Object.keys(ownerLoad).length===0?line("No data."):Object.entries(ownerLoad).sort((a,b)=>b[1]-a[1]).map(([o,c])=>line(o+" — "+c+" open account(s)"))),
+          card("Mode effectiveness", Object.keys(modeStats).length===0?line("No closed deals this period."):Object.entries(modeStats).map(([m,s])=>line(m+" — "+Math.round(100*s.won/s.total)+"% win rate ("+s.total+" closed)"))),
+        ]),
+        category("Geography and Segment",[
+          card("Zone / Region performance", Object.keys(zoneStats).length===0?line("No closed deals this period."):Object.entries(zoneStats).map(([z,s])=>line(z+" — "+Math.round(100*s.won/s.total)+"% win rate ("+s.total+" closed)"))),
+          card("Prospecting vs nurturing", h(React.Fragment,null, line("Cold — "+coldCount+" ("+((coldCount+chaseCount)?Math.round(100*coldCount/(coldCount+chaseCount)):0)+"%)"), line("Offer/Order follow-up — "+chaseCount))),
+        ]),
+        category("Time-based Trends",[
+          card("Deferred reactivation list", deferred.length===0?line("None currently deferred."):deferred.map(q=>line(q.reference_number+" — "+q.customer_name+" — "+(q.status_reason||"no reason logged")))),
+          card("Legacy + Live trend (this period)", h(React.Fragment,null, line("Live quotes — "+liveInPeriod), line("Legacy quotes — "+legacyInPeriod))),
+        ]),
+        category("Owner KPI Scorecard",[
+          h("div",{style:{gridColumn:"1 / -1",overflowX:"auto"}},
+            h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:11.5}},
+              h("thead",null,h("tr",{style:{background:"#eef6f3",textAlign:"left"}},
+                ["Owner","Calls logged","Win rate","Won","Avg. time to close","Late-entry rate"].map(c=>h("th",{key:c,style:{padding:"7px 9px"}},c))
+              )),
+              h("tbody",null, Object.entries(kpiByOwner).map(([owner,k])=>{
+                const totalClosed = k.won+k.lost;
+                const winRate = totalClosed? Math.round(100*k.won/totalClosed)+"%" : "—";
+                const avgDays = k.closeDays.length? Math.round(k.closeDays.reduce((a,b)=>a+b,0)/k.closeDays.length)+" days" : "—";
+                const lateRate = k.calls? Math.round(100*k.late/k.calls)+"%" : "0%";
+                return h("tr",{key:owner,style:{borderTop:"1px solid #eee"}},
+                  h("td",{style:{padding:"7px 9px",fontWeight:600}},owner),
+                  h("td",{style:{padding:"7px 9px"}},k.calls),
+                  h("td",{style:{padding:"7px 9px"}},winRate),
+                  h("td",{style:{padding:"7px 9px"}},k.won),
+                  h("td",{style:{padding:"7px 9px"}},avgDays),
+                  h("td",{style:{padding:"7px 9px",color:k.late>0?"#a3312a":undefined}},lateRate)
+                );
+              }))
+            )
+          )
+        ])
+      );
+    })()
   );
 }
 
@@ -28158,6 +28729,7 @@ function App() {
     tab==="gaps_dashboard"?h(GapsChaseDashboard,{user,onGoTo:goToEntityLookup}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user}):
     tab==="quotes_report"?h(QuotesReportScreen,{user,onOpenQuote:(ref,slNo)=>{setCameFromQuotesReport(true); setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}}):
+    tab==="crm_dashboards"?h(CrmDashboardsScreen,{user}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
     tab==="customers"?h(CustomersScreen,{user}):
