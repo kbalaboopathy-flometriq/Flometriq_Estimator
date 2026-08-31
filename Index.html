@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-31T04:15:00Z";
+  var APP_BUILD_VERSION = "2026-08-31T05:05:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -12541,6 +12541,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // slNoBaseTotalInr basis as everywhere else, so it can't drift
       // from a stale stored figure. Informational only — NOT added into
       // grandTotalInr below, deliberately.
+      // 31 Aug fix — this used to be declared 56 lines further down
+      // (right before the "Can't generate PDF — no Company resolved"
+      // check), but was also being read here for the Lumpsum P&F
+      // conversion below — a genuine "used before initialization" bug,
+      // the same class flagged repeatedly earlier in this app's history.
+      // node --check can't catch this kind of thing since it's a runtime
+      // ordering issue, not a syntax error — it only ever surfaced when
+      // someone actually generated a PDF. Hoisted up here since nothing
+      // between the old and new position depends on anything not yet
+      // available this early.
+      const first = estimatesRows[0];
       const pfBasicPriceTotal = estimatesRows.reduce((s,est)=>s+slNoBaseTotalInr(est),0);
       // Lumpsum P&F is always entered in INR (30 Aug), regardless of the
       // quote's own currency — converted here for display, same as
@@ -12603,7 +12614,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
 
       const {data:revChangesRows} = isRevisionPdf ? await sb.from("revision_changes").select("*").eq("revision_ref",quoteExportRef).order("changed_at",{ascending:true}) : {data:[]};
       const revChangesForPdf = revChangesRows||[];
-      const first = estimatesRows[0];
       if(!first.company_id){
         alert("Can't generate PDF — this quote has no Company resolved.\n\nIt was created by \""+(first.created_by||"unknown")+"\", whose account has no Company assigned. Ask your Super Admin to assign one in Admin \u2192 User Management (or, if the creator is a Super Admin, they need to pick a company at login) before this PDF can be generated.");
         return;
@@ -15944,19 +15954,19 @@ async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, 
   if(newStatus!=="Draft"){
     try{ await purgeQuoteDocumentsIfLeavingDraft(referenceNumber, changedBy); } catch(e){ console.error("Document purge failed:",e); }
   }
-  // Owner alert (31 Aug) — scoped deliberately to the Quote screen only
-  // (source==="Quote form"), per what was actually asked. The worry:
-  // Admin/Super Admin can change status here freely, with no code and no
-  // Log Follow-ups outcome-capture friction — a real customer PO could
-  // get logged as Won by someone other than the account owner, who'd
-  // have no way of knowing unless told. "Owner" here is the CRM
-  // ownership engine's real concept (companies.owner_employee_name), the
-  // only one this app actually has. Every status value notifies, not
-  // just the closing ones — Won is the specific worry raised, but any
-  // change made by someone other than the owner is worth surfacing.
-  // Best-effort: a notification failure never blocks the actual status
-  // change.
-  if(source==="Quote form"){
+  // Owner alert (31 Aug, widened same day) — originally scoped to just
+  // the Quote screen; extended to also cover the CRM Funnel Kanban board
+  // and Quote Status Review, since both can move status just as quietly
+  // (same isQuoteLocked-gated-but-no-outcome-capture path as the Quote
+  // screen) — Log Follow-ups is deliberately still excluded, since
+  // that's the expected/visible way status normally moves, not a quiet
+  // side door. "Owner" here is the CRM ownership engine's real concept
+  // (companies.owner_employee_name), the only one this app actually
+  // has. Every status value notifies, not just the closing ones — Won
+  // is the specific worry raised, but any change made by someone other
+  // than the owner is worth surfacing. Best-effort: a notification
+  // failure never blocks the actual status change.
+  if(source==="Quote form" || source==="CRM funnel board" || source==="Quote Status Review"){
     try{
       const { data: est } = await sb.from("estimates").select("customer_name").eq("reference_number",referenceNumber).limit(1).maybeSingle();
       const customerName = est?.customer_name;
@@ -17966,7 +17976,7 @@ const MANUAL_SECTIONS = [
         "blocks": [
           {
             "type": "p",
-            "text": "If a quote's status is changed from the Quote screen itself by someone other than that account's current CRM owner, the owner gets a banner the next time they log in \u2014 who changed it, to what, and when. Scoped deliberately to the Quote screen only, since that's the one place status can move (Admin/Super Admin freely, anyone else with a code) without going through Log Follow-ups' own Outcome capture."
+            "text": "If a quote's status is changed from the Quote screen, the CRM Funnel Kanban board, or Quote Status Review by someone other than that account's current CRM owner, the owner gets a banner the next time they log in \u2014 who changed it, to what, and when. Scoped to those three screens (31 Aug, widened same day) \u2014 the ones status can move through without going via Log Follow-ups' own Outcome capture; Log Follow-ups itself doesn't trigger this, since that's the expected, visible way status normally moves."
           },
           {
             "type": "bullets",
@@ -18088,7 +18098,8 @@ const MANUAL_SECTIONS = [
               "Live quotes and imported Legacy Quotes show together in one list \u2014 a Legacy row carries a \u201cLegacy\u201d badge and has no Open button, since there's no real BOM behind it to open.",
               "The Reference No is a direct hyperlink into that quote.",
               "Follow-up Stage shows \u201cOutcome - Notes\u201d from that quote's latest logged call. A Legacy row shows its frozen import note until a real call is ever logged against it \u2014 from that point on it behaves exactly like a live quote's follow-up data.",
-              "History (every row) \u2014 asks whether to view every call for this Customer or just this Reference, then opens a full chronological list (Date, Mode, Chase What, Discussed What, Outcome, Notes, Logged by) with a Delete button per entry and a Back button to return here."
+              "History (every row) \u2014 asks whether to view every call for this Customer or just this Reference, then opens a full chronological list (Date, Mode, Chase What, Discussed What, Outcome, Notes, Logged by) with a Delete button per entry and a Back button to return here.",
+              "Reference No/Quote No, Customer Name, and Project Reference are free-text partial search (31 Aug fix) \u2014 previously these silently reverted anything that didn't exactly match an existing value, with no error shown, so a typed search often looked like it did nothing."
             ]
           }
         ]
@@ -18973,6 +18984,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"31 Aug 2026 (44)", summary:"URGENT fix — Generate Quote PDF was completely broken for every quote: \"Cannot access 'first' before initialization\". Root cause: the 30 Aug Lumpsum Packing & Forwarding work read a variable named first (the quote's header row) 56 lines before it was actually declared, in the same PDF-generation function — the exact used-before-initialization bug class flagged repeatedly earlier in this project, invisible to node --check since it's a runtime ordering issue, not a syntax error, so it only ever surfaced when someone actually generated a PDF. Fixed by hoisting the single const first = estimatesRows[0] declaration up to before its first use; verified with an isolated Node reproduction of the exact before/after ordering, not just re-reading the code. No other logic touched." },
+  { date:"31 Aug 2026 (43)", summary:"Two fixes. (1) Quotes Report's Reference No/Quote No, Customer Name, and Project Reference filters fixed — all three were built as limit-to-list combos defaulting to exact match, so a typed value that didn't EXACTLY match an existing reference/customer/project silently reverted to blank on blur (text stayed visible in the box, but the filter itself was empty) — explains why typed searches appeared to return unrelated rows. Now free-text (limitToList:false) with case-insensitive partial matching, same as City's own filter already did. (2) Quote Status Owner Alerts widened from Quote-screen-only to also cover the CRM Funnel Kanban board and Quote Status Review — both can move status just as quietly as the Quote screen (same isQuoteLocked gate, no Outcome-capture friction); Log Follow-ups remains deliberately excluded as the expected/visible path. Banner text and User Manual updated to match the wider scope." },
   { date:"31 Aug 2026 (42)", summary:"Quote screen Status control tightened + a new owner-alert banner. (1) A plain user now needs an authorization code for ANY status change made from the Quote screen itself, including the very first Draft -> Offer Sent move — previously the shared isQuoteLocked rule only kicked in once status was already past Draft, so that first move was unrestricted; Admin/Super Admin unchanged, still free. Real bug found and fixed in the same code: the dropdown's own option list only ever offered \"Draft\" as a choice, even though the screen was meant to allow Offer Sent too — fixed to [\"Draft\",\"Offer Sent\"]. (2) New Quote Status Owner Alerts login banner: when status is changed from the Quote screen by someone other than the account's current CRM owner (companies.owner_employee_name), the owner gets a banner on next login stating who changed it, to what, and when — every status value, not just closing ones, since Admin/Super Admin can move a quote to Won with no code and no Log Follow-ups friction at all, which was the actual worry raised. Deliberately scoped to Quote-screen changes only, not Kanban/Quote Status Review — a real narrowing decision, flagged as something that could be widened later if wanted. Backed by the existing notifications_tbl (new additive notif_type column, notif_type_column_2026-08-31.sql) rather than a new table — reuses the same store the notification bell already reads, just tagged. Shown to any role, not admin-gated, since an owner can be a plain FSE/Telecaller. Each alert has its own dismiss; \"Got it\" clears all at once." },
   { date:"31 Aug 2026 (41)", summary:"History button extended into Log Follow-ups itself — a clock icon at the end of every row in both Log Entries and Review, opening the exact same Customer/Reference popup + FollowupHistoryScreen built for Quotes Report (reused, not rebuilt). Log Entries' row-removal column widened (20px→55px) to fit both icons; Review gained a new trailing column for it, divider rows' colSpan bumped 9→10 to match. On save/close both screens now return to Log Follow-ups (not Quotes Report) via the same onBack callback, since FollowupHistoryScreen only needed a generic onBack, not two separate variants." },
   { date:"31 Aug 2026 (40)", summary:"Quotes Report follow-up data reworked and a new History screen added. Follow-up Stage/Next Follow-up rescoped from \"customer's latest call about anything\" to THIS reference's own latest call — the old company-wide lookup meant two open quotes for the same customer showed identical, possibly-unrelated follow-up data; one activity_log_tbl query (keyed by chase_reference) now covers live and legacy references together. Follow-up Stage now shows \"Outcome - Notes\" instead of just Outcome. Legacy quotes: once a real call is ever logged against a legacy reference, its follow-up data switches over from the frozen Excel-import columns (followup_note/next_followup_date) to the live logged entry automatically — no separate code path, same lookup as a live quote. New History button on every Quotes Report row (live and legacy): a small popup asks Customer or Reference scope, then opens a new FollowupHistoryScreen — full chronological list (Date/Mode/Chase What/Discussed What/Outcome/Notes/Logged by) with a per-row Delete (plain confirm, audit-logged) and a Back button. Also: Notes is now a required field on every new Log Follow-ups row (both the silent auto-save gate and Close for the day's explicit validation) — Review tab's existing inline edits are deliberately left untouched, not retroactively enforced." },
@@ -20515,8 +20528,9 @@ function IncompleteSaleOrderReminder({ user, onDone, onOpenContract }){
   );
 }
 
-// Quote Status Owner Alerts (31 Aug) — "someone other than the account
-// owner changed a quote's status from the Quote screen" alerts, backed
+// Quote Status Owner Alerts (31 Aug, widened same day) — "someone other
+// than the account owner changed a quote's status from the Quote
+// screen, Funnel board, or Quote Status Review" alerts, backed
 // by the existing notifications_tbl (notif_type="quote_status_change"),
 // written by updateQuoteStatusForQuote itself. Shown to ANY role (an
 // owner can be a plain FSE/Telecaller, not just admin/super_admin) —
@@ -20548,7 +20562,7 @@ function QuoteStatusOwnerAlerts({ user, onDone }){
   return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.4)",zIndex:1350,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
     h("div",{style:{background:"#fff",borderRadius:12,padding:"22px 26px",width:560,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
       h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Quote status changed on an account you own"),
-      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Changed from the Quote screen, not through Log Follow-ups — flagging it here in case you weren't aware."),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Changed from the Quote screen, Funnel board, or Quote Status Review — not through Log Follow-ups — flagging it here in case you weren't aware."),
       rows.map(r=>h("div",{key:r.id,style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,padding:"9px 10px",background:"#faf9f4",borderRadius:6,marginBottom:8,fontSize:12.5}},
         h("span",null,r.message),
         h("span",{title:"Dismiss",onClick:()=>dismissOne(r.id),style:{cursor:"pointer",color:colors.mutedLight,fontWeight:700,padding:"0 4px"}},"×")
@@ -24357,8 +24371,8 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   const filtered = rows.filter(r=>{
     if(filters.dateFrom && r.reference_date < filters.dateFrom) return false;
     if(filters.dateTo && r.reference_date > filters.dateTo) return false;
-    if(filters.refLike && r.reference_number!==filters.refLike) return false;
-    if(filters.customerLike && r.customer_name!==filters.customerLike) return false;
+    if(filters.refLike && !r.reference_number.toLowerCase().includes(filters.refLike.toLowerCase())) return false;
+    if(filters.customerLike && !r.customer_name.toLowerCase().includes(filters.customerLike.toLowerCase())) return false;
     if(filters.cityLike && !r.city.toLowerCase().includes(filters.cityLike.toLowerCase())) return false;
     if(filters.stateLike && r.state!==filters.stateLike) return false;
     if(filters.countryLike && r.country!==filters.countryLike) return false;
@@ -24366,7 +24380,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     if(filters.status && r.status!==filters.status) return false;
     if(filters.nature && r.nature!==filters.nature) return false;
     if(filters.followUp && followUpBucket(r)!==filters.followUp) return false;
-    if(filters.projectLike && r.project_reference!==filters.projectLike) return false;
+    if(filters.projectLike && !(r.project_reference||"").toLowerCase().includes(filters.projectLike.toLowerCase())) return false;
     return true;
   });
 
@@ -24393,9 +24407,9 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     h("div",{style:{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:16,background:"#faf9f4",padding:14,borderRadius:8}},
       fld("Reference Date >=", h("input",{type:"date",value:filters.dateFrom,onChange:e=>setF("dateFrom",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
       fld("Reference Date <=", h("input",{type:"date",value:filters.dateTo,onChange:e=>setF("dateTo",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
-      fld("Reference No / Quote No", combo("refLike",refOptions)),
-      fld("Customer Name", combo("customerLike",customerOptions)),
-      fld("Project Reference", combo("projectLike",projectOptions)),
+      fld("Reference No / Quote No", combo("refLike",refOptions,{limitToList:false})),
+      fld("Customer Name", combo("customerLike",customerOptions,{limitToList:false})),
+      fld("Project Reference", combo("projectLike",projectOptions,{limitToList:false})),
       fld("Country", combo("countryLike",WORLD_COUNTRIES)),
       fld("State", combo("stateLike",stateOptions,{disabled:filters.countryLike!=="India"})),
       // City: real master list, but NOT limit-to-list — a genuine city
