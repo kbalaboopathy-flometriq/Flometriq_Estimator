@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-31T03:05:00Z";
+  var APP_BUILD_VERSION = "2026-08-31T04:15:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -13716,11 +13716,27 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                         setOpenRef(r=>({...r,quote_status:newStatus}));
                         setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,quote_status:newStatus}:r));
                       };
-                      if(isQuoteLocked(quoteHeaderRow.quote_status,user)){ setAuthGate({requiredType:"edit",action:doChange}); return; }
+                      // 31 Aug — tightened beyond the shared isQuoteLocked
+                      // rule (which only locks once status is ALREADY
+                      // non-Draft): from THIS screen specifically, a
+                      // plain user needs a code for any change made here,
+                      // including the very first Draft -> Offer Sent
+                      // move, not just changes made once it's already
+                      // Offer Sent. Admin/Super Admin unchanged — still
+                      // free, no code. isQuoteLocked itself is left
+                      // untouched since Kanban/Quote Status Review still
+                      // rely on its original (less strict) behavior.
+                      if(!(user.role==="admin"||user.role==="super_admin")){ setAuthGate({requiredType:"edit",action:doChange}); return; }
                       doChange();
                     },
                     style:{fontSize:13,fontWeight:800,color:quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c",background:"transparent",border:"none",fontFamily:"inherit"}
-                  },["Draft"].map(s=>h("option",{key:s,value:s},s)))
+                  // Real bug found while making the change above: this
+                  // only ever offered "Draft" as an option, even though
+                  // the screen is meant to allow Draft AND Offer Sent
+                  // (see comment above) — fixed alongside, since the new
+                  // gating logic would have nothing to actually test
+                  // otherwise.
+                  },["Draft","Offer Sent"].map(s=>h("option",{key:s,value:s},s)))
             ),
             // Nature of Quote (29 Aug) — independent of Status Funnel;
             // unlike Status, this one IS directly settable here, not
@@ -15928,6 +15944,42 @@ async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, 
   if(newStatus!=="Draft"){
     try{ await purgeQuoteDocumentsIfLeavingDraft(referenceNumber, changedBy); } catch(e){ console.error("Document purge failed:",e); }
   }
+  // Owner alert (31 Aug) — scoped deliberately to the Quote screen only
+  // (source==="Quote form"), per what was actually asked. The worry:
+  // Admin/Super Admin can change status here freely, with no code and no
+  // Log Follow-ups outcome-capture friction — a real customer PO could
+  // get logged as Won by someone other than the account owner, who'd
+  // have no way of knowing unless told. "Owner" here is the CRM
+  // ownership engine's real concept (companies.owner_employee_name), the
+  // only one this app actually has. Every status value notifies, not
+  // just the closing ones — Won is the specific worry raised, but any
+  // change made by someone other than the owner is worth surfacing.
+  // Best-effort: a notification failure never blocks the actual status
+  // change.
+  if(source==="Quote form"){
+    try{
+      const { data: est } = await sb.from("estimates").select("customer_name").eq("reference_number",referenceNumber).limit(1).maybeSingle();
+      const customerName = est?.customer_name;
+      if(customerName){
+        const { data: co } = await sb.from("companies").select("owner_employee_name").eq("company_name",customerName).maybeSingle();
+        const ownerName = co?.owner_employee_name;
+        if(ownerName){
+          const { data: actingEmp } = await sb.from("employee_tbl").select("employee_name").eq("app_user_id",
+            (await sb.from("app_users").select("id").eq("username",changedBy).limit(1).maybeSingle()).data?.id || -1
+          ).limit(1).maybeSingle();
+          const actingName = actingEmp?.employee_name;
+          if(actingName!==ownerName){
+            await sb.from("notifications_tbl").insert({
+              employee_name: ownerName,
+              message: (changedBy||"Someone")+" changed "+referenceNumber+"'s status to "+newStatus+" on "+new Date(now).toLocaleString()+" — you're the owner of "+customerName+", in case you weren't aware.",
+              related_company: customerName,
+              notif_type: "quote_status_change"
+            });
+          }
+        }
+      }
+    } catch(e){ console.error("Owner alert failed:",e); }
+  }
   return { oldStatus };
 }
 // Legacy-aware Outcome dispatch (30 Aug) — a legacy quote has no BOM, no
@@ -17903,7 +17955,26 @@ const MANUAL_SECTIONS = [
           },
           {
             "type": "tip",
-            "text": "Codes expire after 15 minutes and are single-use, same as the older Deletion Codes system."
+            "text": "Codes expire after 15 minutes and are single-use, same as the older Deletion Codes system. The Quote screen's own Status control is stricter still (31 Aug) — a plain user needs a code for ANY change made there, including the very first Draft \u2192 Offer Sent move, not just once it's already past Draft."
+          }
+        ]
+      },
+      {
+        "key": "quote_status_owner_alerts",
+        "title": "Quote status owner alerts",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "If a quote's status is changed from the Quote screen itself by someone other than that account's current CRM owner, the owner gets a banner the next time they log in \u2014 who changed it, to what, and when. Scoped deliberately to the Quote screen only, since that's the one place status can move (Admin/Super Admin freely, anyone else with a code) without going through Log Follow-ups' own Outcome capture."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "Each alert has its own × to dismiss just that one.",
+              "\u201cGot it\u201d dismisses everything shown at once.",
+              "Shown to any role \u2014 an account owner can be a plain FSE or Telecaller, not just Admin/Super Admin."
+            ]
           }
         ]
       },
@@ -18902,6 +18973,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"31 Aug 2026 (42)", summary:"Quote screen Status control tightened + a new owner-alert banner. (1) A plain user now needs an authorization code for ANY status change made from the Quote screen itself, including the very first Draft -> Offer Sent move — previously the shared isQuoteLocked rule only kicked in once status was already past Draft, so that first move was unrestricted; Admin/Super Admin unchanged, still free. Real bug found and fixed in the same code: the dropdown's own option list only ever offered \"Draft\" as a choice, even though the screen was meant to allow Offer Sent too — fixed to [\"Draft\",\"Offer Sent\"]. (2) New Quote Status Owner Alerts login banner: when status is changed from the Quote screen by someone other than the account's current CRM owner (companies.owner_employee_name), the owner gets a banner on next login stating who changed it, to what, and when — every status value, not just closing ones, since Admin/Super Admin can move a quote to Won with no code and no Log Follow-ups friction at all, which was the actual worry raised. Deliberately scoped to Quote-screen changes only, not Kanban/Quote Status Review — a real narrowing decision, flagged as something that could be widened later if wanted. Backed by the existing notifications_tbl (new additive notif_type column, notif_type_column_2026-08-31.sql) rather than a new table — reuses the same store the notification bell already reads, just tagged. Shown to any role, not admin-gated, since an owner can be a plain FSE/Telecaller. Each alert has its own dismiss; \"Got it\" clears all at once." },
   { date:"31 Aug 2026 (41)", summary:"History button extended into Log Follow-ups itself — a clock icon at the end of every row in both Log Entries and Review, opening the exact same Customer/Reference popup + FollowupHistoryScreen built for Quotes Report (reused, not rebuilt). Log Entries' row-removal column widened (20px→55px) to fit both icons; Review gained a new trailing column for it, divider rows' colSpan bumped 9→10 to match. On save/close both screens now return to Log Follow-ups (not Quotes Report) via the same onBack callback, since FollowupHistoryScreen only needed a generic onBack, not two separate variants." },
   { date:"31 Aug 2026 (40)", summary:"Quotes Report follow-up data reworked and a new History screen added. Follow-up Stage/Next Follow-up rescoped from \"customer's latest call about anything\" to THIS reference's own latest call — the old company-wide lookup meant two open quotes for the same customer showed identical, possibly-unrelated follow-up data; one activity_log_tbl query (keyed by chase_reference) now covers live and legacy references together. Follow-up Stage now shows \"Outcome - Notes\" instead of just Outcome. Legacy quotes: once a real call is ever logged against a legacy reference, its follow-up data switches over from the frozen Excel-import columns (followup_note/next_followup_date) to the live logged entry automatically — no separate code path, same lookup as a live quote. New History button on every Quotes Report row (live and legacy): a small popup asks Customer or Reference scope, then opens a new FollowupHistoryScreen — full chronological list (Date/Mode/Chase What/Discussed What/Outcome/Notes/Logged by) with a per-row Delete (plain confirm, audit-logged) and a Back button. Also: Notes is now a required field on every new Log Follow-ups row (both the silent auto-save gate and Close for the day's explicit validation) — Review tab's existing inline edits are deliberately left untouched, not retroactively enforced." },
   { date:"30 Aug 2026 (39)", summary:"New \"Projects\" Chase What in Log Follow-ups, self-contained per the agreed design: Reference is a shallow Major Project picker (project_name only, scoped to Projects where the row's Customer is the End User or Main EPC Contractor — two .eq() queries merged client-side rather than an interpolated .or() string, since a real company name could contain characters that would break that). Outcome pulls from a new project_chase_outcome_tbl master (No movement/EPC identified/Package identified/Customer identified/Enquiry generated/Stalled/Not pursuing) — delivered via project_chase_outcome_2026-08-30.sql (structural + seed) — and is purely descriptive: it does NOT cascade into major_project_tbl, package_status, or allocation_status the way Offer/Order's Outcome writes back to a real quote/order status. \"Not pursuing\" added to CLOSED_OUTCOMES so Next Follow-up isn't forced once a chase is closed out; Stalled/Not pursuing get amber/red badge coloring matching Deferred/Lost for visual consistency. New value can be added two ways: the normal Admin-only add/delete screen (registered in the master-tables list like every other simple master), or inline from the Outcome dropdown's \"+ Add new…\" — Admin/Super Admin adds immediately, a plain user needs a one-time code from a new small admin-only \"Generate code\" control just above the table, reusing the exact gated_action_pin_tbl mechanism the Datasheet fill-out's own \"+Add to list\" already uses (new action_type project_chase_outcome_add). Same fix applied to the Review tab's own Outcome dropdown, which would otherwise have shown Sale Order statuses for a Projects row. Known, deliberately unaddressed side effect: the CRM Dashboards' \"Prospecting vs nurturing\" card's chaseCount only counts Offer/Order, same as before — a Projects-chase activity now falls into neither prospecting (Cold) nor nurturing (Offer/Order) bucket, undercounting total activity slightly. Flagged, not fixed, since redefining that ratio wasn't part of what was asked." },
@@ -20443,8 +20515,52 @@ function IncompleteSaleOrderReminder({ user, onDone, onOpenContract }){
   );
 }
 
+// Quote Status Owner Alerts (31 Aug) — "someone other than the account
+// owner changed a quote's status from the Quote screen" alerts, backed
+// by the existing notifications_tbl (notif_type="quote_status_change"),
+// written by updateQuoteStatusForQuote itself. Shown to ANY role (an
+// owner can be a plain FSE/Telecaller, not just admin/super_admin) —
+// unlike most other login reminders in this app, which are admin-gated.
+// Each alert has its own close (marks that one read); "Got it" marks
+// everything shown here as read and closes the whole banner.
+function QuoteStatusOwnerAlerts({ user, onDone }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  useEffect(()=>{
+    (async()=>{
+      const { data: emp } = await sb.from("employee_tbl").select("employee_name").eq("app_user_id",user.id).limit(1).maybeSingle();
+      if(!emp?.employee_name){ setLoading(false); return; }
+      const { data } = await sb.from("notifications_tbl").select("*").eq("employee_name",emp.employee_name).eq("notif_type","quote_status_change").eq("is_read",false).order("created_at",{ascending:false});
+      setRows(data||[]);
+      setLoading(false);
+    })();
+  },[user.id]);
+  if(loading) return null;
+  if(rows.length===0){ onDone(); return null; }
+  const dismissOne = async(id)=>{
+    await sb.from("notifications_tbl").update({is_read:true}).eq("id",id);
+    setRows(rs=>{ const next = rs.filter(r=>r.id!==id); if(next.length===0) onDone(); return next; });
+  };
+  const dismissAll = async()=>{
+    await sb.from("notifications_tbl").update({is_read:true}).in("id",rows.map(r=>r.id));
+    onDone();
+  };
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.4)",zIndex:1350,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:12,padding:"22px 26px",width:560,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},"Quote status changed on an account you own"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Changed from the Quote screen, not through Log Follow-ups — flagging it here in case you weren't aware."),
+      rows.map(r=>h("div",{key:r.id,style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,padding:"9px 10px",background:"#faf9f4",borderRadius:6,marginBottom:8,fontSize:12.5}},
+        h("span",null,r.message),
+        h("span",{title:"Dismiss",onClick:()=>dismissOne(r.id),style:{cursor:"pointer",color:colors.mutedLight,fontWeight:700,padding:"0 4px"}},"×")
+      )),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:6}},
+        h("button",{onClick:dismissAll,style:btnPrimary},"Got it")
+      )
+    )
+  );
+}
+
 // Continuous Follow-up Entry (27 Aug) — a single tabular screen for a
-// Telecaller/FSE to log every call made in one sitting: one Date of
 // Entry for the whole session, one row per call (potentially across
 // several different customers), "+ Add row" to keep going, one "Close
 // for the day" action saving everything at once. Reuses activity_log_tbl
@@ -29559,6 +29675,13 @@ function App() {
     setShowBillingOverrideReminder(false);
     try{ sessionStorage.setItem("flometriq_billing_override_prompt_date",new Date().toISOString().slice(0,10)); }catch(e){}
   };
+  // Quote Status Owner Alerts (31 Aug) — unlike the reminders above,
+  // no once-per-day sessionStorage dedup: the real dismiss state is
+  // notifications_tbl.is_read itself, and QuoteStatusOwnerAlerts already
+  // self-closes (onDone) the moment nothing unread remains, so a session
+  // flag would just be a second, redundant source of truth. Any role —
+  // an account owner can be a plain FSE/Telecaller, not just admin.
+  const [showQuoteOwnerAlerts,setShowQuoteOwnerAlerts] = useState(true);
   // Document sequence-flag reminder (25 Aug) — same pattern.
   const [showDocSequenceReminder,setShowDocSequenceReminder]=useState(()=>{
     try{ return sessionStorage.getItem("flometriq_doc_sequence_prompt_date")!==new Date().toISOString().slice(0,10); }catch(e){ return true; }
@@ -29608,6 +29731,7 @@ function App() {
       onFixGap:(projectName)=>{ setShowFseOverduePrompt(false); goToEntityLookup("__detailed_project__",projectName); }
     }),
     (user.role==="admin"||user.role==="super_admin") && showBillingOverrideReminder && h(IncompleteSaleOrderReminder,{user,onDone:dismissBillingOverrideReminder,onOpenContract:openContract}),
+    showQuoteOwnerAlerts && h(QuoteStatusOwnerAlerts,{user,onDone:()=>setShowQuoteOwnerAlerts(false)}),
     (user.role==="admin"||user.role==="super_admin") && showDocSequenceReminder && h(DocumentSequenceReminder,{onDone:dismissDocSequenceReminder}),
     showDraftPanel && h(DraftOfferReminder,{user,onDone:()=>{ setShowDraftPanel(false); refreshDraftCount(); }}),
     showSignatoryNoticesPopup && h(SignatoryOverrideNoticesPopup,{notices:signatoryNotices,onAcknowledgeOne:acknowledgeSignatoryNotice,onAcknowledgeAll:acknowledgeAllSignatoryNotices,onClose:()=>setShowSignatoryNoticesPopup(false)}),
