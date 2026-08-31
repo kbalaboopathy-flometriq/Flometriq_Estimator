@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-31T05:05:00Z";
+  var APP_BUILD_VERSION = "2026-08-31T05:30:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -368,6 +368,15 @@ const MASTER_TABLES = [
   { key: "employee_tbl", label: "Employees", columns: ["employee_code","employee_name","nickname","department","designation","crm_role","phone_primary","email","status"], addLabel:"New employee", cascade:[{col:"department",from:"department_tbl",field:"department"},{col:"designation",from:"designation_tbl",field:"value"},{col:"crm_role",from:"crm_role_tbl",field:"value"},{col:"status",from:"employee_status_tbl",field:"value"}], freeText:["employee_code","employee_name","nickname","phone_primary","email"], exportEnabled:true },
   { key: "territory_rule_state_tbl", label: "Territory Rules — States", columns: ["employee_name","state"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"state",from:"state_zone_tbl",field:"state"}], groupBy:["employee_name"], editAllEnabled:true },
   { key: "territory_rule_country_tbl", label: "Territory Rules — Countries", columns: ["employee_name","country"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"country",from:"country_zone_tbl",field:"country"}], groupBy:["employee_name"], editAllEnabled:true },
+  // Zone-level rule (31 Aug) — a third, broader tier: covers a whole
+  // Zone at once (e.g. every UAE-related company) without hand-listing
+  // every State/Country in it. Cascades off the real canonical zone_tbl
+  // (the same list Quotes Report's own Zone filter uses), not the
+  // free-text zone values scattered across state_zone_tbl/
+  // country_zone_tbl, which can vary in spelling. Resolution order is
+  // State -> Country -> Zone (see resolveOwnerForAddress) — this only
+  // ever fires once the more specific two have both missed.
+  { key: "territory_rule_zone_tbl", label: "Territory Rules — Zones", columns: ["employee_name","zone"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"zone",from:"zone_tbl",field:"value"}], groupBy:["employee_name"], editAllEnabled:true },
   { key: "sale_order_status_tbl", label: "Sale Order Status", columns: ["status","sort_order"], addLabel:"New status", freeText:["status","sort_order"] },
 ];
 
@@ -823,11 +832,13 @@ async function fetchAll(table, cols) {
 /* ---- CRM: zone lookup + territory-based owner auto-assignment ----
    Zone is never stored as a free choice on a company — it's always derived
    from billing_state (India, via state_zone_tbl) or billing_country
-   (outside India, via country_zone_tbl). Owner assignment follows the same
-   two tables via territory_rule_state_tbl / territory_rule_country_tbl.
-   Both are best-effort: if nothing matches, they resolve to "" and the
-   existing manual Zone picker / manual ownership assignment remains the
-   fallback — nothing here is a hard requirement. */
+   (outside India, via country_zone_tbl). Owner assignment follows State,
+   then Country, then Zone as a broader fallback (31 Aug —
+   territory_rule_zone_tbl, covers a whole zone at once rather than every
+   State/Country in it needing its own rule). All three are best-effort:
+   if nothing matches, they resolve to "" and the existing manual Zone
+   picker / manual ownership assignment remains the fallback — nothing
+   here is a hard requirement. */
 async function resolveZoneForAddress(billingState, billingCountry){
   const state = (billingState||"").trim();
   const country = (billingCountry||"").trim();
@@ -850,6 +861,17 @@ async function resolveOwnerForAddress(billingState, billingCountry){
   }
   if(country){
     const { data } = await sb.from("territory_rule_country_tbl").select("employee_name").ilike("country",country).limit(1).maybeSingle();
+    if(data && data.employee_name) return data.employee_name;
+  }
+  // Zone-level fallback (31 Aug) — only reached once neither a State
+  // nor a Country rule matched. Resolves the zone the normal way
+  // (resolveZoneForAddress: State first, then Country) and checks for
+  // a rule covering that whole zone — e.g. catches an India company
+  // with a State that has no individual Territory Rule of its own, but
+  // whose zone does.
+  const zone = await resolveZoneForAddress(billingState, billingCountry);
+  if(zone){
+    const { data } = await sb.from("territory_rule_zone_tbl").select("employee_name").ilike("zone",zone).limit(1).maybeSingle();
     if(data && data.employee_name) return data.employee_name;
   }
   return "";
@@ -1324,7 +1346,7 @@ function MenuTabs({ user, active, onChange }) {
     { label:"CRM", subgroups:[
       ...(isAdmin?[
         { label:"Customers", tabs:[{key:"customers",label:"Customers"},{key:"customer_bulk_upload",label:"Customer Bulk Upload"}] },
-        { label:"CRM Setup", tabs: byKeys(["state_zone_tbl","country_zone_tbl","territory_rule_state_tbl","territory_rule_country_tbl","crm_status_tbl"]) },
+        { label:"CRM Setup", tabs: byKeys(["state_zone_tbl","country_zone_tbl","territory_rule_state_tbl","territory_rule_country_tbl","territory_rule_zone_tbl","crm_status_tbl"]) },
       ]:[]),
       { label:"Major Projects", tabs:[
         {key:"major_projects",label:"Projects"},
@@ -18418,7 +18440,7 @@ const MANUAL_SECTIONS = [
               "Master Data \u2192 HR \u2192 Employees \u2014 employee code is auto-generated. Department, Designation, and CRM Role (Telecaller/FSE/Sales Manager) are captured here; a fuller record with payroll and HR history is planned for a later phase.",
               "Master Data \u2192 HR \u2192 Departments \u2014 a simple editable list.",
               "Master Data \u2192 CRM Setup \u2192 States and Zones (India) / Countries and Zones \u2014 the single source of truth for zone. Nothing else stores zone directly \u2014 it's always looked up from here.",
-              "Master Data \u2192 CRM Setup \u2192 Territory Rules (by State, by Country) \u2014 assigns one or more States or Countries to a named employee. City-level assignment was deliberately dropped.",
+              "Master Data \u2192 CRM Setup \u2192 Territory Rules (by State, by Country, and by Zone \u2014 31 Aug) \u2014 assigns one or more States, Countries, or whole Zones to a named employee. City-level assignment was deliberately dropped. Owner resolution checks State first, then Country, then Zone as a broader fallback \u2014 Zone only ever applies once the more specific two have both missed. India itself doesn't appear in the Countries list, by design \u2014 India's zone/owner comes from State, not Country; a Zone rule (e.g. covering an entire India zone) is the right way to set a broader catch-all for it, not adding \u201cIndia\u201d as a country.",
               "Customers \u2192 New company / quick-add / bulk upload \u2014 Zone auto-fills from the State or Country you type (matched against the zone masters); Owner auto-fills from Territory Rules the same way. Both are overridable, not locked \u2014 if no rule matches, they're left blank for manual entry.",
               "Customers \u2192 a selected company now shows CRM status (Cold/Lead) and CRM Owner, and has an Activity section \u2014 log a Call, Visit, or Email with an Outcome and a Next follow-up date; shown as a timeline, newest first."
             ]
@@ -18984,6 +19006,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"31 Aug 2026 (45)", summary:"Territory Rules — Zones added (territory_rule_zone_tbl, territory_rule_zone_2026-08-31.sql), a third owner-assignment tier alongside the existing State and Country rules — covers a whole zone at once (cascades off the real canonical zone_tbl) instead of needing every State/Country in it individually rule'd. resolveOwnerForAddress now checks State -> Country -> Zone, Zone only ever reached once the other two miss. New Master Data -> CRM Setup tab. On the reported \"Country dropdown doesn't show India\" — traced this to NOT be a bug: India's zone/owner has always resolved via State (state_zone_tbl/territory_rule_state_tbl), by original design — the Country tables are explicitly scoped \"outside India\". Since State is checked before Country in resolution order, adding India there would only ever fire for an India company missing a State value — a near-dead-weight fix. The new Zone tier is the actually-useful answer to what was likely wanted (a broader-than-State catch-all for India), so nothing was changed about the Country dropdown itself." },
   { date:"31 Aug 2026 (44)", summary:"URGENT fix — Generate Quote PDF was completely broken for every quote: \"Cannot access 'first' before initialization\". Root cause: the 30 Aug Lumpsum Packing & Forwarding work read a variable named first (the quote's header row) 56 lines before it was actually declared, in the same PDF-generation function — the exact used-before-initialization bug class flagged repeatedly earlier in this project, invisible to node --check since it's a runtime ordering issue, not a syntax error, so it only ever surfaced when someone actually generated a PDF. Fixed by hoisting the single const first = estimatesRows[0] declaration up to before its first use; verified with an isolated Node reproduction of the exact before/after ordering, not just re-reading the code. No other logic touched." },
   { date:"31 Aug 2026 (43)", summary:"Two fixes. (1) Quotes Report's Reference No/Quote No, Customer Name, and Project Reference filters fixed — all three were built as limit-to-list combos defaulting to exact match, so a typed value that didn't EXACTLY match an existing reference/customer/project silently reverted to blank on blur (text stayed visible in the box, but the filter itself was empty) — explains why typed searches appeared to return unrelated rows. Now free-text (limitToList:false) with case-insensitive partial matching, same as City's own filter already did. (2) Quote Status Owner Alerts widened from Quote-screen-only to also cover the CRM Funnel Kanban board and Quote Status Review — both can move status just as quietly as the Quote screen (same isQuoteLocked gate, no Outcome-capture friction); Log Follow-ups remains deliberately excluded as the expected/visible path. Banner text and User Manual updated to match the wider scope." },
   { date:"31 Aug 2026 (42)", summary:"Quote screen Status control tightened + a new owner-alert banner. (1) A plain user now needs an authorization code for ANY status change made from the Quote screen itself, including the very first Draft -> Offer Sent move — previously the shared isQuoteLocked rule only kicked in once status was already past Draft, so that first move was unrestricted; Admin/Super Admin unchanged, still free. Real bug found and fixed in the same code: the dropdown's own option list only ever offered \"Draft\" as a choice, even though the screen was meant to allow Offer Sent too — fixed to [\"Draft\",\"Offer Sent\"]. (2) New Quote Status Owner Alerts login banner: when status is changed from the Quote screen by someone other than the account's current CRM owner (companies.owner_employee_name), the owner gets a banner on next login stating who changed it, to what, and when — every status value, not just closing ones, since Admin/Super Admin can move a quote to Won with no code and no Log Follow-ups friction at all, which was the actual worry raised. Deliberately scoped to Quote-screen changes only, not Kanban/Quote Status Review — a real narrowing decision, flagged as something that could be widened later if wanted. Backed by the existing notifications_tbl (new additive notif_type column, notif_type_column_2026-08-31.sql) rather than a new table — reuses the same store the notification bell already reads, just tagged. Shown to any role, not admin-gated, since an owner can be a plain FSE/Telecaller. Each alert has its own dismiss; \"Got it\" clears all at once." },
