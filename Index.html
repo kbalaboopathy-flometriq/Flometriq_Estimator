@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-31T06:45:00Z";
+  var APP_BUILD_VERSION = "2026-08-31T07:20:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -16045,10 +16045,11 @@ async function applyOutcomeStatus(referenceNumber, newStatus, changedBy, source,
   }
   return { oldStatus:null, notFound:true };
 }
-async function applyOutcomeNature(referenceNumber, nature){
+async function applyOutcomeNature(referenceNumber, nature, changedBy, changedAt){
+  const now = changedAt || new Date().toISOString();
   const { data: liveRow } = await sb.from("estimates").select("id").eq("reference_number",referenceNumber).limit(1).maybeSingle();
-  if(liveRow){ await sb.from("estimates").update({quote_nature:nature}).eq("reference_number",referenceNumber); return; }
-  await sb.from("legacy_quotes_tbl").update({quote_nature:nature}).eq("reference_number",referenceNumber);
+  if(liveRow){ await sb.from("estimates").update({quote_nature:nature,quote_nature_changed_at:now,quote_nature_changed_by:changedBy||null}).eq("reference_number",referenceNumber); return; }
+  await sb.from("legacy_quotes_tbl").update({quote_nature:nature,quote_nature_changed_at:now,quote_nature_changed_by:changedBy||null}).eq("reference_number",referenceNumber);
 }
 
 // Documents live in Supabase only while the quote is being actively worked
@@ -18125,17 +18126,17 @@ const MANUAL_SECTIONS = [
         "blocks": [
           {
             "type": "p",
-            "text": "A filterable list of every quote \u2014 Reference Date range, Reference No/Quote No, Customer, Project Reference, City/State/Country/Region (limit-to-list, cascading), Status, Nature of Quote, and Follow-up Status (Overdue/Due today/Upcoming/None, computed from THIS quote's own latest Log Follow-ups entry \u2014 not the customer's, so two open quotes for the same customer no longer show identical follow-up data)."
+            "text": "A filterable, boxed green-themed list (matching Log Follow-ups' look, 31 Aug) of every quote \u2014 Reference Date range, Reference No/Quote No, Customer, Project Reference, City/State/Country/Region (limit-to-list, cascading), Status, Stage, and Follow-up Status (Overdue/Due today/Upcoming/None, computed from THIS quote's own latest Log Follow-ups entry \u2014 not the customer's, so two open quotes for the same customer no longer show identical follow-up data)."
           },
           {
             "type": "bullets",
             "items": [
               "Live quotes and imported Legacy Quotes show together in one list \u2014 a Legacy row carries a \u201cLegacy\u201d badge and has no Open button, since there's no real BOM behind it to open.",
               "The Reference No is a direct hyperlink into that quote.",
-              "Follow-up Stage shows \u201cOutcome - Notes\u201d from that quote's latest logged call. A Legacy row shows its frozen import note until a real call is ever logged against it \u2014 from that point on it behaves exactly like a live quote's follow-up data.",
+              "Follow-up Stage shows \u201cOutcome - Notes\u201d from that quote's latest logged call. A Legacy row shows its frozen import note until a real call is ever logged against it \u2014 from that point on it behaves exactly like a live quote's follow-up data. Clicking it (31 Aug) opens a dialog to log a real Log Follow-ups entry (Outcome, required Notes, optional Next Follow-up) rather than editing a stored field directly \u2014 Follow-up Stage is always computed from the latest entry, so this keeps one source of truth instead of forking it.",
               "History (every row) \u2014 asks whether to view every call for this Customer or just this Reference, then opens a full chronological list (Date, Mode, Chase What, Discussed What, Outcome, Notes, Logged by) with a Delete button per entry and a Back button to return here.",
               "Reference No/Quote No, Customer Name, and Project Reference are free-text partial search (31 Aug fix) \u2014 previously these silently reverted anything that didn't exactly match an existing value, with no error shown, so a typed search often looked like it did nothing.",
-              "Status is clickable (31 Aug) \u2014 opens a dialog to set any of the 9 statuses, plus the date it actually changed (defaults today, backdateable). Won/Lost/Deferred/Went Cold still trigger the same reason-capture dialog as everywhere else. Works on Legacy rows too. Sales-department Admin/Super Admin can change any quote; a plain user needs to be that account's current owner, or enter a one-time code.",
+              "Status and Stage are both clickable (31 Aug), opening ONE shared dialog \u2014 set any of the 9 statuses, the Stage (Unknown/Budgetary/Purchase Requirement \u2014 the same field previously labeled \u201cNature\u201d, relabeled in this screen's UI only), and the date this actually changed. Editing both together uses the same date, shown underneath Status as \u201cUpdated DD/MM/YYYY by X\u201d \u2014 one line, not two, even when both changed in the same sitting. Won/Lost/Deferred/Went Cold still trigger the same reason-capture dialog as everywhere else. Works on Legacy rows too. Sales-department Admin/Super Admin can change any quote; a plain user needs to be that account's current owner, or enter a one-time code.",
               "\u201c+\u201d next to Next Follow-up (31 Aug) opens a small dialog (date + required Notes) that creates a real Log Follow-ups entry \u2014 not a field living only here \u2014 so it shows up in Review, History, and the Overdue Calls screen exactly like any other logged call. Same access rule as Status."
             ]
           }
@@ -19022,6 +19023,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"31 Aug 2026 (48)", summary:"Quotes Report visually reworked and editing extended. Visual: whole screen now sits in a boxed white card with a green left-accent bar matching Log Follow-ups' own look, table font bumped from 12.5px to 14px to match. \"Nature\" column relabeled \"Stage\" in this screen's UI only (same underlying Unknown/Budgetary/Purchase Requirement values, filters.nature key unchanged internally). Status and Stage editing merged into ONE dialog (previously Status alone had its own): pick a new Status and/or Stage together, with a single shared date field for both — editing both in one sitting now shows as one \"Updated DD/MM/YYYY by X\" line under Status, not two separate dates. Stage changes are tracked with their own quote_nature_changed_at/quote_nature_changed_by columns (quote_nature_changed_columns_2026-08-31.sql, additive) — deliberately NOT reusing status_changed_at, since Quote Status Review's stale-quote flag reads that column specifically to mean \"the funnel stage hasn't moved,\" and a Stage-only edit bumping it would have quietly broken that flag. Follow-up Stage is now clickable too — opens a dialog to log a real Log Follow-ups entry (Outcome, required Notes, optional Next Follow-up), same non-forking principle as the existing \"+ Next Follow-up\" action, rather than turning a computed field into a directly-editable one. Known gap, not fixed this round: the Quote screen's own Stage/Nature setter still writes quote_nature directly, bypassing applyOutcomeNature — a Stage change made there won't show an \"Updated by\" date on this screen." },
   { date:"31 Aug 2026 (47)", summary:"CRM Funnel Kanban board reworked. Layout: the 9 status columns split into two rows (open pipeline Draft->Finalised on top, closed outcomes Won/Lost/Deferred/Went Cold below) with flexible-width columns instead of a fixed 230px each — eliminates the horizontal scroll that came from 9 fixed-width columns never fitting a normal screen. Each column's card list gets its own independent vertical scrollbar, height set relative to the browser viewport (not a fixed px count) so it adapts across monitor/window sizes — scrolling one column never affects its neighbors or the page itself. New Trello-style filter bar: search (Customer/Reference), Owner, Zone, Nature, and an Include Legacy toggle (on by default). Two real bugs fixed, not just the layout: (1) legacy quotes never appeared on this board at all — load() only ever queried estimates; now merges legacy_quotes_tbl in too, shown with the same Legacy badge Quotes Report uses, value shown as \"—\" since there's no BOM to sum. (2) drag-to-move was calling updateQuoteStatusForQuote directly (estimates-only) — a legacy card dragged to a new column would look like it moved (optimistic local state) while nothing was actually saved; switched to the legacy-aware applyOutcomeStatus dispatcher, same fix pattern already applied to Quotes Report's inline editor." },
   { date:"31 Aug 2026 (46)", summary:"Quotes Report gets full inline status/date editing, plus a real bug fix found along the way. New: Status is clickable, opens a dialog for any of the 9 statuses AND the actual date it changed (defaults today, backdateable) — routed through the existing applyOutcomeStatus dispatcher, so live and legacy quotes both get exactly the right update path (Extra Price/testing/document-purge/audit/owner-alert for live, the simpler direct update for legacy) with zero new orphan risk, since it's the same choke point every other status-change screen already uses. New \"+\" next to Next Follow-up opens a small dialog (date + required Notes) that writes a REAL Log Follow-ups entry rather than a field living only on the quote, so it shows up in Review/History/Overdue Calls like any other logged call. Access: Sales-department Admin or Super Admin can change anything; a plain user needs to be the account's current owner, or a one-time code (same fallback pattern as every other gated action). Real bug fixed in the same pass: WonLostOutcomeModal — the shared Won/Lost/Deferred/Went Cold reason-capture dialog used by Quote form, Kanban, Quote Status Review, and Log Follow-ups — was hardcoding its status-change source to the literal string \"status change\" regardless of which screen actually opened it, which meant the 31 Aug owner-alert banner (gated on real source strings) had never once fired for a CLOSED-outcome change — Won specifically, the exact case that motivated building it. Now threads the real caller's source (and the new changedAt) through properly; all 4 existing call sites updated to pass their own source, Quotes Report added as a 5th. Also added: legacy_quotes_tbl.status_changed_at/status_changed_by (legacy_status_changed_columns_2026-08-31.sql, additive) — legacy never tracked this before, needed now that its status-change date can be set explicitly." },
   { date:"31 Aug 2026 (45)", summary:"Territory Rules — Zones added (territory_rule_zone_tbl, territory_rule_zone_2026-08-31.sql), a third owner-assignment tier alongside the existing State and Country rules — covers a whole zone at once (cascades off the real canonical zone_tbl) instead of needing every State/Country in it individually rule'd. resolveOwnerForAddress now checks State -> Country -> Zone, Zone only ever reached once the other two miss. New Master Data -> CRM Setup tab. On the reported \"Country dropdown doesn't show India\" — traced this to NOT be a bug: India's zone/owner has always resolved via State (state_zone_tbl/territory_rule_state_tbl), by original design — the Country tables are explicitly scoped \"outside India\". Since State is checked before Country in resolution order, adding India there would only ever fire for an India company missing a State value — a near-dead-weight fix. The new Zone tier is the actually-useful answer to what was likely wanted (a broader-than-State catch-all for India), so nothing was changed about the Country dropdown itself." },
@@ -21086,7 +21088,7 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
         // the Quote screen itself, unlike Status Funnel. Legacy-aware
         // (30 Aug) — see applyOutcomeNature.
         if(r.chaseWhat==="Offer" && r.nature && refNumber){
-          await applyOutcomeNature(refNumber, r.nature);
+          await applyOutcomeNature(refNumber, r.nature, user.username);
         }
       }
       if(queue.length){ setWonLostQueue(queue.slice(1)); setOutcomeTarget(queue[0]); }
@@ -24271,19 +24273,22 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   // over to FollowupHistoryScreen until Back is pressed.
   const [historyPopupFor,setHistoryPopupFor] = useState(null);
   const [historyView,setHistoryView] = useState(null); // {scope:"customer"|"reference", value}
-  // Inline status/date editing (31 Aug) — every status settable here,
-  // routed through the SAME applyOutcomeStatus dispatcher every other
-  // status-change surface uses (live/legacy both handled correctly,
-  // Extra Price/testing/document-purge/audit/owner-alert all fire
-  // identically — reuse is what prevents an orphaned/inconsistent
-  // record here, not new bookkeeping). Access: Super Admin or a
-  // Sales-department Admin can change anything freely; a plain user
-  // needs to be the account's own current owner, or a one-time code —
-  // same fallback every other gated action in this app has.
+  // Inline edit — Status and Stage/Nature together (31 Aug), one shared
+  // "last updated" date rather than two separate ones, per what was
+  // asked. Routed through the SAME applyOutcomeStatus/applyOutcomeNature
+  // dispatchers every other status/nature-change surface uses (live and
+  // legacy both handled correctly, Extra Price/testing/document-purge/
+  // audit/owner-alert all fire identically for Status — reuse is what
+  // prevents an orphaned/inconsistent record here, not new bookkeeping).
+  // Access: Super Admin or a Sales-department Admin can change anything
+  // freely; a plain user needs to be the account's own current owner, or
+  // a one-time code — same fallback every other gated action in this
+  // app has.
   const [authGate,setAuthGate] = useState(null);
-  const [statusEditFor,setStatusEditFor] = useState(null); // the row
-  const [statusEditValue,setStatusEditValue] = useState("");
-  const [statusEditDate,setStatusEditDate] = useState("");
+  const [editFor,setEditFor] = useState(null); // the row
+  const [editStatusValue,setEditStatusValue] = useState("");
+  const [editNatureValue,setEditNatureValue] = useState("");
+  const [editDate,setEditDate] = useState("");
   const [outcomeTarget,setOutcomeTarget] = useState(null); // {referenceNumber,newStatus,changedAt}
   // "+ Next Follow-up" (31 Aug) — writes a REAL Log Follow-ups entry
   // (activity_log_tbl), not a field living only on the quote — so it
@@ -24295,6 +24300,17 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   const [nfDate,setNfDate] = useState("");
   const [nfNotes,setNfNotes] = useState("");
   const [nfBusy,setNfBusy] = useState(false);
+  // Follow-up Stage editor (31 Aug) — Follow-up Stage isn't a stored
+  // field, it's computed live from the quote's latest Log Follow-ups
+  // entry (Outcome + Notes) — deliberately, so there's exactly one
+  // source of truth instead of two that can drift apart. "Editable"
+  // here means logging a new entry, same as "+ Next Follow-up" above,
+  // not writing directly into a field that would fork that.
+  const [stageEditFor,setStageEditFor] = useState(null); // the row
+  const [stageOutcome,setStageOutcome] = useState("");
+  const [stageNotes,setStageNotes] = useState("");
+  const [stageNextDate,setStageNextDate] = useState("");
+  const [stageBusy,setStageBusy] = useState(false);
   const CLOSED_OUTCOMES_QR = ["Won","Lost","Deferred","Went Cold"];
   const canEditFreely = async(customerName)=>{
     if(user.role==="super_admin") return true;
@@ -24308,26 +24324,35 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     const { data: myEmp } = await sb.from("employee_tbl").select("employee_name").eq("app_user_id",user.id).limit(1).maybeSingle();
     return myEmp?.employee_name===ownerName;
   };
-  const openStatusEditor = (row)=>{
-    setStatusEditFor(row);
-    setStatusEditValue(row.status);
-    setStatusEditDate(new Date().toISOString().slice(0,10));
+  const openEditor = (row)=>{
+    setEditFor(row);
+    setEditStatusValue(row.status);
+    setEditNatureValue(row.nature);
+    setEditDate(new Date().toISOString().slice(0,10));
   };
-  const confirmStatusEdit = async()=>{
-    const row = statusEditFor;
-    const newStatus = statusEditValue;
+  const confirmEdit = async()=>{
+    const row = editFor;
+    const newStatus = editStatusValue;
+    const newNature = editNatureValue;
     // Noon, not midnight, so a date picked in any reasonable timezone
     // doesn't silently roll back to the previous calendar day once
-    // converted to UTC for storage.
-    const changedAtIso = new Date(statusEditDate+"T12:00:00").toISOString();
+    // converted to UTC for storage. Shared by both Status and Nature —
+    // whichever of the two actually changed uses this same date, so
+    // editing both together never produces two different dates.
+    const changedAtIso = new Date(editDate+"T12:00:00").toISOString();
     const proceed = async()=>{
-      setStatusEditFor(null);
-      if(CLOSED_OUTCOMES_QR.includes(newStatus)){
-        setOutcomeTarget({ referenceNumber: row.reference_number, newStatus, changedAt: changedAtIso });
-      } else {
-        await applyOutcomeStatus(row.reference_number, newStatus, user.username, "Quotes Report", null, changedAtIso);
-        load();
+      setEditFor(null);
+      if(newNature!==row.nature){
+        await applyOutcomeNature(row.reference_number, newNature, user.username, changedAtIso);
       }
+      if(newStatus!==row.status){
+        if(CLOSED_OUTCOMES_QR.includes(newStatus)){
+          setOutcomeTarget({ referenceNumber: row.reference_number, newStatus, changedAt: changedAtIso });
+          return;
+        }
+        await applyOutcomeStatus(row.reference_number, newStatus, user.username, "Quotes Report", null, changedAtIso);
+      }
+      load();
     };
     const allowed = await canEditFreely(row.customer_name);
     if(!allowed){ setAuthGate({ requiredType:"edit", action: proceed }); return; }
@@ -24337,6 +24362,39 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     setNextFollowupFor(row);
     setNfDate("");
     setNfNotes("");
+  };
+  const openStageEditor = (row)=>{
+    setStageEditFor(row);
+    setStageOutcome("");
+    setStageNotes("");
+    setStageNextDate("");
+  };
+  const saveStageEdit = async()=>{
+    const row = stageEditFor;
+    if(!stageNotes.trim()){ alert("A short note is required — what's this update about?"); return; }
+    const doSave = async()=>{
+      setStageBusy(true);
+      try{
+        await sb.from("activity_log_tbl").insert({
+          company_name: row.customer_name,
+          activity_date: new Date().toISOString().slice(0,10),
+          activity_type: "Others",
+          chase_what: "Offer",
+          chase_reference: row.reference_number,
+          contacted_whom: "",
+          discussed_what: "Follow-up Stage updated from Quotes Report",
+          outcome: stageOutcome||null,
+          next_followup_date: stageNextDate||null,
+          notes: stageNotes,
+          logged_by: user.username,
+        });
+        setStageEditFor(null);
+        load();
+      } finally { setStageBusy(false); }
+    };
+    const allowed = await canEditFreely(row.customer_name);
+    if(!allowed){ setAuthGate({ requiredType:"edit", action: doSave }); return; }
+    await doSave();
   };
   const saveNextFollowup = async()=>{
     const row = nextFollowupFor;
@@ -24394,7 +24452,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     setLoading(true);
     try{
       const { data: estRows } = await sb.from("estimates")
-        .select("reference_number,customer_name,quote_date,created_at,quote_status,quote_nature,linked_project_id")
+        .select("reference_number,customer_name,quote_date,created_at,quote_status,quote_nature,linked_project_id,status_changed_at,status_changed_by,quote_nature_changed_at,quote_nature_changed_by")
         .order("created_at",{ascending:false});
       const byRef = new Map();
       (estRows||[]).forEach(r=>{ if(!byRef.has(r.reference_number)) byRef.set(r.reference_number,r); });
@@ -24440,6 +24498,20 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
         const parts = [act.outcome, act.notes].filter(p=>p && p.trim());
         return parts.length ? parts.join(" - ") : null;
       };
+      // Shared "last updated" (31 Aug) — Status and Stage/Nature each
+      // track their own changed_at/changed_by (status_changed_at stays
+      // pure for Quote Status Review's stale-quote flag, which reads it
+      // specifically to mean "the funnel stage hasn't moved" — a
+      // Nature-only edit must never bump it). Displayed as ONE line
+      // here regardless: whichever of the two is more recent, so
+      // editing both together (same date, from the unified dialog)
+      // naturally shows as a single date, not two.
+      const lastUpdated = (h)=>{
+        const sAt = h.status_changed_at, nAt = h.quote_nature_changed_at;
+        if(!sAt && !nAt) return null;
+        const useStatus = !nAt || (sAt && new Date(sAt)>=new Date(nAt));
+        return useStatus ? {at:sAt,by:h.status_changed_by} : {at:nAt,by:h.quote_nature_changed_by};
+      };
 
       const merged = headers.map(h=>{
         const co = coByName.get(h.customer_name)||{};
@@ -24457,6 +24529,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           project_reference: h.linked_project_id ? (projById.get(h.linked_project_id)||"—") : "—",
           followup_stage: stageText(act)||"—",
           next_followup: act?.next_followup_date||"—",
+          last_updated: lastUpdated(h),
           is_legacy: false,
         };
       });
@@ -24478,6 +24551,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           // the moment one exists — see comment above.
           followup_stage: stageText(act)||l.followup_note||"—",
           next_followup: act?.next_followup_date||l.next_followup_date||"—",
+          last_updated: lastUpdated(l),
           is_legacy: true,
         };
       });
@@ -24537,8 +24611,11 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   if(historyView) return h(FollowupHistoryScreen,{scope:historyView.scope, value:historyView.value, user, onBack:()=>setHistoryView(null)});
 
   return h(React.Fragment,null,
-  h("div",{style:{padding:"20px 24px"}},
-    h("h2",{style:{marginTop:0}},"Quotes Report"),
+  h("div",{style:{padding:"20px 24px",fontSize:14}},
+    h("div",{style:{background:"#fff",border:"1px solid #cfe3dd",borderLeft:"4px solid #0f7a5c",borderRadius:6,padding:"12px 16px",marginBottom:14}},
+      h("div",{style:{fontWeight:700,fontSize:16,color:"#124c3d"}},"Quotes Report"),
+      h("div",{style:{fontSize:11.5,color:"#8a9d97",marginTop:2}},"Click Status, Stage, or Follow-up Stage to edit inline")
+    ),
     h("div",{style:{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:16,background:"#faf9f4",padding:14,borderRadius:8}},
       fld("Reference Date >=", h("input",{type:"date",value:filters.dateFrom,onChange:e=>setF("dateFrom",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
       fld("Reference Date <=", h("input",{type:"date",value:filters.dateTo,onChange:e=>setF("dateTo",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
@@ -24557,7 +24634,10 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       fld("Status", h("select",{value:filters.status,onChange:e=>setF("status",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), statusOptions.map(s=>h("option",{key:s,value:s},s))
       )),
-      fld("Nature", h("select",{value:filters.nature,onChange:e=>setF("nature",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+      // Relabeled "Stage" in the UI (31 Aug) — same underlying values
+      // (Unknown/Budgetary/Purchase Requirement), filters.nature key
+      // left unchanged internally.
+      fld("Stage", h("select",{value:filters.nature,onChange:e=>setF("nature",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), reportNatureOptions.map(n=>h("option",{key:n,value:n},n))
       )),
       fld("Follow-up Status", h("select",{value:filters.followUp,onChange:e=>setF("followUp",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
@@ -24565,15 +24645,15 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       ))
     ),
     loading ? h("div",{style:{color:colors.mutedLight}},"Loading…") :
-    h("div",{style:{overflowX:"auto"}},
-      h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:12.5}},
-        h("thead",null,h("tr",{style:{background:colors.bg,textAlign:"left"}},
-          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Status","Nature","Project Reference","Follow-up Stage","Next Follow-up",""].map(c=>
-            h("th",{key:c,style:{padding:"7px 9px",borderBottom:"2px solid "+colors.dark,whiteSpace:"nowrap"}},c))
+    h("div",{style:{overflowX:"auto",background:"#fff",border:"1px solid #cfe3dd",borderRadius:6}},
+      h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:14}},
+        h("thead",null,h("tr",{style:{background:"#eef6f3",textAlign:"left"}},
+          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Status","Stage","Project Reference","Follow-up Stage","Next Follow-up",""].map(c=>
+            h("th",{key:c,style:{padding:"9px 10px",borderBottom:"2px solid #0f7a5c",whiteSpace:"nowrap",fontSize:11.5,color:"#4c6a61"}},c))
         )),
-        h("tbody",null, filtered.map((r,i)=>h("tr",{key:r.reference_number,style:{borderBottom:"1px solid "+colors.border}},
-          h("td",{style:{padding:"6px 9px"}},i+1),
-          h("td",{style:{padding:"6px 9px",fontWeight:600}},
+        h("tbody",null, filtered.map((r,i)=>h("tr",{key:r.reference_number,style:{borderBottom:"1px solid #e2ede9"}},
+          h("td",{style:{padding:"10px"}},i+1),
+          h("td",{style:{padding:"10px",fontWeight:600}},
             // Legacy rows have no real quote/BOM behind them — clicking
             // through would land on a broken, empty screen. Shown as
             // plain text with a badge instead of a link for those.
@@ -24581,23 +24661,28 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
               ? h(React.Fragment,null, r.reference_number, h("span",{style:{marginLeft:6,fontSize:9.5,padding:"1px 6px",borderRadius:8,background:"#f0eee6",color:colors.mutedLight}},"Legacy"))
               : h("a",{href:"#",onClick:e=>{e.preventDefault(); onOpenQuote(r.reference_number,1);},style:{color:"#0c447c",textDecoration:"underline",cursor:"pointer"}},r.reference_number)
           ),
-          h("td",{style:{padding:"6px 9px"}},r.reference_date),
-          h("td",{style:{padding:"6px 9px"}},r.customer_name),
-          h("td",{style:{padding:"6px 9px"}},r.region),
-          h("td",{style:{padding:"6px 9px"}},r.city),
-          h("td",{style:{padding:"6px 9px"}},r.state),
-          h("td",{style:{padding:"6px 9px"}},
-            h("span",{onClick:()=>openStatusEditor(r),title:"Click to change status",style:{cursor:"pointer",fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#e6f1fb",color:"#0c447c"}},r.status)
+          h("td",{style:{padding:"10px"}},r.reference_date),
+          h("td",{style:{padding:"10px"}},r.customer_name),
+          h("td",{style:{padding:"10px"}},r.region),
+          h("td",{style:{padding:"10px"}},r.city),
+          h("td",{style:{padding:"10px"}},r.state),
+          h("td",{style:{padding:"10px"}},
+            h("span",{onClick:()=>openEditor(r),title:"Click to edit Status/Stage",style:{cursor:"pointer",fontSize:12,padding:"3px 10px",borderRadius:10,background:"#eaf9f4",color:"#085041",fontWeight:600}},r.status+" ✎"),
+            r.last_updated && h("div",{style:{fontSize:9,color:colors.mutedLight,marginTop:3}},"Updated "+new Date(r.last_updated.at).toLocaleDateString()+(r.last_updated.by?" by "+r.last_updated.by:""))
           ),
-          h("td",{style:{padding:"6px 9px"}},h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#faf3e6",color:"#8a5a0c"}},r.nature)),
-          h("td",{style:{padding:"6px 9px"}},r.project_reference),
-          h("td",{style:{padding:"6px 9px"}},r.followup_stage),
-          h("td",{style:{padding:"6px 9px"}},
+          h("td",{style:{padding:"10px"}},
+            h("span",{onClick:()=>openEditor(r),title:"Click to edit Status/Stage",style:{cursor:"pointer",fontSize:12,padding:"3px 10px",borderRadius:10,background:"#faf3e6",color:"#8a5a0c",fontWeight:600}},r.nature+" ✎")
+          ),
+          h("td",{style:{padding:"10px"}},r.project_reference),
+          h("td",{style:{padding:"10px"}},
+            h("span",{onClick:()=>openStageEditor(r),title:"Click to log an update",style:{cursor:"pointer",color:"#0f7a5c",textDecoration:"underline dotted"}},r.followup_stage+" ✎")
+          ),
+          h("td",{style:{padding:"10px"}},
             r.next_followup, " ",
-            h("span",{onClick:()=>openNextFollowup(r),title:"Set/append a Next Follow-up date",style:{cursor:"pointer",fontSize:11,color:colors.accent,fontWeight:700}},"+")
+            h("span",{onClick:()=>openNextFollowup(r),title:"Set/append a Next Follow-up date",style:{cursor:"pointer",fontSize:12,color:colors.accent,fontWeight:700}},"+")
           ),
-          h("td",{style:{padding:"6px 9px",display:"flex",gap:6}}, (!r.is_legacy && h("button",{onClick:()=>onOpenQuote(r.reference_number,1),style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Open")),
-            h("button",{onClick:()=>setHistoryPopupFor(r),style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"History")
+          h("td",{style:{padding:"10px",display:"flex",gap:6}}, (!r.is_legacy && h("button",{onClick:()=>onOpenQuote(r.reference_number,1),style:{...btnSmall,fontSize:11,padding:"4px 10px"}},"Open")),
+            h("button",{onClick:()=>setHistoryPopupFor(r),style:{...btnSmall,fontSize:11,padding:"4px 10px"}},"History")
           )
         )))
       ),
@@ -24619,23 +24704,28 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       )
     )
   ),
-  // Status editor (31 Aug) — status + the date it actually changed
-  // (defaults today, editable/backdateable). Won/Lost/Deferred/Went
-  // Cold hand off to the existing WonLostOutcomeModal for the reason
-  // capture, same as everywhere else — this dialog just closes and lets
-  // that one take over.
-  statusEditFor && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center"}},
+  // Unified Status + Stage(Nature) editor (31 Aug) — one shared date,
+  // so editing both together never produces two different "changed on"
+  // dates. Won/Lost/Deferred/Went Cold hand off to the existing
+  // WonLostOutcomeModal for the reason capture, same as everywhere
+  // else — this dialog just closes and lets that one take over; the
+  // Stage/Nature half (if also changed) has already been saved by then.
+  editFor && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center"}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"90%"}},
-      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:14}},"Change status — "+statusEditFor.reference_number),
-      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"New status"),
-      h("select",{value:statusEditValue,onChange:e=>setStatusEditValue(e.target.value),style:{...inputStyle,marginBottom:12}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:14}},"Edit — "+editFor.reference_number),
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Status"),
+      h("select",{value:editStatusValue,onChange:e=>setEditStatusValue(e.target.value),style:{...inputStyle,marginBottom:12}},
         statusOptions.map(s=>h("option",{key:s,value:s},s))
       ),
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Stage"),
+      h("select",{value:editNatureValue,onChange:e=>setEditNatureValue(e.target.value),style:{...inputStyle,marginBottom:12}},
+        reportNatureOptions.map(n=>h("option",{key:n,value:n},n))
+      ),
       h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Date this actually changed"),
-      h("input",{type:"date",value:statusEditDate,onChange:e=>setStatusEditDate(e.target.value),style:{...inputStyle,marginBottom:16}}),
+      h("input",{type:"date",value:editDate,onChange:e=>setEditDate(e.target.value),style:{...inputStyle,marginBottom:16}}),
       h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
-        h("button",{onClick:()=>setStatusEditFor(null),style:btnSecondary},"Cancel"),
-        h("button",{onClick:confirmStatusEdit,style:btnPrimary},"Save")
+        h("button",{onClick:()=>setEditFor(null),style:btnSecondary},"Cancel"),
+        h("button",{onClick:confirmEdit,style:btnPrimary},"Save")
       )
     )
   ),
@@ -24653,6 +24743,29 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
         h("button",{onClick:()=>setNextFollowupFor(null),style:btnSecondary},"Cancel"),
         h("button",{onClick:saveNextFollowup,disabled:nfBusy,style:btnPrimary},nfBusy?"Saving…":"Save")
+      )
+    )
+  ),
+  // Follow-up Stage editor (31 Aug) — logs a real Log Follow-ups entry
+  // (Outcome + required Notes, optional Next Follow-up alongside) rather
+  // than writing a field directly — see the state comment above for why
+  // that matters. Outcome list matches the Offer funnel, since every
+  // reference on this screen is a Quote.
+  stageEditFor && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center"}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:400,maxWidth:"90%"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Follow-up Stage — "+stageEditFor.reference_number),
+      h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:14}},"This creates a real Log Follow-ups entry, same as logging it from CRM \u2192 Daily."),
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Outcome (optional)"),
+      h("select",{value:stageOutcome,onChange:e=>setStageOutcome(e.target.value),style:{...inputStyle,marginBottom:12}},
+        h("option",{value:""},"— no change —"), statusOptions.map(s=>h("option",{key:s,value:s},s))
+      ),
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Notes (required)"),
+      h("textarea",{rows:3,value:stageNotes,onChange:e=>setStageNotes(e.target.value),style:{...inputStyle,marginBottom:12,resize:"vertical"}}),
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Next Follow-up date (optional)"),
+      h("input",{type:"date",value:stageNextDate,onChange:e=>setStageNextDate(e.target.value),style:{...inputStyle,marginBottom:16}}),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:()=>setStageEditFor(null),style:btnSecondary},"Cancel"),
+        h("button",{onClick:saveStageEdit,disabled:stageBusy,style:btnPrimary},stageBusy?"Saving…":"Save")
       )
     )
   ),
