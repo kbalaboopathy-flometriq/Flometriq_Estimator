@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-31T05:30:00Z";
+  var APP_BUILD_VERSION = "2026-08-31T06:10:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -111,7 +111,7 @@ function LimitToListCombo({ value, onChange, options, placeholder, style, disabl
 // competitor. Saves quote_outcomes, then calls updateQuoteStatusForQuote
 // itself and reports back through onDone so the caller can refresh its
 // own local list.
-function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCancel }){
+function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCancel, source, changedAt }){
   const [draft,setDraft]=useState({lost_reason:"",competitor_name:"",competitor_price:"",po_number:"",po_date:"",po_value:""});
   const [loading,setLoading]=useState(true);
   const [saving,setSaving]=useState(false);
@@ -151,7 +151,14 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
       const { data: existing } = await sb.from("quote_outcomes").select("id").eq("reference_number",referenceNumber).maybeSingle();
       if(existing) await sb.from("quote_outcomes").update(payload).eq("id",existing.id);
       else await sb.from("quote_outcomes").insert(payload);
-      const result = await applyOutcomeStatus(referenceNumber,newStatus,user?.username||"unknown","status change",needsReason?draft.lost_reason:null);
+      // 31 Aug fix — this used to hardcode source as "status change"
+      // regardless of which of the four screens actually triggered it,
+      // which meant the owner-alert banner (gated on real source
+      // strings) silently NEVER fired for Won/Lost/Deferred/Went Cold —
+      // the exact cases that matter most, Won especially. Now passes
+      // through whatever the real caller's source (and, since 31 Aug,
+      // possibly-backdated changedAt) actually was.
+      const result = await applyOutcomeStatus(referenceNumber,newStatus,user?.username||"unknown",source||"status change",needsReason?draft.lost_reason:null,changedAt);
       if(result && result.blocked){ return; }
       await logAudit("UPDATE","quote_outcomes",referenceNumber,"Captured "+newStatus+" outcome details for Quote# "+referenceNumber,user?.username||"unknown",null,payload);
       onDone(newStatus);
@@ -15230,7 +15237,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       )
     ),
     outcomeTarget && h(WonLostOutcomeModal,{
-      referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user,
+      referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user, source:"Quote form",
       onDone:(newStatus)=>{
         setOpenRef(r=>({...r,quote_status:newStatus}));
         setRefs(rs=>rs.map(r=>r.reference_number===outcomeTarget.referenceNumber?{...r,quote_status:newStatus}:r));
@@ -15945,7 +15952,7 @@ async function verifyAndConsumeGatedPin(actionType, enteredPin, username, entity
   await sb.from("gated_action_pin_log_tbl").insert({action_type:actionType, used_by:username||"unknown", entity_type:entityType||null, entity_id:entityId||null, context:context||null});
   return {ok:true};
 }
-async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source, reason){
+async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source, reason, changedAt){
   if(newStatus!=="Draft"){
     const [{count},{data:declined}] = await Promise.all([
       sb.from("quote_extra_price_tbl").select("id",{count:"exact",head:true}).eq("reference_number",referenceNumber),
@@ -15962,7 +15969,11 @@ async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, 
     // prompt only if needed, and remembers the choice either way.
     await resolveTestingMode(referenceNumber, changedBy);
   }
-  const now = new Date().toISOString();
+  // 31 Aug — changedAt lets a caller backdate the status-change date
+  // (Quotes Report's new inline editor: "which date did this actually
+  // change"), rather than always stamping the moment the click happened.
+  // Every existing caller still just omits it and gets "now", unchanged.
+  const now = changedAt || new Date().toISOString();
   const { data: allRows } = await sb.from("estimates").select("id,item_sl_no,quote_status").eq("reference_number",referenceNumber);
   const oldStatus = allRows && allRows[0] ? allRows[0].quote_status : null;
   await sb.from("estimates").update({quote_status:newStatus,status_changed_by:changedBy,status_changed_at:now,status_reason:reason||null}).eq("reference_number",referenceNumber);
@@ -15976,19 +15987,20 @@ async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, 
   if(newStatus!=="Draft"){
     try{ await purgeQuoteDocumentsIfLeavingDraft(referenceNumber, changedBy); } catch(e){ console.error("Document purge failed:",e); }
   }
-  // Owner alert (31 Aug, widened same day) — originally scoped to just
-  // the Quote screen; extended to also cover the CRM Funnel Kanban board
-  // and Quote Status Review, since both can move status just as quietly
-  // (same isQuoteLocked-gated-but-no-outcome-capture path as the Quote
-  // screen) — Log Follow-ups is deliberately still excluded, since
-  // that's the expected/visible way status normally moves, not a quiet
-  // side door. "Owner" here is the CRM ownership engine's real concept
-  // (companies.owner_employee_name), the only one this app actually
-  // has. Every status value notifies, not just the closing ones — Won
-  // is the specific worry raised, but any change made by someone other
-  // than the owner is worth surfacing. Best-effort: a notification
-  // failure never blocks the actual status change.
-  if(source==="Quote form" || source==="CRM funnel board" || source==="Quote Status Review"){
+  // Owner alert (31 Aug, widened twice same day) — originally scoped to
+  // just the Quote screen; extended to the CRM Funnel Kanban board and
+  // Quote Status Review, and now Quotes Report's own inline editor too
+  // — all four can move status just as quietly (Sales-dept Admin/Super
+  // Admin freely, anyone else with a code) — Log Follow-ups is
+  // deliberately still excluded, since that's the expected/visible way
+  // status normally moves, not a quiet side door. "Owner" here is the
+  // CRM ownership engine's real concept (companies.owner_employee_name),
+  // the only one this app actually has. Every status value notifies,
+  // not just the closing ones — Won is the specific worry raised, but
+  // any change made by someone other than the owner is worth surfacing.
+  // Best-effort: a notification failure never blocks the actual status
+  // change.
+  if(source==="Quote form" || source==="CRM funnel board" || source==="Quote Status Review" || source==="Quotes Report"){
     try{
       const { data: est } = await sb.from("estimates").select("customer_name").eq("reference_number",referenceNumber).limit(1).maybeSingle();
       const customerName = est?.customer_name;
@@ -16021,12 +16033,13 @@ async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, 
 // for live. The only entry point that can ever pass a legacy reference
 // is Log Follow-ups (legacy quotes never appear anywhere else), but
 // this stays generic rather than assuming that.
-async function applyOutcomeStatus(referenceNumber, newStatus, changedBy, source, reason){
+async function applyOutcomeStatus(referenceNumber, newStatus, changedBy, source, reason, changedAt){
   const { data: liveRow } = await sb.from("estimates").select("id").eq("reference_number",referenceNumber).limit(1).maybeSingle();
-  if(liveRow) return await updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source, reason);
+  if(liveRow) return await updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, source, reason, changedAt);
   const { data: legacyRow } = await sb.from("legacy_quotes_tbl").select("id,quote_status").eq("reference_number",referenceNumber).maybeSingle();
   if(legacyRow){
-    await sb.from("legacy_quotes_tbl").update({quote_status:newStatus, status_reason:reason||null}).eq("id",legacyRow.id);
+    const now = changedAt || new Date().toISOString();
+    await sb.from("legacy_quotes_tbl").update({quote_status:newStatus, status_reason:reason||null, status_changed_at:now, status_changed_by:changedBy}).eq("id",legacyRow.id);
     await logAudit("UPDATE","legacy_quotes_tbl",referenceNumber,"Status changed from "+(legacyRow.quote_status||"Draft")+" to "+newStatus+" via "+source,changedBy,{quote_status:legacyRow.quote_status},{quote_status:newStatus});
     return { oldStatus: legacyRow.quote_status };
   }
@@ -18121,7 +18134,9 @@ const MANUAL_SECTIONS = [
               "The Reference No is a direct hyperlink into that quote.",
               "Follow-up Stage shows \u201cOutcome - Notes\u201d from that quote's latest logged call. A Legacy row shows its frozen import note until a real call is ever logged against it \u2014 from that point on it behaves exactly like a live quote's follow-up data.",
               "History (every row) \u2014 asks whether to view every call for this Customer or just this Reference, then opens a full chronological list (Date, Mode, Chase What, Discussed What, Outcome, Notes, Logged by) with a Delete button per entry and a Back button to return here.",
-              "Reference No/Quote No, Customer Name, and Project Reference are free-text partial search (31 Aug fix) \u2014 previously these silently reverted anything that didn't exactly match an existing value, with no error shown, so a typed search often looked like it did nothing."
+              "Reference No/Quote No, Customer Name, and Project Reference are free-text partial search (31 Aug fix) \u2014 previously these silently reverted anything that didn't exactly match an existing value, with no error shown, so a typed search often looked like it did nothing.",
+              "Status is clickable (31 Aug) \u2014 opens a dialog to set any of the 9 statuses, plus the date it actually changed (defaults today, backdateable). Won/Lost/Deferred/Went Cold still trigger the same reason-capture dialog as everywhere else. Works on Legacy rows too. Sales-department Admin/Super Admin can change any quote; a plain user needs to be that account's current owner, or enter a one-time code.",
+              "\u201c+\u201d next to Next Follow-up (31 Aug) opens a small dialog (date + required Notes) that creates a real Log Follow-ups entry \u2014 not a field living only here \u2014 so it shows up in Review, History, and the Overdue Calls screen exactly like any other logged call. Same access rule as Status."
             ]
           }
         ]
@@ -19006,6 +19021,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"31 Aug 2026 (46)", summary:"Quotes Report gets full inline status/date editing, plus a real bug fix found along the way. New: Status is clickable, opens a dialog for any of the 9 statuses AND the actual date it changed (defaults today, backdateable) — routed through the existing applyOutcomeStatus dispatcher, so live and legacy quotes both get exactly the right update path (Extra Price/testing/document-purge/audit/owner-alert for live, the simpler direct update for legacy) with zero new orphan risk, since it's the same choke point every other status-change screen already uses. New \"+\" next to Next Follow-up opens a small dialog (date + required Notes) that writes a REAL Log Follow-ups entry rather than a field living only on the quote, so it shows up in Review/History/Overdue Calls like any other logged call. Access: Sales-department Admin or Super Admin can change anything; a plain user needs to be the account's current owner, or a one-time code (same fallback pattern as every other gated action). Real bug fixed in the same pass: WonLostOutcomeModal — the shared Won/Lost/Deferred/Went Cold reason-capture dialog used by Quote form, Kanban, Quote Status Review, and Log Follow-ups — was hardcoding its status-change source to the literal string \"status change\" regardless of which screen actually opened it, which meant the 31 Aug owner-alert banner (gated on real source strings) had never once fired for a CLOSED-outcome change — Won specifically, the exact case that motivated building it. Now threads the real caller's source (and the new changedAt) through properly; all 4 existing call sites updated to pass their own source, Quotes Report added as a 5th. Also added: legacy_quotes_tbl.status_changed_at/status_changed_by (legacy_status_changed_columns_2026-08-31.sql, additive) — legacy never tracked this before, needed now that its status-change date can be set explicitly." },
   { date:"31 Aug 2026 (45)", summary:"Territory Rules — Zones added (territory_rule_zone_tbl, territory_rule_zone_2026-08-31.sql), a third owner-assignment tier alongside the existing State and Country rules — covers a whole zone at once (cascades off the real canonical zone_tbl) instead of needing every State/Country in it individually rule'd. resolveOwnerForAddress now checks State -> Country -> Zone, Zone only ever reached once the other two miss. New Master Data -> CRM Setup tab. On the reported \"Country dropdown doesn't show India\" — traced this to NOT be a bug: India's zone/owner has always resolved via State (state_zone_tbl/territory_rule_state_tbl), by original design — the Country tables are explicitly scoped \"outside India\". Since State is checked before Country in resolution order, adding India there would only ever fire for an India company missing a State value — a near-dead-weight fix. The new Zone tier is the actually-useful answer to what was likely wanted (a broader-than-State catch-all for India), so nothing was changed about the Country dropdown itself." },
   { date:"31 Aug 2026 (44)", summary:"URGENT fix — Generate Quote PDF was completely broken for every quote: \"Cannot access 'first' before initialization\". Root cause: the 30 Aug Lumpsum Packing & Forwarding work read a variable named first (the quote's header row) 56 lines before it was actually declared, in the same PDF-generation function — the exact used-before-initialization bug class flagged repeatedly earlier in this project, invisible to node --check since it's a runtime ordering issue, not a syntax error, so it only ever surfaced when someone actually generated a PDF. Fixed by hoisting the single const first = estimatesRows[0] declaration up to before its first use; verified with an isolated Node reproduction of the exact before/after ordering, not just re-reading the code. No other logic touched." },
   { date:"31 Aug 2026 (43)", summary:"Two fixes. (1) Quotes Report's Reference No/Quote No, Customer Name, and Project Reference filters fixed — all three were built as limit-to-list combos defaulting to exact match, so a typed value that didn't EXACTLY match an existing reference/customer/project silently reverted to blank on blur (text stayed visible in the box, but the filter itself was empty) — explains why typed searches appeared to return unrelated rows. Now free-text (limitToList:false) with case-insensitive partial matching, same as City's own filter already did. (2) Quote Status Owner Alerts widened from Quote-screen-only to also cover the CRM Funnel Kanban board and Quote Status Review — both can move status just as quietly as the Quote screen (same isQuoteLocked gate, no Outcome-capture friction); Log Follow-ups remains deliberately excluded as the expected/visible path. Banner text and User Manual updated to match the wider scope." },
@@ -21386,7 +21402,7 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
       onSaved:(contact)=>saveNewContact(r._key,contact)
     })),
     outcomeTarget && h(WonLostOutcomeModal,{
-      referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user,
+      referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user, source:"Follow-up log",
       onDone:advanceWonLostQueue, onCancel:advanceWonLostQueue
     })
   ),
@@ -24253,6 +24269,100 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   // over to FollowupHistoryScreen until Back is pressed.
   const [historyPopupFor,setHistoryPopupFor] = useState(null);
   const [historyView,setHistoryView] = useState(null); // {scope:"customer"|"reference", value}
+  // Inline status/date editing (31 Aug) — every status settable here,
+  // routed through the SAME applyOutcomeStatus dispatcher every other
+  // status-change surface uses (live/legacy both handled correctly,
+  // Extra Price/testing/document-purge/audit/owner-alert all fire
+  // identically — reuse is what prevents an orphaned/inconsistent
+  // record here, not new bookkeeping). Access: Super Admin or a
+  // Sales-department Admin can change anything freely; a plain user
+  // needs to be the account's own current owner, or a one-time code —
+  // same fallback every other gated action in this app has.
+  const [authGate,setAuthGate] = useState(null);
+  const [statusEditFor,setStatusEditFor] = useState(null); // the row
+  const [statusEditValue,setStatusEditValue] = useState("");
+  const [statusEditDate,setStatusEditDate] = useState("");
+  const [outcomeTarget,setOutcomeTarget] = useState(null); // {referenceNumber,newStatus,changedAt}
+  // "+ Next Follow-up" (31 Aug) — writes a REAL Log Follow-ups entry
+  // (activity_log_tbl), not a field living only on the quote — so it
+  // shows up in Review, History, and the FSE/Telecaller Overdue Calls
+  // screen exactly like any other logged call. Notes is required, same
+  // rule as Log Entries itself; Discussed What auto-fills since this
+  // isn't really "a call", just a date being set from here.
+  const [nextFollowupFor,setNextFollowupFor] = useState(null); // the row
+  const [nfDate,setNfDate] = useState("");
+  const [nfNotes,setNfNotes] = useState("");
+  const [nfBusy,setNfBusy] = useState(false);
+  const CLOSED_OUTCOMES_QR = ["Won","Lost","Deferred","Went Cold"];
+  const canEditFreely = async(customerName)=>{
+    if(user.role==="super_admin") return true;
+    if(user.role==="admin"){
+      const { data: emp } = await sb.from("employee_tbl").select("department").eq("app_user_id",user.id).limit(1).maybeSingle();
+      if(emp && emp.department==="Sales") return true;
+    }
+    const { data: co } = await sb.from("companies").select("owner_employee_name").eq("company_name",customerName).maybeSingle();
+    const ownerName = co?.owner_employee_name;
+    if(!ownerName) return false;
+    const { data: myEmp } = await sb.from("employee_tbl").select("employee_name").eq("app_user_id",user.id).limit(1).maybeSingle();
+    return myEmp?.employee_name===ownerName;
+  };
+  const openStatusEditor = (row)=>{
+    setStatusEditFor(row);
+    setStatusEditValue(row.status);
+    setStatusEditDate(new Date().toISOString().slice(0,10));
+  };
+  const confirmStatusEdit = async()=>{
+    const row = statusEditFor;
+    const newStatus = statusEditValue;
+    // Noon, not midnight, so a date picked in any reasonable timezone
+    // doesn't silently roll back to the previous calendar day once
+    // converted to UTC for storage.
+    const changedAtIso = new Date(statusEditDate+"T12:00:00").toISOString();
+    const proceed = async()=>{
+      setStatusEditFor(null);
+      if(CLOSED_OUTCOMES_QR.includes(newStatus)){
+        setOutcomeTarget({ referenceNumber: row.reference_number, newStatus, changedAt: changedAtIso });
+      } else {
+        await applyOutcomeStatus(row.reference_number, newStatus, user.username, "Quotes Report", null, changedAtIso);
+        load();
+      }
+    };
+    const allowed = await canEditFreely(row.customer_name);
+    if(!allowed){ setAuthGate({ requiredType:"edit", action: proceed }); return; }
+    await proceed();
+  };
+  const openNextFollowup = (row)=>{
+    setNextFollowupFor(row);
+    setNfDate("");
+    setNfNotes("");
+  };
+  const saveNextFollowup = async()=>{
+    const row = nextFollowupFor;
+    if(!nfDate){ alert("Pick a Next Follow-up date."); return; }
+    if(!nfNotes.trim()){ alert("A short note is required — what's this follow-up about?"); return; }
+    const doSave = async()=>{
+      setNfBusy(true);
+      try{
+        await sb.from("activity_log_tbl").insert({
+          company_name: row.customer_name,
+          activity_date: new Date().toISOString().slice(0,10),
+          activity_type: "Others",
+          chase_what: "Offer",
+          chase_reference: row.reference_number,
+          contacted_whom: "",
+          discussed_what: "Follow-up date set from Quotes Report",
+          next_followup_date: nfDate,
+          notes: nfNotes,
+          logged_by: user.username,
+        });
+        setNextFollowupFor(null);
+        load();
+      } finally { setNfBusy(false); }
+    };
+    const allowed = await canEditFreely(row.customer_name);
+    if(!allowed){ setAuthGate({ requiredType:"edit", action: doSave }); return; }
+    await doSave();
+  };
   const [filters,setFilters] = useState({
     dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"", countryLike:"",
     zone:"", status:"", nature:"", followUp:"", projectLike:"",
@@ -24474,11 +24584,16 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           h("td",{style:{padding:"6px 9px"}},r.region),
           h("td",{style:{padding:"6px 9px"}},r.city),
           h("td",{style:{padding:"6px 9px"}},r.state),
-          h("td",{style:{padding:"6px 9px"}},h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#e6f1fb",color:"#0c447c"}},r.status)),
+          h("td",{style:{padding:"6px 9px"}},
+            h("span",{onClick:()=>openStatusEditor(r),title:"Click to change status",style:{cursor:"pointer",fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#e6f1fb",color:"#0c447c"}},r.status)
+          ),
           h("td",{style:{padding:"6px 9px"}},h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:8,background:"#faf3e6",color:"#8a5a0c"}},r.nature)),
           h("td",{style:{padding:"6px 9px"}},r.project_reference),
           h("td",{style:{padding:"6px 9px"}},r.followup_stage),
-          h("td",{style:{padding:"6px 9px"}},r.next_followup),
+          h("td",{style:{padding:"6px 9px"}},
+            r.next_followup, " ",
+            h("span",{onClick:()=>openNextFollowup(r),title:"Set/append a Next Follow-up date",style:{cursor:"pointer",fontSize:11,color:colors.accent,fontWeight:700}},"+")
+          ),
           h("td",{style:{padding:"6px 9px",display:"flex",gap:6}}, (!r.is_legacy && h("button",{onClick:()=>onOpenQuote(r.reference_number,1),style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Open")),
             h("button",{onClick:()=>setHistoryPopupFor(r),style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"History")
           )
@@ -24501,7 +24616,51 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
         h("button",{onClick:()=>setHistoryPopupFor(null),style:btnSecondary},"Cancel")
       )
     )
-  )
+  ),
+  // Status editor (31 Aug) — status + the date it actually changed
+  // (defaults today, editable/backdateable). Won/Lost/Deferred/Went
+  // Cold hand off to the existing WonLostOutcomeModal for the reason
+  // capture, same as everywhere else — this dialog just closes and lets
+  // that one take over.
+  statusEditFor && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center"}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"90%"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:14}},"Change status — "+statusEditFor.reference_number),
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"New status"),
+      h("select",{value:statusEditValue,onChange:e=>setStatusEditValue(e.target.value),style:{...inputStyle,marginBottom:12}},
+        statusOptions.map(s=>h("option",{key:s,value:s},s))
+      ),
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Date this actually changed"),
+      h("input",{type:"date",value:statusEditDate,onChange:e=>setStatusEditDate(e.target.value),style:{...inputStyle,marginBottom:16}}),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:()=>setStatusEditFor(null),style:btnSecondary},"Cancel"),
+        h("button",{onClick:confirmStatusEdit,style:btnPrimary},"Save")
+      )
+    )
+  ),
+  // "+ Next Follow-up" (31 Aug) — writes a real Log Follow-ups entry;
+  // see the state comment above for why. Notes required, same rule as
+  // Log Entries itself.
+  nextFollowupFor && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center"}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:400,maxWidth:"90%"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Next Follow-up — "+nextFollowupFor.reference_number),
+      h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:14}},"This creates a real Log Follow-ups entry, same as logging it from CRM \u2192 Daily."),
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Next Follow-up date"),
+      h("input",{type:"date",value:nfDate,onChange:e=>setNfDate(e.target.value),style:{...inputStyle,marginBottom:12}}),
+      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Notes (required)"),
+      h("textarea",{rows:3,value:nfNotes,onChange:e=>setNfNotes(e.target.value),style:{...inputStyle,marginBottom:16,resize:"vertical"}}),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:()=>setNextFollowupFor(null),style:btnSecondary},"Cancel"),
+        h("button",{onClick:saveNextFollowup,disabled:nfBusy,style:btnPrimary},nfBusy?"Saving…":"Save")
+      )
+    )
+  ),
+  authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action }),
+  outcomeTarget && h(WonLostOutcomeModal,{
+    referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user,
+    source:"Quotes Report", changedAt:outcomeTarget.changedAt,
+    onDone:()=>{ setOutcomeTarget(null); load(); },
+    onCancel:()=>setOutcomeTarget(null)
+  })
   );
 }
 
@@ -24960,7 +25119,7 @@ function CrmFunnelKanban({ user }){
     ),
     authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action }),
     outcomeTarget && h(WonLostOutcomeModal,{
-      referenceNumber:outcomeTarget.card.reference_number, newStatus:outcomeTarget.newStatus, user,
+      referenceNumber:outcomeTarget.card.reference_number, newStatus:outcomeTarget.newStatus, user, source:"CRM funnel board",
       onDone:(newStatus)=>{
         const by = user?.username||"unknown";
         setCards(cs=>cs.map(c=>c.reference_number===outcomeTarget.card.reference_number?{...c,quote_status:newStatus,status_changed_by:by,status_changed_at:new Date().toISOString()}:c));
@@ -25214,7 +25373,7 @@ function QuoteStatusReview({ user }){
     ),
     authGate && h(AuthCodeGate,{ requiredType:authGate.requiredType, user, onClose:()=>setAuthGate(null), onAuthorized:authGate.action }),
     outcomeTarget && h(WonLostOutcomeModal,{
-      referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user,
+      referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user, source:"Quote Status Review",
       onDone:()=>{ setOutcomeTarget(null); load(); },
       onCancel:()=>setOutcomeTarget(null)
     })
