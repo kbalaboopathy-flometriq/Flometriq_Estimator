@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-31T07:20:00Z";
+  var APP_BUILD_VERSION = "2026-08-31T07:50:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -16146,6 +16146,13 @@ function PdfPreviewModal({ doc:initialDoc, filename, onClose, buildDoc, quickEdi
 // exactly — same proven mechanism, just re-keyed. Returns the new
 // sale_order_tbl row, or throws.
 async function cloneQuoteIntoContract(quoteRef, contractNumber, customerName, username){
+  // Defensive duplicate check (31 Aug) — belt-and-braces alongside the
+  // picker's own pre-check: catches the rare race where two people
+  // create a Contract with the same number within moments of each
+  // other. Lives here, not just in the caller, so EVERY path that
+  // creates a Contract is protected, not only the new picker screen.
+  const { data: dupCheck } = await sb.from("sale_order_tbl").select("contract_number").eq("contract_number",contractNumber).maybeSingle();
+  if(dupCheck) throw new Error("Contract "+contractNumber+" already exists — refusing to create a duplicate.");
   const stripId = (r)=>{ const c={...r}; delete c.id; return c; };
   const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows},{data:slEpRows},{data:slTestRows},{data:globalTestRows},{data:docParents}] = await Promise.all([
     sb.from("estimates").select("*").eq("reference_number",quoteRef),
@@ -16347,23 +16354,70 @@ function ContractNumberSetupScreen({ user }){
 // the Quotes screen's own selector). Picking one either opens the
 // existing Contract for that Quote (already created) or creates one on
 // the spot (same clone + Won-status validation as Gateway 1's button).
-function SaleOrderOfferPicker({ user, onOpenContract }){
-  const [options,setOptions] = useState([]); // [{rn,label,latestRef,status}]
+// Sale Order tab, Gateway 2 (24 Aug, rebuilt 31 Aug) — Contract Number
+// leads now, not the underlying Quote/Offer Number. Picking an existing
+// Contract (limit-to-list) opens it directly; typing something that
+// matches nothing offers "+ Add new contract", which still needs a
+// source Won Quote to clone from — that hasn't changed, only the entry
+// order has. A duplicate Contract Number is refused at TWO points: here
+// (before even attempting the clone) and again inside
+// cloneQuoteIntoContract itself (defense against a same-moment race).
+// The separate Customer browse panel alongside it is new — predictive
+// off the real Companies list, double-click a row to jump straight in.
+function SaleOrderContractPicker({ user, onOpenContract }){
+  const [contracts,setContracts] = useState([]); // [{contract_number,customer_name,status}]
   const [loading,setLoading] = useState(true);
   const [search,setSearch] = useState("");
   const [busy,setBusy] = useState(false);
-  const baseRefOf = (ref)=> (ref||"").replace(/-Rev-\d+$/,"");
+  const [showAdd,setShowAdd] = useState(false);
+  const [addNumber,setAddNumber] = useState("");
+  const [addQuoteSearch,setAddQuoteSearch] = useState("");
+  const [quoteOptions,setQuoteOptions] = useState([]);
+  const [quoteOptionsLoading,setQuoteOptionsLoading] = useState(false);
+  const [dupError,setDupError] = useState(null); // {contract_number,customer_name}
 
-  useEffect(()=>{ (async()=>{
+  const [customerOptions,setCustomerOptions] = useState([]);
+  const [custSearch,setCustSearch] = useState("");
+  const [custContracts,setCustContracts] = useState([]);
+  const [custLoading,setCustLoading] = useState(false);
+
+  const load = useCallback(async()=>{
     setLoading(true);
-    const [{data:estRows},{data:contracts}] = await Promise.all([
+    const { data } = await sb.from("sale_order_tbl").select("contract_number,customer_name,status").order("contract_number");
+    setContracts(data||[]);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+  useEffect(()=>{
+    sb.from("companies").select("company_name").order("company_name").then(({data})=>setCustomerOptions((data||[]).map(c=>c.company_name)));
+  },[]);
+
+  const contractLabel = (c)=> c.contract_number+" — "+(c.customer_name||"—");
+  const trimmedSearch = search.trim();
+  const exactMatch = contracts.find(c=>contractLabel(c)===search);
+  const showNoMatchPrompt = trimmedSearch && !exactMatch && !showAdd;
+
+  const openExisting = async(c)=>{
+    setBusy(true);
+    try{
+      const { data } = await sb.from("sale_order_tbl").select("*").eq("contract_number",c.contract_number).maybeSingle();
+      if(data) onOpenContract(data);
+    } finally { setBusy(false); }
+  };
+  const handleMainSearchChange = (val)=>{
+    setSearch(val);
+    const hit = contracts.find(c=>contractLabel(c)===val);
+    if(hit && !busy) openExisting(hit);
+  };
+
+  const baseRefOf = (ref)=> (ref||"").replace(/-Rev-\d+$/,"");
+  const loadQuoteOptions = async()=>{
+    setQuoteOptionsLoading(true);
+    const [{data:estRows},{data:contractsAll}] = await Promise.all([
       sb.from("estimates").select("reference_number,customer_name,quote_status,item_sl_no").order("reference_number"),
       sb.from("sale_order_tbl").select("contract_number"),
     ]);
-    const contractNumbers = new Set((contracts||[]).map(c=>c.contract_number));
-    // Exclude rows that are themselves a Contract's own cloned data — a
-    // Contract's reference_number IS its contract_number in these same
-    // tables, so it would otherwise show up here as if it were a Quote.
+    const contractNumbers = new Set((contractsAll||[]).map(c=>c.contract_number));
     const quoteRows = (estRows||[]).filter(r=>!contractNumbers.has(r.reference_number));
     const byBase = new Map();
     quoteRows.forEach(r=>{
@@ -16374,44 +16428,121 @@ function SaleOrderOfferPicker({ user, onOpenContract }){
         byBase.set(base,{rn:base, latestRef:r.reference_number, revNum:revNum?Number(revNum):0, customer_name:r.customer_name, quote_status:r.quote_status});
       }
     });
-    setOptions(Array.from(byBase.values()).sort((a,b)=>a.rn.localeCompare(b.rn)));
-    setLoading(false);
-  })(); },[]);
+    setQuoteOptions(Array.from(byBase.values()).sort((a,b)=>a.rn.localeCompare(b.rn)));
+    setQuoteOptionsLoading(false);
+  };
+  const openAddFlow = async()=>{
+    setShowAdd(true);
+    setAddQuoteSearch("");
+    setDupError(null);
+    loadQuoteOptions();
+    const suggested = await suggestNextContractNumber();
+    if(!suggested && !/^\d+$/.test(trimmedSearch)){
+      alert("Contract Numbering hasn't been set up yet. An Admin needs to set the starting Contract Number first (Admin → Contract Numbering).");
+    }
+    // If what was typed up top looks like digits (a genuine number
+    // attempt, not a customer-name search that just missed), carry it
+    // straight into the Add box rather than overwriting it with the
+    // suggestion — respects what the person was actually trying to type.
+    const digitsOnly = /^\d+$/.test(trimmedSearch) ? trimmedSearch : null;
+    setAddNumber(digitsOnly || suggested || "");
+    if(digitsOnly) checkAddNumberDup(digitsOnly);
+  };
+  const cancelAdd = ()=>{ setShowAdd(false); setDupError(null); };
 
-  const pick = async(opt)=>{
+  const checkAddNumberDup = async(num)=>{
+    if(!/^\d{7}$/.test(num)) { setDupError(null); return; }
+    const { data } = await sb.from("sale_order_tbl").select("contract_number,customer_name").eq("contract_number",num).maybeSingle();
+    setDupError(data||null);
+  };
+
+  const confirmCreate = async()=>{
+    const num = addNumber.trim();
+    if(!/^\d{7}$/.test(num)){ alert("Contract Number must be exactly 7 digits."); return; }
+    const quoteHit = quoteOptions.find(o=>(o.rn+" — "+(o.customer_name||"—"))===addQuoteSearch);
+    if(!quoteHit){ alert("Pick a real Quote from the list — search by Offer Number or Customer Name."); return; }
+    if(quoteHit.quote_status!=="Won"){ alert("Can't create a Sale Order yet — Quote "+quoteHit.rn+" is \""+(quoteHit.quote_status||"Draft")+"\", not Won."); return; }
     setBusy(true);
     try{
-      const { data: existing } = await sb.from("sale_order_tbl").select("*").eq("quote_reference_number",opt.latestRef).maybeSingle();
-      if(existing){ onOpenContract(existing); return; }
-      if(opt.quote_status!=="Won"){
-        alert("Can't create a Sale Order yet — Quote "+opt.rn+" is \""+(opt.quote_status||"Draft")+"\", not Won.");
-        return;
-      }
-      const suggested = await suggestNextContractNumber();
-      if(!suggested){ alert("Contract Numbering hasn't been set up yet. An Admin needs to set the starting Contract Number first (Admin → Contract Numbering)."); return; }
-      const typed = prompt("Contract Number (7 digits — YY + 5-digit sequence):", suggested);
-      if(typed===null) return;
-      const contractNumber = typed.trim();
-      if(!/^\d{7}$/.test(contractNumber)){ alert("Contract Number must be exactly 7 digits."); return; }
-      const newContract = await cloneQuoteIntoContract(opt.latestRef, contractNumber, opt.customer_name, user?.username);
-      await advanceContractNumberSuggestion(contractNumber, user?.username);
+      // Pre-check (30 Aug convention: check first, THEN act) — avoids
+      // running the whole clone just to fail at the very end. The
+      // second check inside cloneQuoteIntoContract itself is the real
+      // backstop against a same-moment race, not this one.
+      const { data: existingDup } = await sb.from("sale_order_tbl").select("*").eq("contract_number",num).maybeSingle();
+      if(existingDup){ setDupError(existingDup); return; }
+      const newContract = await cloneQuoteIntoContract(quoteHit.latestRef, num, quoteHit.customer_name, user?.username);
+      await advanceContractNumberSuggestion(num, user?.username);
       onOpenContract(newContract);
-    } catch(e){ alert("Couldn't open the Sale Order: "+e.message); }
+    } catch(e){ alert("Couldn't create the Contract: "+e.message); }
     finally{ setBusy(false); }
   };
 
-  return h("div",{style:{padding:"20px 24px",maxWidth:520}},
-    h("h2",{style:{marginTop:0}},"Sale Order"),
-    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:16}},"Pick the Offer Number (Quote#) to open its Sale Order — creates one if it doesn't exist yet, providing the Quote is Won."),
-    loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
-    h("div",null,
-      h("input",{list:"so-offer-datalist",value:search,onChange:e=>{
-        setSearch(e.target.value);
-        const hit = options.find(o=>(o.rn+" — "+(o.customer_name||"—"))===e.target.value);
-        if(hit && !busy) pick(hit);
-      },placeholder:"Offer number or customer name…",style:{...inputStyle,padding:"8px 10px",width:320}}),
-      h("datalist",{id:"so-offer-datalist"}, options.map(o=>h("option",{key:o.rn,value:o.rn+" — "+(o.customer_name||"—")}))),
-      busy && h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginTop:8}},"Working…")
+  const handleCustSearchChange = (val)=>{
+    setCustSearch(val);
+    const hit = customerOptions.find(o=>o===val);
+    if(hit) loadCustContracts(hit); else setCustContracts([]);
+  };
+  const loadCustContracts = async(customerName)=>{
+    setCustLoading(true);
+    const { data } = await sb.from("sale_order_tbl").select("*").eq("customer_name",customerName).order("contract_number");
+    setCustContracts(data||[]);
+    setCustLoading(false);
+  };
+
+  return h("div",{style:{padding:"20px 24px",display:"flex",gap:16,flexWrap:"wrap"}},
+    h("div",{style:{flex:"1 1 420px",background:"#fff",border:"1px solid "+colors.border,borderLeft:"4px solid "+colors.dark,borderRadius:6,padding:"16px 18px",maxWidth:520}},
+      h("div",{style:{fontWeight:700,fontSize:16,marginBottom:2}},"Sale Order"),
+      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Pick the Contract Number to open its Sale Order."),
+      loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
+      h(React.Fragment,null,
+        h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:4}},"Contract Number"),
+        h("input",{list:"so-contract-datalist",value:search,onChange:e=>handleMainSearchChange(e.target.value),placeholder:"Contract number or customer name…",style:{...inputStyle,padding:"8px 10px",width:"100%",boxSizing:"border-box",marginBottom:6}}),
+        h("datalist",{id:"so-contract-datalist"}, contracts.map(c=>h("option",{key:c.contract_number,value:contractLabel(c)}))),
+        h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginBottom:14}},"Limit to list — matches an existing Contract exactly, opens it directly."),
+
+        showNoMatchPrompt && h("div",{style:{background:"#fff4d6",border:"1px solid #f0d9a8",borderRadius:6,padding:"10px 12px",marginBottom:16}},
+          h("div",{style:{fontSize:12,color:"#854f0b",marginBottom:8}},h("b",null,"No contract found for \""+trimmedSearch+"\"")," — nothing matches."),
+          h("button",{onClick:openAddFlow,style:btnPrimary},"+ Add new contract")
+        ),
+
+        !showAdd && !showNoMatchPrompt && h("button",{onClick:openAddFlow,style:{...btnSecondary,fontSize:11.5}},"+ Add new contract"),
+
+        showAdd && h("div",{style:{borderTop:"1px solid "+colors.border,paddingTop:14,marginTop:showNoMatchPrompt?0:14}},
+          h("div",{style:{fontSize:12,fontWeight:700,marginBottom:8}},"Add New Contract"),
+          h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:4}},"Contract Number"),
+          h("input",{value:addNumber,onChange:e=>{ setAddNumber(e.target.value); checkAddNumberDup(e.target.value.trim()); },style:{...inputStyle,padding:"7px 9px",width:"100%",boxSizing:"border-box",marginBottom:4}}),
+          h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:12}},"7 digits — YY + 5-digit sequence. Suggested next shown by default; if you type one that already exists, you'll be offered that Contract instead of creating a duplicate."),
+          dupError && h("div",{style:{background:"#fdecea",border:"1px solid #f3c6c1",borderRadius:6,padding:"9px 11px",marginBottom:12,fontSize:11.5,color:"#a3312a"}},
+            h("b",null,"Contract "+dupError.contract_number+" already exists")," — "+(dupError.customer_name||"—")+". ",
+            h("span",{onClick:()=>openExisting(dupError),style:{textDecoration:"underline",cursor:"pointer",fontWeight:600}},"Open it instead →")
+          ),
+          h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:4}},"Which Quote is this Contract for?"),
+          h("input",{list:"so-quote-datalist",value:addQuoteSearch,onChange:e=>setAddQuoteSearch(e.target.value),placeholder:quoteOptionsLoading?"Loading Won quotes…":"Offer number or customer name… (must be Won)",style:{...inputStyle,padding:"7px 9px",width:"100%",boxSizing:"border-box",marginBottom:14}}),
+          h("datalist",{id:"so-quote-datalist"}, quoteOptions.map(o=>h("option",{key:o.rn,value:o.rn+" — "+(o.customer_name||"—")}))),
+          h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+            h("button",{onClick:cancelAdd,style:btnSecondary},"Cancel"),
+            h("button",{onClick:confirmCreate,disabled:busy||!!dupError,style:{...btnPrimary,opacity:(busy||dupError)?0.6:1}},busy?"Creating…":"Create Contract")
+          )
+        )
+      )
+    ),
+    h("div",{style:{flex:"1 1 320px",background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"16px 18px",maxWidth:400}},
+      h("div",{style:{fontWeight:700,fontSize:13,marginBottom:2}},"Browse by Customer"),
+      h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:12}},"Double-click a contract to open it."),
+      h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:4}},"Customer"),
+      h("input",{list:"so-customer-datalist",value:custSearch,onChange:e=>handleCustSearchChange(e.target.value),placeholder:"Customer name…",style:{...inputStyle,padding:"7px 9px",width:"100%",boxSizing:"border-box",marginBottom:12}}),
+      h("datalist",{id:"so-customer-datalist"}, customerOptions.map(n=>h("option",{key:n,value:n}))),
+      custLoading ? h("div",{style:{fontSize:11.5,color:colors.mutedLight}},"Loading…") :
+      custSearch && h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+        h("div",{style:{background:colors.bg,padding:"7px 10px",fontSize:10.5,fontWeight:700,color:colors.muted,display:"flex",justifyContent:"space-between"}},
+          h("span",null,"Contract #"), h("span",null,"Status")
+        ),
+        custContracts.map(c=>h("div",{
+          key:c.contract_number, onDoubleClick:()=>onOpenContract(c), title:"Double-click to open",
+          style:{padding:"9px 10px",fontSize:12.5,display:"flex",justifyContent:"space-between",borderTop:"1px solid #f0efe8",cursor:"pointer"}
+        }, h("span",null,c.contract_number), h("span",{style:{color:colors.mutedLight}},c.status))),
+        custContracts.length===0 && h("div",{style:{padding:12,fontSize:11.5,color:colors.mutedLight}},"No contracts for this customer yet.")
+      )
     )
   );
 }
@@ -18034,6 +18165,26 @@ const MANUAL_SECTIONS = [
             "text": "The \"History\" button on the Quotes screen shows every create, edit, and export logged against that specific quote — same underlying Audit Log data, just filtered to one quote."
           }
         ]
+      },
+      {
+        "key": "sale_order_contract_picker",
+        "title": "Opening or creating a Sale Order",
+        "tag": "Sales \u2192 Sale Order",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Contract Number leads here (31 Aug), not the Quote/Offer Number \u2014 pick an existing Contract (limit-to-list combo, Contract# \u2014 Customer) to open it directly."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "Typing something that doesn't match any existing Contract shows \u201c+ Add new contract\u201d.",
+              "Add New Contract still needs a source Quote to clone from \u2014 that hasn't changed, only the order has. The Contract Number field is pre-filled with the suggested next number (7 digits, YY + 5-digit sequence) but editable; \u201cWhich Quote is this Contract for?\u201d only accepts a Won Quote, same rule as before.",
+              "A duplicate Contract Number is never allowed \u2014 typing or confirming one that already exists offers a direct link to that real Contract instead of creating a second one.",
+              "Browse by Customer (side panel) \u2014 a predictive, limit-to-list Customer search (straight off the Companies master) lists every Contract under that customer; double-click a row to open it."
+            ]
+          }
+        ]
       }
     ]
   },
@@ -19023,6 +19174,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"31 Aug 2026 (49)", summary:"Sale Order landing screen rebuilt around Contract Number instead of Offer/Quote Number. SaleOrderOfferPicker replaced by SaleOrderContractPicker: a limit-to-list Contract Number combo (Contract# — Customer) opens an existing Contract directly; typing something that matches nothing offers \"+ Add new contract\", which still requires picking a source Won Quote to clone from (unchanged mechanism, just reached from the other direction now) — the Contract Number field pre-fills with the existing suggested-next-number logic (untouched, still 7 digits/YY+5-digit sequence, still advances by whatever number actually gets used). Duplicate Contract Numbers are refused at two points: immediately when typed/confirmed in the Add flow (offers a direct link to the real Contract instead), and again as a defensive check inside cloneQuoteIntoContract itself, protecting every caller against a same-moment creation race, not just this screen. New: a separate Browse-by-Customer side panel — predictive limit-to-list search off the real Companies master, lists every Contract under that customer, double-click a row to open it. The old single mixed Offer-Number-or-customer-text box is gone, replaced by these two clearly separate flows." },
   { date:"31 Aug 2026 (48)", summary:"Quotes Report visually reworked and editing extended. Visual: whole screen now sits in a boxed white card with a green left-accent bar matching Log Follow-ups' own look, table font bumped from 12.5px to 14px to match. \"Nature\" column relabeled \"Stage\" in this screen's UI only (same underlying Unknown/Budgetary/Purchase Requirement values, filters.nature key unchanged internally). Status and Stage editing merged into ONE dialog (previously Status alone had its own): pick a new Status and/or Stage together, with a single shared date field for both — editing both in one sitting now shows as one \"Updated DD/MM/YYYY by X\" line under Status, not two separate dates. Stage changes are tracked with their own quote_nature_changed_at/quote_nature_changed_by columns (quote_nature_changed_columns_2026-08-31.sql, additive) — deliberately NOT reusing status_changed_at, since Quote Status Review's stale-quote flag reads that column specifically to mean \"the funnel stage hasn't moved,\" and a Stage-only edit bumping it would have quietly broken that flag. Follow-up Stage is now clickable too — opens a dialog to log a real Log Follow-ups entry (Outcome, required Notes, optional Next Follow-up), same non-forking principle as the existing \"+ Next Follow-up\" action, rather than turning a computed field into a directly-editable one. Known gap, not fixed this round: the Quote screen's own Stage/Nature setter still writes quote_nature directly, bypassing applyOutcomeNature — a Stage change made there won't show an \"Updated by\" date on this screen." },
   { date:"31 Aug 2026 (47)", summary:"CRM Funnel Kanban board reworked. Layout: the 9 status columns split into two rows (open pipeline Draft->Finalised on top, closed outcomes Won/Lost/Deferred/Went Cold below) with flexible-width columns instead of a fixed 230px each — eliminates the horizontal scroll that came from 9 fixed-width columns never fitting a normal screen. Each column's card list gets its own independent vertical scrollbar, height set relative to the browser viewport (not a fixed px count) so it adapts across monitor/window sizes — scrolling one column never affects its neighbors or the page itself. New Trello-style filter bar: search (Customer/Reference), Owner, Zone, Nature, and an Include Legacy toggle (on by default). Two real bugs fixed, not just the layout: (1) legacy quotes never appeared on this board at all — load() only ever queried estimates; now merges legacy_quotes_tbl in too, shown with the same Legacy badge Quotes Report uses, value shown as \"—\" since there's no BOM to sum. (2) drag-to-move was calling updateQuoteStatusForQuote directly (estimates-only) — a legacy card dragged to a new column would look like it moved (optimistic local state) while nothing was actually saved; switched to the legacy-aware applyOutcomeStatus dispatcher, same fix pattern already applied to Quotes Report's inline editor." },
   { date:"31 Aug 2026 (46)", summary:"Quotes Report gets full inline status/date editing, plus a real bug fix found along the way. New: Status is clickable, opens a dialog for any of the 9 statuses AND the actual date it changed (defaults today, backdateable) — routed through the existing applyOutcomeStatus dispatcher, so live and legacy quotes both get exactly the right update path (Extra Price/testing/document-purge/audit/owner-alert for live, the simpler direct update for legacy) with zero new orphan risk, since it's the same choke point every other status-change screen already uses. New \"+\" next to Next Follow-up opens a small dialog (date + required Notes) that writes a REAL Log Follow-ups entry rather than a field living only on the quote, so it shows up in Review/History/Overdue Calls like any other logged call. Access: Sales-department Admin or Super Admin can change anything; a plain user needs to be the account's current owner, or a one-time code (same fallback pattern as every other gated action). Real bug fixed in the same pass: WonLostOutcomeModal — the shared Won/Lost/Deferred/Went Cold reason-capture dialog used by Quote form, Kanban, Quote Status Review, and Log Follow-ups — was hardcoding its status-change source to the literal string \"status change\" regardless of which screen actually opened it, which meant the 31 Aug owner-alert banner (gated on real source strings) had never once fired for a CLOSED-outcome change — Won specifically, the exact case that motivated building it. Now threads the real caller's source (and the new changedAt) through properly; all 4 existing call sites updated to pass their own source, Quotes Report added as a 5th. Also added: legacy_quotes_tbl.status_changed_at/status_changed_by (legacy_status_changed_columns_2026-08-31.sql, additive) — legacy never tracked this before, needed now that its status-change date can be set explicitly." },
@@ -30164,7 +30316,7 @@ function App() {
     ),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,sessionCompany,onRefresh:refresh,onOpenQuote:(ref,slNo,openDatasheet)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo,openDatasheet:!!openDatasheet});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null),pendingNewSlNo,onConsumedPendingNewSlNo:()=>setPendingNewSlNo(null),onGoToTab:setTab})),
     tab==="saved"?h(SavedEstimates,{user,sessionCompany,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo,headerFields)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo,headerFields:headerFields||null});setTab("estimator");},onOpenContract:openContract,cameFromQuotesReport,onBackToQuotesReport:()=>{setCameFromQuotesReport(false); setTab("quotes_report");}}):
-    tab==="sale_order_entry"?h(SaleOrderOfferPicker,{user,onOpenContract:openContract}):
+    tab==="sale_order_entry"?h(SaleOrderContractPicker,{user,onOpenContract:openContract}):
     tab==="sale_order"?h(SavedEstimates,{user,sessionCompany,openTarget:saleOrderTarget,onConsumedTarget:()=>setSaleOrderTarget(null),onGoToTab:setTab,onNewSlNo:(ref,slNo,headerFields)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo,headerFields:headerFields||null});setTab("estimator");},mode:"contract",contractInfo:saleOrderContractInfo,onContractInfoChanged:refreshSaleOrderContractInfo,onOpenContract:openContract}):
     tab==="contract_number_setup"?h(ContractNumberSetupScreen,{user}):
     tab==="reports"?h(ReportsScreen,{user,onOpenModel:(m)=>{setOpenModelTarget(m);setTab("estimator");}}):
