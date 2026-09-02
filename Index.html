@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-31T07:50:00Z";
+  var APP_BUILD_VERSION = "2026-08-31T08:35:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -9632,25 +9632,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // same reasoning as the Extra Price declined flag above.
       if(globalTestRows?.length) await sb.from("quote_global_testing_tbl").insert(globalTestRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(amendAreas.documents){
-        const { data: docParents } = await sb.from("universal_documents_tbl").select("*").eq("entity_type","quote").eq("entity_id",latestRef).eq("is_archived",false);
-        if(docParents?.length){
-          const oldIds = docParents.map(p=>p.id);
-          const { data: oldHistory } = await sb.from("universal_document_history_tbl").select("*").in("document_id",oldIds).order("rev_number",{ascending:false});
-          const latestByOldDoc = new Map();
-          (oldHistory||[]).forEach(h=>{ if(!latestByOldDoc.has(h.document_id)) latestByOldDoc.set(h.document_id,h); });
-          for(const p of docParents){
-            const { data:newParent } = await sb.from("universal_documents_tbl").insert({
-              doc_number:p.doc_number, doc_name:p.doc_name, category:p.category, entity_type:"quote", entity_id:newRef,
-              is_mandatory:p.is_mandatory, is_archived:false, created_by:user?.username||"unknown"
-            }).select().single();
-            const latestOld = latestByOldDoc.get(p.id);
-            if(newParent) await sb.from("universal_document_history_tbl").insert({
-              document_id:newParent.id, doc_number:p.doc_number, rev_number:0, direction:"Out", status:null,
-              link:(latestOld&&latestOld.link)||"", file_path:null, lives_in_supabase:false,
-              reason:"Carried forward from previous revision", changed_by:user?.username||"unknown"
-            });
-          }
-        }
+        // 31 Aug — now calls the shared carryForwardDocuments helper
+        // instead of its own inline copy of the same logic; behavior is
+        // identical (still carries everything, no selection UI here —
+        // that's specific to the new Contract-creation flow).
+        await carryForwardDocuments("quote", latestRef, "quote", newRef, user?.username);
       }
 
       await logAudit("CREATE","estimates",newRef,"Amendment: created "+newRef+" as a clone of "+latestRef+" ("+Object.entries(amendAreas).filter(([k,v])=>v).map(([k])=>k).join(", ")+")",user?.username||"unknown",null,{cloned_from:latestRef,areas:amendAreas});
@@ -16145,6 +16131,37 @@ function PdfPreviewModal({ doc:initialDoc, filename, onClose, buildDoc, quickEdi
 // Quote revision. Table list and stripId pattern match startAmendment
 // exactly — same proven mechanism, just re-keyed. Returns the new
 // sale_order_tbl row, or throws.
+// Shared document carry-forward (31 Aug) — extracted from startAmendment's
+// own inline logic (unchanged behavior there) so the new Contract-creation
+// picker can reuse the exact same proven mechanism instead of a second,
+// hand-copied version. For each selected source document: a fresh parent
+// row under the new entity, plus one new Rev-0/Out history row carrying
+// the PRIOR LINK forward (not the file) — same "carried forward" pattern
+// already used for Quote amendments. selectedDocIds filters which of the
+// source's documents actually get carried; pass null/undefined to carry
+// everything (matches startAmendment's original all-or-nothing behavior).
+async function carryForwardDocuments(sourceEntityType, sourceEntityId, targetEntityType, targetEntityId, username, selectedDocIds){
+  const { data: docParentsAll } = await sb.from("universal_documents_tbl").select("*").eq("entity_type",sourceEntityType).eq("entity_id",sourceEntityId).eq("is_archived",false);
+  const docParents = selectedDocIds ? (docParentsAll||[]).filter(p=>selectedDocIds.includes(p.id)) : (docParentsAll||[]);
+  if(!docParents.length) return;
+  const oldIds = docParents.map(p=>p.id);
+  const { data: oldHistory } = await sb.from("universal_document_history_tbl").select("*").in("document_id",oldIds).order("rev_number",{ascending:false});
+  const latestByOldDoc = new Map();
+  (oldHistory||[]).forEach(h=>{ if(!latestByOldDoc.has(h.document_id)) latestByOldDoc.set(h.document_id,h); });
+  for(const p of docParents){
+    const { data:newParent } = await sb.from("universal_documents_tbl").insert({
+      doc_number:p.doc_number, doc_name:p.doc_name, category:p.category, entity_type:targetEntityType, entity_id:targetEntityId,
+      is_mandatory:p.is_mandatory, is_archived:false, created_by:username||"unknown"
+    }).select().single();
+    const latestOld = latestByOldDoc.get(p.id);
+    if(newParent) await sb.from("universal_document_history_tbl").insert({
+      document_id:newParent.id, doc_number:p.doc_number, rev_number:0, direction:"Out", status:null,
+      link:(latestOld&&latestOld.link)||"", file_path:null, lives_in_supabase:false,
+      reason:"Carried forward", changed_by:username||"unknown"
+    });
+  }
+}
+
 async function cloneQuoteIntoContract(quoteRef, contractNumber, customerName, username){
   // Defensive duplicate check (31 Aug) — belt-and-braces alongside the
   // picker's own pre-check: catches the rare race where two people
@@ -16154,7 +16171,7 @@ async function cloneQuoteIntoContract(quoteRef, contractNumber, customerName, us
   const { data: dupCheck } = await sb.from("sale_order_tbl").select("contract_number").eq("contract_number",contractNumber).maybeSingle();
   if(dupCheck) throw new Error("Contract "+contractNumber+" already exists — refusing to create a duplicate.");
   const stripId = (r)=>{ const c={...r}; delete c.id; return c; };
-  const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows},{data:slEpRows},{data:slTestRows},{data:globalTestRows},{data:docParents}] = await Promise.all([
+  const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows},{data:slEpRows},{data:slTestRows},{data:globalTestRows}] = await Promise.all([
     sb.from("estimates").select("*").eq("reference_number",quoteRef),
     sb.from("estimate_lines").select("*").eq("reference_number",quoteRef),
     sb.from("quote_commercial_terms").select("*").eq("reference_number",quoteRef),
@@ -16164,7 +16181,6 @@ async function cloneQuoteIntoContract(quoteRef, contractNumber, customerName, us
     sb.from("quote_sl_extra_price_tbl").select("*").eq("reference_number",quoteRef),
     sb.from("quote_sl_testing_tbl").select("*").eq("reference_number",quoteRef),
     sb.from("quote_global_testing_tbl").select("*").eq("reference_number",quoteRef),
-    sb.from("universal_documents_tbl").select("*").eq("entity_type","quote").eq("entity_id",quoteRef).eq("is_archived",false),
   ]);
   if(!estRows?.length) throw new Error("No Sl Nos found under "+quoteRef+" — nothing to clone.");
 
@@ -16177,10 +16193,15 @@ async function cloneQuoteIntoContract(quoteRef, contractNumber, customerName, us
   if(slEpRows?.length) await sb.from("quote_sl_extra_price_tbl").insert(slEpRows.map(r=>({...stripId(r), reference_number:contractNumber})));
   if(slTestRows?.length) await sb.from("quote_sl_testing_tbl").insert(slTestRows.map(r=>({...stripId(r), reference_number:contractNumber})));
   if(globalTestRows?.length) await sb.from("quote_global_testing_tbl").insert(globalTestRows.map(r=>({...stripId(r), reference_number:contractNumber})));
-  // Documents clone forward with entity_type kept as "quote" deliberately
-  // — the Documents panel this screen reuses isn't mode-aware, so this
-  // keeps it working unmodified rather than forking it too.
-  if(docParents?.length) await sb.from("universal_documents_tbl").insert(docParents.map(r=>({...stripId(r), entity_id:contractNumber})));
+  // Documents (31 Aug) — no longer cloned automatically here. The old
+  // version only ever copied the parent "shell" row, not its actual
+  // revision/link/status data, which meant a "carried forward" document
+  // on a fresh Contract had nothing real to show — effectively broken,
+  // not actually absent. Replaced by an explicit picker in
+  // SaleOrderContractPicker's Add flow (calls carryForwardDocuments with
+  // whichever documents were selected, using the SAME complete mechanism
+  // startAmendment already relies on) — the caller decides what to carry,
+  // this function no longer does it silently/incompletely on its own.
 
   const { data: contractRow, error } = await sb.from("sale_order_tbl").insert({
     contract_number: contractNumber, quote_reference_number: quoteRef, customer_name: customerName, status:"Open", created_by: username||"unknown"
@@ -16364,6 +16385,34 @@ function ContractNumberSetupScreen({ user }){
 // cloneQuoteIntoContract itself (defense against a same-moment race).
 // The separate Customer browse panel alongside it is new — predictive
 // off the real Companies list, double-click a row to jump straight in.
+// Real live-filtering predictive text field (31 Aug) — native
+// <input list><datalist> (used everywhere else via LimitToListCombo)
+// is inconsistent across browsers about actually filtering as you
+// type; some builds only show/filter the list once you click the
+// dropdown arrow, which reads as "not really predictive." This
+// filters the option list client-side on every keystroke and renders
+// its own suggestion list. onMouseDown (not onClick) on a suggestion
+// so it fires before the input's onBlur closes the list.
+function PredictiveTextField({ value, onChange, options, placeholder, onPick, style, maxSuggestions=8 }){
+  const [open,setOpen] = useState(false);
+  const trimmed = (value||"").trim().toLowerCase();
+  const matches = trimmed ? (options||[]).filter(o=>o.toLowerCase().includes(trimmed)).slice(0,maxSuggestions) : [];
+  return h("div",{style:{position:"relative"}},
+    h("input",{
+      value:value||"", placeholder, style,
+      onChange:e=>{ onChange(e.target.value); setOpen(true); },
+      onFocus:()=>setOpen(true),
+      onBlur:()=>setTimeout(()=>setOpen(false),150),
+    }),
+    open && matches.length>0 && h("div",{style:{position:"absolute",top:"100%",left:0,right:0,background:"#fff",border:"1px solid "+colors.border,borderRadius:4,marginTop:2,maxHeight:180,overflowY:"auto",zIndex:50,boxShadow:"0 2px 6px rgba(0,0,0,0.1)"}},
+      matches.map(m=>h("div",{
+        key:m, onMouseDown:()=>{ onPick(m); setOpen(false); },
+        style:{padding:"7px 10px",fontSize:12.5,cursor:"pointer"}
+      },m))
+    )
+  );
+}
+
 function SaleOrderContractPicker({ user, onOpenContract }){
   const [contracts,setContracts] = useState([]); // [{contract_number,customer_name,status}]
   const [loading,setLoading] = useState(true);
@@ -16375,6 +16424,13 @@ function SaleOrderContractPicker({ user, onOpenContract }){
   const [quoteOptions,setQuoteOptions] = useState([]);
   const [quoteOptionsLoading,setQuoteOptionsLoading] = useState(false);
   const [dupError,setDupError] = useState(null); // {contract_number,customer_name}
+  // Document carry-forward picker (31 Aug) — shown between confirming
+  // the Contract Number/source Quote and actually creating the Contract,
+  // only when the source Quote has documents worth asking about.
+  const [pendingCreate,setPendingCreate] = useState(null); // {num,quoteHit}
+  const [docPickList,setDocPickList] = useState([]);
+  const [docPickSelected,setDocPickSelected] = useState(new Set());
+  const [showDocPick,setShowDocPick] = useState(false);
 
   const [customerOptions,setCustomerOptions] = useState([]);
   const [custSearch,setCustSearch] = useState("");
@@ -16470,34 +16526,97 @@ function SaleOrderContractPicker({ user, onOpenContract }){
       // backstop against a same-moment race, not this one.
       const { data: existingDup } = await sb.from("sale_order_tbl").select("*").eq("contract_number",num).maybeSingle();
       if(existingDup){ setDupError(existingDup); return; }
-      const newContract = await cloneQuoteIntoContract(quoteHit.latestRef, num, quoteHit.customer_name, user?.username);
-      await advanceContractNumberSuggestion(num, user?.username);
-      onOpenContract(newContract);
+      // Document carry-forward prompt (31 Aug) — only bother asking if
+      // the source Quote actually has any. entity_type stays "quote"
+      // even though this is headed for a Contract — see the comment on
+      // carryForwardDocuments' call below for why.
+      const { data: srcDocs } = await sb.from("universal_documents_tbl").select("*").eq("entity_type","quote").eq("entity_id",quoteHit.latestRef).eq("is_archived",false);
+      if(srcDocs && srcDocs.length){
+        setPendingCreate({ num, quoteHit });
+        // Select-all by default (matches the existing amendment "Documents"
+        // area-picker precedent, which also carries everything when
+        // checked) — unchecking is the exception, not the default ask.
+        setDocPickList(srcDocs);
+        setDocPickSelected(new Set(srcDocs.map(d=>d.id)));
+        setShowDocPick(true);
+        return;
+      }
+      await finishCreate(num, quoteHit, []);
     } catch(e){ alert("Couldn't create the Contract: "+e.message); }
     finally{ setBusy(false); }
   };
 
+  const finishCreate = async(num, quoteHit, selectedDocIds)=>{
+    const newContract = await cloneQuoteIntoContract(quoteHit.latestRef, num, quoteHit.customer_name, user?.username);
+    if(selectedDocIds && selectedDocIds.length){
+      // Documents panel everywhere in this app queries entity_type="quote"
+      // unconditionally, even for a Contract's own documents (existing,
+      // deliberate convention — "the Documents panel this screen reuses
+      // isn't mode-aware") — carrying forward with any other entity_type
+      // would make these silently invisible on the new Contract.
+      await carryForwardDocuments("quote", quoteHit.latestRef, "quote", num, user?.username, selectedDocIds);
+    }
+    await advanceContractNumberSuggestion(num, user?.username);
+    onOpenContract(newContract);
+  };
+  const confirmDocPick = async()=>{
+    setBusy(true);
+    try{
+      await finishCreate(pendingCreate.num, pendingCreate.quoteHit, Array.from(docPickSelected));
+      setShowDocPick(false); setPendingCreate(null);
+    } catch(e){ alert("Couldn't create the Contract: "+e.message); }
+    finally{ setBusy(false); }
+  };
+  const skipDocPick = async()=>{
+    setBusy(true);
+    try{
+      await finishCreate(pendingCreate.num, pendingCreate.quoteHit, []);
+      setShowDocPick(false); setPendingCreate(null);
+    } catch(e){ alert("Couldn't create the Contract: "+e.message); }
+    finally{ setBusy(false); }
+  };
+  const toggleDocPick = (id)=>{
+    setDocPickSelected(s=>{ const next=new Set(s); if(next.has(id)) next.delete(id); else next.add(id); return next; });
+  };
+
   const handleCustSearchChange = (val)=>{
     setCustSearch(val);
-    const hit = customerOptions.find(o=>o===val);
+    const hit = customerOptions.find(o=>o.toLowerCase()===val.trim().toLowerCase());
     if(hit) loadCustContracts(hit); else setCustContracts([]);
+  };
+  const pickCustomer = (name)=>{
+    setCustSearch(name);
+    loadCustContracts(name);
   };
   const loadCustContracts = async(customerName)=>{
     setCustLoading(true);
-    const { data } = await sb.from("sale_order_tbl").select("*").eq("customer_name",customerName).order("contract_number");
+    // Case-insensitive match (31 Aug fix) — a Contract's customer_name
+    // is copied once, at creation time, from whatever the source Quote
+    // said. If the real Companies record has since been renamed or
+    // corrected (even just a casing/spacing difference), an exact
+    // match would silently show zero contracts for a customer who
+    // genuinely has some — same bug class as the UAE/legacy-customer
+    // mismatches found earlier this session.
+    const { data } = await sb.from("sale_order_tbl").select("*").ilike("customer_name",customerName).order("contract_number");
     setCustContracts(data||[]);
     setCustLoading(false);
   };
 
-  return h("div",{style:{padding:"20px 24px",display:"flex",gap:16,flexWrap:"wrap"}},
+  return h(React.Fragment,null,
+  h("div",{style:{padding:"20px 24px",display:"flex",gap:16,flexWrap:"wrap"}},
     h("div",{style:{flex:"1 1 420px",background:"#fff",border:"1px solid "+colors.border,borderLeft:"4px solid "+colors.dark,borderRadius:6,padding:"16px 18px",maxWidth:520}},
       h("div",{style:{fontWeight:700,fontSize:16,marginBottom:2}},"Sale Order"),
       h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"Pick the Contract Number to open its Sale Order."),
       loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
       h(React.Fragment,null,
         h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:4}},"Contract Number"),
-        h("input",{list:"so-contract-datalist",value:search,onChange:e=>handleMainSearchChange(e.target.value),placeholder:"Contract number or customer name…",style:{...inputStyle,padding:"8px 10px",width:"100%",boxSizing:"border-box",marginBottom:6}}),
-        h("datalist",{id:"so-contract-datalist"}, contracts.map(c=>h("option",{key:c.contract_number,value:contractLabel(c)}))),
+        h(PredictiveTextField,{
+          value:search, onChange:handleMainSearchChange,
+          options:contracts.map(contractLabel),
+          placeholder:"Contract number or customer name…",
+          onPick:(label)=>{ setSearch(label); const hit=contracts.find(c=>contractLabel(c)===label); if(hit) openExisting(hit); },
+          style:{...inputStyle,padding:"8px 10px",width:"100%",boxSizing:"border-box",marginBottom:6}
+        }),
         h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginBottom:14}},"Limit to list — matches an existing Contract exactly, opens it directly."),
 
         showNoMatchPrompt && h("div",{style:{background:"#fff4d6",border:"1px solid #f0d9a8",borderRadius:6,padding:"10px 12px",marginBottom:16}},
@@ -16517,8 +16636,13 @@ function SaleOrderContractPicker({ user, onOpenContract }){
             h("span",{onClick:()=>openExisting(dupError),style:{textDecoration:"underline",cursor:"pointer",fontWeight:600}},"Open it instead →")
           ),
           h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:4}},"Which Quote is this Contract for?"),
-          h("input",{list:"so-quote-datalist",value:addQuoteSearch,onChange:e=>setAddQuoteSearch(e.target.value),placeholder:quoteOptionsLoading?"Loading Won quotes…":"Offer number or customer name… (must be Won)",style:{...inputStyle,padding:"7px 9px",width:"100%",boxSizing:"border-box",marginBottom:14}}),
-          h("datalist",{id:"so-quote-datalist"}, quoteOptions.map(o=>h("option",{key:o.rn,value:o.rn+" — "+(o.customer_name||"—")}))),
+          h(PredictiveTextField,{
+            value:addQuoteSearch, onChange:setAddQuoteSearch,
+            options:quoteOptions.map(o=>o.rn+" — "+(o.customer_name||"—")),
+            placeholder:quoteOptionsLoading?"Loading Won quotes…":"Offer number or customer name… (must be Won)",
+            onPick:setAddQuoteSearch,
+            style:{...inputStyle,padding:"7px 9px",width:"100%",boxSizing:"border-box",marginBottom:14}
+          }),
           h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
             h("button",{onClick:cancelAdd,style:btnSecondary},"Cancel"),
             h("button",{onClick:confirmCreate,disabled:busy||!!dupError,style:{...btnPrimary,opacity:(busy||dupError)?0.6:1}},busy?"Creating…":"Create Contract")
@@ -16530,8 +16654,13 @@ function SaleOrderContractPicker({ user, onOpenContract }){
       h("div",{style:{fontWeight:700,fontSize:13,marginBottom:2}},"Browse by Customer"),
       h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:12}},"Double-click a contract to open it."),
       h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:4}},"Customer"),
-      h("input",{list:"so-customer-datalist",value:custSearch,onChange:e=>handleCustSearchChange(e.target.value),placeholder:"Customer name…",style:{...inputStyle,padding:"7px 9px",width:"100%",boxSizing:"border-box",marginBottom:12}}),
-      h("datalist",{id:"so-customer-datalist"}, customerOptions.map(n=>h("option",{key:n,value:n}))),
+      h(PredictiveTextField,{
+        value:custSearch, onChange:handleCustSearchChange,
+        options:customerOptions,
+        placeholder:"Customer name…",
+        onPick:pickCustomer,
+        style:{...inputStyle,padding:"7px 9px",width:"100%",boxSizing:"border-box",marginBottom:12}
+      }),
       custLoading ? h("div",{style:{fontSize:11.5,color:colors.mutedLight}},"Loading…") :
       custSearch && h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
         h("div",{style:{background:colors.bg,padding:"7px 10px",fontSize:10.5,fontWeight:700,color:colors.muted,display:"flex",justifyContent:"space-between"}},
@@ -16544,6 +16673,31 @@ function SaleOrderContractPicker({ user, onOpenContract }){
         custContracts.length===0 && h("div",{style:{padding:12,fontSize:11.5,color:colors.mutedLight}},"No contracts for this customer yet.")
       )
     )
+  ),
+  // Document carry-forward picker (31 Aug) — select-all by default,
+  // matching the existing amendment "Documents" area-picker precedent.
+  showDocPick && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:520,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:2}},"Carry documents into Contract "+(pendingCreate&&pendingCreate.num)+"?"),
+      h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},"From Quote "+(pendingCreate&&pendingCreate.quoteHit.rn)+" — pick which ones belong on the Sale Order; the prior link comes with each one selected, no re-upload needed."),
+      h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden",marginBottom:14}},
+        h("div",{style:{background:colors.bg,padding:"8px 10px",fontSize:10.5,fontWeight:700,color:colors.muted,display:"flex",gap:10}},
+          h("span",{style:{width:20}}), h("span",{style:{flex:1}},"Category"), h("span",{style:{width:140}},"Doc #")
+        ),
+        docPickList.map(d=>h("div",{key:d.id,style:{padding:"8px 10px",fontSize:12.5,display:"flex",gap:10,alignItems:"center",borderTop:"1px solid #f0efe8"}},
+          h("input",{type:"checkbox",checked:docPickSelected.has(d.id),onChange:()=>toggleDocPick(d.id),style:{width:20}}),
+          h("span",{style:{flex:1}},d.category||d.doc_name||"—"),
+          h("span",{style:{width:140,color:colors.mutedLight}},d.doc_number||"—")
+        )),
+        docPickList.length===0 && h("div",{style:{padding:12,fontSize:11.5,color:colors.mutedLight}},"No documents on this Quote.")
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+        h("button",{onClick:()=>{ setShowDocPick(false); setPendingCreate(null); },disabled:busy,style:btnSecondary},"Cancel"),
+        h("button",{onClick:skipDocPick,disabled:busy,style:btnSecondary},"Skip — start empty"),
+        h("button",{onClick:confirmDocPick,disabled:busy,style:{...btnPrimary,opacity:busy?0.6:1}},busy?"Creating…":"Carry forward selected ("+docPickSelected.size+")")
+      )
+    )
+  )
   );
 }
 
@@ -18180,8 +18334,9 @@ const MANUAL_SECTIONS = [
             "items": [
               "Typing something that doesn't match any existing Contract shows \u201c+ Add new contract\u201d.",
               "Add New Contract still needs a source Quote to clone from \u2014 that hasn't changed, only the order has. The Contract Number field is pre-filled with the suggested next number (7 digits, YY + 5-digit sequence) but editable; \u201cWhich Quote is this Contract for?\u201d only accepts a Won Quote, same rule as before.",
+              "If the source Quote has any documents, you're asked which ones to carry into the new Contract before it's created (31 Aug) \u2014 all selected by default, uncheck any that don't belong on the Sale Order. The prior link comes with each one carried forward, no re-upload needed. Skip it entirely to start with an empty documents list.",
               "A duplicate Contract Number is never allowed \u2014 typing or confirming one that already exists offers a direct link to that real Contract instead of creating a second one.",
-              "Browse by Customer (side panel) \u2014 a predictive, limit-to-list Customer search (straight off the Companies master) lists every Contract under that customer; double-click a row to open it."
+              "Browse by Customer (side panel) \u2014 a real live-filtering predictive search (31 Aug, not the browser's native dropdown \u2014 the suggestion list updates on every keystroke) over every Customer in the Companies master. Lists every Contract under whichever customer you pick, double-click a row to open it. The match against Contracts is case-insensitive, so a Customer whose name in Companies differs only by casing/spacing from what's saved on the Contract still shows up correctly."
             ]
           }
         ]
@@ -19174,6 +19329,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"31 Aug 2026 (51)", summary:"Sale Order document carry-forward, with a real bug fixed along the way. Real bug found: cloneQuoteIntoContract (creates a Contract from a Won Quote) was already attempting to carry documents over, but only cloned the parent \"shell\" row, never the actual revision/link/status data — a carried document had nothing real to show, effectively broken rather than genuinely absent, which is why Contracts looked like they started with a clean empty list. Fixed by extracting the ALREADY-PROVEN complete mechanism from startAmendment's own Quote-amendment document carry-forward (parent + a fresh Rev-0/Out history row carrying the prior link forward) into a new shared carryForwardDocuments() helper, used by both startAmendment (unchanged behavior, just de-duplicated) and the new Contract flow. New: when creating a Contract, if the source Quote has documents, a picker shows them (select-all by default, matching the amendment area-picker's own precedent) before the Contract is created — pick which ones actually belong on the Sale Order rather than an all-or-nothing carry. Kept entity_type=\"quote\" for carried documents even though they're headed for a Contract — the Documents panel everywhere in this app already queries that value unconditionally (an existing, deliberate convention), so anything else would make carried documents silently invisible." },
+  { date:"31 Aug 2026 (50)", summary:"Fixed the Sale Order picker's Browse-by-Customer bug (Zeeco had a real Contract but didn't show up there) and replaced its native browser datalist with a genuinely live-filtering dropdown. Root cause: a Contract's customer_name is copied once at creation time from the source Quote — if the real Companies record has since been renamed/corrected even slightly (casing, spacing), an exact match against sale_order_tbl silently found nothing, same bug class as the UAE/legacy-customer mismatches found earlier this session. Fixed by matching case-insensitively (.ilike) rather than exact (.eq) — kept pulling the FULL Companies list for the predictive options, not narrowed to only customers with existing contracts, per what was actually asked. Separately: native <input list><datalist> (used here and via LimitToListCombo generally) is inconsistent across browsers about actually filtering as you type — some only show/filter once you click the dropdown arrow. Built a new PredictiveTextField (client-side filter on every keystroke, own suggestion list, onMouseDown so it fires before blur closes it) and swapped it into all three text fields on this screen — Contract Number, the Add flow's Quote search, and Customer — for a consistent, real predictive-search feel across the whole picker." },
   { date:"31 Aug 2026 (49)", summary:"Sale Order landing screen rebuilt around Contract Number instead of Offer/Quote Number. SaleOrderOfferPicker replaced by SaleOrderContractPicker: a limit-to-list Contract Number combo (Contract# — Customer) opens an existing Contract directly; typing something that matches nothing offers \"+ Add new contract\", which still requires picking a source Won Quote to clone from (unchanged mechanism, just reached from the other direction now) — the Contract Number field pre-fills with the existing suggested-next-number logic (untouched, still 7 digits/YY+5-digit sequence, still advances by whatever number actually gets used). Duplicate Contract Numbers are refused at two points: immediately when typed/confirmed in the Add flow (offers a direct link to the real Contract instead), and again as a defensive check inside cloneQuoteIntoContract itself, protecting every caller against a same-moment creation race, not just this screen. New: a separate Browse-by-Customer side panel — predictive limit-to-list search off the real Companies master, lists every Contract under that customer, double-click a row to open it. The old single mixed Offer-Number-or-customer-text box is gone, replaced by these two clearly separate flows." },
   { date:"31 Aug 2026 (48)", summary:"Quotes Report visually reworked and editing extended. Visual: whole screen now sits in a boxed white card with a green left-accent bar matching Log Follow-ups' own look, table font bumped from 12.5px to 14px to match. \"Nature\" column relabeled \"Stage\" in this screen's UI only (same underlying Unknown/Budgetary/Purchase Requirement values, filters.nature key unchanged internally). Status and Stage editing merged into ONE dialog (previously Status alone had its own): pick a new Status and/or Stage together, with a single shared date field for both — editing both in one sitting now shows as one \"Updated DD/MM/YYYY by X\" line under Status, not two separate dates. Stage changes are tracked with their own quote_nature_changed_at/quote_nature_changed_by columns (quote_nature_changed_columns_2026-08-31.sql, additive) — deliberately NOT reusing status_changed_at, since Quote Status Review's stale-quote flag reads that column specifically to mean \"the funnel stage hasn't moved,\" and a Stage-only edit bumping it would have quietly broken that flag. Follow-up Stage is now clickable too — opens a dialog to log a real Log Follow-ups entry (Outcome, required Notes, optional Next Follow-up), same non-forking principle as the existing \"+ Next Follow-up\" action, rather than turning a computed field into a directly-editable one. Known gap, not fixed this round: the Quote screen's own Stage/Nature setter still writes quote_nature directly, bypassing applyOutcomeNature — a Stage change made there won't show an \"Updated by\" date on this screen." },
   { date:"31 Aug 2026 (47)", summary:"CRM Funnel Kanban board reworked. Layout: the 9 status columns split into two rows (open pipeline Draft->Finalised on top, closed outcomes Won/Lost/Deferred/Went Cold below) with flexible-width columns instead of a fixed 230px each — eliminates the horizontal scroll that came from 9 fixed-width columns never fitting a normal screen. Each column's card list gets its own independent vertical scrollbar, height set relative to the browser viewport (not a fixed px count) so it adapts across monitor/window sizes — scrolling one column never affects its neighbors or the page itself. New Trello-style filter bar: search (Customer/Reference), Owner, Zone, Nature, and an Include Legacy toggle (on by default). Two real bugs fixed, not just the layout: (1) legacy quotes never appeared on this board at all — load() only ever queried estimates; now merges legacy_quotes_tbl in too, shown with the same Legacy badge Quotes Report uses, value shown as \"—\" since there's no BOM to sum. (2) drag-to-move was calling updateQuoteStatusForQuote directly (estimates-only) — a legacy card dragged to a new column would look like it moved (optimistic local state) while nothing was actually saved; switched to the legacy-aware applyOutcomeStatus dispatcher, same fix pattern already applied to Quotes Report's inline editor." },
