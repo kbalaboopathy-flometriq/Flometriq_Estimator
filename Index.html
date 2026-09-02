@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-08-31T08:35:00Z";
+  var APP_BUILD_VERSION = "2026-09-02T09:20:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -340,6 +340,7 @@ const COMPANY_LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAABlCAYA
 const MASTER_TABLES = [
   { key: "model_tbl", label: "Models", columns: ["item","size","model","category"], addLabel:"New model", cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"size",from:"size_tbl",field:"size"},{col:"category",from:"category_tbl",field:"category"}], freeText:["model"], groupBy:["model","size"], editAllEnabled:true },
   { key: "category_tbl", label: "Categories", columns: ["category"], addLabel:"New category", freeText:["category"] },
+  { key: "job_attribute_tbl", label: "Job attributes", columns: ["attribute","sort_order"], addLabel:"New attribute", freeText:["attribute","sort_order"] },
   { key: "item_tbl", label: "Items", columns: ["item","hsn_code"], addLabel:"New item", freeText:["item","hsn_code"], exportEnabled:true },
   { key: "size_tbl", label: "Sizes", columns: ["size"], addLabel:"New size", freeText:["size"], editAllEnabled:true },
   { key: "component_item_tbl", label: "Components by item", columns: ["component","item"], addLabel:"New component", cascade:[{col:"item",from:"item_tbl",field:"item"}], freeText:["component"], editAllEnabled:true, exportEnabled:true },
@@ -9495,7 +9496,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     // for a revision, ghost ("" = keep") is fine except currency/rate, which
     // we want visibly pre-filled with the real current value.
     if(isRevisionRef){
-      setHeaderDraft({ enquiry_number:"", enquiry_date:"", quote_date:"", currency:quoteHeaderRow.currency||"INR", conversion_rate:String(quoteHeaderRow.conversion_rate||1), customer_address:"", contact_name:"", contact_designation:"", signatory_name:"", signatory_designation:"" });
+      setHeaderDraft({ enquiry_number:"", enquiry_date:"", quote_date:"", currency:quoteHeaderRow.currency||"INR", conversion_rate:String(quoteHeaderRow.conversion_rate||1), customer_address:"", contact_name:"", contact_designation:"", signatory_name:"", signatory_designation:"", end_user_name:"" });
     } else {
       setHeaderDraft({
         enquiry_number: quoteHeaderRow.enquiry_number||"", enquiry_date: quoteHeaderRow.enquiry_date||"",
@@ -9503,7 +9504,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         conversion_rate: String(quoteHeaderRow.conversion_rate||1),
         customer_name: quoteHeaderRow.customer_name||"", customer_address: quoteHeaderRow.customer_address||"",
         contact_name: quoteHeaderRow.contact_name||"", contact_designation: quoteHeaderRow.contact_designation||"",
-        signatory_name: quoteHeaderRow.signatory_name||"", signatory_designation: quoteHeaderRow.signatory_designation||""
+        signatory_name: quoteHeaderRow.signatory_name||"", signatory_designation: quoteHeaderRow.signatory_designation||"",
+        end_user_name: quoteHeaderRow.end_user_name||""
       });
     }
     setQuickCurrencyEditOpen(true);
@@ -9602,7 +9604,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const base = baseRefOf(refFilter);
       const newRef = base+"-Rev-"+nextRevNum;
 
-      const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows},{data:slEpRows},{data:slTestRows},{data:globalTestRows}] = await Promise.all([
+      const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows},{data:slEpRows},{data:slTestRows},{data:globalTestRows},{data:slJobAttrRows}] = await Promise.all([
         sb.from("estimates").select("*").eq("reference_number",latestRef),
         sb.from("estimate_lines").select("*").eq("reference_number",latestRef),
         sb.from("quote_commercial_terms").select("*").eq("reference_number",latestRef),
@@ -9612,6 +9614,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         sb.from("quote_sl_extra_price_tbl").select("*").eq("reference_number",latestRef),
         sb.from("quote_sl_testing_tbl").select("*").eq("reference_number",latestRef),
         sb.from("quote_global_testing_tbl").select("*").eq("reference_number",latestRef),
+        sb.from("quote_sl_job_attribute_tbl").select("*").eq("reference_number",latestRef),
       ]);
 
       const stripId = (r)=>{ const c={...r}; delete c.id; return c; };
@@ -9631,6 +9634,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // (the remembered Pro-rata/Separate choice) deliberately does NOT,
       // same reasoning as the Extra Price declined flag above.
       if(globalTestRows?.length) await sb.from("quote_global_testing_tbl").insert(globalTestRows.map(r=>({...stripId(r), reference_number:newRef})));
+      // Per-Sl-No compliance attributes clone forward with the lines they
+      // describe. Office-use notes deliberately do NOT clone — each
+      // revision gets its own note thread, and the old one stays readable
+      // on the revision it was written against.
+      if(slJobAttrRows?.length) await sb.from("quote_sl_job_attribute_tbl").insert(slJobAttrRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(amendAreas.documents){
         // 31 Aug — now calls the shared carryForwardDocuments helper
         // instead of its own inline copy of the same logic; behavior is
@@ -10042,9 +10050,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           customer_address: pick("customer_address"),
           contact_name: pick("contact_name"), contact_designation: pick("contact_designation"),
           signatory_name: pick("signatory_name"), signatory_designation: pick("signatory_designation"),
+          end_user_name: pick("end_user_name"),
           updated_at: new Date().toISOString()
         };
-        const fieldLabels = {enquiry_number:"Enquiry number",enquiry_date:"Enquiry date",quote_date:"Quote date",currency:"Currency",conversion_rate:"Conversion rate",customer_address:"Address",contact_name:"Contact name",contact_designation:"Contact designation",signatory_name:"Signatory",signatory_designation:"Signatory designation"};
+        const fieldLabels = {enquiry_number:"Enquiry number",enquiry_date:"Enquiry date",quote_date:"Quote date",currency:"Currency",conversion_rate:"Conversion rate",customer_address:"Address",contact_name:"Contact name",contact_designation:"Contact designation",signatory_name:"Signatory",signatory_designation:"Signatory designation",end_user_name:"End user"};
         const logs = [];
         Object.keys(fieldLabels).forEach(f=>{
           if(String(payload[f])!==String(quoteHeaderRow[f]||"")) logs.push(logRevisionChange(refFilter,"header",fieldLabels[f],quoteHeaderRow[f],payload[f]));
@@ -10058,6 +10067,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           customer_name: headerDraft.customer_name.trim(), customer_address: headerDraft.customer_address.trim(),
           contact_name: headerDraft.contact_name.trim(), contact_designation: headerDraft.contact_designation.trim(),
           signatory_name: headerDraft.signatory_name.trim(), signatory_designation: headerDraft.signatory_designation.trim(),
+          end_user_name: (headerDraft.end_user_name||"").trim(),
           updated_at: new Date().toISOString()
         };
       }
@@ -10547,6 +10557,61 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
 
   const currentSlNoUnitPrice = openLines.reduce((s,l)=>s+(Number(l.sales_price)||0),0);
 
+  // Per-Sl-No compliance attributes (2 Sep). Line level, not header:
+  // one order can carry some UL-listed lines and some not. The header
+  // rollup is computed live from these rows, never stored.
+  const [jobAttrOptions,setJobAttrOptions] = useState([]);
+  const [slJobAttrs,setSlJobAttrs] = useState([]);
+  const [quoteJobAttrs,setQuoteJobAttrs] = useState([]);
+  const loadJobAttrOptions = useCallback(async()=>{
+    const { data } = await sb.from("job_attribute_tbl").select("attribute,sort_order").order("sort_order").order("attribute");
+    setJobAttrOptions(data||[]);
+  },[]);
+  useEffect(()=>{ loadJobAttrOptions(); },[loadJobAttrOptions]);
+  const loadQuoteJobAttrs = useCallback(async(ref)=>{
+    if(!ref){ setQuoteJobAttrs([]); return; }
+    const { data } = await sb.from("quote_sl_job_attribute_tbl").select("*").eq("reference_number",ref);
+    setQuoteJobAttrs(data||[]);
+  },[]);
+  useEffect(()=>{ loadQuoteJobAttrs(quoteExportRef); },[quoteExportRef,loadQuoteJobAttrs]);
+  const toggleSlJobAttr = async(attribute,on)=>{
+    if(!openRef || !openRef.item_sl_no) return;
+    if(on){
+      await sb.from("quote_sl_job_attribute_tbl").insert({reference_number:quoteExportRef,item_sl_no:openRef.item_sl_no,attribute,created_by:user?.username||"unknown"});
+    } else {
+      await sb.from("quote_sl_job_attribute_tbl").delete().eq("reference_number",quoteExportRef).eq("item_sl_no",openRef.item_sl_no).eq("attribute",attribute);
+    }
+    const { data } = await sb.from("quote_sl_job_attribute_tbl").select("*").eq("reference_number",quoteExportRef).eq("item_sl_no",openRef.item_sl_no);
+    setSlJobAttrs(data||[]);
+    loadQuoteJobAttrs(quoteExportRef);
+  };
+
+  // Office-use-only notes (2 Sep). Separate table from quote_notes on
+  // purpose — the PDF builders never query internal_notes_tbl, so no
+  // filter change can leak one onto a customer document. Append-only.
+  const [showInternalNotes,setShowInternalNotes] = useState(false);
+  const [internalNotes,setInternalNotes] = useState([]);
+  const [internalNoteDraft,setInternalNoteDraft] = useState("");
+  const [internalNoteErr,setInternalNoteErr] = useState("");
+  const loadInternalNotes = async(ref)=>{
+    if(!ref){ setInternalNotes([]); return; }
+    const { data } = await sb.from("internal_notes_tbl").select("*").eq("reference_number",ref).order("created_at",{ascending:false});
+    setInternalNotes(data||[]);
+  };
+  const openInternalNotes = async()=>{ setInternalNoteErr(""); setInternalNoteDraft(""); setShowInternalNotes(true); await loadInternalNotes(quoteExportRef); };
+  const addInternalNote = async()=>{
+    if(!internalNoteDraft.trim()){ setInternalNoteErr("Type a note first."); return; }
+    setInternalNoteErr("");
+    await sb.from("internal_notes_tbl").insert({reference_number:quoteExportRef,note_text:internalNoteDraft.trim(),created_by:user?.username||"unknown"});
+    setInternalNoteDraft("");
+    await loadInternalNotes(quoteExportRef);
+  };
+  const deleteInternalNote = async(row)=>{
+    if(!confirm("Remove this note? Internal notes are not edited, only added or removed.")) return;
+    await sb.from("internal_notes_tbl").delete().eq("id",row.id);
+    await loadInternalNotes(quoteExportRef);
+  };
+
   const openOptionsTesting=async()=>{
     if(!openRef || !openRef.item_sl_no) return;
     setShowOptionsTesting(true);
@@ -10556,6 +10621,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     ]);
     setSlExtraPriceLines(opRows||[]);
     setSlTestingLines(testRows||[]);
+    const { data: attrRows } = await sb.from("quote_sl_job_attribute_tbl").select("*").eq("reference_number",quoteExportRef).eq("item_sl_no",openRef.item_sl_no);
+    setSlJobAttrs(attrRows||[]);
   };
   const addSlExtraPriceLine=async(label,price)=>{
     if(!label||!label.trim()) return;
@@ -13955,7 +14022,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               ),
               h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}},
                 h("div",{style:{width:170}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Signatory"),h(LimitToListCombo,{value:headerDraft.signatory_name,onChange:v=>{ const match=activeSignatoryEmployees.find(e=>e.employee_name===v); setHeaderDraft(d=>({...d,signatory_name:v,signatory_designation:(match&&match.designation)?match.designation:d.signatory_designation})); },options:activeSignatoryEmployees.map(e=>e.employee_name),placeholder:"Start typing a name…",invalidMessage:v=>"\""+v+"\" isn't an active employee on file — check Master Data \u2192 HR \u2192 Employees.",style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
-                h("div",{style:{width:160}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Signatory Designation"),h("input",{value:headerDraft.signatory_designation,onChange:e=>setHeaderDraft(d=>({...d,signatory_designation:e.target.value})),placeholder:"Auto-fills from Employee master",style:{...inputStyle,padding:"6px 8px",fontSize:12}}))
+                h("div",{style:{width:160}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Signatory Designation"),h("input",{value:headerDraft.signatory_designation,onChange:e=>setHeaderDraft(d=>({...d,signatory_designation:e.target.value})),placeholder:"Auto-fills from Employee master",style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
+                h("div",{style:{width:220}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"End user"),
+                  h(CustomerSelect,{value:headerDraft.end_user_name||"",user,onSelect:(p)=>setHeaderDraft(d=>({...d,end_user_name:p.company_name}))}),
+                  h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginTop:2}},"Same list as Customers. Never printed.")
+                )
               ),
               h("div",{style:{display:"flex",gap:8,alignItems:"center"}},
                 h("button",{onClick:saveQuoteHeader,disabled:savingHeader||!isHeaderDirty,style:{...btnPrimary,fontSize:12,opacity:(savingHeader||!isHeaderDirty)?0.6:1}},savingHeader?"Saving…":"Save (applies to all Sl Nos)"),
@@ -14037,6 +14108,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           ),
           h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}},
             h("button",{onClick:openCommercialTerms,style:{...btnSmall,background:"#5c2d91",color:"#fff",border:"none",fontWeight:600}},"Commercial Terms"),
+            h("button",{onClick:openInternalNotes,disabled:!quoteExportRef,style:{...btnSmall,background:"#8a5a00",color:"#fff",border:"none",fontWeight:600}},"Office Use Only"),
+            (function(){
+              // Compliance rollup, computed live from the per-Sl-No rows.
+              // Never stored — this app has been bitten by stale stored
+              // totals more than once.
+              if(!quoteJobAttrs.length) return null;
+              const counts = {};
+              quoteJobAttrs.forEach(a=>{ counts[a.attribute] = (counts[a.attribute]||new Set()); counts[a.attribute].add(a.item_sl_no); });
+              return h("span",{style:{display:"inline-flex",gap:5,flexWrap:"wrap",alignItems:"center"}},
+                Object.keys(counts).sort().map(k=>h("span",{key:k,style:{fontSize:10.5,color:"#0f766e",background:"#e6f4f1",border:"1px solid #9fe1cb",padding:"2px 7px",borderRadius:9}},k+" \u00b7 "+counts[k].size+" Sl No"+(counts[k].size===1?"":"s")))
+              );
+            })(),
             h("button",{onClick:openExtraPrice,style:{...btnSmall,background:"#0f766e",color:"#fff",border:"none",fontWeight:600}},"Extra Price Addition"),
             h("button",{onClick:readiness.ready?openGlobalTestPicker:()=>alert(formatReadinessGaps(readiness.missing)),title:readiness.ready?"":"Click to see what's still needed",style:{...btnSmall,background:readiness.ready?"#8a4b1f":"#fff",color:readiness.ready?"#fff":colors.muted,border:readiness.ready?"none":"1px solid "+colors.border,fontWeight:600,cursor:"pointer"}},(ndeRollupSummary?("NDE Testing ("+ndeRollupSummary.count+" item"+(ndeRollupSummary.count!==1?"s":"")+", ₹"+ndeRollupSummary.total.toFixed(0)+")"):"NDE Testing")+(readiness.ready?"":" — quote not ready yet")),
             h("div",{style:{display:"flex",gap:4,alignItems:"center"}},
@@ -15653,7 +15736,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Both fold into this Sl No's own unit price (total ÷ qty). Shown as labels only on the Datasheet — no cost breakdown there."),
         h("div",{style:{display:"flex",gap:6,marginBottom:14,borderBottom:"1px solid "+colors.border}},
           h("button",{onClick:()=>setOptionsTestingTab("options"),style:{fontSize:12,padding:"7px 14px",border:"none",borderBottom:optionsTestingTab==="options"?"2px solid "+colors.accent:"2px solid transparent",background:"none",fontWeight:optionsTestingTab==="options"?700:400,color:optionsTestingTab==="options"?colors.accent:colors.muted,cursor:"pointer"}},"Options (Extra Price)"),
-          h("button",{onClick:()=>setOptionsTestingTab("testing"),style:{fontSize:12,padding:"7px 14px",border:"none",borderBottom:optionsTestingTab==="testing"?"2px solid "+colors.accent:"2px solid transparent",background:"none",fontWeight:optionsTestingTab==="testing"?700:400,color:optionsTestingTab==="testing"?colors.accent:colors.muted,cursor:"pointer"}},"Testing (NDE)")
+          h("button",{onClick:()=>setOptionsTestingTab("testing"),style:{fontSize:12,padding:"7px 14px",border:"none",borderBottom:optionsTestingTab==="testing"?"2px solid "+colors.accent:"2px solid transparent",background:"none",fontWeight:optionsTestingTab==="testing"?700:400,color:optionsTestingTab==="testing"?colors.accent:colors.muted,cursor:"pointer"}},"Testing (NDE)"),
+          h("button",{onClick:()=>setOptionsTestingTab("compliance"),style:{fontSize:12,padding:"7px 14px",border:"none",borderBottom:optionsTestingTab==="compliance"?"2px solid "+colors.accent:"2px solid transparent",background:"none",fontWeight:optionsTestingTab==="compliance"?700:400,color:optionsTestingTab==="compliance"?colors.accent:colors.muted,cursor:"pointer"}},"Compliance")
         ),
 
         optionsTestingTab==="options" ? h("div",null,
@@ -15691,8 +15775,54 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             "Datasheet will show each as \"<test> — Included in scope\". How the cost enters the price (folded vs. shown separately) is chosen when you generate the PDF."
           )
         ),
+
+        optionsTestingTab==="compliance" ? h("div",null,
+          h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:10}},
+            "Certification this Sl No is built to. Set per line — one order can have some UL-listed lines and some not. Add new attributes in Master Data \u2192 Job attributes."),
+          jobAttrOptions.length===0
+            ? h("p",{style:{fontSize:12,color:colors.muted}},"No job attributes on file yet. Add them in Master Data \u2192 Job attributes.")
+            : h("div",{style:{display:"flex",flexDirection:"column",gap:2}},
+                jobAttrOptions.map(o=>{
+                  const on = slJobAttrs.some(a=>a.attribute===o.attribute);
+                  return h("label",{key:o.attribute,style:{display:"flex",alignItems:"center",gap:8,padding:"7px 8px",borderBottom:"1px solid "+colors.border,fontSize:12.5,cursor:"pointer"}},
+                    h("input",{type:"checkbox",checked:on,onChange:e=>toggleSlJobAttr(o.attribute,e.target.checked)}),
+                    h("span",null,o.attribute)
+                  );
+                })
+              ),
+          h("p",{style:{fontSize:11,color:colors.muted,marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:8}},
+            "Not printed on the quote. Carries into the Contract with this line, and onto the order board so inspection scope is visible per item.")
+        ) : null,
+
         h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:16,borderTop:"1px solid "+colors.border,paddingTop:14}},
           h("button",{onClick:()=>setShowOptionsTesting(false),style:btnPrimary},"Close")
+        )
+      )
+    ),
+    showInternalNotes && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+        h("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:2}},
+          h("div",{style:{fontWeight:700,fontSize:14}},"Office use only \u2014 "+(quoteExportRef||"")),
+          h("span",{style:{marginLeft:"auto",fontSize:10.5,fontWeight:600,color:"#8a5a00",background:"#fdf3e0",border:"1px solid #e0c48a",padding:"2px 8px",borderRadius:9}},"Never printed")
+        ),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},
+          "Internal record, visible to every logged-in user. Does not appear on the quote, OA, DC or invoice. Notes are added or removed, never edited \u2014 so the history stays honest."),
+        internalNotes.length===0
+          ? h("p",{style:{fontSize:12,color:colors.muted,padding:"10px 0"}},"No internal notes on this quote yet.")
+          : h("div",null, internalNotes.map(n=>h("div",{key:n.id,style:{padding:"9px 0",borderBottom:"1px solid "+colors.border}},
+              h("div",{style:{fontSize:12.5,lineHeight:1.55,whiteSpace:"pre-wrap",marginBottom:4}},n.note_text),
+              h("div",{style:{display:"flex",alignItems:"center",gap:8}},
+                h("span",{style:{fontSize:10.5,color:colors.mutedLight}},(n.created_by||"unknown")+" \u00b7 "+(n.created_at?new Date(n.created_at).toLocaleString():"")),
+                h("button",{onClick:()=>deleteInternalNote(n),style:{...btnSmall,fontSize:10.5,color:colors.danger}},"Remove")
+              )
+            ))),
+        h("div",{style:{marginTop:14}},
+          h("textarea",{rows:3,value:internalNoteDraft,onChange:e=>{ setInternalNoteDraft(e.target.value); if(internalNoteErr) setInternalNoteErr(""); },placeholder:"Add an internal note",style:{...inputStyle,width:"100%",padding:"7px 8px",fontSize:12.5,resize:"vertical",fontFamily:"inherit"}}),
+          internalNoteErr ? h("div",{style:{fontSize:11,color:colors.danger,marginTop:4}},internalNoteErr) : null
+        ),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14,borderTop:"1px solid "+colors.border,paddingTop:14}},
+          h("button",{onClick:addInternalNote,style:btnSecondary},"Add note"),
+          h("button",{onClick:()=>setShowInternalNotes(false),style:btnPrimary},"Close")
         )
       )
     ),
@@ -16171,7 +16301,7 @@ async function cloneQuoteIntoContract(quoteRef, contractNumber, customerName, us
   const { data: dupCheck } = await sb.from("sale_order_tbl").select("contract_number").eq("contract_number",contractNumber).maybeSingle();
   if(dupCheck) throw new Error("Contract "+contractNumber+" already exists — refusing to create a duplicate.");
   const stripId = (r)=>{ const c={...r}; delete c.id; return c; };
-  const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows},{data:slEpRows},{data:slTestRows},{data:globalTestRows}] = await Promise.all([
+  const [{data:estRows},{data:lineRows},{data:termsRows},{data:noteRows},{data:dsRows},{data:epRows},{data:slEpRows},{data:slTestRows},{data:globalTestRows},{data:slJobAttrRows}] = await Promise.all([
     sb.from("estimates").select("*").eq("reference_number",quoteRef),
     sb.from("estimate_lines").select("*").eq("reference_number",quoteRef),
     sb.from("quote_commercial_terms").select("*").eq("reference_number",quoteRef),
@@ -16181,6 +16311,7 @@ async function cloneQuoteIntoContract(quoteRef, contractNumber, customerName, us
     sb.from("quote_sl_extra_price_tbl").select("*").eq("reference_number",quoteRef),
     sb.from("quote_sl_testing_tbl").select("*").eq("reference_number",quoteRef),
     sb.from("quote_global_testing_tbl").select("*").eq("reference_number",quoteRef),
+    sb.from("quote_sl_job_attribute_tbl").select("*").eq("reference_number",quoteRef),
   ]);
   if(!estRows?.length) throw new Error("No Sl Nos found under "+quoteRef+" — nothing to clone.");
 
@@ -16193,6 +16324,10 @@ async function cloneQuoteIntoContract(quoteRef, contractNumber, customerName, us
   if(slEpRows?.length) await sb.from("quote_sl_extra_price_tbl").insert(slEpRows.map(r=>({...stripId(r), reference_number:contractNumber})));
   if(slTestRows?.length) await sb.from("quote_sl_testing_tbl").insert(slTestRows.map(r=>({...stripId(r), reference_number:contractNumber})));
   if(globalTestRows?.length) await sb.from("quote_global_testing_tbl").insert(globalTestRows.map(r=>({...stripId(r), reference_number:contractNumber})));
+  // Per-Sl-No compliance attributes carry into the Contract with their
+  // lines. End user rides along on the estimates rows themselves and is
+  // deliberately not copied onto sale_order_tbl as a second stored copy.
+  if(slJobAttrRows?.length) await sb.from("quote_sl_job_attribute_tbl").insert(slJobAttrRows.map(r=>({...stripId(r), reference_number:contractNumber})));
   // Documents (31 Aug) — no longer cloned automatically here. The old
   // version only ever copied the parent "shell" row, not its actual
   // revision/link/status data, which meant a "carried forward" document
@@ -18013,6 +18148,41 @@ const MANUAL_SECTIONS = [
   {
     "group": "Sales",
     "articles": [
+      {
+        "key": "enduser_compliance_notes",
+        "title": "End user, compliance and office-use notes",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Three things live on a quote alongside the customer: who the material is ultimately for, what certification each line is built to, and your own internal notes. None of the three is printed on any customer document."
+          },
+          {
+            "type": "p",
+            "text": "End user is the operator the goods finally belong to \u2014 ADNOC, Aramco, IOCL, NTPC \u2014 which is often not the company you are billing. It sits on the quote header next to Signatory, and it picks from the same Customers list the customer field uses, so an end user is never spelled two different ways. It carries into the Contract automatically."
+          },
+          {
+            "type": "p",
+            "text": "Compliance attributes are set per Sl No, not per order, because one order can have some UL-listed lines and some not. Open a Sl No, choose Options & Testing, then the Compliance tab, and tick what applies. A summary of what is ticked across the whole quote shows next to the Commercial Terms button. Add new attributes yourself in Master Data \u2192 Job attributes \u2014 NACE, IBR, CRN and so on \u2014 no rebuild needed."
+          },
+          {
+            "type": "p",
+            "text": "Office Use Only is your internal note thread on the quote. Anything you would tell a colleague but never a customer: what was agreed on a call, a payment history worth remembering, a requirement the enquiry does not mention. Every note records who wrote it and when."
+          },
+          {
+            "type": "tip",
+            "text": "Internal notes are added or removed, never edited. That is deliberate \u2014 the value of a note from eight months ago is that nobody has rewritten it since."
+          },
+          {
+            "type": "tip",
+            "text": "Internal notes are stored completely separately from the quote's own Notes and are never queried when a PDF is built, so there is no way for one to reach a customer document. They also do not clone into a new amendment: each revision keeps its own thread."
+          },
+          {
+            "type": "p",
+            "text": "On an amendment the end user is preserved from the previous revision and is not editable, the same way the customer name is locked. Compliance attributes clone forward with the lines they describe."
+          }
+        ]
+      },
       {
         "key": "estimator",
         "title": "Estimator \u2014 building a BOM",
