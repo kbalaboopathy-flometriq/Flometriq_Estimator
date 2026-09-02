@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-02T09:20:00Z";
+  var APP_BUILD_VERSION = "2026-09-02T11:05:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -12897,7 +12897,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // authentic since R00 is never a clone of anything).
       let revHistStartPage = null, revHistEndPage = null;
       if(isRevisionPdf){
-        const AREA_LABELS_PDF = {header:"Header",commercial_terms:"Commercial Terms",notes:"Notes",datasheet:"Datasheet",bom:"BOM"};
+        const AREA_LABELS_PDF = {header:"Header",commercial_terms:"Commercial Terms",notes:"Notes",datasheet:"Datasheet",extra_price:"Extra Price"};
         const baseRefForHist = quoteExportRef.replace(/-Rev-\d+$/,"");
         const currentRevNum = revMatch ? Number(revMatch[1]) : 0;
         const { data: histSiblingRows } = await sb.from("estimates").select("reference_number").ilike("reference_number", baseRefForHist+"%");
@@ -12920,16 +12920,22 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               });
             } else {
               const [{data:changes},{data:auditRows}] = await Promise.all([
-                sb.from("revision_changes").select("*").eq("revision_ref",sib.ref).order("changed_at",{ascending:true}),
+                sb.from("revision_changes").select("*").eq("revision_ref",sib.ref).neq("area","bom").order("changed_at",{ascending:true}),
                 sb.from("audit_log").select("*").eq("table_name","estimates").eq("record_id",sib.ref).eq("action","CREATE").order("performed_at",{ascending:true}).limit(1)
               ]);
               const auditRow = (auditRows&&auditRows[0])||null;
+              // BOM changes are INTERNAL and never printed for the customer (2 Sep).
+              // The query above already excludes them; this second filter means a
+              // future change to that query still cannot leak one onto a customer
+              // document. BOM history stays fully visible on the in-app Revision
+              // History screen, which has its own labels for it.
+              const custChanges = (changes||[]).filter(r=>r.area!=="bom");
               const dateStr = auditRow ? new Date(auditRow.performed_at).toLocaleDateString("en-GB")
-                : ((changes&&changes[0]) ? new Date(changes[0].changed_at).toLocaleDateString("en-GB") : "—");
+                : ((custChanges[0]) ? new Date(custChanges[0].changed_at).toLocaleDateString("en-GB") : "—");
               revGroups.push({
                 label:"R"+String(sib.revNum).padStart(2,"0"),
                 date: dateStr,
-                rows: (changes&&changes.length) ? changes.map(r=>({
+                rows: (custChanges.length) ? custChanges.map(r=>({
                   field:(AREA_LABELS_PDF[r.area]||r.area)+(r.item_sl_no?(" — Sl "+r.item_sl_no):"")+" — "+((r.field_name||"").split("|").pop()),
                   original:r.old_value||"—", revised:r.new_value||"—", by:r.changed_by||"—"
                 })) : [{field:null, original:"—", revised:"No logged field changes for this revision", by:(auditRow&&auditRow.performed_by)||"—"}]
@@ -12987,7 +12993,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             styles:{font:"helvetica",fontSize:8,textColor:dark,cellPadding:3,lineColor:[26,26,26],lineWidth:0.2},
             headStyles:{font:"helvetica",fontStyle:"bold",fillColor:[217,217,217],textColor:dark,halign:"center"},
             columnStyles:{0:{cellWidth:14},1:{cellWidth:22},2:{cellWidth:32},3:{cellWidth:44},4:{cellWidth:44},5:{cellWidth:"auto"}},
-            margin:{top:14,left:12,right:12,bottom:16},
+            // top:14 put continuation pages' header row straight through the
+            // doc-control banner, which occupies y=10..30 (by=10 + bh=20).
+            // 36 clears it with a 6pt gap. Page 1 uses startY:82 and was fine.
+            margin:{top:36,left:12,right:12,bottom:16},
             didDrawPage:()=>{
               docControlBanner();
               doc.setFont("helvetica","normal"); doc.setFontSize(7); doc.setTextColor(120,120,120);
@@ -18180,6 +18189,14 @@ const MANUAL_SECTIONS = [
           {
             "type": "p",
             "text": "On an amendment the end user is preserved from the previous revision and is not editable, the same way the customer name is locked. Compliance attributes clone forward with the lines they describe."
+          },
+          {
+            "type": "p",
+            "text": "One more thing that is internal by design: BOM changes never appear on the Revision History page of a customer PDF. Header, Commercial Terms, Notes, Datasheet and Extra Price changes still print, because those are things the customer agreed to. Material and BOM edits are yours \u2014 they stay on the in-app Revision History screen, which shows every area including BOM."
+          },
+          {
+            "type": "tip",
+            "text": "If a BOM change is something the customer genuinely needs told \u2014 a material or schedule substitution, say \u2014 write it as a Note on the revision. Notes do print. Nothing decides that for you, and nothing should."
           }
         ]
       },
