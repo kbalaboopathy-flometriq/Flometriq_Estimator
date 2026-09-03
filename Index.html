@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-02T11:40:00Z";
+  var APP_BUILD_VERSION = "2026-09-02T13:15:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1449,7 +1449,7 @@ function MenuTabs({ user, active, onChange }) {
       { label:"Rules", tabs:[{key:"item_moc_rules",label:"Datasheet MOC"},{key:"description_master",label:"Description"}] }
     ]});
     groups.push({ label:"Admin", subgroups:[
-      { label:"Company", tabs:[{key:"company_master",label:"Company Master"},{key:"gst_structures",label:"GST Structures"},{key:"gst_variance_report",label:"GST Variance Report"},{key:"contract_number_setup",label:"Contract Numbering"},{key:"sale_order_status_tbl",label:"Sale Order Status"},{key:"doc_status_master",label:"Document Status Master"},{key:"data_quality_flags",label:"Data Quality Flags"}] },
+      { label:"Company", tabs:[{key:"company_master",label:"Company Master"},{key:"gst_structures",label:"GST Structures"},{key:"gst_variance_report",label:"GST Variance Report"},{key:"contract_number_setup",label:"Contract Numbering"},{key:"sale_order_status_tbl",label:"Sale Order Status"},{key:"doc_status_master",label:"Document Status Master"},{key:"data_quality_flags",label:"Data Quality Flags"},...(isSuperAdmin?[{key:"posts",label:"Posts"}]:[])] },
       { label:"Access control", tabs:[
         {key:"users",label:"Users"},
         {key:"permissions",label:"Permissions"},
@@ -18820,6 +18820,42 @@ const MANUAL_SECTIONS = [
     "group": "Admin",
     "articles": [
       {
+        "key": "posts",
+        "title": "Posts \u2014 who holds each job",
+        "tag": "Admin",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A post is a job someone holds today \u2014 Production Head, Purchase Manager, Sales Head. The order board routes work to posts rather than to named people, so this screen is what decides whose queue a card lands in. Super admin only, under Admin \u2192 Posts."
+          },
+          {
+            "type": "p",
+            "text": "A post is NOT a login permission. What a person is allowed to open and approve still comes from their user role, exactly as before, and nothing on this screen changes that. A post records responsibility and routing; the role grants access. The two are meant to agree, and keeping them separate means you can see when they don't."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "Type over a post name to rename it. Every screen in the app follows immediately.",
+              "Use + Assign to put an employee in a post. More than one person can hold the same post.",
+              "Click the \u00d7 beside a name to remove them from that post.",
+              "Add a post at the bottom. The key is built from the name unless you type one."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "The greyed key beside each post name \u2014 production_manager, sales_head \u2014 is what the code uses, and it can never be changed once created. That is deliberate: it means you can call the job whatever your factory calls it without any risk of breaking where work routes."
+          },
+          {
+            "type": "tip",
+            "text": "Changing who holds a post does NOT move cards that are already assigned. Cards belong to a person; the post only decides where NEW work goes. Reassigning a post can never rewrite the record of who actually did something."
+          },
+          {
+            "type": "p",
+            "text": "A post with nobody in it is shown as Vacant and counted in a banner at the top. That is on purpose \u2014 work routing to an empty post has nowhere to go, and it is better to see that than to have cards quietly disappear."
+          }
+        ]
+      },
+      {
         "key": "users_perms",
         "title": "Users and Permissions",
         "tag": "Admin",
@@ -19718,6 +19754,143 @@ function DataQualityFlagsScreen({ user }){
       section("Billing Address Overrides", billingOverrides.length, billingOverrides, b=>b.contract_number+" — "+(b.customer_name||"—")),
       section("Document Sequence Breaks", sequenceFlags.length, sequenceFlags, s=>s.doc_number+" ("+s.entity_id+") — "+(s.sequence_flag_note||"—")),
       section("Late Follow-up Entries", lateEntries.length, lateEntries, e=>e.company_name+" — logged by "+e.logged_by+" — visit date "+e.activity_date)
+    )
+  );
+}
+
+/* ---- POSTS (2 Sep) ----
+   A POST is not an app role. The app-user `role` column still grants
+   permission and is untouched by this screen. A post records WHOSE
+   QUEUE work lands in — the order board's stage owners, the OA
+   deviation route's Sales Head, purchase delegation.
+
+   post_key is FROZEN and never editable: code references it, so
+   renaming a post must not be able to break routing. label is free
+   text and is what every screen displays. That split is the whole
+   point of the design — see SOP FMQ-SOP-ORD-001 Rev 2, clause 6.2.
+
+   Changing who holds a post does NOT move existing cards (clause
+   6.7). Cards belong to a person; the post decides where NEW work
+   routes. Nothing here rewrites history. */
+function PostsEditor({ user }){
+  const [posts,setPosts] = useState([]);
+  const [holders,setHolders] = useState([]);
+  const [employees,setEmployees] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [newLabel,setNewLabel] = useState("");
+  const [newKey,setNewKey] = useState("");
+  const [addErr,setAddErr] = useState("");
+  const [pickFor,setPickFor] = useState(null);
+  const [pickEmp,setPickEmp] = useState("");
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const [{data:p},{data:hh},{data:e}] = await Promise.all([
+      sb.from("post_tbl").select("*").order("sort_order").order("label"),
+      sb.from("post_holder_tbl").select("*"),
+      sb.from("employee_tbl").select("employee_name").order("employee_name"),
+    ]);
+    setPosts(p||[]); setHolders(hh||[]); setEmployees(e||[]);
+    setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const holdersOf = (key)=> (holders||[]).filter(h=>h.post_key===key);
+
+  // Derive a key from the label ONCE, at creation. After that it is frozen.
+  const keyFromLabel = (t)=> t.trim().toLowerCase().replace(/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"").slice(0,40);
+
+  const addPost = async()=>{
+    const label = newLabel.trim();
+    if(!label){ setAddErr("Post name is required."); return; }
+    const key = (newKey.trim() || keyFromLabel(label));
+    if(!key){ setAddErr("Could not build a key from that name — type one."); return; }
+    if(posts.some(p=>p.post_key===key)){ setAddErr("A post with the key \""+key+"\" already exists."); return; }
+    setAddErr("");
+    const maxSort = posts.reduce((m,p)=>Math.max(m,Number(p.sort_order)||0),0);
+    const { error } = await sb.from("post_tbl").insert({post_key:key, label:label, sort_order:maxSort+10});
+    if(error){ setAddErr("Failed: "+error.message); return; }
+    await logAudit("CREATE","post_tbl",key,"Post created: "+label,user?.username||"unknown",null,null);
+    setNewLabel(""); setNewKey(""); load();
+  };
+
+  const renamePost = async(row,label)=>{
+    setPosts(ps=>ps.map(p=>p.post_key===row.post_key?{...p,label}:p));
+    await sb.from("post_tbl").update({label}).eq("post_key",row.post_key);
+  };
+
+  const assign = async(key)=>{
+    if(!pickEmp) return;
+    const { error } = await sb.from("post_holder_tbl").insert({post_key:key, employee_name:pickEmp, assigned_by:user?.username||"unknown"});
+    if(error){ alert("Failed: "+error.message); return; }
+    await logAudit("CREATE","post_holder_tbl",key,pickEmp+" assigned to "+key,user?.username||"unknown",null,null);
+    setPickFor(null); setPickEmp(""); load();
+  };
+
+  const unassign = async(row)=>{
+    if(!confirm("Remove "+row.employee_name+" from this post?\n\nCards already assigned to them are NOT moved — this only changes where new work routes.")) return;
+    await sb.from("post_holder_tbl").delete().eq("id",row.id);
+    await logAudit("DELETE","post_holder_tbl",row.post_key,row.employee_name+" removed from "+row.post_key,user?.username||"unknown",null,null);
+    load();
+  };
+
+  const vacantCount = posts.filter(p=>holdersOf(p.post_key).length===0).length;
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:760}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:6}},"Posts"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:6}},
+      "Who holds each job today. The order board routes cards to posts, not to people, so this is what decides whose queue work lands in."),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:16}},
+      "Rename a post freely — the key beside it is what the code uses and never changes, so renaming cannot break routing. Changing who holds a post does not move cards that are already assigned."),
+
+    vacantCount>0 ? h("div",{style:{background:"#fff4d6",border:"1px solid #e0c48a",color:"#854f0b",borderRadius:6,padding:"8px 11px",fontSize:12,marginBottom:14}},
+      vacantCount===1 ? "1 post is vacant. Work routing to it has nowhere to go."
+                      : vacantCount+" posts are vacant. Work routing to them has nowhere to go.") : null,
+
+    loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
+    h("div",{style:{display:"flex",flexDirection:"column",gap:8,marginBottom:18}},
+      posts.map(p=>{
+        const hs = holdersOf(p.post_key);
+        return h("div",{key:p.post_key,style:{border:"1px solid "+colors.border,borderRadius:6,padding:"10px 12px"}},
+          h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8}},
+            h("input",{value:p.label,onChange:e=>renamePost(p,e.target.value),
+              style:{...inputStyle,padding:"5px 8px",fontSize:13,width:220}}),
+            h("span",{style:{fontSize:10.5,color:colors.mutedLight,fontFamily:"monospace"}},p.post_key+" (fixed)")
+          ),
+          h("div",{style:{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center"}},
+            hs.length===0
+              ? h("span",{style:{fontSize:11.5,color:"#854f0b",background:"#fff4d6",padding:"3px 9px",borderRadius:9}},"Vacant")
+              : hs.map(hh=>h("span",{key:hh.id,style:{fontSize:11.5,background:"#e8f1fb",color:"#185fa5",padding:"3px 4px 3px 9px",borderRadius:9,display:"inline-flex",alignItems:"center",gap:5}},
+                  hh.employee_name,
+                  h("button",{onClick:()=>unassign(hh),title:"Remove",style:{border:"none",background:"none",cursor:"pointer",color:"#185fa5",fontSize:12,padding:"0 5px"}},"\u00d7")
+                )),
+            pickFor===p.post_key
+              ? h("span",{style:{display:"inline-flex",gap:6,alignItems:"center"}},
+                  h("select",{value:pickEmp,onChange:e=>setPickEmp(e.target.value),style:{...inputStyle,padding:"4px 6px",fontSize:12,width:200}},
+                    h("option",{value:""},"Pick an employee\u2026"),
+                    employees.filter(e=>!hs.some(x=>x.employee_name===e.employee_name))
+                             .map(e=>h("option",{key:e.employee_name,value:e.employee_name},e.employee_name))),
+                  h("button",{onClick:()=>assign(p.post_key),style:{...btnSmall,fontSize:11}},"Add"),
+                  h("button",{onClick:()=>{setPickFor(null);setPickEmp("");},style:{...btnSmall,fontSize:11}},"Cancel")
+                )
+              : h("button",{onClick:()=>{setPickFor(p.post_key);setPickEmp("");},style:{...btnSmall,fontSize:11}},"+ Assign")
+          )
+        );
+      })
+    ),
+
+    h("div",{style:{borderTop:"1px solid "+colors.border,paddingTop:14}},
+      h("div",{style:{fontSize:12,fontWeight:600,marginBottom:8}},"Add a post"),
+      h("div",{style:{display:"flex",gap:8,alignItems:"flex-start",flexWrap:"wrap"}},
+        h("input",{value:newLabel,onChange:e=>{setNewLabel(e.target.value); if(addErr) setAddErr("");},
+          placeholder:"Post name, e.g. Quality Head",style:{...inputStyle,padding:"6px 8px",fontSize:12.5,width:230}}),
+        h("input",{value:newKey,onChange:e=>{setNewKey(e.target.value); if(addErr) setAddErr("");},
+          placeholder:newLabel?("key: "+keyFromLabel(newLabel)):"key (auto)",style:{...inputStyle,padding:"6px 8px",fontSize:12.5,width:190,fontFamily:"monospace"}}),
+        h("button",{onClick:addPost,style:btnSecondary},"Add post")
+      ),
+      addErr ? h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:6}},addErr) : null,
+      h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:6}},
+        "The key is set once, here, and can never be changed afterwards. Leave it blank and it is built from the name.")
     )
   );
 }
@@ -30740,6 +30913,7 @@ function App() {
     tab==="company_master"?h(CompanyMasterEditor,{user}):
     tab==="gst_structures"?h(GstStructureEditor,{user}):
     tab==="doc_status_master"?h(DocStatusEditor,{user}):
+    tab==="posts"?h(PostsEditor,{user}):
     tab==="data_quality_flags"?h(DataQualityFlagsScreen,{user}):
     tab==="gst_variance_report"?h(GstVarianceReport,{user}):
     tab==="description_master"?h(DescriptionMasterEditor,{user}):
