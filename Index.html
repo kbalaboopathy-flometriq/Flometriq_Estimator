@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-03T10:10:00Z";
+  var APP_BUILD_VERSION = "2026-09-03T11:25:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -17121,9 +17121,73 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
   // other country now cascades Country->City directly (29 Aug) — no
   // more free text there. Disabled until the field it depends on
   // (State for India, Country otherwise) is actually picked.
+  // isAdmin is not passed into this form, only `user`, so derive it here
+  // the same way the rest of the app does.
+  const isAdmin = !!user && (user.role==="admin" || user.role==="super_admin");
+
+  // ---- CITY GATEWAY (3 Sep) ----
+  // City is mandatory, and the list is a master, so before this an
+  // unseeded city was a hard stop with no way past it. An ADMIN can now
+  // add one here, on the spot, and it is written to city_tbl so it is
+  // there for everyone next time. Non-admins still pick from the list.
+  //
+  // The row written matches the cascade the form itself uses: India
+  // carries the state, everywhere else carries the country with state
+  // NULL. Get that wrong and the city is saved but never appears again.
+  const [addCityFor,setAddCityFor] = useState(null);   // cityKey being added to
+  const [newCity,setNewCity] = useState("");
+  const [cityErr,setCityErr] = useState("");
+  const [citySaving,setCitySaving] = useState(false);
+  const saveNewCity = async (countryKey,stateKey,cityKey)=>{
+    const name=(newCity||"").trim();
+    if(!name){ setCityErr("Type the city name."); return; }
+    const country=f[countryKey]; const isIndia = country==="India";
+    if(!country){ setCityErr("Pick a country first."); return; }
+    if(isIndia && !f[stateKey]){ setCityErr("Pick a state first — Indian cities hang off a state."); return; }
+    setCitySaving(true); setCityErr("");
+    const row={ city:name, state: isIndia ? f[stateKey] : null, country };
+    const { error } = await sb.from("city_tbl").insert(row);
+    setCitySaving(false);
+    if(error){ setCityErr("Could not save: "+error.message); return; }
+    await logAudit("CREATE","city_tbl",name,"City added from the customer form: "+name+" / "+(row.state||"-")+" / "+country,user?.username||"unknown",null,null);
+    set(cityKey,name);
+    setAddCityFor(null); setNewCity("");
+    // re-fetch so the new city is in the list rather than only selected
+    if(isIndia) sb.from("city_tbl").select("city").eq("state",f[stateKey]).order("city").then(({data})=>{
+      const names=(data||[]).map(r=>r.city);
+      if(cityKey.startsWith("billing")) setBillingCities(names); else setShippingCities(names);
+    });
+    else sb.from("city_tbl").select("city").eq("country",country).is("state",null).order("city").then(({data})=>{
+      const names=(data||[]).map(r=>r.city);
+      if(cityKey.startsWith("billing")) setBillingCities(names); else setShippingCities(names);
+    });
+  };
+
   const cityField = (label,countryKey,stateKey,cityKey,citiesForBlock)=> h("div",{style:{flex:1}},
-    h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},label),
-    f[countryKey]==="India"
+    h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2,display:"flex",alignItems:"center",gap:6}},
+      label,
+      isAdmin && f[countryKey] && (f[countryKey]!=="India" || f[stateKey])
+        ? h("button",{onClick:()=>{setAddCityFor(cityKey); setNewCity(""); setCityErr("");},
+            style:{border:"none",background:"none",padding:0,cursor:"pointer",color:colors.accent,fontSize:10,textDecoration:"underline"}},
+            "+ add city")
+        : null
+    ),
+    addCityFor===cityKey
+      ? h("div",null,
+          h("div",{style:{display:"flex",gap:5}},
+            h("input",{value:newCity,autoFocus:true,placeholder:"New city name",
+              onChange:e=>{setNewCity(e.target.value); if(cityErr) setCityErr("");},
+              onKeyDown:e=>{ if(e.key==="Enter") saveNewCity(countryKey,stateKey,cityKey); },
+              style:{...inputStyle,padding:"7px 9px",fontSize:12,flex:1}}),
+            h("button",{onClick:()=>saveNewCity(countryKey,stateKey,cityKey),disabled:citySaving,
+              style:{...btnSmall,fontSize:11}},citySaving?"…":"Save"),
+            h("button",{onClick:()=>{setAddCityFor(null); setCityErr("");},style:{...btnSmall,fontSize:11}},"Cancel")
+          ),
+          cityErr?h("div",{style:{fontSize:10,color:colors.danger,marginTop:3}},cityErr)
+                :h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginTop:3}},
+                   "Saved to the city master for "+(f[countryKey]==="India"?(f[stateKey]||"India"):f[countryKey])+", so it is there next time.")
+        )
+      : (f[countryKey]==="India"
       ? h("select",{value:f[cityKey]||"",disabled:!f[stateKey],onChange:e=>set(cityKey,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,opacity:f[stateKey]?1:0.6}},
           h("option",{value:""},f[stateKey]?"Select city…":"Pick a state first"),
           citiesForBlock.map(c=>h("option",{key:c,value:c},c))
@@ -17131,7 +17195,7 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
       : h("select",{value:f[cityKey]||"",disabled:!f[countryKey],onChange:e=>set(cityKey,e.target.value),style:{...inputStyle,padding:"7px 9px",fontSize:12,opacity:f[countryKey]?1:0.6}},
           h("option",{value:""},f[countryKey]?"Select city…":"Pick a country first"),
           citiesForBlock.map(c=>h("option",{key:c,value:c},c))
-        )
+        ))
   );
   return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
@@ -19049,6 +19113,14 @@ const MANUAL_SECTIONS = [
           {
             "type": "p",
             "text": "The list is grouped by country so you can see at a glance which countries have cities on file. States come from the States and Zones (India) master, so a state has to exist there before a city can point at it."
+          },
+          {
+            "type": "p",
+            "text": "You can also add a city WITHOUT leaving the customer form. Pick the country (and the state, if it is India), then click \"+ add city\" beside the City label, type the name and Save. It is written to this master straight away, so it is on the list for everyone next time rather than only on that one customer."
+          },
+          {
+            "type": "tip",
+            "text": "That shortcut is admin only. Anyone else picks from the list, which keeps the master from filling up with typos and duplicates of the same place."
           }
         ]
       },
