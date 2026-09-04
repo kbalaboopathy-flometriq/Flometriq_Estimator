@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-03T07:20:00Z";
+  var APP_BUILD_VERSION = "2026-09-03T10:10:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -373,6 +373,12 @@ const MASTER_TABLES = [
   { key: "designation_tbl", label: "Designations", columns: ["value"], addLabel:"New designation", freeText:["value"] },
   { key: "state_zone_tbl", label: "States and Zones (India)", columns: ["state","zone"], addLabel:"New state", freeText:["state","zone"], editAllEnabled:true, exportEnabled:true },
   { key: "country_zone_tbl", label: "Countries and Zones (outside India)", columns: ["country","zone"], addLabel:"New country", freeText:["country","zone"], editAllEnabled:true, exportEnabled:true },
+  // Cities (3 Sep). city_tbl was seeded 14 Aug and had NO screen until now,
+  // so a customer in an unseeded city simply could not be entered. Note the
+  // cascade is not uniform: India goes Country -> State -> City, every other
+  // country goes Country -> City with no state level, so BOTH columns are
+  // here and state is left blank outside India.
+  { key: "city_tbl", label: "Cities", columns: ["city","state","country"], addLabel:"New city", cascade:[{col:"state",from:"state_zone_tbl",field:"state"}], freeText:["city","country"], groupBy:["country"], editAllEnabled:true, exportEnabled:true },
   { key: "employee_tbl", label: "Employees", columns: ["employee_code","employee_name","nickname","department","designation","crm_role","phone_primary","email","status"], addLabel:"New employee", cascade:[{col:"department",from:"department_tbl",field:"department"},{col:"designation",from:"designation_tbl",field:"value"},{col:"crm_role",from:"crm_role_tbl",field:"value"},{col:"status",from:"employee_status_tbl",field:"value"}], freeText:["employee_code","employee_name","nickname","phone_primary","email"], exportEnabled:true },
   { key: "territory_rule_state_tbl", label: "Territory Rules — States", columns: ["employee_name","state"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"state",from:"state_zone_tbl",field:"state"}], groupBy:["employee_name"], editAllEnabled:true },
   { key: "territory_rule_country_tbl", label: "Territory Rules — Countries", columns: ["employee_name","country"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"country",from:"country_zone_tbl",field:"country"}], groupBy:["employee_name"], editAllEnabled:true },
@@ -1337,6 +1343,7 @@ function MenuTabs({ user, active, onChange }) {
         {key:"calcs",label:"ASME VIII Thickness"},
         {key:"bolting_calc",label:"Bolting Calculator"},
         {key:"flange_chart",label:"Flange Chart"},
+        {key:"free_area_calc",label:"Free Area Calculator"},
       ]},
       ...(isAdmin?[{ label:"Engineering master", tabs:[{key:"allowable_stress",label:"Allowable Stress"},{key:"datasheet_master",label:"Datasheet Master"}] }]:[]),
     ]},
@@ -1354,7 +1361,7 @@ function MenuTabs({ user, active, onChange }) {
     { label:"CRM", subgroups:[
       ...(isAdmin?[
         { label:"Customers", tabs:[{key:"customers",label:"Customers"},{key:"customer_bulk_upload",label:"Customer Bulk Upload"}] },
-        { label:"CRM Setup", tabs: byKeys(["state_zone_tbl","country_zone_tbl","territory_rule_state_tbl","territory_rule_country_tbl","territory_rule_zone_tbl","crm_status_tbl"]) },
+        { label:"CRM Setup", tabs: byKeys(["state_zone_tbl","country_zone_tbl","city_tbl","territory_rule_state_tbl","territory_rule_country_tbl","territory_rule_zone_tbl","crm_status_tbl"]) },
       ]:[]),
       { label:"Major Projects", tabs:[
         {key:"major_projects",label:"Projects"},
@@ -18162,6 +18169,51 @@ const MANUAL_SECTIONS = [
     ]
   },
   {
+    "group": "Engineering Calc",
+    "articles": [
+      {
+        "key": "free_area_calc",
+        "title": "Free Flow / Open Area Calculator",
+        "tag": "Engineering Calc",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Works out the free straining area of a pleated filter element and expresses it as a percentage of the inlet pipe area \u2014 the ratio a datasheet asks for when it specifies a minimum opening area. Engineering Calc \u2192 Free Area Calculator."
+          },
+          {
+            "type": "p",
+            "text": "Every parameter is typed in. Nothing is assumed and nothing is carried over from another screen, so the sheet you produce is exactly the sum you entered. The results on the right recalculate as you type."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "Fill in the job: item, size, filtration size, and the company whose letterhead the PDF should carry.",
+              "Enter the geometry: inlet nozzle bore, outer and inner filter diameter, filter height, pleat pitch.",
+              "Enter the screen media: perforation hole size and pitch, the sheet's open area, and a lining factor.",
+              "Read the free/open area ratio at the bottom right, then Generate PDF."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "Pleat depth and pleat count are DERIVED, not typed. Pleat depth is always (D1 \u2212 D2) \u00f7 2 and the count always \u03c0 \u00d7 D2 \u00f7 pleat pitch, so they cannot contradict the diameters you entered. The exact pleat figure is shown in brackets beside the rounded one \u2014 \u03c0 \u00d7 70 \u00f7 10 is 21.99, which becomes 22 pleats."
+          },
+          {
+            "type": "tip",
+            "text": "PLEAT pitch and PERFORATION pitch are separate fields on purpose. They are different dimensions that older sheets sometimes call by the same name, which is how a calculation ends up using one number in the header and another in the arithmetic."
+          },
+          {
+            "type": "p",
+            "text": "Two checks run automatically. If the open area you typed disagrees with what the hole and pitch give on a 60\u00b0 staggered pattern, an amber note says so and tells you which figure was used \u2014 yours. And if the bridge between holes falls below 3 mm, a red note points at clause 11.1 of the estimating SOP, because below that the sheet may not be perforable."
+          },
+          {
+            "type": "p",
+            "text": "The PDF carries the letterhead of whichever company you pick, taken from the Company master. If no company is picked the PDF is refused rather than produced without a letterhead."
+          }
+        ]
+      }
+    ]
+  },
+  {
     "group": "Sales",
     "articles": [
       {
@@ -18968,6 +19020,39 @@ const MANUAL_SECTIONS = [
   {
     "group": "CRM",
     "articles": [
+      {
+        "key": "cities_master",
+        "title": "Cities",
+        "tag": "CRM",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The list of cities the customer form offers. CRM \u2192 CRM Setup \u2192 Cities, sitting straight after States and Zones and Countries and Zones, because the three work together."
+          },
+          {
+            "type": "p",
+            "text": "City is mandatory when you enter a customer. Until now this list could not be added to, so a customer in a city that was not in the original seed simply could not be saved. This screen fixes that."
+          },
+          {
+            "type": "tip",
+            "text": "The cascade is NOT the same everywhere. For India the customer form goes Country \u2192 State \u2192 City, so an Indian city MUST have its state filled in or it will never appear in the dropdown. For every other country the form goes Country \u2192 City directly, with no state level \u2014 so leave State blank and just fill Country."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "Click New city.",
+              "Type the city name.",
+              "For an Indian city, pick the State from the list. For anywhere else, leave State blank.",
+              "Type the Country. Use exactly the same spelling as the customer form's country list, or the city will not appear."
+            ]
+          },
+          {
+            "type": "p",
+            "text": "The list is grouped by country so you can see at a glance which countries have cities on file. States come from the States and Zones (India) master, so a state has to exist there before a city can point at it."
+          }
+        ]
+      },
+
       {
         "key": "crm_funnel",
         "title": "CRM Funnel board",
@@ -29229,6 +29314,198 @@ function BoltingCalcHistoryViewer({ user }){
 }
 
 /* ---- FLANGE CHART ---- */
+/* ---- FREE FLOW / OPEN AREA CALCULATOR (3 Sep) ----
+   Built from the Procedyne free-flow sheet. Every parameter is an
+   INPUT, at the user's instruction — nothing is assumed and nothing
+   is hardcoded. Results derive from those inputs and are computed
+   live, never stored.
+
+   The source sheet contradicted itself in four places and each is
+   handled by asking rather than deciding:
+     * it labelled pleat depth (D1-D2)/2 = 20 when (90-70)/2 = 10,
+       and its own developed length used 10. Pleat depth is now
+       DERIVED so the two cannot disagree.
+     * it said 8mm pitch in the header but used 10 in the pleat
+       count. Pleat pitch and perforation pitch are now SEPARATE
+       inputs, because they are different things.
+     * L_R appeared in the formula with no value. It is an input,
+       defaulting to 1, labelled as the lining factor.
+     * "Nozzle inside Diameter (590.94 mm)" sat beside a sum using
+       80mm. Dropped.
+
+   Open area is shown BOTH ways: the figure the user enters, and
+   what 0.907 x (hole/pitch)^2 gives for a 60-degree staggered
+   pattern. If they disagree the screen says so rather than
+   silently preferring one. */
+function FreeAreaCalculator({ user }){
+  const [f,setF] = useState({
+    item:"Y Type Strainers", size:"", filtration:"",
+    nozzleId:80, d1:90, d2:70, height:130,
+    pleatPitch:10, holeDia:6, perfPitch:8, openArea:51, lining:1,
+  });
+  const [companies,setCompanies] = useState([]);
+  const [companyId,setCompanyId] = useState("");
+  const [sizes,setSizes] = useState([]);
+  const [busy,setBusy] = useState(false);
+  const [msg,setMsg] = useState("");
+
+  useEffect(()=>{
+    (async()=>{
+      const [{data:c},{data:s}] = await Promise.all([
+        sb.from("company_master").select("id,company_name,logo_data").order("company_name"),
+        sb.from("size_tbl").select("size"),
+      ]);
+      setCompanies(c||[]);
+      if((c||[]).length===1) setCompanyId(String(c[0].id));
+      setSizes((s||[]).map(x=>x.size).filter(Boolean));
+    })();
+  },[]);
+
+  const n = (k)=> Number(f[k])||0;
+  const set = (k,v)=>{ setF(d=>({...d,[k]:v})); if(msg) setMsg(""); };
+
+  // ---- derived, live ----
+  const pleatDepth = (n('d1')-n('d2'))/2;
+  // PI x D2 / pitch rarely lands on a whole number — 70mm at 10mm pitch
+  // gives 21.99. Rounded, not floored, because flooring would drop a whole
+  // pleat for a 0.05% shortfall. The raw value is shown beside it so a
+  // round UP is never hidden.
+  const pleatRaw = n('pleatPitch')>0 ? Math.PI*n('d2')/n('pleatPitch') : 0;
+  const pleatCount = Math.round(pleatRaw);
+  const devLength  = 2*pleatDepth*pleatCount;
+  const surfaceArea= devLength*n('height');
+  const netBasket  = surfaceArea*(n('openArea')/100)*n('lining');
+  const inletArea  = Math.PI/4*Math.pow(n('nozzleId'),2);
+  const ratio      = inletArea>0 ? (netBasket/inletArea)*100 : 0;
+  const calcOpen   = n('perfPitch')>0 ? 0.907*Math.pow(n('holeDia')/n('perfPitch'),2)*100 : 0;
+  const openMismatch = Math.abs(calcOpen-n('openArea'))>1.0;
+  const bridge     = n('perfPitch')-n('holeDia');
+  const company    = companies.find(c=>String(c.id)===String(companyId));
+
+  const fmt=(v,d=2)=> (isFinite(v)?v:0).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+
+  const rowsForPdf = ()=>[
+    ["Inlet nozzle ID","D","mm",fmt(n('nozzleId'),1)],
+    ["Outer filter diameter","D1","mm",fmt(n('d1'),1)],
+    ["Inner filter diameter","D2","mm",fmt(n('d2'),1)],
+    ["Height of filter","h","mm",fmt(n('height'),1)],
+    ["Pleat pitch","-","mm",fmt(n('pleatPitch'),1)],
+    ["Pleat depth  (D1-D2)/2","W","mm",fmt(pleatDepth,1)],
+    ["Number of pleats  PI x D2 / pleat pitch (exact "+fmt(pleatRaw,2)+")","N","nos",String(pleatCount)],
+    ["Developed length  2 x W x N","l","mm",fmt(devLength,1)],
+    ["Filter surface area  h x l","A","sq.mm",fmt(surfaceArea,1)],
+    ["Perforation hole dia","-","mm",fmt(n('holeDia'),1)],
+    ["Perforation pitch","-","mm",fmt(n('perfPitch'),1)],
+    ["Bridge  pitch - hole","-","mm",fmt(bridge,1)],
+    ["Open area of perforated sheet","BR","%",fmt(n('openArea'),1)],
+    ["Open area computed  0.907 x (hole/pitch)^2","-","%",fmt(calcOpen,1)],
+    ["Lining factor","LR","-",fmt(n('lining'),2)],
+    ["Net basket area  A x BR x LR","FS","sq.mm",fmt(netBasket,1)],
+    ["Inlet pipe area  PI x D^2 / 4","FL","sq.mm",fmt(inletArea,1)],
+    ["FREE / OPEN AREA RATIO  (FS/FL) x 100","-","%",fmt(ratio,1)],
+  ];
+
+  const makePdf = ()=>{
+    if(!companyId){ setMsg("Pick the issuing company first — the letterhead comes from that record."); return; }
+    setBusy(true);
+    try{
+      generatePDF({
+        title:"Free Flow / Open Area Calculation",
+        description:[f.item,f.size?("Size: "+f.size):"",f.filtration?("Filtration: "+f.filtration):""].filter(Boolean).join("   |   "),
+        createdBy:user?.username||"", createdAt:new Date().toISOString(),
+        headers:["Parameter","Symbol","Unit","Value"],
+        rows:rowsForPdf(),
+        company,
+        filename:"FreeArea_"+(f.size||"calc").replace(/[^A-Za-z0-9]+/g,"_")+".pdf",
+      });
+    }catch(e){ setMsg("Could not build the PDF: "+e.message); }
+    setBusy(false);
+  };
+
+  const F = (label,key,unit,opts)=>h("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:6}},
+    h("label",{style:{fontSize:12,width:210,color:colors.muted}},label),
+    h("input",{type:"number",value:f[key],onChange:e=>set(key,e.target.value),
+      style:{...inputStyle,padding:"5px 7px",fontSize:12.5,width:100,textAlign:"right"}}),
+    h("span",{style:{fontSize:11,color:colors.mutedLight,width:44}},unit),
+    opts?h("span",{style:{fontSize:11,color:colors.mutedLight}},opts):null
+  );
+  const R = (label,val,unit,strong)=>h("div",{style:{display:"flex",alignItems:"center",gap:8,
+      padding:"5px 0",borderBottom:"1px solid "+colors.border}},
+    h("span",{style:{fontSize:12,width:250,fontWeight:strong?700:400}},label),
+    h("span",{style:{fontSize:12.5,width:110,textAlign:"right",fontWeight:strong?700:400}},val),
+    h("span",{style:{fontSize:11,color:colors.mutedLight}},unit));
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:940}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:6}},"Free Flow / Open Area Calculator"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:16}},
+      "Every parameter is entered — nothing is assumed. Results below are computed live from what you type. Pleat depth and pleat count are derived so they cannot disagree with the diameters."),
+
+    h("div",{style:{display:"flex",gap:28,flexWrap:"wrap"}},
+      h("div",{style:{flex:"1 1 380px"}},
+        h("div",{style:{fontSize:12,fontWeight:600,marginBottom:8}},"Job"),
+        h("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:6}},
+          h("label",{style:{fontSize:12,width:210,color:colors.muted}},"Item"),
+          h("input",{value:f.item,onChange:e=>set('item',e.target.value),style:{...inputStyle,padding:"5px 7px",fontSize:12.5,width:180}})),
+        h("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:6}},
+          h("label",{style:{fontSize:12,width:210,color:colors.muted}},"Size"),
+          h("input",{value:f.size,onChange:e=>set('size',e.target.value),list:"fa_sizes",placeholder:"e.g. 80nb",
+            style:{...inputStyle,padding:"5px 7px",fontSize:12.5,width:180}}),
+          h("datalist",{id:"fa_sizes"},sizes.map(x=>h("option",{key:x,value:x})))),
+        h("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:6}},
+          h("label",{style:{fontSize:12,width:210,color:colors.muted}},"Filtration size"),
+          h("input",{value:f.filtration,onChange:e=>set('filtration',e.target.value),placeholder:"e.g. 6 mm x 9 mm pitch",
+            style:{...inputStyle,padding:"5px 7px",fontSize:12.5,width:180}})),
+        h("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:14}},
+          h("label",{style:{fontSize:12,width:210,color:colors.muted}},"Issuing company (letterhead)"),
+          h("select",{value:companyId,onChange:e=>{setCompanyId(e.target.value); if(msg) setMsg("");},
+            style:{...inputStyle,padding:"5px 7px",fontSize:12.5,width:180}},
+            h("option",{value:""},"Pick a company\u2026"),
+            companies.map(c=>h("option",{key:c.id,value:c.id},c.company_name)))),
+
+        h("div",{style:{fontSize:12,fontWeight:600,marginBottom:8}},"Geometry"),
+        F("Inlet nozzle ID  (D)","nozzleId","mm"),
+        F("Outer filter diameter  (D1)","d1","mm"),
+        F("Inner filter diameter  (D2)","d2","mm"),
+        F("Height of filter  (h)","height","mm"),
+        F("Pleat pitch","pleatPitch","mm"),
+
+        h("div",{style:{fontSize:12,fontWeight:600,margin:"14px 0 8px"}},"Screen media"),
+        F("Perforation hole dia","holeDia","mm"),
+        F("Perforation pitch","perfPitch","mm"),
+        F("Open area of sheet  (BR)","openArea","%"),
+        F("Lining factor  (LR)","lining","-","1 = no allowance")
+      ),
+
+      h("div",{style:{flex:"1 1 380px"}},
+        h("div",{style:{fontSize:12,fontWeight:600,marginBottom:8}},"Results"),
+        R("Pleat depth  W = (D1-D2)/2",fmt(pleatDepth,1),"mm"),
+        R("Number of pleats  N = \u03c0 x D2 / pitch",String(pleatCount)+"  ("+fmt(pleatRaw,2)+")","nos"),
+        R("Developed length  l = 2 x W x N",fmt(devLength,1),"mm"),
+        R("Filter surface area  A = h x l",fmt(surfaceArea,1),"sq.mm"),
+        R("Bridge  pitch - hole",fmt(bridge,1),"mm"),
+        R("Net basket area  FS = A x BR x LR",fmt(netBasket,1),"sq.mm"),
+        R("Inlet pipe area  FL = \u03c0D\u00b2/4",fmt(inletArea,1),"sq.mm"),
+        R("Free / open area ratio  (FS/FL) x 100",fmt(ratio,1),"%",true),
+
+        openMismatch ? h("div",{style:{background:"#fff4d6",border:"1px solid #e0c48a",color:"#854f0b",
+            borderRadius:6,padding:"8px 11px",fontSize:11.5,marginTop:12}},
+          "Open area entered is "+fmt(n('openArea'),1)+"%, but "+fmt(n('holeDia'),1)+" mm holes at "+
+          fmt(n('perfPitch'),1)+" mm pitch give "+fmt(calcOpen,1)+"% on a 60\u00b0 staggered pattern. "+
+          "The entered figure is what has been used. Check which is right.") : null,
+
+        (bridge>0 && bridge<3) ? h("div",{style:{background:"#fdecea",border:"1px solid #e8b4ae",color:"#a32b1c",
+            borderRadius:6,padding:"8px 11px",fontSize:11.5,marginTop:8}},
+          "Bridge is "+fmt(bridge,1)+" mm. FMQ-SOP-EST-001 clause 11.1 puts the perforating limit at 3 mm \u2014 "+
+          "closing the pitch further may not be manufacturable.") : null,
+
+        h("div",{style:{marginTop:16,display:"flex",gap:8,alignItems:"center"}},
+          h("button",{onClick:makePdf,disabled:busy,style:btnPrimary},busy?"Building\u2026":"Generate PDF")),
+        msg?h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:8}},msg):null
+      )
+    )
+  );
+}
+
 function FlangeChart({ user }){
   const isAdmin = user && (user.role==="admin"||user.role==="super_admin");
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
@@ -30897,6 +31174,7 @@ function App() {
     tab==="calcs"?h("div",null,h(EngineeringCalcs,{user}),h(CalcHistoryViewer,{user})):
     tab==="bolting_calc"?h("div",null,h(BoltingCalculator,{user}),h(BoltingCalcHistoryViewer,{user})):
     tab==="flange_chart"?h(FlangeChart,{user}):
+    tab==="free_area_calc"?h(FreeAreaCalculator,{user}):
     tab==="major_projects"?h(MajorProjectsScreen,{user,
       onCreateQuoteFromAllocation:(ref,allocationId,prefillCustomerName)=>{ setPendingNewSlNo({reference_number:ref,item_sl_no:1,linked_allocation_id:allocationId,prefillCustomerName}); setTab("estimator"); },
       onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");},
