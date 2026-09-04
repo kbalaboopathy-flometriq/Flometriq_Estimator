@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-03T11:25:00Z";
+  var APP_BUILD_VERSION = "2026-09-03T12:40:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -378,7 +378,9 @@ const MASTER_TABLES = [
   // cascade is not uniform: India goes Country -> State -> City, every other
   // country goes Country -> City with no state level, so BOTH columns are
   // here and state is left blank outside India.
-  { key: "city_tbl", label: "Cities", columns: ["city","state","country"], addLabel:"New city", cascade:[{col:"state",from:"state_zone_tbl",field:"state"}], freeText:["city","country"], groupBy:["country"], editAllEnabled:true, exportEnabled:true },
+  // nullableCols: state must be NULL, not "", for a non-India city — the
+  // customer form filters those with .is("state",null).
+  { key: "city_tbl", label: "Cities", columns: ["city","state","country"], addLabel:"New city", cascade:[{col:"state",from:"state_zone_tbl",field:"state"}], freeText:["city","country"], nullableCols:["state"], groupBy:["country"], editAllEnabled:true, exportEnabled:true },
   { key: "employee_tbl", label: "Employees", columns: ["employee_code","employee_name","nickname","department","designation","crm_role","phone_primary","email","status"], addLabel:"New employee", cascade:[{col:"department",from:"department_tbl",field:"department"},{col:"designation",from:"designation_tbl",field:"value"},{col:"crm_role",from:"crm_role_tbl",field:"value"},{col:"status",from:"employee_status_tbl",field:"value"}], freeText:["employee_code","employee_name","nickname","phone_primary","email"], exportEnabled:true },
   { key: "territory_rule_state_tbl", label: "Territory Rules — States", columns: ["employee_name","state"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"state",from:"state_zone_tbl",field:"state"}], groupBy:["employee_name"], editAllEnabled:true },
   { key: "territory_rule_country_tbl", label: "Territory Rules — Countries", columns: ["employee_name","country"], addLabel:"New rule", cascade:[{col:"employee_name",from:"employee_tbl",field:"employee_name"},{col:"country",from:"country_zone_tbl",field:"country"}], groupBy:["employee_name"], editAllEnabled:true },
@@ -3538,7 +3540,13 @@ function MasterEditor({ tableKey, user }) {
 
   const saveEdit = async()=>{
     const payload={};
-    tableDef.columns.forEach(c=>{ let v=editDraft[c]; if(NUMERIC_COLS.has(c)) v=v===""||v===null?null:Number(v); payload[c]=v; });
+    const nullableE = new Set(tableDef.nullableCols||[]);
+    tableDef.columns.forEach(c=>{
+      let v=editDraft[c];
+      if(NUMERIC_COLS.has(c)) v = (v===""||v===null) ? null : Number(v);
+      else if(nullableE.has(c) && (v===undefined || v===null || String(v).trim()==="")) v = null;
+      payload[c]=v;
+    });
     if(tableKey==="material_rates"){ payload.created_at = new Date().toISOString(); payload.created_by = user?.username||"unknown"; }
     const { error:err } = await sb.from(tableKey).update(payload).eq("id",editingId);
     if(err) { alert("Save failed: "+err.message); return; }
@@ -3608,7 +3616,19 @@ function MasterEditor({ tableKey, user }) {
 
   const saveAdd = async()=>{
     const payload={};
-    tableDef.columns.forEach(c=>{ let v=addDraft[c]; if(NUMERIC_COLS.has(c)) v=v===""||v===undefined?0:Number(v); payload[c]=v===undefined?"":v; });
+    // Blank text used to be stored as "" for every column. That silently broke
+    // city_tbl: the customer form finds non-India cities with .is("state",null),
+    // and an empty string is not null, so any city added from this screen was
+    // saved but never appeared. Columns listed in nullableCols now write NULL
+    // when left blank, so there is ONE representation of "nothing here".
+    const nullable = new Set(tableDef.nullableCols||[]);
+    tableDef.columns.forEach(c=>{
+      let v=addDraft[c];
+      if(NUMERIC_COLS.has(c)) v = (v===""||v===undefined) ? 0 : Number(v);
+      else if(nullable.has(c) && (v===undefined || String(v).trim()==="")) v = null;
+      else v = v===undefined ? "" : v;
+      payload[c]=v;
+    });
     if(tableKey==="material_rates"){
       payload.created_by = user?.username||"unknown";
       payload.spec_grade = ((addDraft.material_spec||"")+" "+(addDraft.material_grade||"")).trim(); // locked/auto — never trust a typed value
@@ -3760,7 +3780,14 @@ function MasterEditor({ tableKey, user }) {
       for(const r of sortedFilteredRows){
         const draft = genericEditAllDrafts[r.id]||r;
         const payload={};
-        tableDef.columns.forEach(c=>{ let v=draft[c]; if(NUMERIC_COLS.has(c)) v=v===""||v===undefined?0:Number(v); payload[c]=v===undefined?"":v; });
+        const nullableB = new Set(tableDef.nullableCols||[]);
+        tableDef.columns.forEach(c=>{
+          let v=draft[c];
+          if(NUMERIC_COLS.has(c)) v = (v===""||v===undefined) ? 0 : Number(v);
+          else if(nullableB.has(c) && (v===undefined || v===null || String(v).trim()==="")) v = null;
+          else v = v===undefined ? "" : v;
+          payload[c]=v;
+        });
         await sb.from(tableKey).update(payload).eq("id",r.id);
         updates.push({id:r.id,...payload});
       }
@@ -17037,7 +17064,7 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
       if(!f.billing_state){ setBillingCities([]); return; }
       sb.from("city_tbl").select("city").eq("state",f.billing_state).order("city").then(({data})=>setBillingCities((data||[]).map(r=>r.city)));
     } else if(f.billing_country){
-      sb.from("city_tbl").select("city").eq("country",f.billing_country).is("state",null).order("city").then(({data})=>setBillingCities((data||[]).map(r=>r.city)));
+      sb.from("city_tbl").select("city").eq("country",f.billing_country).or("state.is.null,state.eq.").order("city").then(({data})=>setBillingCities((data||[]).map(r=>r.city)));
     } else setBillingCities([]);
   },[f.billing_country,f.billing_state]);
   useEffect(()=>{
@@ -17045,7 +17072,7 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
       if(!f.shipping_state){ setShippingCities([]); return; }
       sb.from("city_tbl").select("city").eq("state",f.shipping_state).order("city").then(({data})=>setShippingCities((data||[]).map(r=>r.city)));
     } else if(f.shipping_country){
-      sb.from("city_tbl").select("city").eq("country",f.shipping_country).is("state",null).order("city").then(({data})=>setShippingCities((data||[]).map(r=>r.city)));
+      sb.from("city_tbl").select("city").eq("country",f.shipping_country).or("state.is.null,state.eq.").order("city").then(({data})=>setShippingCities((data||[]).map(r=>r.city)));
     } else setShippingCities([]);
   },[f.shipping_country,f.shipping_state]);
 
@@ -17157,7 +17184,7 @@ function CustomerCompanyForm({ initial, onCancel, onSaved, user }){
       const names=(data||[]).map(r=>r.city);
       if(cityKey.startsWith("billing")) setBillingCities(names); else setShippingCities(names);
     });
-    else sb.from("city_tbl").select("city").eq("country",country).is("state",null).order("city").then(({data})=>{
+    else sb.from("city_tbl").select("city").eq("country",country).or("state.is.null,state.eq.").order("city").then(({data})=>{
       const names=(data||[]).map(r=>r.city);
       if(cityKey.startsWith("billing")) setBillingCities(names); else setShippingCities(names);
     });
@@ -19121,6 +19148,10 @@ const MANUAL_SECTIONS = [
           {
             "type": "tip",
             "text": "That shortcut is admin only. Anyone else picks from the list, which keeps the master from filling up with typos and duplicates of the same place."
+          },
+          {
+            "type": "p",
+            "text": "Fixed 3 September: a city added from this screen for a country outside India was saved but never appeared on the customer form. The blank State box was being stored as an empty value rather than as nothing at all, and the customer form looks for cities with no state. Cities loaded by SQL worked, cities typed in did not \u2014 which made it look like a refresh problem. Leaving State blank now stores it properly, and the customer form finds cities saved either way, so older rows appear too."
           }
         ]
       },
@@ -25302,7 +25333,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       if(!filters.stateLike){ setCityOptionsLive([]); return; }
       sb.from("city_tbl").select("city").eq("state",filters.stateLike).order("city").then(({data})=>setCityOptionsLive((data||[]).map(r=>r.city)));
     } else if(filters.countryLike){
-      sb.from("city_tbl").select("city").eq("country",filters.countryLike).is("state",null).order("city").then(({data})=>setCityOptionsLive((data||[]).map(r=>r.city)));
+      sb.from("city_tbl").select("city").eq("country",filters.countryLike).or("state.is.null,state.eq.").order("city").then(({data})=>setCityOptionsLive((data||[]).map(r=>r.city)));
     } else setCityOptionsLive([]);
   },[filters.countryLike,filters.stateLike]);
 
