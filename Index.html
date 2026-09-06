@@ -44,7 +44,12 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-04T00:20:00Z";
+  var APP_BUILD_VERSION = "2026-09-04T01:10:00Z";
+  // Published so the app can read it — issue reports record the build they
+  // were raised on, which answers a good share of them outright. ONE source:
+  // declaring a second copy in the app script would drift on the first build
+  // where somebody updated one and not the other.
+  window.APP_BUILD_VERSION = APP_BUILD_VERSION;
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -1543,6 +1548,10 @@ function MenuTabs({ user, active, onChange }) {
       h("button",{onClick:()=>pick("faq"),style:{...itemStyle({key:"faq"}),width:"auto",padding:"5px 10px",color:active==="faq"?"#0f5132":colors.mutedLight}},"FAQ"),
       h("button",{onClick:()=>pick("user_manual"),style:{...itemStyle({key:"user_manual"}),width:"auto",padding:"5px 10px",color:active==="user_manual"?"#0f5132":colors.mutedLight}},"User Manual"),
       h("button",{onClick:()=>pick("tour"),style:{...itemStyle({key:"tour"}),width:"auto",padding:"5px 10px",color:active==="tour"?"#0f5132":colors.mutedLight}},"Tour"),
+      // Reachable from EVERY screen. A report raised from the wrong place
+      // captures the wrong context, and the context is most of its value.
+      h("button",{onClick:()=>pick("report_issue"),style:{...itemStyle({key:"report_issue"}),width:"auto",padding:"5px 10px",color:"#a32b1c"}},"Report an issue"),
+      h("button",{onClick:()=>pick("issues"),style:{...itemStyle({key:"issues"}),width:"auto",padding:"5px 10px",color:active==="issues"?"#0f5132":colors.mutedLight}},"Issues"),
       isSuperAdmin && h("button",{onClick:()=>pick("version_history"),style:{...itemStyle({key:"version_history"}),width:"auto",padding:"5px 10px",color:active==="version_history"?"#0f5132":colors.mutedLight}},"Version History"),
       h("button",{onClick:()=>pick("change_password"),style:{...itemStyle({key:"change_password"}),width:"auto",padding:"5px 10px",color:active==="change_password"?"#0f5132":colors.mutedLight}},"Change Password")
     )
@@ -19394,6 +19403,43 @@ const MANUAL_SECTIONS = [
     "group": "Admin",
     "articles": [
       {
+        "key": "report_an_issue",
+        "title": "Reporting an issue",
+        "tag": "Getting Started",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Report an issue sits in the top right of every screen, beside FAQ and User Manual. Click it from wherever the problem happened \u2014 not afterwards from somewhere else, because the app records the screen you were on."
+          },
+          {
+            "type": "p",
+            "text": "It also records which build you are running, who you are and your department. None of that is typed. The build version in particular saves a lot of time: a fair share of reports turn out to be things already fixed in a newer build than the one you have."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "Click Report an issue from the screen where it happened.",
+              "Choose Bug or Suggestion.",
+              "Say what happened, and for a bug what you expected instead.",
+              "Take a screenshot, put it in Drive, and paste the share link.",
+              "Say how badly it blocks you, and Send."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "Check the screenshot link opens for someone else before pasting it. The app cannot test that, and a link nobody else can open is the commonest reason a report stalls."
+          },
+          {
+            "type": "p",
+            "text": "You get an issue number. When a super admin picks it up, and again when it is fixed, you see a note next time you log in \u2014 and so does your department admin. A fixed issue says which build it was fixed in, so you know whether you already have it."
+          },
+          {
+            "type": "p",
+            "text": "The Issues tab beside it lists everything reported, by anyone, with its full history. Everyone can read it; only a super admin can change a status. Being able to see what others have already raised is deliberate \u2014 it stops five people reporting the same thing."
+          }
+        ]
+      },
+      {
         "key": "bom_total_summary",
         "title": "Total Summary on the BOM exports",
         "tag": "Sales",
@@ -30149,6 +30195,234 @@ function BoltingCalcHistoryViewer({ user }){
    what 0.907 x (hole/pitch)^2 gives for a 60-degree staggered
    pattern. If they disagree the screen says so rather than
    silently preferring one. */
+/* ---- REPORT AN ISSUE (4 Sep) ----
+   Reachable from every screen, because a report raised from the wrong
+   place captures the wrong context and the context is most of the value.
+
+   The app fills in the screen, the record on it, the BUILD VERSION, the
+   reporter and their department. Build version matters more than it
+   looks: a good share of reports are things already fixed in a build the
+   reporter has not got yet, and knowing they were on 17:40 when the fix
+   landed at 21:50 answers it without anyone investigating.
+
+   The badge on next login reuses notifications_tbl — the table the Owner
+   Alert banner already uses. No second notification mechanism. */
+function ReportIssueDialog({ user, screenContext, recordRef, onClose }){
+  const [type,setType] = useState("Bug");
+  const [title,setTitle] = useState("");
+  const [expected,setExpected] = useState("");
+  const [link,setLink] = useState("");
+  const [severity,setSeverity] = useState("");
+  const [sevOptions,setSevOptions] = useState([]);
+  const [dept,setDept] = useState("");
+  const [busy,setBusy] = useState(false);
+  const [err,setErr] = useState("");
+  const [done,setDone] = useState(null);
+
+  useEffect(()=>{
+    (async()=>{
+      const [{data:sev},{data:emp}] = await Promise.all([
+        sb.from("issue_severity_tbl").select("severity").order("sort_order"),
+        sb.from("employee_tbl").select("employee_name,department").eq("app_user_id",user?.id||"").maybeSingle(),
+      ]);
+      setSevOptions((sev||[]).map(r=>r.severity));
+      setDept((emp&&emp.department)||"");
+    })();
+  },[user]);
+
+  const submit = async()=>{
+    if(!title.trim()){ setErr("Say what happened — one line is enough."); return; }
+    setBusy(true); setErr("");
+    const { data, error } = await sb.from("issue_tbl").insert({
+      issue_type:type, title:title.trim(), expected:expected.trim()||null,
+      screenshot_link:link.trim()||null, severity:severity||null,
+      screen_context:screenContext||null, record_ref:recordRef||null,
+      build_version:window.APP_BUILD_VERSION||"",
+      raised_by:user?.username||"unknown", raised_department:dept||null,
+      status:"Open",
+    }).select().single();
+    setBusy(false);
+    if(error){ setErr("Could not send: "+error.message); return; }
+    await sb.from("issue_history_tbl").insert({issue_id:data.id,from_status:null,to_status:"Open",
+      note:"Raised",changed_by:user?.username||"unknown"});
+    setDone(data.issue_no||data.id);
+  };
+
+  if(done!==null){
+    return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1300,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"22px 26px",width:420,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},"Sent \u2014 issue #"+done),
+        h("div",{style:{fontSize:12.5,color:colors.muted,lineHeight:1.6,marginBottom:16}},
+          "You will see a note when it is looked at, and again when it is fixed. Your department admin sees it too."),
+        h("div",{style:{display:"flex",justifyContent:"flex-end"}},
+          h("button",{onClick:onClose,style:btnPrimary},"Close"))));
+  }
+
+  return h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1300,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:640,maxWidth:"100%",maxHeight:"88vh",overflow:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:14,marginBottom:12}},"Report an issue"),
+
+      h("div",{style:{background:"#e6f4f1",borderRadius:6,padding:"9px 11px",marginBottom:14}},
+        h("div",{style:{fontSize:11,color:"#0f6e56",marginBottom:4}},"Filled in for you"),
+        h("div",{style:{fontSize:11.5,color:"#0f6e56",lineHeight:1.7}},
+          "Screen ",h("b",null,screenContext||"(unknown)"),
+          recordRef?[" \u00b7 ",h("b",{key:"r"},recordRef)]:null,
+          h("br",null),
+          "Build ",h("b",null,window.APP_BUILD_VERSION||"?")," \u00b7 ",h("b",null,user?.username||"unknown"),
+          dept?(" \u00b7 "+dept):"")),
+
+      h("div",{style:{display:"flex",gap:8,marginBottom:12}},
+        ["Bug","Suggestion"].map(t=>h("button",{key:t,onClick:()=>setType(t),
+          style:{...btnSmall,fontSize:12,background:type===t?"#1c1f1a":"#fff",color:type===t?"#fff":colors.muted}},t))),
+
+      h("div",{style:{fontSize:11,color:colors.muted,marginBottom:3}},type==="Bug"?"What happened":"What would you like"),
+      h("textarea",{value:title,onChange:e=>{setTitle(e.target.value); if(err)setErr("");},rows:2,
+        placeholder:type==="Bug"?"e.g. Grand total does not match the column above it":"e.g. A column for coating thickness on the BOM",
+        style:{...inputStyle,width:"100%",padding:"7px 9px",fontSize:12.5,fontFamily:"inherit",resize:"vertical",marginBottom:10}}),
+
+      type==="Bug" ? h("div",null,
+        h("div",{style:{fontSize:11,color:colors.muted,marginBottom:3}},"What you expected instead"),
+        h("textarea",{value:expected,onChange:e=>setExpected(e.target.value),rows:2,
+          style:{...inputStyle,width:"100%",padding:"7px 9px",fontSize:12.5,fontFamily:"inherit",resize:"vertical",marginBottom:10}})) : null,
+
+      h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}},
+        h("div",{style:{flex:2,minWidth:240}},
+          h("div",{style:{fontSize:11,color:colors.muted,marginBottom:3}},"Screenshot link"),
+          h("input",{value:link,onChange:e=>setLink(e.target.value),placeholder:"Paste a Drive share link",
+            style:{...inputStyle,width:"100%",padding:"7px 9px",fontSize:12.5}})),
+        h("div",{style:{flex:1,minWidth:170}},
+          h("div",{style:{fontSize:11,color:colors.muted,marginBottom:3}},"How badly it blocks you"),
+          h("select",{value:severity,onChange:e=>setSeverity(e.target.value),style:{...inputStyle,width:"100%",padding:"7px 9px",fontSize:12.5}},
+            h("option",{value:""},"Not sure"),
+            sevOptions.map(sv=>h("option",{key:sv,value:sv},sv))))),
+
+      h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:8}},
+        "Anyone with the link must be able to open it \u2014 the app cannot check that for you."),
+
+      err?h("div",{style:{fontSize:11.5,color:colors.danger,marginTop:8}},err):null,
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16,borderTop:"1px solid "+colors.border,paddingTop:14}},
+        h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
+        h("button",{onClick:submit,disabled:busy,style:btnPrimary},busy?"Sending\u2026":"Send"))
+    ));
+}
+
+/* ---- THE TRACKER ---- */
+function IssueTracker({ user }){
+  const isSuper = user?.role==="super_admin";
+  const [rows,setRows] = useState([]);
+  const [statuses,setStatuses] = useState([]);
+  const [filterType,setFilterType] = useState("All");
+  const [filterOpen,setFilterOpen] = useState(true);
+  const [loading,setLoading] = useState(true);
+  const [openId,setOpenId] = useState(null);
+  const [history,setHistory] = useState([]);
+  const [note,setNote] = useState("");
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const [{data:i},{data:st}] = await Promise.all([
+      sb.from("issue_tbl").select("*").order("issue_no",{ascending:false}),
+      sb.from("issue_status_tbl").select("*").order("sort_order"),
+    ]);
+    setRows(i||[]); setStatuses(st||[]); setLoading(false);
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const closedSet = new Set(statuses.filter(s=>s.is_closed).map(s=>s.status));
+  const shown = rows.filter(r=>
+    (filterType==="All" || r.issue_type===filterType) &&
+    (!filterOpen || !closedSet.has(r.status)));
+
+  const openHistory = async(row)=>{
+    setOpenId(row.id===openId?null:row.id); setNote("");
+    if(row.id!==openId){
+      const { data } = await sb.from("issue_history_tbl").select("*").eq("issue_id",row.id).order("changed_at");
+      setHistory(data||[]);
+    }
+  };
+
+  const setStatus = async(row,to)=>{
+    if(!isSuper) return;
+    const patch = {status:to, updated_at:new Date().toISOString()};
+    if(closedSet.has(to)){
+      patch.resolved_by = user?.username||"unknown";
+      patch.resolved_at = new Date().toISOString();
+      if(to==="Fixed") patch.fixed_in_build = window.APP_BUILD_VERSION||null;
+    }
+    if(note.trim()) patch.resolution_note = note.trim();
+    await sb.from("issue_tbl").update(patch).eq("id",row.id);
+    await sb.from("issue_history_tbl").insert({issue_id:row.id,from_status:row.status,to_status:to,
+      note:note.trim()||null,changed_by:user?.username||"unknown"});
+    // Tell the person who raised it, and their department admin. Same table
+    // the Owner Alert banner uses — one notification mechanism, not two.
+    const msg = "Issue #"+(row.issue_no||row.id)+" \u2014 "+to+
+                (to==="Fixed" ? (" in build "+(window.APP_BUILD_VERSION||"")) : "")+": "+row.title;
+    const targets = new Set([row.raised_by].filter(Boolean));
+    if(row.raised_department){
+      const { data:admins } = await sb.from("employee_tbl").select("employee_name").eq("department",row.raised_department);
+      (admins||[]).forEach(a=>targets.add(a.employee_name));
+    }
+    for(const t of targets){
+      try{ await sb.from("notifications_tbl").insert({employee_name:t,message:msg,created_at:new Date().toISOString()}); }catch(e){}
+    }
+    await logAudit("UPDATE","issue_tbl",String(row.issue_no||row.id),msg,user?.username||"unknown",null,null);
+    setNote(""); load();
+  };
+
+  const pill=(txt,bg,fg)=>h("span",{style:{background:bg,color:fg,fontSize:11,padding:"2px 9px",borderRadius:9,whiteSpace:"nowrap"}},txt);
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:1100}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:6}},"Issues"),
+    h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginBottom:14}},
+      isSuper ? "Everything reported, newest first. Change a status and the person who raised it is told, along with their department."
+              : "Everything reported, newest first. Only a super admin can change a status."),
+
+    h("div",{style:{display:"flex",gap:8,alignItems:"center",marginBottom:12,flexWrap:"wrap"}},
+      ["All","Bug","Suggestion"].map(t=>h("button",{key:t,onClick:()=>setFilterType(t),
+        style:{...btnSmall,fontSize:11.5,background:filterType===t?"#1c1f1a":"#fff",color:filterType===t?"#fff":colors.muted}},t)),
+      h("label",{style:{fontSize:11.5,color:colors.muted,display:"flex",alignItems:"center",gap:5,marginLeft:8}},
+        h("input",{type:"checkbox",checked:filterOpen,onChange:e=>setFilterOpen(e.target.checked)}),"Hide closed"),
+      h("span",{style:{fontSize:11.5,color:colors.mutedLight,marginLeft:"auto"}},shown.length+" shown")),
+
+    loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading\u2026")
+    : shown.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Nothing here.")
+    : h("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+        shown.map(r=>h("div",{key:r.id,style:{border:"1px solid "+colors.border,borderRadius:6,padding:"9px 11px"}},
+          h("div",{style:{display:"flex",gap:10,alignItems:"flex-start",flexWrap:"wrap"}},
+            h("span",{style:{fontSize:11.5,color:colors.mutedLight,width:34}},"#"+(r.issue_no||"")),
+            h("div",{style:{flex:2,minWidth:230}},
+              h("div",{style:{fontSize:12.5,marginBottom:2}},r.title),
+              h("div",{style:{fontSize:10.5,color:colors.mutedLight}},
+                (r.screen_context||"")+(r.record_ref?(" \u00b7 "+r.record_ref):"")+" \u00b7 build "+(r.build_version||"?"))),
+            h("div",{style:{flex:1,minWidth:120,fontSize:11.5}},
+              r.raised_by||"", h("div",{style:{fontSize:10.5,color:colors.mutedLight}},r.raised_department||"")),
+            h("div",{style:{minWidth:150}},
+              closedSet.has(r.status)
+                ? pill(r.status+(r.fixed_in_build?(" in "+r.fixed_in_build.slice(11,16)):""),"#e6f4f1","#0f6e56")
+                : r.status==="Open" ? pill("Open","transparent",colors.mutedLight)
+                : pill(r.status,"#fff4d6","#854f0b")),
+            h("button",{onClick:()=>openHistory(r),style:{...btnSmall,fontSize:11}},openId===r.id?"Hide":"Detail")),
+
+          openId===r.id ? h("div",{style:{marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:10}},
+            r.expected?h("div",{style:{fontSize:12,marginBottom:6}},h("b",null,"Expected: "),r.expected):null,
+            r.severity?h("div",{style:{fontSize:12,marginBottom:6}},h("b",null,"Impact: "),r.severity):null,
+            r.screenshot_link?h("div",{style:{fontSize:12,marginBottom:6}},
+              h("a",{href:r.screenshot_link,target:"_blank",rel:"noreferrer",style:{color:colors.accent}},"Screenshot")):null,
+            r.resolution_note?h("div",{style:{fontSize:12,marginBottom:6}},h("b",null,"Note: "),r.resolution_note):null,
+            h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:4}},"History"),
+            (history||[]).map(hh=>h("div",{key:hh.id,style:{fontSize:11.5,color:colors.muted,padding:"2px 0"}},
+              (hh.from_status?hh.from_status+" \u2192 ":"")+hh.to_status+
+              " \u00b7 "+(hh.changed_by||"")+" \u00b7 "+(hh.changed_at?new Date(hh.changed_at).toLocaleString():"")+
+              (hh.note?(" \u2014 "+hh.note):""))),
+            isSuper ? h("div",{style:{marginTop:10,display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}},
+              h("input",{value:note,onChange:e=>setNote(e.target.value),placeholder:"Note (optional)",
+                style:{...inputStyle,padding:"5px 8px",fontSize:11.5,flex:1,minWidth:180}}),
+              statuses.filter(s=>s.status!==r.status).map(s=>
+                h("button",{key:s.status,onClick:()=>setStatus(r,s.status),style:{...btnSmall,fontSize:11}},s.status))) : null
+          ) : null
+        ))));
+}
+
 function FreeAreaCalculator({ user }){
   const [f,setF] = useState({
     item:"Y Type Strainers", size:"", filtration:"",
@@ -31686,6 +31960,11 @@ function App() {
     try{ const raw=sessionStorage.getItem("flometriq_user"); return raw?JSON.parse(raw):null; } catch(e){ return null; }
   });
   const [tab,setTab]=useState("home");
+  // Reporting an issue must NOT navigate anywhere. If picking it changed the
+  // tab, the screen captured on the report would be the report screen itself,
+  // which is the one piece of context nobody needs.
+  const [reportOpen,setReportOpen] = useState(false);
+  const pickTab = (t)=>{ if(t==="report_issue"){ setReportOpen(true); return; } setTab(t); };
   const [sessionCompanyId,setSessionCompanyId]=useState(()=>{
     try{ return sessionStorage.getItem("flometriq_session_company")||null; } catch(e){ return null; }
   });
@@ -31938,8 +32217,11 @@ function App() {
     }),
     h("div",{id:"app-sticky-header",style:{position:"sticky",top:0,zIndex:60}},
       h(TopBar,{user,sessionCompanyId,sessionCompany,onChangeCompany:user.role==="super_admin"?(()=>setSessionCompanyIdPersisted(null)):null,onLogout:()=>{setUserPersisted(null);setSessionCompanyIdPersisted(null);setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true});}}),
-      h(MenuTabs,{user,active:tab,onChange:setTab})
+      h(MenuTabs,{user,active:tab,onChange:pickTab})
     ),
+    // Mounted at app level so it can be opened from any screen, and captures
+    // the tab the user was actually on rather than the one they navigated to.
+    reportOpen && h(ReportIssueDialog,{user,screenContext:tab,recordRef:null,onClose:()=>setReportOpen(false)}),
     draftCount>0 && h("div",{onClick:()=>setShowDraftPanel(true),style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
       "⚠ "+draftCount+" quote"+(draftCount===1?"":"s")+" still in Draft — click to review and update status"
     ),
@@ -32014,6 +32296,7 @@ function App() {
     tab==="vendors"?h(VendorsScreen,{user}):
     tab==="test_types"?h(TestTypesScreen,null):
     tab==="crm_helper_masters"?h(CrmHelperMastersScreen,{user}):
+    tab==="issues"?h(IssueTracker,{user}):
     tab==="user_manual"?h(UserManualScreen,null):
     tab==="tour"?h(TourScreen,null):
     tab==="faq"?h(FaqScreen,null):
