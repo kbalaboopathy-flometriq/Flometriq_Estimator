@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-03T17:40:00Z";
+  var APP_BUILD_VERSION = "2026-09-04T00:20:00Z";
   if (sessionStorage.getItem("appReloadedFor") === APP_BUILD_VERSION) return;
   fetch("./version.txt?_=" + Date.now(), { cache: "no-store" })
     .then(function(r){ return r.ok ? r.text() : null; })
@@ -8876,12 +8876,78 @@ function QuoteNotesPanel({ referenceNumber, user }){
 // everything else → Technical Head. Admin/Super Admin can still approve
 // any section too, as a practical override — same as every other
 // role-gated action in this app.
+// Does a free-text payment term look like it carries an advance? The app
+// only RAISES THE SUSPICION — the Accounts Head decides. Parsing payment
+// terms reliably is not possible, and a wrong automatic answer would either
+// invent an advance or lose a delivery trigger.
+function paymentTermSmellsOfAdvance(term){
+  if(!term) return false;
+  const t = String(term).toLowerCase();
+  const phrases = ["advance","along with order","with order","with the order","against order",
+                   "pro forma","proforma","against pi","against p.i","on order","upfront",
+                   "down payment","token"];
+  if(phrases.some(p=>t.includes(p))) return true;
+  // "30% with PO", "20 % against order"
+  return /\d{1,3}\s*%[^.;]{0,30}\b(order|po|p\.o|pi|p\.i)\b/.test(t);
+}
+
 function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, onEditDetails, onPoFieldsSaved }){
   const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
   const isSuperAdmin = user.role==="super_admin";
   const roleFor = { commercial_approved:"accounts_admin", testing_approved:"qc", technical_approved:"technical_head" };
   const roleLabel = { accounts_admin:"Accounts Admin", qc:"QC", technical_head:"Technical Head" };
   const [statusOptions,setStatusOptions] = useState([]);
+  // ---- ADVANCE PROMPT (3 Sep) ----
+  // The Accounts Head cannot approve Commercial Terms until he has said
+  // whether this order carries an advance. has_advance is NULL until then,
+  // deliberately three-state: a boolean defaulting to false would be
+  // indistinguishable from "no advance", which silently loses the delivery
+  // trigger that counts days from receipt of advance.
+  const [advOpen,setAdvOpen] = useState(false);
+  const [advPct,setAdvPct] = useState("");
+  const [advAmt,setAdvAmt] = useState("");
+  const [advReason,setAdvReason] = useState("");
+  const [advErr,setAdvErr] = useState("");
+  const [advBusy,setAdvBusy] = useState(false);
+  const advSmell = paymentTermSmellsOfAdvance(quoteHeaderRow?.payment_term || contractInfo?.payment_term);
+  const advAnswered = contractInfo && contractInfo.has_advance !== null && contractInfo.has_advance !== undefined;
+
+  const answerAdvance = async(yes)=>{
+    if(yes){
+      if(!String(advAmt).trim() && !String(advPct).trim()){
+        setAdvErr("Enter the advance percentage or the amount — the proforma needs one of them."); return;
+      }
+    } else if(advSmell && !advReason.trim()){
+      setAdvErr("The payment terms mention an advance. Say why this order does not carry one."); return;
+    }
+    setAdvBusy(true); setAdvErr("");
+    const patch = {
+      has_advance: yes,
+      advance_percent: yes && String(advPct).trim() ? Number(advPct) : null,
+      advance_amount:  yes && String(advAmt).trim() ? Number(advAmt) : null,
+      advance_answered_by: user?.username||"unknown",
+      advance_answered_at: new Date().toISOString(),
+      advance_override_reason: (!yes && advSmell) ? advReason.trim() : null,
+    };
+    const { error } = await sb.from("sale_order_tbl").update(patch).eq("contract_number",contractInfo.contract_number);
+    if(error){ setAdvBusy(false); setAdvErr("Could not save: "+error.message); return; }
+    if(yes){
+      // Open the register entry now. Part 2 builds the screen that works it.
+      await sb.from("advance_register_tbl").insert({
+        contract_number: contractInfo.contract_number,
+        advance_percent: patch.advance_percent, advance_amount: patch.advance_amount,
+        currency: contractInfo.currency || quoteHeaderRow?.currency || null,
+        status: "Pending proforma", created_by: user?.username||"unknown",
+      });
+    }
+    await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,
+      "Advance answered: "+(yes?"YES":"NO")+(patch.advance_percent?(" "+patch.advance_percent+"%"):"")+
+      ((!yes&&advSmell)?(" — reason: "+advReason.trim()):""),
+      user?.username||"unknown",null,null);
+    setAdvBusy(false); setAdvOpen(false);
+    onChanged && onChanged();
+  };
+
   const [poNumber,setPoNumber] = useState(quoteHeaderRow?.po_number||"");
   const [poDate,setPoDate] = useState(quoteHeaderRow?.po_date||"");
   // Consolidated (24 Aug follow-up) — every missing mandatory field is
@@ -8979,6 +9045,14 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
   };
 
   const approve = async(field)=>{
+    // Commercial Terms cannot be approved until the advance question is
+    // answered. This is the ONE moment someone is definitely looking at the
+    // payment terms, so it is the right place to ask.
+    if(field==="commercial_approved" && !advAnswered){
+      setAdvOpen(true);
+      setAdvErr("");
+      return;
+    }
     if(!canApproveAtAll){ alert("Can't approve yet — still missing: "+[...otherMissing, billingMissing?"Billing Address":null].filter(Boolean).join(", ")); return; }
     if(!isAdminOrAbove && user.role!==roleFor[field]){
       alert("Only "+roleLabel[roleFor[field]]+" (or an Admin/Super Admin) can approve this section.");
@@ -9014,7 +9088,38 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     );
   };
   const df = (key,placeholder,width)=>h("input",{value:draft[key],onChange:e=>setDraft(d=>({...d,[key]:e.target.value})),placeholder,style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:width||"100%"}});
+  const advPanel = advOpen && h("div",{style:{background:"#fff8e1",border:"1px solid #f0c060",borderRadius:6,padding:"12px 14px",marginBottom:8}},
+    h("div",{style:{fontSize:12,fontWeight:700,color:"#7a5000",marginBottom:4}},"Does this order carry an advance?"),
+    h("div",{style:{fontSize:11.5,color:"#7a5000",marginBottom:8}},
+      advSmell
+        ? "The payment terms mention one. Confirm before approving Commercial Terms."
+        : "The payment terms do not obviously mention one, but the PO may still call for it."),
+    quoteHeaderRow?.payment_term ? h("div",{style:{fontSize:11,color:colors.muted,marginBottom:8,fontStyle:"italic"}},
+      "Payment term: "+quoteHeaderRow.payment_term) : null,
+    h("div",{style:{display:"flex",gap:8,alignItems:"flex-end",flexWrap:"wrap",marginBottom:8}},
+      h("div",null,h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"Advance %"),
+        h("input",{value:advPct,onChange:e=>{setAdvPct(e.target.value); if(advErr)setAdvErr("");},placeholder:"30",
+          style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:80}})),
+      h("div",null,h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"or amount"),
+        h("input",{value:advAmt,onChange:e=>{setAdvAmt(e.target.value); if(advErr)setAdvErr("");},placeholder:"0.00",
+          style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:120}})),
+      h("button",{onClick:()=>answerAdvance(true),disabled:advBusy,style:{...btnSmall,fontSize:11}},
+        advBusy?"…":"Yes — opens the advance register"),
+      h("button",{onClick:()=>answerAdvance(false),disabled:advBusy,style:{...btnSmall,fontSize:11}},"No advance"),
+      h("button",{onClick:()=>{setAdvOpen(false); setAdvErr("");},style:{...btnSmall,fontSize:11}},"Cancel")
+    ),
+    advSmell ? h("div",null,
+      h("div",{style:{fontSize:10,color:colors.muted,marginBottom:2}},"If NO — why, given the terms say otherwise"),
+      h("input",{value:advReason,onChange:e=>{setAdvReason(e.target.value); if(advErr)setAdvErr("");},
+        placeholder:"e.g. client confirmed advance waived on the PO",
+        style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:"100%"}})) : null,
+    advErr ? h("div",{style:{fontSize:11,color:colors.danger,marginTop:6}},advErr) : null,
+    h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:6}},
+      "The date the advance actually lands is what starts the delivery clock on contracts using that trigger.")
+  );
+
   return h("div",{style:{marginTop:10}},
+    advPanel,
     (otherMissing.length>0 || billingMissing) && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"10px 12px",marginBottom:8}},
       h("div",{style:{fontSize:12,fontWeight:700,color:"#a3312a",marginBottom:6}},"Required before this Sale Order can be approved:"),
       otherMissing.length>0 && h("div",{style:{fontSize:11.5,color:"#a3312a",marginBottom:8}},otherMissing.join(", ")),
@@ -9053,6 +9158,14 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
       h("span",{style:{fontSize:12,fontWeight:700}},"Contract "+contractInfo.contract_number),
       h("span",{style:{fontSize:11,color:colors.muted}},"from Quote "+contractInfo.quote_reference_number),
       row("Commercial Terms (Accounts Admin)","commercial_approved"),
+      // Advance state, shown beside the approval it gates.
+      advAnswered ? h("span",{style:{fontSize:10.5,color:contractInfo.has_advance?"#0f6e56":colors.mutedLight,
+          background:contractInfo.has_advance?"#e6f4f1":"transparent",padding:contractInfo.has_advance?"2px 8px":0,borderRadius:9}},
+        contractInfo.has_advance
+          ? ("Advance "+(contractInfo.advance_percent?contractInfo.advance_percent+"% ":"")+"— in the register")
+          : "No advance")
+        : h("span",{style:{fontSize:10.5,color:"#854f0b",background:"#fff4d6",padding:"2px 8px",borderRadius:9}},
+            advSmell ? "Advance? terms suggest yes" : "Advance? not answered"),
       row("NDE/Testing (QC)","testing_approved"),
       row("Everything else (Technical Head)","technical_approved"),
       h("div",{style:{display:"flex",alignItems:"center",gap:5,marginLeft:"auto"}},
@@ -10044,6 +10157,20 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [pdfPreview,setPdfPreview]=useState(null); // {doc, filename} — Quote/BOM PDFs preview before download
   const [editingDescSlNo,setEditingDescSlNo]=useState(false);
   const [descDraft,setDescDraft]=useState("");
+  // 3 Sep — when an item has NO description_master rule, the Rebuild button
+  // was simply hidden and the auto-refresh returned silently. Nothing told
+  // anyone why the description never updated. Hold the item name so the
+  // screen can say so plainly instead of showing nothing at all.
+  // MANUAL DESCRIPTION (3 Sep). A description is either BUILT from the BOM or
+  // TYPED by hand. Before this the app had to pick one blunt rule for
+  // everybody — overwrite a typed one on every BOM change, or never touch it.
+  // Now a typed description is left alone, and when a BOM change WOULD have
+  // altered it the user is asked, on the way out of that Sl No, whether to
+  // update. Asked every time, deliberately: a stale description that quietly
+  // stops asking drifts further from the BOM with nothing saying so.
+  const [descStalePrompt,setDescStalePrompt]=useState(null); // {slNoRef, current, built, then}
+  const [descStale,setDescStale]=useState(false);            // marker while the panel is open
+  const [descMasterMissingItem,setDescMasterMissingItem]=useState(null);
   const [descMasterRowForItem,setDescMasterRowForItem]=useState(null); // the description_master row for openRef's item, or null if none
   useEffect(()=>{
     (async()=>{
@@ -10051,19 +10178,28 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       if(!item){ setDescMasterRowForItem(null); return; }
       const { data } = await sb.from("description_master").select("*").eq("item",item).maybeSingle();
       setDescMasterRowForItem(data||null);
+      setDescMasterMissingItem(data ? null : (item||null));
     })();
   },[openLines]);
   const rebuildDescriptionFromBom = ()=>{
-    if(!descMasterRowForItem) return;
+    if(!descMasterRowForItem){
+      alert("There is no Description Master rule for the item \""+(descMasterMissingItem||openLines[0]?.item||"")+"\".\n\n"+
+            "Without one the description cannot be built from the BOM \u2014 not by this button, and not automatically "+
+            "when a BOM line changes. It can only be typed by hand.\n\n"+
+            "Add a rule under Master Data \u2192 Description Master to change that.");
+      return;
+    }
     if(!confirm("This replaces the current description with the auto-generated one built from this item's Description Master rule. This can't be undone. Continue?")) return;
     const doRebuild = async()=>{
       const item = openLines[0]?.item || "";
       const size = openLines[0]?.size || "";
       const built = buildAutoDescription(descMasterRowForItem, openLines, item, size);
       if(!built){ alert("Couldn't build a description from the current BOM lines."); return; }
-      await sb.from("estimates").update({description:built}).eq("id",openRef.id);
-      setOpenRef(r=>({...r,description:built}));
-      setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:built}:r));
+      // Rebuilding makes it a BUILT description again, so the manual flag clears.
+      await sb.from("estimates").update({description:built,description_is_manual:false}).eq("id",openRef.id);
+      setOpenRef(r=>({...r,description:built,description_is_manual:false}));
+      setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:built,description_is_manual:false}:r));
+      setDescStale(false);
       refreshReadiness(refFilter);
     };
     if(isQuoteLocked(openRef.quote_status,user)){ setAuthGate({requiredType:"edit",action:doRebuild}); return; }
@@ -10082,13 +10218,38 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const size = freshLines[0]?.size || openLines[0]?.size || "";
     const built = buildAutoDescription(descMasterRowForItem, freshLines, item, size);
     if(!built) return;
-    if(built.trim()===(openRef.description||"").trim()) return; // already matches — nothing to do
+    if(built.trim()===(openRef.description||"").trim()){ setDescStale(false); return; } // already matches
+    if(openRef.description_is_manual){
+      // Typed by hand. Do NOT overwrite it — mark it stale and ask on the way
+      // out. "Would the rule have changed it?" is exactly the same question as
+      // "is a line the rule reads dirty?", answered without new machinery.
+      setDescStale(true);
+      return;
+    }
     try{
       await sb.from("estimates").update({description:built}).eq("id",openRef.id);
       setOpenRef(r=>r?{...r,description:built}:r);
       setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:built}:r));
     } catch(e){ console.error("Auto-refresh description failed",e); }
   };
+  const resolveDescStale = async(update)=>{
+    const p = descStalePrompt; if(!p) return;
+    if(update){
+      await sb.from("estimates").update({description:p.built,description_is_manual:false}).eq("id",p.ref.id);
+      setRefs(rs=>rs.map(r=>r.id===p.ref.id?{...r,description:p.built,description_is_manual:false}:r));
+      await logAudit("UPDATE","estimates",p.ref.reference_number+"-"+p.ref.item_sl_no,
+        "Manual description replaced with the BOM-built one on leaving the Sl No",user?.username||"unknown",null,null);
+    }
+    // If they keep it manual, nothing is written — the flag stays, and the
+    // question is asked again next time a BOM line makes it stale. Asked every
+    // time by explicit decision: a prompt that stops asking lets a description
+    // drift further from the BOM with nothing saying so.
+    setDescStale(false);
+    const next = p.next;
+    setDescStalePrompt(null);
+    if(next) openEstimate(next);
+  };
+
   const quoteAnyNonDraft = ()=> refs.some(r=>r.reference_number===refFilter && r.quote_status && r.quote_status!=="Draft");
   const quoteFamilyAnyNonDraft = ()=>{
     const base = (refFilter||"").replace(/-Rev-\d+$/,"");
@@ -10102,9 +10263,43 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     }
     doConfirmDeleteEntireQuote();
   };
+  // Changing the CURRENCY once a Packing & Forwarding LUMPSUM exists needs an
+  // admin code (3 Sep). The lumpsum is stored in the quote's currency, so
+  // switching the currency silently turns that figure into a different amount
+  // to the customer — and the same figure carries into the Sale Order and the
+  // invoice. The conversion RATE is not gated: it no longer affects what a
+  // lumpsum means.
+  const lumpsumBlocksCurrencyChange = async()=>{
+    try{
+      const { data } = await sb.from("quote_commercial_terms")
+        .select("packing_forwarding_basis,packing_forwarding_value")
+        .eq("reference_number",refFilter).maybeSingle();
+      return !!(data && data.packing_forwarding_basis==="Flat" && Number(data.packing_forwarding_value));
+    }catch(e){ return false; }
+  };
+
   const doSaveQuoteHeader = async()=>{
     if(!refFilter) return;
     const effCurrency = (headerDraft.currency||"").trim()!=="" ? headerDraft.currency : (quoteHeaderRow?quoteHeaderRow.currency:"INR");
+    const currencyChanged = (headerDraft.currency||"").trim()!=="" && headerDraft.currency!==(quoteHeaderRow?quoteHeaderRow.currency:"INR");
+    if(currencyChanged && await lumpsumBlocksCurrencyChange()){
+      alert("This quote has a Packing & Forwarding LUMPSUM, which is stored in "+
+            (quoteHeaderRow?.currency||"INR")+" \u2014 the currency it was entered in.\n\n"+
+            "Changing the quote currency to "+headerDraft.currency+" would leave that amount unchanged as a "+
+            "NUMBER while meaning a completely different sum to the customer, and it carries into the Sale Order "+
+            "and the invoice.\n\n"+
+            "Clear the lumpsum first and re-enter it in the new currency, or get an admin code to override.");
+      setAuthGate({requiredType:"edit",action:()=>doSaveQuoteHeaderInner()});
+      return;
+    }
+    return doSaveQuoteHeaderInner();
+  };
+
+  const doSaveQuoteHeaderInner = async()=>{
+    if(!refFilter) return;
+    const effCurrency = (headerDraft.currency||"").trim()!=="" ? headerDraft.currency : (quoteHeaderRow?quoteHeaderRow.currency:"INR");
+    // recomputed here, not inherited: this function is also called on its own
+    // from the admin-code path, where the outer scope is gone.
     const currencyChanged = (headerDraft.currency||"").trim()!=="" && headerDraft.currency!==(quoteHeaderRow?quoteHeaderRow.currency:"INR");
     const effConvRate = (headerDraft.conversion_rate||"").trim()!=="" ? Number(headerDraft.conversion_rate) : (currencyChanged ? 0 : (quoteHeaderRow?quoteHeaderRow.conversion_rate:1));
     if(effCurrency!=="INR" && !(Number(effConvRate)>10)){ alert("Enter a valid conversion rate (1 "+effCurrency+" = ? INR, must be greater than 10) before saving — required for any non-INR quote."); return; }
@@ -10554,6 +10749,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [extraPriceLines,setExtraPriceLines]=useState([]); // rows from quote_extra_price_tbl for this ref
   const [extraPriceGhostDraft,setExtraPriceGhostDraft]=useState({}); // {[lineId]: {label,price}} — only used in amendment mode
   const [extraPriceNewLines,setExtraPriceNewLines]=useState([]); // brand-new lines added this session, not yet saved
+  const [extraPriceValueOptions,setExtraPriceValueOptions]=useState([]);
+  const loadExtraPriceValues=useCallback(async()=>{
+    const{data}=await sb.from("extra_price_value_tbl").select("value").order("sort_order").order("value");
+    setExtraPriceValueOptions((data||[]).map(r=>r.value));
+  },[]);
+  useEffect(()=>{ loadExtraPriceValues(); },[loadExtraPriceValues]);
   const [extraPriceLabelOptions,setExtraPriceLabelOptions]=useState([]);
   const loadExtraPriceLabels=useCallback(async()=>{
     const{data}=await sb.from("extra_price_labels_tbl").select("value").order("value");
@@ -10700,9 +10901,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const { data: attrRows } = await sb.from("quote_sl_job_attribute_tbl").select("*").eq("reference_number",quoteExportRef).eq("item_sl_no",openRef.item_sl_no);
     setSlJobAttrs(attrRows||[]);
   };
-  const addSlExtraPriceLine=async(label,price)=>{
+  const addSlExtraPriceLine=async(label,price,datasheetValue)=>{
     if(!label||!label.trim()) return;
-    await sb.from("quote_sl_extra_price_tbl").insert({reference_number:quoteExportRef,item_sl_no:openRef.item_sl_no,label:label.trim(),price:Number(price)||0,created_by:user?.username||"unknown"});
+    await sb.from("quote_sl_extra_price_tbl").insert({reference_number:quoteExportRef,item_sl_no:openRef.item_sl_no,label:label.trim(),price:Number(price)||0,datasheet_value:(datasheetValue||"").trim()||null,created_by:user?.username||"unknown"});
     openOptionsTesting();
   };
   const deleteSlExtraPriceLine=async(row)=>{
@@ -11538,6 +11739,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
 
   const openEstimate=async(ref)=>{
     const isDifferentSlNo = !openRef || openRef.reference_number!==ref.reference_number || openRef.item_sl_no!==ref.item_sl_no;
+    // LEAVING a Sl No whose manual description has gone stale — ask before
+    // moving on. Moving to another Sl No is the ordinary way out of the BOM
+    // window, so this is where the question belongs.
+    if(isDifferentSlNo && descStale && openRef && openRef.description_is_manual && descMasterRowForItem){
+      const item = openLines[0]?.item || "";
+      const size = openLines[0]?.size || "";
+      const built = buildAutoDescription(descMasterRowForItem, openLines, item, size);
+      if(built && built.trim()!==(openRef.description||"").trim()){
+        setDescStalePrompt({ ref:openRef, current:openRef.description||"", built:built.trim(), next:ref });
+        return;   // hold here until answered
+      }
+    }
     setOpenRef(ref); setLoadingLines(true); setOrderQty(ref.order_qty||1); setLineEdits({}); setSavingLine({});
     setEditingDescSlNo(false);
     setUnsavedGuard(false);
@@ -12194,6 +12407,30 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // Column A ("Component" header) is always blank on data rows — the sub-assembly
   // name is shown once as its own group-header row instead. Column B ("Sub
   // Assembly" header) carries the line's own component value.
+  // TOTAL SUMMARY for the BOM exports (3 Sep). The screen has shown unit and
+  // total cost and sale under every Sl No for a while; the exports never
+  // carried it. Computed on the SAME basis as bomDataRow so the block always
+  // agrees with the rows above it, and rounded through roundedUnitTotal so the
+  // unit multiplies out — the same treatment the Price Summary gets.
+  //
+  // These are INTERNAL documents. Cost appears here and must never reach a
+  // customer-facing one.
+  const bomTotalsFor = (lines, orderQtyForSl, currency, conversionRate)=>{
+    const q = Number(orderQtyForSl)||1;
+    let cost=0, sale=0;
+    (lines||[]).forEach(l=>{
+      const qtyByOrder = r2(r2(l.qty_required)*q);
+      const c = r2(qtyByOrder*r2(l.rate));
+      cost += c; sale += r2(c*r2(l.sf||3.1));
+    });
+    const ccy = currency||"INR";
+    const fx = Number(conversionRate)||1;
+    const costR = roundedUnitTotal(cost,q);
+    const saleR = roundedUnitTotal(sale,q);
+    const saleConvR = (ccy!=="INR" && fx>0) ? roundedUnitTotal(sale/fx,q) : null;
+    return { q, ccy, costR, saleR, saleConvR };
+  };
+
   const bomDataRow = (l, orderQtyForSl, withSales)=>{
     const qtyReqd = r2(l.qty_required);
     const qtyByOrder = r2(qtyReqd*(orderQtyForSl||1));
@@ -12243,6 +12480,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           rows.push([]);
           withRowSpacing(grp.lines.map(l=>bomDataRow(l, est.order_qty||1, withSales)), []).forEach(r=>rows.push(r));
         });
+        // ---- TOTAL SUMMARY, matching the on-screen panel ----
+        const T = bomTotalsFor(lines, est.order_qty||1, est.currency, est.conversion_rate);
+        rows.push([]); rows.push([]);
+        rows.push(["TOTAL SUMMARY"]);
+        rows.push(["", "Unit", "Qty", "Total"]);
+        rows.push(["Cost", T.costR.unit, T.q, T.costR.total]);
+        if(withSales){
+          rows.push(["Sale", T.saleR.unit, T.q, T.saleR.total]);
+          if(T.saleConvR) rows.push(["Sale ("+T.ccy+")", T.saleConvR.unit, T.q, T.saleConvR.total]);
+        }
         const ws = XLSX.utils.aoa_to_sheet(rows);
         ws["!cols"] = [{wch:14},{wch:12},{wch:18},{wch:36},{wch:15},{wch:12},{wch:8},{wch:14},{wch:11},{wch:7},{wch:12},{wch:13}];
         applyNumberFormat(ws, headerRowCount+1);
@@ -12390,6 +12637,28 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           headStyles:{fillColor:[255,255,255],textColor:dark,fontStyle:"bold",fontSize:8,font:"times",lineColor:[200,200,200],lineWidth:0.2},
           bodyStyles:{fontSize:7.5,textColor:dark,lineWidth:0},
           columnStyles,
+          margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
+          didDrawPage: ensureLetterhead
+        });
+        // ---- TOTAL SUMMARY, the same block the screen shows ----
+        // Its own small table under the BOM rather than a footer row, so unit,
+        // qty and total read across as they do on screen.
+        const T = bomTotalsFor(lines, est.order_qty||1, est.currency, est.conversion_rate);
+        const sumBody = [["Cost", fmt(T.costR.unit), String(T.q), fmt(T.costR.total)]];
+        if(withSales){
+          sumBody.push(["Sale", fmt(T.saleR.unit), String(T.q), fmt(T.saleR.total)]);
+          if(T.saleConvR) sumBody.push(["Sale ("+T.ccy+")", fmt(T.saleConvR.unit), String(T.q), fmt(T.saleConvR.total)]);
+        }
+        doc.autoTable({
+          startY: doc.lastAutoTable.finalY + 4,
+          head:[["TOTAL SUMMARY","Unit","Qty","Total"]],
+          body: sumBody,
+          theme:"grid",
+          tableWidth:"wrap",
+          styles:{font:"times",cellPadding:{top:1.5,right:4,bottom:1.5,left:4}},
+          headStyles:{fillColor:[244,242,234],textColor:dark,fontStyle:"bold",fontSize:8,font:"times",lineColor:[200,200,200],lineWidth:0.2},
+          bodyStyles:{fontSize:8,textColor:dark},
+          columnStyles:{0:{cellWidth:34},1:{cellWidth:30,halign:"right"},2:{cellWidth:16,halign:"right"},3:{cellWidth:34,halign:"right"}},
           margin:{top:CONTENT_TOP_Y,left:14,right:14,bottom:18},
           didDrawPage: ensureLetterhead
         });
@@ -12718,11 +12987,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // those aren't declared yet at this point in the function.
       const pfQuoteIsInr = (first.currency||"INR")==="INR";
       const pfQuoteFx = Number(first.conversion_rate)||1;
+      // A LUMPSUM IS ALREADY IN THE QUOTE CURRENCY (3 Sep) — it is no longer
+      // divided by the rate. Before this it was always stored in INR and
+      // converted here, which is what made "which currency do I type in"
+      // impossible to answer on screen. Percentage is unaffected: a percentage
+      // of a total that is already in the display currency.
       const pfComputedAmount = terms.packing_forwarding_basis==="Flat"
-        ? (pfQuoteIsInr ? (Number(terms.packing_forwarding_value)||0) : (Number(terms.packing_forwarding_value)||0)/pfQuoteFx)
+        ? (Number(terms.packing_forwarding_value)||0)
         : pfBasicPriceTotal*(Number(terms.packing_forwarding_value)||0)/100;
       const pfDisplay = !terms.packing_forwarding_basis ? (terms.packing_forwarding||"—") // pre-24-Aug quotes with only the old free-text value
-        : terms.packing_forwarding_basis==="Flat" ? fmtR(pfComputedAmount)+" (Lumpsum, entered in ₹"+fmtR(Number(terms.packing_forwarding_value)||0)+")"
+        : terms.packing_forwarding_basis==="Flat" ? fmtR(pfComputedAmount)+" (Lumpsum)"
         : (Number(terms.packing_forwarding_value)||0)+"% ("+fmtR(pfComputedAmount)+")";
       // Global testing redistribution: each test's combined total (across
       // all items it was applied to — always "all items" per the confirmed
@@ -12776,6 +13050,33 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         return slNoBaseTotalInr(est) + slExtraTotal + testingFold;
       };
       const grandTotalInr = estimatesRows.reduce((s,est)=>s+slNoFoldedTotalInr(est),0) + extraPriceTotal + testingSeparateTotal;
+
+      // GRAND TOTAL AS PRINTED (3 Sep). Every Price Summary ROW is rounded by
+      // roundedUnitTotal — the unit is rounded once and the row total derived
+      // as rounded_unit x qty, so each row multiplies out correctly. The grand
+      // total was NOT: it summed the raw unrounded Sl No values and converted
+      // at the end, so the printed column did not add up to the printed total.
+      // Across enough Sl Nos those per-row roundings accumulate visibly.
+      //
+      // Now the grand total is the SUM OF THE ROWS AS PRINTED, which is what
+      // anyone checking by hand will add up. Computed in DISPLAY currency,
+      // because that is the currency the rounding happened in — converting a
+      // rounded rupee figure afterwards would reintroduce the same drift.
+      //
+      // The Cover Letter's Total Basic Price reads this same value. That was
+      // always the point of sharing one figure between the two documents;
+      // this keeps them together while making both agree with the table.
+      const grandTotalPrinted = (()=>{
+        const slNoSum = estimatesRows.reduce((acc,est)=>{
+          const q = est.order_qty||1;
+          const tInr = slNoFoldedTotalInr(est);
+          const tDisp = quoteIsInr ? tInr : (quoteFx>0 ? tInr/quoteFx : 0);
+          return acc + roundedUnitTotal(tDisp, q).total;
+        },0);
+        const extrasInr = extraPriceTotal + testingSeparateTotal;
+        const extrasDisp = quoteIsInr ? extrasInr : (quoteFx>0 ? extrasInr/quoteFx : 0);
+        return slNoSum + extrasDisp;
+      })();
 
       const {data:revChangesRows} = isRevisionPdf ? await sb.from("revision_changes").select("*").eq("revision_ref",quoteExportRef).order("changed_at",{ascending:true}) : {data:[]};
       const revChangesForPdf = revChangesRows||[];
@@ -12941,7 +13242,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const coverLetterBody = [
           ["Delivery", effDelivery],
           ["Validity", effValidity],
-          ["Total Basic Price", quoteCurrency+" "+fmtR(quoteIsInr?grandTotalInr:(grandTotalInr/quoteFx))]
+          // Same figure the Price Summary adds up to — see grandTotalPrinted.
+          ["Total Basic Price", quoteCurrency+" "+fmtR(grandTotalPrinted)]
         ];
         doc.autoTable({
           startY:y,
@@ -13195,7 +13497,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // wherever it prints, since Contract data is keyed by it.
       doc.addPage();
       const summaryStartPage = doc.internal.getNumberOfPages();
-      const grandTotalDisplay = quoteIsInr ? grandTotalInr : (grandTotalInr/quoteFx);
+      const grandTotalDisplay = grandTotalPrinted;   // see grandTotalPrinted above
       let summaryEndPage;
       const annexureIITitle = "ANNEXURE II - PRICE SUMMARY";
       const summaryRows = estimatesRows.map(est=>{
@@ -13341,8 +13643,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             cursorY = doc.lastAutoTable.finalY+6;
           }
           const body=[];
+          const priceSecGrp = grp.sectionsRows.find(sec=>sec.title==="Price Data");
           grp.sectionsRows.forEach(sec=>{
             if(!sec.rows.length) return;
+            if(sec.title==="Price Data") return;
             body.push([{content:sec.title,colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
             sec.rows.forEach(r=>body.push([r.label, r.value]));
           });
@@ -13354,10 +13658,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           // and every other section matched exactly.
           const slOptionsUnion=[]; const seenOpt=new Set();
           grp.members.forEach(m=>(slExtraByItem.get(m.slNo)||[]).forEach(o=>{ if(!seenOpt.has(o.label)){ seenOpt.add(o.label); slOptionsUnion.push(o); } }));
-          if(slOptionsUnion.length){ body.push([{content:"Options",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]); slOptionsUnion.forEach(o=>body.push([o.label,""])); }
+          if(slOptionsUnion.length){ body.push([{content:"Options",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]); slOptionsUnion.forEach(o=>body.push([o.label, o.datasheet_value||""])); }
           const slTestsUnion=[]; const seenTest=new Set();
           grp.members.forEach(m=>[...(slTestingByItem.get(m.slNo)||[]), ...(globalTestingByItem.get(m.slNo)||[]).map(g=>({test_name:g.test_name}))].forEach(t=>{ if(!seenTest.has(t.test_name)){ seenTest.add(t.test_name); slTestsUnion.push(t); } }));
           if(slTestsUnion.length){ body.push([{content:"Testing",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]); slTestsUnion.forEach(t=>body.push([t.test_name+" — Included in scope",""])); }
+          // PRICE DATA LAST, always. Held back above and pushed here, after
+          // Options and Testing.
+          if(priceSecGrp && priceSecGrp.rows.length){
+            body.push([{content:priceSecGrp.title,colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
+            priceSecGrp.rows.forEach(r=>body.push([r.label, r.value]));
+          }
           doc.autoTable({
             startY:cursorY, body, theme:"plain",
             styles:{font:"helvetica",fontSize:8.5,textColor:dark,cellPadding:{top:1,right:5,bottom:1,left:5}},
@@ -13424,20 +13734,33 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           doc.setFontSize(9); doc.setTextColor(...dark); doc.setFont(undefined,"bold");
           doc.text("Sl No "+inst.slNo+" — "+inst.itemName,12,yy);
           const body=[];
+          // Price Data is held back and pushed after Options and Testing —
+          // see the order rule below. It is identified by title so a section
+          // added to the template later cannot displace it.
+          const priceSecInst = inst.sectionsRows.find(sec=>sec.title==="Price Data");
           inst.sectionsRows.forEach(sec=>{
             if(!sec.rows.length) return;
+            if(sec.title==="Price Data") return;
             body.push([{content:sec.title,colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
             sec.rows.forEach(r=>body.push([r.label, r.value]));
           });
+          // ORDER RULE (3 Sep): Options, then Testing, then Price Data LAST.
+          // Price Data is separated out of the section list above and pushed
+          // at the very end, so a section added later cannot land after it.
           const slOptions = slExtraByItem.get(inst.slNo)||[];
           if(slOptions.length){
             body.push([{content:"Options",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
-            slOptions.forEach(o=>body.push([o.label, ""]));
+            slOptions.forEach(o=>body.push([o.label, o.datasheet_value||""]));
           }
           const slTests = [...(slTestingByItem.get(inst.slNo)||[]), ...(globalTestingByItem.get(inst.slNo)||[]).map(g=>({test_name:g.test_name}))];
           if(slTests.length){
             body.push([{content:"Testing",colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
             slTests.forEach(t=>body.push([t.test_name+" — Included in scope", ""]));
+          }
+          // PRICE DATA LAST, always.
+          if(priceSecInst && priceSecInst.rows.length){
+            body.push([{content:priceSecInst.title,colSpan:2,styles:{fontStyle:"bold",font:"times",fontSize:10}}]);
+            priceSecInst.rows.forEach(r=>body.push([r.label, r.value]));
           }
           doc.autoTable({
             startY:yy+6, body, theme:"plain",
@@ -14369,6 +14692,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                     ? h("div",{style:{fontSize:13,fontWeight:700,color:colors.text}},openRef.description)
                     : h("div",{style:{fontSize:11.5,color:colors.danger}},"Description is missing for this Sl No — required for the quote to be \"ready to go\"."),
                   h("button",{onClick:()=>{ setDescDraft(openRef.description||""); setEditingDescSlNo(true); setUnsavedGuard(true,"You have an unsaved description edit. Leave anyway?"); },style:{...btnSmall,fontSize:10.5,padding:"3px 9px"}},"Edit"),
+                  (descStale && openRef?.description_is_manual) && h("span",{
+                    title:"This description was typed by hand, and a BOM change since then would have produced different wording. It has been left exactly as you wrote it. You will be asked whether to update it when you leave this Sl No.",
+                    style:{fontSize:10.5,color:"#854f0b",background:"#fff4d6",border:"1px solid #e0c48a",padding:"2px 8px",borderRadius:9,cursor:"help"}},
+                    "Manual \u2014 out of date with the BOM"),
+                  (!descStale && openRef?.description_is_manual) && h("span",{
+                    title:"Typed by hand. BOM changes will not overwrite it; you will be asked first.",
+                    style:{fontSize:10.5,color:colors.mutedLight,border:"1px solid "+colors.border,padding:"2px 8px",borderRadius:9,cursor:"help"}},
+                    "Manual"),
+                  (!descMasterRowForItem && descMasterMissingItem) && h("span",{
+                    title:"Master Data \u2192 Description Master has no rule for the item \""+descMasterMissingItem+"\". Without one this description can only ever be typed by hand \u2014 it will not rebuild from the BOM, and it will not update when a BOM line changes.",
+                    style:{fontSize:10.5,color:"#854f0b",background:"#fff4d6",border:"1px solid #e0c48a",padding:"2px 8px",borderRadius:9,cursor:"help"}},
+                    "No description rule for \u201c"+descMasterMissingItem+"\u201d \u2014 manual only"),
                   descMasterRowForItem && h("button",{onClick:rebuildDescriptionFromBom,style:{...btnSmall,fontSize:10.5,padding:"3px 9px",color:"#8a6d1f",borderColor:colors.accent}},"Rebuilt From BOM")
                 ),
                 editingDescSlNo && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.45)",zIndex:1260,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
@@ -14381,9 +14716,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                       h("button",{onClick:()=>{
                         if(!descDraft.trim()){ alert("Description is required."); return; }
                         const doSave = async()=>{
-                          await sb.from("estimates").update({description:descDraft.trim()}).eq("id",openRef.id);
-                          setOpenRef(r=>({...r,description:descDraft.trim()}));
-                          setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:descDraft.trim()}:r));
+                          // Typed by hand, so flag it. That is what stops the
+                          // auto-refresh silently overwriting this wording.
+                          await sb.from("estimates").update({description:descDraft.trim(),description_is_manual:true}).eq("id",openRef.id);
+                          setOpenRef(r=>({...r,description:descDraft.trim(),description_is_manual:true}));
+                          setRefs(rs=>rs.map(r=>r.id===openRef.id?{...r,description:descDraft.trim(),description_is_manual:true}:r));
+                          setDescStale(false);
                           refreshReadiness(refFilter);
                           setEditingDescSlNo(false);
                           setUnsavedGuard(false);
@@ -15691,9 +16029,34 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             fld("Packing and forwarding",null,h("div",null,
               h("div",{style:{display:"flex",gap:6}},
                 h("select",{value:ctData.packing_forwarding_basis||"Percentage",onChange:e=>setCtData(d=>({...d,packing_forwarding_basis:e.target.value})),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:110}},
-                  h("option",{value:"Percentage"},"Percentage"), h("option",{value:"Flat"},"Lumpsum (₹)")
+                  h("option",{value:"Percentage"},"Percentage"), h("option",{value:"Flat"},"Lumpsum")
                 ),
-                h("input",{type:"number",value:ctData.packing_forwarding_value||"",onChange:e=>setCtData(d=>({...d,packing_forwarding_value:e.target.value})),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:100},placeholder:ctData.packing_forwarding_basis==="Flat"?"Amount in ₹":"%"})
+                // A lumpsum is now entered in the QUOTE'S OWN CURRENCY, not
+                // always in INR as it was before 3 Sep. The badge is inside the
+                // field border so it reads as one control — there is nothing to
+                // pick, it simply states what the number means. That matters
+                // beyond the quote: the same figure carries into the Sale Order
+                // and the invoice, where "which currency is this" cannot be a
+                // rule someone has to remember.
+                (()=>{
+                  const ccy = quoteHeaderRow?.currency||"";
+                  const fxSet = ccy==="INR" || Number(quoteHeaderRow?.conversion_rate)>0;
+                  const ready = !!ccy && fxSet;
+                  if(ctData.packing_forwarding_basis!=="Flat"){
+                    return h("input",{type:"number",value:ctData.packing_forwarding_value||"",onChange:e=>setCtData(d=>({...d,packing_forwarding_value:e.target.value})),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:100},placeholder:"%"});
+                  }
+                  if(!ready){
+                    // ONLY the lumpsum is held, not the whole screen — validity,
+                    // payment and delivery terms do not care about currency.
+                    return h("span",{style:{fontSize:11.5,color:"#854f0b",background:"#fff4d6",border:"1px solid #e0c48a",borderRadius:6,padding:"6px 10px",display:"inline-block",maxWidth:340}},
+                      !ccy ? "Set the quote CURRENCY on the header before entering a lumpsum — otherwise the amount has no currency attached to it."
+                           : "Set the CONVERSION RATE on the header before entering a lumpsum.");
+                  }
+                  return h("span",{style:{display:"inline-flex",alignItems:"stretch",border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
+                    h("span",{style:{display:"flex",alignItems:"center",padding:"0 10px",background:"#e6f4f1",color:"#0f6e56",fontSize:12,fontWeight:600,borderRight:"1px solid "+colors.border}},ccy),
+                    h("input",{type:"number",value:ctData.packing_forwarding_value||"",onChange:e=>setCtData(d=>({...d,packing_forwarding_value:e.target.value})),style:{...inputStyle,padding:"7px 9px",fontSize:12,width:110,border:"none",textAlign:"right"},placeholder:"Amount"})
+                  );
+                })()
               ),
               // Lumpsum is always entered in INR (30 Aug), regardless of
               // the quote's own currency — converted here for the
@@ -15705,8 +16068,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   const quoteCcy = quoteHeaderRow.currency||"INR";
                   const quoteFxRate = Number(quoteHeaderRow.conversion_rate)||1;
                   if(ctData.packing_forwarding_basis==="Flat"){
-                    const converted = quoteCcy==="INR" ? v : v/quoteFxRate;
-                    return "Computed: "+quoteCcy+" "+fmtR(converted)+(quoteCcy==="INR"?"":" (entered as ₹"+fmtR(v)+", converted)");
+                    // No conversion any more — entered and printed in the same
+                    // currency (3 Sep). Previously the value was always INR and
+                    // was divided by the rate here and in the PDF.
+                    return "Prints as: "+quoteCcy+" "+fmtR(v)+" — entered and shown in the same currency, no conversion.";
                   }
                   const amt = ctBasicPrice*v/100;
                   return "Computed: "+fmtR(amt)+" ("+v+"% of "+fmtR(ctBasicPrice)+" basic)";
@@ -15845,7 +16210,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("td",{style:{padding:"5px 6px",textAlign:"center"}},h("button",{onClick:()=>deleteSlExtraPriceLine(l),style:{...btnSmall,color:colors.danger}},"Delete"))
             )))
           ),
-          h(NewOptionsLineForm,{labelOptions:extraPriceLabelOptions,refreshLabels:loadExtraPriceLabels,onAdd:addSlExtraPriceLine}),
+          h(NewOptionsLineForm,{labelOptions:extraPriceLabelOptions,refreshLabels:loadExtraPriceLabels,valueOptions:extraPriceValueOptions,refreshValues:loadExtraPriceValues,onAdd:addSlExtraPriceLine}),
           slExtraPriceLines.length>0 && h("p",{style:{fontSize:11,color:colors.muted,marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:8}},
             "Total ₹"+slExtraPriceLines.reduce((s,l)=>s+Number(l.price),0).toFixed(2)+" ÷ qty "+(openRef&&openRef.order_qty||1)+" = ₹"+(slExtraPriceLines.reduce((s,l)=>s+Number(l.price),0)/((openRef&&openRef.order_qty)||1)).toFixed(2)+" added to unit price"
           )
@@ -15918,6 +16283,25 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
+    descStalePrompt && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1100,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:640,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"This description was typed by hand"),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14}},
+          "Sl No "+(descStalePrompt.ref.item_sl_no||"")+" \u2014 the BOM has changed since it was written, and the rule would now produce different wording. Nothing has been overwritten."),
+        h("div",{style:{marginBottom:10}},
+          h("div",{style:{fontSize:11,fontWeight:600,color:colors.muted,marginBottom:3}},"What you typed"),
+          h("div",{style:{fontSize:12,lineHeight:1.55,border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#fafaf7",whiteSpace:"pre-wrap"}},descStalePrompt.current||"(empty)")),
+        h("div",{style:{marginBottom:14}},
+          h("div",{style:{fontSize:11,fontWeight:600,color:"#0f6e56",marginBottom:3}},"What the BOM now gives"),
+          h("div",{style:{fontSize:12,lineHeight:1.55,border:"1px solid #9fe1cb",borderRadius:6,padding:"8px 10px",background:"#f2fbf8",whiteSpace:"pre-wrap"}},descStalePrompt.built)),
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:12}},
+          "Keeping it manual changes nothing. You will be asked again the next time a BOM line makes it out of date."),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,borderTop:"1px solid "+colors.border,paddingTop:14}},
+          h("button",{onClick:()=>resolveDescStale(false),style:btnSecondary},"Keep mine"),
+          h("button",{onClick:()=>resolveDescStale(true),style:btnPrimary},"Use the BOM description"))
+      )
+    ),
+
     showGlobalTestPicker && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:480,maxWidth:"100%",maxHeight:"85vh",overflow:"auto"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Which tests are required?"),
@@ -19009,6 +19393,236 @@ const MANUAL_SECTIONS = [
   {
     "group": "Admin",
     "articles": [
+      {
+        "key": "bom_total_summary",
+        "title": "Total Summary on the BOM exports",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The BOM PDF and the BOM Excel now carry a Total Summary under each Sl No \u2014 unit, quantity and total, for cost and for sale, the same block the screen has always shown. Until 3 September the exports carried the rows but no totals, so anyone reading the document had to add them up."
+          },
+          {
+            "type": "tip",
+            "text": "The summary is worked out from exactly the same figures as the rows above it, so the two can never disagree. The unit is rounded once and the total derived from it, which means the block multiplies out when someone checks it by hand."
+          },
+          {
+            "type": "p",
+            "text": "On a non-INR quote a third line shows the sale in the quote currency. The conversion happens once, on the total, after the rows are summed."
+          },
+          {
+            "type": "tip",
+            "text": "These are INTERNAL documents and they show COST. The customer-facing Annexure II shows sale only. Take care which one is being sent."
+          },
+          {
+            "type": "p",
+            "text": "Exporting the cost-only version of the BOM leaves the sale lines off the summary as well, so it stays a cost document throughout."
+          }
+        ]
+      },
+      {
+        "key": "pf_lumpsum_currency",
+        "title": "Packing and forwarding \u2014 which currency",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A Packing and Forwarding LUMPSUM is entered in the quote's own currency. The currency is shown as a badge inside the amount box, so there is nothing to remember and nothing to work out."
+          },
+          {
+            "type": "p",
+            "text": "It changed on 3 September. Before, a lumpsum was always typed in rupees whatever the quote's currency, and was divided by the conversion rate wherever it printed. That was never obvious on screen, and people reasonably typed dollars into a rupee field."
+          },
+          {
+            "type": "tip",
+            "text": "The number is now printed exactly as typed \u2014 no conversion at any point. Type 1,250 on a USD quote and the customer sees USD 1,250."
+          },
+          {
+            "type": "tip",
+            "text": "The lumpsum box is held until the header carries a currency, and a conversion rate for anything other than INR. Only that one box \u2014 validity, payment and delivery terms can still be filled in, since they do not depend on currency."
+          },
+          {
+            "type": "p",
+            "text": "Once a lumpsum exists, changing the quote's CURRENCY needs an admin code. The stored figure would otherwise stay the same number while meaning a completely different amount to the customer, and it carries through to the Sale Order and the invoice. Clearing the lumpsum and re-entering it is usually the better answer. The conversion RATE is not restricted \u2014 it no longer affects what a lumpsum means."
+          },
+          {
+            "type": "p",
+            "text": "PERCENTAGE basis is unaffected throughout. A percentage has no currency."
+          },
+          {
+            "type": "p",
+            "text": "Quotes created before this change that used a lumpsum on a non-INR quote hold a rupee figure that will now print as the quote currency. Nothing was altered automatically \u2014 those quotes are listed by the phase 41 report so they can be corrected by hand."
+          }
+        ]
+      },
+      {
+        "key": "options_datasheet_value",
+        "title": "Options on the datasheet",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "An option carries a label, what the datasheet should say against it, and a price. The middle one is new as of 3 September."
+          },
+          {
+            "type": "p",
+            "text": "Before, an option had only a label and a price, so the datasheet printed the label with nothing beside it \u2014 \"RT Charges\" and then blank. A customer reading that cannot tell whether it is included, chargeable, or not offered at all."
+          },
+          {
+            "type": "tip",
+            "text": "The value is REQUIRED, with \"leave blank\" as an explicit choice on the list. A blank is then something you decided rather than something you forgot."
+          },
+          {
+            "type": "tip",
+            "text": "It is deliberately NOT filled in for you from the price. A priced line is not necessarily in your scope \u2014 it may be a chargeable extra the customer goes on to decline \u2014 so the app asks rather than assumes."
+          },
+          {
+            "type": "p",
+            "text": "The wording comes from a master seeded with Our Scope, Included in scope, By others, Not applicable and Refer Note. Add your own from the same dropdown and it is there for everyone next time."
+          },
+          {
+            "type": "p",
+            "text": "Options added before this change have no value and still print blank. Nothing has been altered retrospectively \u2014 re-run a quote if you want the new wording on it."
+          }
+        ]
+      },
+      {
+        "key": "datasheet_section_order",
+        "title": "The order of sections on a datasheet",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A datasheet prints its template sections first, then Options, then Testing, and PRICE DATA LAST. Always."
+          },
+          {
+            "type": "p",
+            "text": "Until 3 September Price Data landed in the middle \u2014 after the template sections but before Options and Testing, because those two were added to the page afterwards. Price sitting above scope reads wrongly on a customer document."
+          },
+          {
+            "type": "tip",
+            "text": "This is a standing rule, not a one-off fix. Price Data is now held back deliberately and pushed at the very end, so any section added to the datasheet in future cannot land after it."
+          }
+        ]
+      },
+      {
+        "key": "grand_total_rounding",
+        "title": "Why the Price Summary now adds up",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Every row of Annexure II shows a unit price, a quantity and a total. The unit price is rounded, and the row total is that rounded unit multiplied by the quantity \u2014 so each row multiplies out exactly as a customer would check it by hand."
+          },
+          {
+            "type": "p",
+            "text": "The Grand Total used to be worked out differently: from the raw unrounded figures, converted to the quote currency at the end. Each row was rounded by a rupee or two, and across a quote with several Sl Nos those roundings added up. The column did not equal the total printed beneath it."
+          },
+          {
+            "type": "tip",
+            "text": "Fixed 3 September. The Grand Total is now the sum of the rows AS PRINTED. Add the Total column up yourself and you will get the Grand Total, every time."
+          },
+          {
+            "type": "p",
+            "text": "The Cover Letter's Total Basic Price reads the same figure, so the two documents still agree with each other \u2014 and now both agree with the table as well. On a quote regenerated after this change the total may differ from an older copy by a few rupees. That is the correction, not a new error."
+          }
+        ]
+      },
+      {
+        "key": "manual_description",
+        "title": "Typed descriptions and the BOM",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A Sl No description is either BUILT from the BOM using the item's Description Master rule, or TYPED by hand. The app now knows which, and treats them differently."
+          },
+          {
+            "type": "p",
+            "text": "A built description follows the BOM. Change a line and it updates itself. A typed one does not \u2014 it stays exactly as you wrote it, whatever happens to the BOM."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "Click Edit and save your own wording. The description is now marked Manual.",
+              "Change a BOM line that the rule would have used. Nothing is overwritten, but an amber marker appears saying the description is out of date with the BOM.",
+              "Leave that Sl No. You are shown what you typed and what the BOM now gives, side by side.",
+              "Choose Keep mine or Use the BOM description."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "Keeping yours changes nothing at all, and you will be asked AGAIN the next time a BOM line makes it out of date. That is deliberate: a prompt that stops asking lets a description drift further and further from what is actually being built, with nothing to say so."
+          },
+          {
+            "type": "tip",
+            "text": "Pressing Rebuild makes the description BUILT again, so it goes back to following the BOM and the Manual marker disappears. That is how you undo a manual description."
+          },
+          {
+            "type": "p",
+            "text": "Before 3 September there was no such distinction. A typed description was silently overwritten the next time any BOM line changed, and there was no way to keep your own wording short of not touching the BOM."
+          }
+        ]
+      },
+      {
+        "key": "description_rule_missing",
+        "title": "Why a description will not rebuild",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The Sl No description is normally built from the BOM using the rule held for that item in Master Data \u2192 Description Master. Change a BOM line and the description follows; the Rebuild button forces it."
+          },
+          {
+            "type": "p",
+            "text": "If the item has NO rule, none of that can happen. The description can only be typed by hand \u2014 it will not rebuild, and it will not update when a BOM line changes."
+          },
+          {
+            "type": "tip",
+            "text": "Until 3 September this failed silently: the Rebuild button was simply hidden and nothing said why, so the description just never updated and it looked like a fault. An amber note now appears beside the description naming the item that has no rule."
+          },
+          {
+            "type": "p",
+            "text": "The fix is to add a rule for that item under Master Data \u2192 Description Master. Once it exists, the description rebuilds from the BOM like every other item."
+          }
+        ]
+      },
+      {
+        "key": "advance_prompt",
+        "title": "Advance payment \u2014 the question at approval",
+        "tag": "Sale Order",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Commercial Terms cannot be approved until someone has said whether the order carries an advance. Click Approve and the question appears first."
+          },
+          {
+            "type": "p",
+            "text": "It is asked there because that is the one moment somebody is definitely reading the payment terms. Asked anywhere else it gets skipped, and a missed advance is not a small thing \u2014 on contracts whose delivery is counted from receipt of advance, the clock never starts."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "Click Approve on Commercial Terms.",
+              "Read the payment term shown in the panel.",
+              "If there is an advance, enter the percentage or the amount and choose Yes. An entry opens in the Advance Register straight away.",
+              "If there is none, choose No advance."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "The app reads the payment terms and tells you what it thinks. If they mention an advance it says so, and answering No then needs a one-line reason \u2014 not to argue with you, but because in six months somebody will ask why an order with '30% advance' in its terms was recorded as having none."
+          },
+          {
+            "type": "tip",
+            "text": "The app never decides this itself. Payment terms are free text and cannot be read reliably, so it raises the suspicion and you settle it. If the terms say nothing but the PO calls for an advance, answer Yes \u2014 you have read the PO and the app has not."
+          },
+          {
+            "type": "p",
+            "text": "Answering Yes needs the percentage or the amount, because the proforma cannot be raised without one. Until the question is answered the banner shows an amber note beside Commercial Terms; afterwards it shows the advance and confirms it is in the register."
+          }
+        ]
+      },
       {
         "key": "doc_categories",
         "title": "Document Categories",
@@ -31487,15 +32101,38 @@ function exportRowsToPdf(title, columns, rows, filename){
   });
   doc.save(filename+".pdf");
 }
-function NewOptionsLineForm({ labelOptions, refreshLabels, onAdd }){
+// "Shows on datasheet as" (3 Sep). An option used to carry a label and a
+// price only, so the datasheet printed the label with a blank beside it —
+// "RT Charges" and then nothing, which tells a customer nothing at all.
+// REQUIRED, with an explicit "leave blank" choice, so a blank is a decision
+// rather than something forgotten. Deliberately NOT defaulted from the
+// price: a priced line is not necessarily in your scope, it may be a
+// chargeable extra the customer declines.
+const EXTRA_VALUE_BLANK = "\u2014 leave blank \u2014";
+function NewOptionsLineForm({ labelOptions, refreshLabels, valueOptions, refreshValues, onAdd }){
   const [label,setLabel]=useState("");
+  const [dsValue,setDsValue]=useState("");
   const [price,setPrice]=useState("");
-  return h("div",{style:{display:"flex",gap:8,alignItems:"flex-end",marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:10}},
-    h("div",{style:{flex:1}},
-      h(MasterSelect,{value:label,onChange:setLabel,options:labelOptions,table:"extra_price_labels_tbl",fieldLabel:"Extra Price Labels",refreshOptions:refreshLabels,placeholder:"Select label…",style:{fontSize:12.5,padding:"7px 9px"}})
+  const [err,setErr]=useState("");
+  const submit = ()=>{
+    if(!label||!label.trim()){ setErr("Pick a label."); return; }
+    if(!dsValue){ setErr("Say what the datasheet should show against this label, or choose to leave it blank."); return; }
+    setErr("");
+    onAdd(label, price, dsValue===EXTRA_VALUE_BLANK ? "" : dsValue);
+    setLabel(""); setPrice(""); setDsValue("");
+  };
+  return h("div",{style:{marginTop:10,borderTop:"1px solid "+colors.border,paddingTop:10}},
+    h("div",{style:{display:"flex",gap:8,alignItems:"flex-end"}},
+      h("div",{style:{flex:1}},
+        h(MasterSelect,{value:label,onChange:v=>{setLabel(v); if(err)setErr("");},options:labelOptions,table:"extra_price_labels_tbl",fieldLabel:"Extra Price Labels",refreshOptions:refreshLabels,placeholder:"Select label…",style:{fontSize:12.5,padding:"7px 9px"}})
+      ),
+      h("div",{style:{flex:1}},
+        h(MasterSelect,{value:dsValue,onChange:v=>{setDsValue(v); if(err)setErr("");},options:[...(valueOptions||[]),EXTRA_VALUE_BLANK],table:"extra_price_value_tbl",fieldLabel:"Datasheet Values",refreshOptions:refreshValues,placeholder:"Shows on datasheet as…",style:{fontSize:12.5,padding:"7px 9px"}})
+      ),
+      h("input",{value:price,onChange:e=>setPrice(e.target.value),placeholder:"Price",style:{...inputStyle,width:100,padding:"7px 9px",fontSize:12.5,textAlign:"right"}}),
+      h("button",{onClick:submit,style:btnPrimary},"+ Add")
     ),
-    h("input",{value:price,onChange:e=>setPrice(e.target.value),placeholder:"Price",style:{...inputStyle,width:100,padding:"7px 9px",fontSize:12.5,textAlign:"right"}}),
-    h("button",{onClick:()=>{ onAdd(label,price); setLabel(""); setPrice(""); },style:btnPrimary},"+ Add")
+    err ? h("div",{style:{fontSize:11,color:colors.danger,marginTop:6}},err) : null
   );
 }
 
