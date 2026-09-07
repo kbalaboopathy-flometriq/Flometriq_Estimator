@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-04T01:10:00Z";
+  var APP_BUILD_VERSION = "2026-09-05T02:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -9595,7 +9595,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const syncCuttingScrollFromBottom=()=>{ if(cuttingBottomScrollRef.current&&cuttingTopScrollRef.current) cuttingTopScrollRef.current.scrollLeft=cuttingBottomScrollRef.current.scrollLeft; };
   const [lineEdits,setLineEdits]=useState({}); // {refNum-slNo: {field:value}} — pending unsaved edits
   const [savingLine,setSavingLine]=useState({}); // {refNum-slNo: true} — saving in progress
-  const [quoteExportRef,setQuoteExportRef]=useState(""); const [exportingQuote,setExportingQuote]=useState("");
+  const [quoteExportRef,setQuoteExportRef]=useState(""); const [showCartSummary,setShowCartSummary]=useState(false);
+  const [exportingQuote,setExportingQuote]=useState("");
   // PDF generation counter — reads the existing audit_log EXPORT entries
   // attemptGenerateQuotePdf already writes on every successful generation
   // (no new tracking table). Scoped per Quote# family (base + every -Rev-N),
@@ -9931,7 +9932,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           const rate = Number(l.rate)||0;
           const sf = Number(l.sf)||3.1;
           clean.cost = Number((qty*Number(newQty)*rate).toFixed(4));
-          clean.sales_price = Number((clean.cost*sf).toFixed(4));
+          clean.sales_price = computeSalesPrice(clean.cost, sf);
         }
         return clean;
       });
@@ -10044,7 +10045,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const rate = Number(line.rate)||0;
         const sf = Number(line.sf)||3.1;
         const cost = Number((qty*n*rate).toFixed(4));
-        const sales_price = Number((cost*sf).toFixed(4));
+        const sales_price = computeSalesPrice(cost, sf);
         if(Number(line.cost)===cost && Number(line.sales_price)===sales_price) continue;
         await sb.from("estimate_lines").update({cost,sales_price}).eq("id",line.id);
         if(openRef && openRef.id===ref.id) setOpenLines(ls=>ls.map(l=>l.id===line.id?{...l,cost,sales_price}:l));
@@ -11440,7 +11441,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const rate=Number(edits.rate!==undefined?edits.rate:line.rate)||0;
       const sf=Number(edits.sf!==undefined?edits.sf:line.sf)||3.1;
       const cost=Number((qty*(orderQty||1)*rate).toFixed(4));
-      const sales_price=Number((cost*sf).toFixed(4));
+      const sales_price=computeSalesPrice(cost, sf);
       const payload={...edits,cost,sales_price};
       // A Validated Direct Price line whose price actually changes on a
       // revision needs re-validation — the whole point of Validated is
@@ -11487,7 +11488,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const qty = Number(getLineVal(line,"qty_required"))||0;
     const sf = Number(getLineVal(line,"sf"))||3.1;
     const cost = Number((qty*(orderQty||1)*newRate).toFixed(4));
-    const sales_price = Number((cost*sf).toFixed(4));
+    const sales_price = computeSalesPrice(cost, sf);
     if(Number(line.rate)===Number(newRate)) return false; // already current, nothing to write
     const payload = {rate:newRate, cost, sales_price};
     if(line.is_direct_price===true && line.validation_status==="Validated" && Number(line.sales_price)!==sales_price){
@@ -11887,7 +11888,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         cutting_plan_layout_size:addCuttingPlan||"", cutting_plan_qty:Number(addCutPlanQty)||0, cutting_plan_uom:addCuttingUom||"",
         material_spec:addSpec, grade:addGrade, qty_required:Number(addQty)||0,
         uom:addUom, rate, cost:(Number(addQty)||0)*rate, sf:Number(addSf)||3.1,
-        sales_price:(Number(addSf)||3.1)*(Number(addQty)||0)*rate
+        sales_price:computeSalesPrice((Number(addQty)||0)*rate, Number(addSf)||3.1)
       };
       const{data,error:err}=await sb.from("estimate_lines").insert(payload).select().single();
       if(err) throw err;
@@ -11919,7 +11920,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         lines: (rows||[]).map(r=>({reference_number:r.reference_number,item_sl_no:r.item_sl_no,sl_no:r.sl_no,sf:r.sf,sales_price:r.sales_price}))
       });
       for(const r of rows||[]){
-        const newSales = (Number(r.cost)||0) * v;
+        const newSales = computeSalesPrice(r.cost, v);
         await sb.from("estimate_lines").update({sf:v, sales_price:newSales}).eq("reference_number",r.reference_number).eq("item_sl_no",r.item_sl_no).eq("sl_no",r.sl_no);
       }
       await logAudit("UPDATE","estimate_lines",refFilter,"Bulk Sf change to "+v+" across all Sl Nos of Quote# "+refFilter,user?.username||"unknown",null,{sf:v,lineCount:(rows||[]).length});
@@ -11975,7 +11976,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     try{
       const { data: rows } = await sb.from("estimate_lines").select("*").eq("reference_number",openRef.reference_number).eq("item_sl_no",openRef.item_sl_no);
       for(const r of rows||[]){
-        const newSales = (Number(r.cost)||0) * v;
+        const newSales = computeSalesPrice(r.cost, v);
         await sb.from("estimate_lines").update({sf:v, sales_price:newSales}).eq("reference_number",r.reference_number).eq("item_sl_no",r.item_sl_no).eq("sl_no",r.sl_no);
       }
       await logAudit("UPDATE","estimate_lines",openRef.reference_number+"-"+openRef.item_sl_no,"Sf change to "+v+" for Sl No "+openRef.item_sl_no+" only",user?.username||"unknown",null,{sf:v,lineCount:(rows||[]).length});
@@ -12142,7 +12143,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const rate = Number(getLineVal(line,"rate"))||0;
         const sf = Number(getLineVal(line,"sf"))||3.1;
         const cost = Number((qty*n*rate).toFixed(4));
-        const sales_price = Number((cost*sf).toFixed(4));
+        const sales_price = computeSalesPrice(cost, sf);
         if(Number(line.cost)===cost && Number(line.sales_price)===sales_price) continue; // already correct
         const payload = {cost, sales_price};
         if(line.is_direct_price===true && line.validation_status==="Validated" && Number(line.sales_price)!==sales_price){
@@ -14569,6 +14570,14 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         ),
         h("div",{style:{display:"flex",gap:16,flexWrap:"wrap"}},
           h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            // CART, as a fixed block. The Go to Cart button used to move about
+            // the toolbar depending on which warning banners were showing, so it
+            // was never in the same place twice. The old button stays where it is;
+            // this one does not move.
+            h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4",marginRight:8,display:"inline-block",verticalAlign:"top"}},
+              h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"CART"),
+              h("button",{onClick:()=>setShowCart(true),disabled:!quoteExportRef,style:{...btnSmall,fontSize:11.5,width:"100%"}},"Go to Cart"),
+              h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginTop:5}},"always here")),
             h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"BOM ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(per Sl No)")),
             h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:colors.muted,marginBottom:6,cursor:"pointer"}},
               h("input",{type:"checkbox",checked:includeSalesPrice,onChange:e=>setIncludeSalesPrice(e.target.checked)}),
@@ -14603,9 +14612,22 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("button",{onClick:()=>exportQuoteCuttingPlanExcel(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-xlsx"?"Working…":"Excel"),
               h("button",{onClick:()=>exportQuoteCuttingPlanPDF(quoteCuttingPlanIncludeCost),disabled:!quoteExportRef||!!exportingQuote,style:btnSmall},exportingQuote==="cut-pdf"?"Working…":"PDF")
             )
+          ),
+          // CART SUMMARY — one row per Sl No across the whole estimator sheet,
+          // with the EFFECTIVE sales factor, and the Sales Head's way in to
+          // change a factor by sub-assembly.
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},
+              "Cart Summary ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(whole estimator sheet)")),
+            h("button",{onClick:()=>setShowCartSummary(true),disabled:!quoteExportRef,style:{...btnSmall,width:"100%"}},"Open")
           )
         )
       ),
+      showCartSummary && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1150,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"24px 16px",overflow:"auto"}},
+        h("div",{style:{background:"#fff",borderRadius:8,width:1200,maxWidth:"100%"}},
+          h(CartSummaryScreen,{user,quoteRef:quoteExportRef}),
+          h("div",{style:{display:"flex",justifyContent:"flex-end",padding:"0 24px 18px"}},
+            h("button",{onClick:()=>setShowCartSummary(false),style:btnPrimary},"Close")))),
             refFilter && h(QuoteNotesPanel,{referenceNumber:refFilter,user}),
       showAmendGate && h(AuthCodeGate,{requiredType:"edit",user,onClose:()=>setShowAmendGate(false),onAuthorized:async()=>{ setShowAmendGate(false); setShowAmendPicker(true); }}),
       showAmendPicker && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:250}},
@@ -19402,6 +19424,51 @@ const MANUAL_SECTIONS = [
   {
     "group": "Admin",
     "articles": [
+      {
+        "key": "cart_summary",
+        "title": "Cart Summary and the sales factor",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "One row per Sl No across the whole estimator sheet, with the description, cost, sales factor, quantity and total. Open it from the Cart Summary block in Export full quote."
+          },
+          {
+            "type": "p",
+            "text": "The Sf column shows the EFFECTIVE factor \u2014 total sale divided by total cost for that Sl No. Where the sub-assemblies under it do not all share one factor, the number appears in italics with a star, because it is a figure nobody typed."
+          },
+          {
+            "type": "tip",
+            "text": "A row can only be expanded where its factors actually differ. Rows with a single factor show a dot instead of a plus \u2014 there is nothing behind it. Inside, the tweaked sub-assemblies are named and everything else collapses to one Others line."
+          },
+          {
+            "type": "p",
+            "text": "The base factor is the one on the MOST LINES, not the most money. A tweak is usually the minority by count, so this states which is the exception and which is the rule."
+          },
+          {
+            "type": "steps",
+            "items": [
+              "Expand an Sl No that shows a plus.",
+              "Press Edit beside the sub-assembly whose factor you want to change.",
+              "The dialog lists every BOM line it will rewrite, and shows what the Sl No total becomes before you commit.",
+              "Apply stages it. The row updates and an unsaved marker appears \u2014 nothing is written yet.",
+              "Save writes every staged change together."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "Only the SALES HEAD can change a factor here \u2014 whoever currently holds that post under Admin \u2192 Posts. Everyone else sees the same figures read only, which is the point: they can see what the Sales Head decided."
+          },
+          {
+            "type": "p",
+            "text": "Undo my changes clears everything staged and puts the screen back to how you found it. It does not touch anything saved earlier, by you or anyone else."
+          },
+          {
+            "type": "p",
+            "text": "Changing a factor rewrites sf AND the sales price on every affected line, together, in one operation. Every route that changes a sales factor \u2014 this screen, the BOM line editor, the global Sf tool \u2014 now uses one shared calculation, so the same change made from different screens can no longer produce different numbers."
+          }
+        ]
+      },
       {
         "key": "report_an_issue",
         "title": "Reporting an issue",
@@ -30421,6 +30488,281 @@ function IssueTracker({ user }){
                 h("button",{key:s.status,onClick:()=>setStatus(r,s.status),style:{...btnSmall,fontSize:11}},s.status))) : null
           ) : null
         ))));
+}
+
+// ---- SALES PRICE: ONE FORMULA, EVERYWHERE (5 Sep) ----
+// Before this there were FOUR. Five call sites used
+// Number((cost*sf).toFixed(4)); the global Sf tool used a bare
+// cost*sf with no rounding; the per-Sl-No Sf tool did the same; and
+// the manual-line adder computed sf*qty*rate without the cost
+// intermediate at all. The same change made through different
+// screens therefore wrote values that disagreed in the fourth
+// decimal — and the manual adder could disagree by more, because it
+// skipped the rounding of cost that every other path applies first.
+//
+// computeCost and computeSalesPrice are now the ONLY way either is
+// worked out. Any new gateway calls these; none rolls its own.
+function computeCost(qtyRequired, orderQty, rate){
+  return Number(((Number(qtyRequired)||0) * (Number(orderQty)||1) * (Number(rate)||0)).toFixed(4));
+}
+function computeSalesPrice(cost, sf){
+  return Number(((Number(cost)||0) * (Number(sf)||3.1)).toFixed(4));
+}
+
+/* ---- CART SUMMARY / SALES FACTOR REVIEW (5 Sep) ----
+   One row per Sl No across the whole estimator sheet, with the
+   EFFECTIVE sales factor — total sale over total cost — because a
+   single Sl No may carry several factors and no one of them is "the"
+   factor for that row.
+
+   A row expands only where its sub-assemblies actually differ. Inside,
+   the exceptions are named and everything else collapses to one
+   "Others" line.
+
+   ORPHANS. Lines are grouped by sub_assembly. A line with a blank or
+   null sub_assembly would silently vanish from the grouping and its
+   cost would disappear from the row — so those are folded into Others
+   explicitly, and the group totals are asserted against the ungrouped
+   line total before anything is shown.
+
+   CONSISTENCY. Writes go through computeSalesPrice, the same helper
+   every other gateway now uses. sf and sales_price are always written
+   together; a factor is never stored without its price being
+   recomputed in the same statement. */
+function CartSummaryScreen({ user, quoteRef }){
+  const [lines,setLines] = useState([]);
+  const [ests,setEsts] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [open,setOpen] = useState({});
+  const [edit,setEdit] = useState(null);      // {slNo, group, from, to, lineIds}
+  const [toVal,setToVal] = useState("");
+  const [staged,setStaged] = useState({});    // key slNo||group -> new sf
+  const [saving,setSaving] = useState(false);
+  const [msg,setMsg] = useState("");
+  const [salesHead,setSalesHead] = useState(false);
+
+  const OTHERS = "Others";
+
+  const load = useCallback(async()=>{
+    if(!quoteRef){ setLoading(false); return; }
+    setLoading(true);
+    const [{data:e},{data:l},{data:holders},{data:emp}] = await Promise.all([
+      sb.from("estimates").select("*").eq("reference_number",quoteRef),
+      sb.from("estimate_lines").select("*").eq("reference_number",quoteRef),
+      sb.from("post_holder_tbl").select("employee_name").eq("post_key","sales_head"),
+      sb.from("employee_tbl").select("employee_name").eq("app_user_id",user?.id||"").maybeSingle(),
+    ]);
+    setEsts(e||[]); setLines(l||[]);
+    const me = emp && emp.employee_name;
+    setSalesHead(!!me && (holders||[]).some(h=>h.employee_name===me));
+    setStaged({}); setLoading(false);
+  },[quoteRef,user]);
+  useEffect(()=>{ load(); },[load]);
+
+  // ---- grouping, with the orphan guard ----
+  const rows = useMemo(()=>{
+    const bySl = new Map();
+    (ests||[]).forEach(e=>bySl.set(String(e.item_sl_no), {est:e, lines:[]}));
+    (lines||[]).forEach(l=>{
+      const k = String(l.item_sl_no);
+      if(!bySl.has(k)) bySl.set(k, {est:null, lines:[]});   // never drop a line
+      bySl.get(k).lines.push(l);
+    });
+    const out = [];
+    bySl.forEach((v,slNo)=>{
+      const sfOf = (l)=> staged[slNo+"||"+groupNameOf(l)] ?? (Number(l.sf)||3.1);
+      // count lines per sub-assembly factor to find the BASE — the factor on
+      // the MOST LINES, not the most cost. A tweak is the minority by count.
+      const cnt = new Map();
+      v.lines.forEach(l=>{ const f=String(Number(l.sf)||3.1); cnt.set(f,(cnt.get(f)||0)+1); });
+      let baseF = null, best = -1;
+      cnt.forEach((n,f)=>{ if(n>best){best=n; baseF=f;} });
+      function groupNameOf(l){
+        const sa = (l.sub_assembly||"").trim();
+        return (String(Number(l.sf)||3.1) === baseF || !sa) ? OTHERS : sa;
+      }
+      const groups = new Map();
+      v.lines.forEach(l=>{
+        const g = groupNameOf(l);
+        if(!groups.has(g)) groups.set(g, {name:g, lines:[], cost:0, sf:Number(l.sf)||3.1});
+        const G = groups.get(g);
+        G.lines.push(l); G.cost += Number(l.cost)||0;
+      });
+      const gl = [...groups.values()].map(G=>({
+        ...G, sf: staged[slNo+"||"+G.name] ?? G.sf,
+      }));
+      gl.sort((a,b)=> a.name===OTHERS ? 1 : b.name===OTHERS ? -1 : a.name.localeCompare(b.name));
+      const cost = gl.reduce((s,G)=>s+G.cost,0);
+      const sale = gl.reduce((s,G)=>s+computeSalesPrice(G.cost,G.sf),0);
+      // ORPHAN CHECK — grouped cost must equal ungrouped cost exactly.
+      const raw = v.lines.reduce((s,l)=>s+(Number(l.cost)||0),0);
+      const lost = Math.abs(raw-cost) > 0.005;
+      out.push({slNo, est:v.est, groups:gl, cost, sale,
+                qty: Number(v.est?.order_qty)||1,
+                mixed: gl.length>1, lost, lineCount:v.lines.length});
+    });
+    out.sort((a,b)=>{
+      const na=Number(a.slNo), nb=Number(b.slNo);
+      if(isFinite(na)&&isFinite(nb)) return na-nb;         // 1,2,3,10 not 1,10,2
+      return String(a.slNo).localeCompare(String(b.slNo));
+    });
+    return out;
+  },[ests,lines,staged]);
+
+  const gCost = rows.reduce((s,r)=>s+r.cost*r.qty,0);
+  const gSale = rows.reduce((s,r)=>s+r.sale*r.qty,0);
+  const dirty = Object.keys(staged).length>0;
+  const fmt=(v)=> (Number(v)||0).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+
+  const openEdit = (row,G)=>{
+    if(!salesHead){ setMsg("Only the Sales Head can change a sales factor here."); return; }
+    setMsg(""); setEdit({slNo:row.slNo, group:G.name, from:G.sf, lines:G.lines});
+    setToVal(String(G.sf));
+  };
+  const preview = ()=>{
+    if(!edit) return null;
+    const row = rows.find(r=>r.slNo===edit.slNo); if(!row) return null;
+    const v = Number(toVal);
+    const before = row.sale*row.qty;
+    const after = row.groups.reduce((s,G)=>
+      s + computeSalesPrice(G.cost, G.name===edit.group ? (v||0) : G.sf), 0) * row.qty;
+    return {before, after, delta:after-before,
+            effAfter: row.cost ? row.groups.reduce((s,G)=>
+              s + computeSalesPrice(G.cost, G.name===edit.group ? (v||0) : G.sf),0)/row.cost : 0};
+  };
+  const applyEdit = ()=>{
+    const v = Number(toVal);
+    if(!(v>0)){ setMsg("Enter a sales factor greater than zero."); return; }
+    if(v===Number(edit.from)){ setMsg("That is the same factor."); return; }
+    const p = preview();
+    if(!confirm(edit.group+" on Sl No "+edit.slNo+" goes from "+Number(edit.from).toFixed(2)+
+                " to "+v.toFixed(2)+".\n\n"+edit.lines.length+" BOM line"+(edit.lines.length>1?"s":"")+
+                " will be rewritten, and their sales prices recalculated with them.\n\n"+
+                "This Sl No moves by "+(p&&p.delta>=0?"+":"")+fmt(p?p.delta:0)+".\n\n"+
+                "Nothing is written until you press Save.")) return;
+    setStaged(st=>({...st,[edit.slNo+"||"+edit.group]:v}));
+    setEdit(null); setMsg("");
+  };
+
+  const doSave = async()=>{
+    setSaving(true); setMsg("");
+    try{
+      for(const key of Object.keys(staged)){
+        const [slNo,group] = key.split("||");
+        const v = staged[key];
+        const row = rows.find(r=>r.slNo===slNo);
+        const G = row && row.groups.find(x=>x.name===group);
+        if(!G) continue;
+        for(const l of G.lines){
+          // sf and sales_price ALWAYS written together, through the one helper.
+          const sales_price = computeSalesPrice(l.cost, v);
+          await sb.from("estimate_lines").update({sf:v, sales_price}).eq("id",l.id);
+        }
+        await logAudit("UPDATE","estimate_lines",quoteRef+" Sl "+slNo,
+          "Sales factor "+group+": "+Number(G.sf).toFixed(2)+" \u2192 "+Number(v).toFixed(2)+
+          " across "+G.lines.length+" line(s), from the Cart Summary",
+          user?.username||"unknown",null,null);
+      }
+      await load();
+    }catch(e){ setMsg("Could not save: "+e.message); }
+    setSaving(false);
+  };
+
+  const p = preview();
+
+  return h("div",{style:{padding:"20px 24px",maxWidth:1180}},
+    h("div",{style:{display:"flex",alignItems:"baseline",gap:12,flexWrap:"wrap",marginBottom:4}},
+      h("div",{style:{fontWeight:700,fontSize:16}},"Cart Summary \u2014 "+(quoteRef||"")),
+      h("span",{style:{fontSize:11.5,color:colors.mutedLight}},"whole estimator sheet"),
+      h("span",{style:{marginLeft:"auto",display:"flex",gap:6}},
+        dirty?h("button",{onClick:()=>setStaged({}),style:btnSecondary},"Undo my changes"):null,
+        dirty?h("button",{onClick:doSave,disabled:saving,style:btnPrimary},saving?"Saving\u2026":"Save"):null)),
+
+    h("div",{style:{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap",padding:"9px 12px",
+        background:"#f4f2ea",borderRadius:6,marginBottom:12}},
+      h("span",{style:{fontSize:12.5}},"Effective sales factor ",
+        h("b",{style:{fontSize:15}}, gCost? (gSale/gCost).toFixed(2) : "\u2014")),
+      h("span",{style:{fontSize:11.5,color:colors.mutedLight}},"total sale \u00f7 total cost, whole sheet"),
+      salesHead
+        ? h("span",{style:{fontSize:11.5,background:"#e6f4f1",color:"#0f6e56",padding:"2px 9px",borderRadius:9}},"Sales Head \u2014 editable")
+        : h("span",{style:{fontSize:11.5,color:colors.mutedLight,border:"1px solid "+colors.border,padding:"2px 9px",borderRadius:9}},"read only"),
+      dirty?h("span",{style:{fontSize:11.5,background:"#fff4d6",color:"#854f0b",padding:"2px 9px",borderRadius:9}},"unsaved"):null),
+
+    msg?h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},msg):null,
+
+    loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading\u2026")
+    : rows.length===0 ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Nothing on this quote yet.")
+    : h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflowX:"auto"}},
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",minWidth:760}},
+        h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.border,background:"#faf9f4"}},
+          h("th",{style:{width:28}}),
+          ["Sl No in Enq","Item","Description"].map(x=>h("th",{key:x,style:{textAlign:"left",padding:"8px 6px",fontWeight:600}},x)),
+          ["Unit cost","Sf","Unit price","Qty","Total"].map(x=>h("th",{key:x,style:{textAlign:"right",padding:"8px 6px",fontWeight:600}},x)))),
+        h("tbody",null, rows.flatMap(r=>{
+          const eff = r.cost ? r.sale/r.cost : 0;
+          const main = h("tr",{key:r.slNo,style:{borderBottom:"1px solid "+colors.border}},
+            h("td",{style:{padding:"8px 5px"}},
+              r.mixed
+                ? h("button",{onClick:()=>setOpen(o=>({...o,[r.slNo]:!o[r.slNo]})),style:{...btnSmall,fontSize:11,padding:"1px 7px"}},open[r.slNo]?"\u2212":"+")
+                : h("span",{title:"single factor \u2014 nothing to open",style:{color:colors.mutedLight,cursor:"help"}},"\u00b7")),
+            h("td",{style:{padding:"8px 6px"}},r.est?.sl_no_in_enq||r.slNo),
+            h("td",{style:{padding:"8px 6px"}},r.est?.item||""),
+            h("td",{style:{padding:"8px 6px"}},
+              (r.est?.description||"").slice(0,90),
+              r.lost?h("span",{title:"Some lines could not be grouped. Figures may be short — tell whoever maintains the app.",
+                style:{marginLeft:6,fontSize:10.5,background:"#fdecea",color:"#a32b1c",padding:"1px 7px",borderRadius:9}},"grouping gap"):null),
+            h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmt(r.cost)),
+            h("td",{style:{padding:"8px 6px",textAlign:"right",fontStyle:r.mixed?"italic":"normal"}},eff.toFixed(2)+(r.mixed?" *":"")),
+            h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmt(r.sale)),
+            h("td",{style:{padding:"8px 6px",textAlign:"right"}},r.qty),
+            h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmt(r.sale*r.qty)));
+          if(!open[r.slNo]) return [main];
+          const det = h("tr",{key:r.slNo+"-d",style:{background:"#faf9f4"}},
+            h("td",null), h("td",{colSpan:8,style:{padding:"9px 6px 12px"}},
+              h("div",{style:{display:"flex",flexDirection:"column",gap:5,maxWidth:470}},
+                r.groups.map(G=>h("div",{key:G.name,style:{display:"flex",alignItems:"center",gap:10,
+                    borderTop:G.name===OTHERS?"1px solid "+colors.border:"none",paddingTop:G.name===OTHERS?6:0}},
+                  h("span",{style:{flex:1,fontSize:12,color:G.name===OTHERS?colors.text:"#854f0b"}},
+                    G.name, h("span",{style:{color:colors.mutedLight,fontSize:11}}," ("+G.lines.length+")")),
+                  h("span",{style:{fontSize:12,width:44,textAlign:"right"}},Number(G.sf).toFixed(2)),
+                  salesHead?h("button",{onClick:()=>openEdit(r,G),style:{...btnSmall,fontSize:11,padding:"2px 9px"}},"Edit"):null)))));
+          return [main,det];
+        })),
+        h("tfoot",null,h("tr",{style:{fontWeight:700,borderTop:"2px solid "+colors.border}},
+          h("td",null),h("td",{colSpan:7,style:{padding:"9px 6px"}},"Total"),
+          h("td",{style:{padding:"9px 6px",textAlign:"right"}},fmt(gSale)))))),
+
+    edit ? h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:600,maxWidth:"100%",maxHeight:"88vh",overflow:"auto"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Change sales factor \u2014 "+edit.group),
+        h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},
+          "Sl No "+edit.slNo+" \u00b7 applies to this Sl No only"),
+        h("div",{style:{display:"flex",gap:12,alignItems:"flex-end",marginBottom:14,flexWrap:"wrap"}},
+          h("div",{style:{width:96}},h("div",{style:{fontSize:11,color:colors.muted,marginBottom:3}},"Current"),
+            h("input",{value:Number(edit.from).toFixed(2),disabled:true,style:{...inputStyle,padding:"7px 9px",fontSize:13,width:"100%",textAlign:"right"}})),
+          h("div",{style:{fontSize:17,color:colors.mutedLight,paddingBottom:5}},"\u2192"),
+          h("div",{style:{width:96}},h("div",{style:{fontSize:11,color:colors.muted,marginBottom:3}},"New"),
+            h("input",{value:toVal,autoFocus:true,onChange:e=>{setToVal(e.target.value); if(msg)setMsg("");},
+              style:{...inputStyle,padding:"7px 9px",fontSize:13,width:"100%",textAlign:"right"}}))),
+        h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden",marginBottom:14}},
+          h("div",{style:{background:"#f4f2ea",padding:"7px 11px",fontSize:12,fontWeight:600}},
+            "The "+edit.lines.length+" BOM line"+(edit.lines.length>1?"s":"")+" this rewrites"),
+          edit.lines.slice(0,12).map(l=>h("div",{key:l.id,style:{display:"flex",gap:10,padding:"6px 11px",borderTop:"1px solid "+colors.border,fontSize:11.5}},
+            h("span",{style:{flex:1}},(l.component||"")+(l.sub_assembly?(" \u2014 "+l.sub_assembly):"")+(l.material_spec?(" \u00b7 "+l.material_spec):"")),
+            h("span",{style:{color:colors.mutedLight}},fmt(l.cost)),
+            h("span",{style:{width:90,textAlign:"right"}},fmt(computeSalesPrice(l.cost, Number(toVal)||0))))),
+          edit.lines.length>12?h("div",{style:{padding:"6px 11px",fontSize:11,color:colors.mutedLight,borderTop:"1px solid "+colors.border}},
+            "\u2026and "+(edit.lines.length-12)+" more"):null),
+        p?h("div",{style:{background:"#fff4d6",borderRadius:6,padding:"11px 13px",marginBottom:14,fontSize:12.5,color:"#854f0b",lineHeight:1.8}},
+          "Sl No total ",h("b",null,fmt(p.before))," \u2192 ",h("b",null,fmt(p.after)),
+          p.delta?h("span",null," ("+(p.delta>0?"+":"")+fmt(p.delta)+")"):null,
+          h("br",null),
+          "Sl No effective factor \u2192 ",h("b",null,p.effAfter.toFixed(2))):null,
+        msg?h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},msg):null,
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,borderTop:"1px solid "+colors.border,paddingTop:14}},
+          h("button",{onClick:()=>{setEdit(null);setMsg("");},style:btnSecondary},"Cancel"),
+          h("button",{onClick:applyEdit,style:btnPrimary},"Apply")))) : null
+  );
 }
 
 function FreeAreaCalculator({ user }){
