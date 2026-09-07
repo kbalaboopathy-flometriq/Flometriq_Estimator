@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-07T04:10:00Z";
+  var APP_BUILD_VERSION = "2026-09-07T05:40:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -7154,7 +7154,7 @@ function MocGradeRow({ row, onPickSingle, onPickSplit }){
   );
 }
 
-function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose }) {
+function DatasheetModal({ openRef, openLines, model, modelItemMap, user, sessionCompany, onClose }) {
   const itemName = (modelItemMap&&model&&modelItemMap.get(model)) || (openLines && openLines[0] && openLines[0].item) || "";
   const [template,setTemplate] = useState(undefined); // undefined=loading, null=none found
   const [values,setValues] = useState({});
@@ -7504,6 +7504,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
   };
 
   const exportPDF = async()=>{
+    try {
     const today = new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
@@ -7555,6 +7556,16 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, onClose
       doc.text(pdfFooterCompanyName(sessionCompany)+" | Datasheet | "+today,12,doc.internal.pageSize.getHeight()-5);
     }
     doc.save(openRef.reference_number+"_sl"+openRef.item_sl_no+"_"+itemName.replace(/\s+/g,"_")+"_Datasheet.pdf");
+    // 7 Sep — this export used to fail SILENTLY. It read sessionCompany for
+    // the letterhead and footer, but DatasheetModal was never given that
+    // prop, so the button threw and simply looked dead. The prop is threaded
+    // in now; this catch is here so the NEXT such fault announces itself
+    // instead of being mistaken for a button that does nothing. Excel export
+    // is untouched.
+    } catch(e){
+      console.error("Datasheet PDF failed", e);
+      alert("Could not generate the datasheet PDF: "+(e.message||e));
+    }
   };
 
   const filledCount = editableSections.reduce((sum,s)=>sum+s.fields.filter(f=>(values[f.key]!==undefined&&values[f.key]!=="")||f.default).length,0);
@@ -9862,6 +9873,20 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   };
   const [showNewSlNoModal,setShowNewSlNoModal]=useState(false);
   const [showCartScreen,setShowCartScreen]=useState(false);
+  // THE ONLY WAY THE CART IS OPENED (7 Sep). There are two Go to Cart
+  // buttons on this screen — the one in the toolbar row and the fixed one
+  // in the CART block — and they had drifted: the toolbar one called
+  // setShowCartScreen and worked, the fixed one called a setShowCart that
+  // was never declared anywhere, so it threw a ReferenceError and looked
+  // like a dead button. They also disagreed on when to be available.
+  // Same principle as computeCost/computeSalesPrice: one behaviour, one
+  // definition, called from every gateway. A new Go to Cart button anywhere
+  // uses openCartScreen and cartUnavailable — it does not roll its own.
+  // quoteExportRef mirrors refFilter (see the effect that syncs them), so
+  // this is the same "is a quote selected" test the toolbar button already
+  // applied through its render condition — no button loses availability.
+  const cartUnavailable = !quoteExportRef;
+  const openCartScreen = ()=>setShowCartScreen(true);
   const [newSlNoInput,setNewSlNoInput]=useState("");
   const [newSlNoError,setNewSlNoError]=useState("");
   const [newSlNoStep,setNewSlNoStep]=useState("input"); // "input" | "confirm"
@@ -14301,7 +14326,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             onSaved: async()=>{ setShowBomExemptions(false); await refreshReadiness(refFilter); }
           }),
           h("div",{style:{display:"flex",gap:8}},
-            h("button",{onClick:()=>setShowCartScreen(true),style:{...btnSmall,border:"1px solid "+colors.border,display:"flex",alignItems:"center",gap:5}},h("i",{className:"ti ti-shopping-cart","aria-hidden":"true",style:{fontSize:13}}),"Go to Cart"),
+            h("button",{onClick:openCartScreen,disabled:cartUnavailable,style:{...btnSmall,border:"1px solid "+colors.border,display:"flex",alignItems:"center",gap:5}},h("i",{className:"ti ti-shopping-cart","aria-hidden":"true",style:{fontSize:13}}),"Go to Cart"),
             isAdmin && h("button",{onClick:openDeleteQuote,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger}},"Delete this Revision"),
             isAdmin && h("button",{onClick:openDeleteEntireQuote,style:{...btnSmall,background:colors.danger,color:"#fff",border:"none",fontWeight:600}},mode==="contract"?"Delete Entire Sale Order":"Delete Entire Quote"),
             h("button",{onClick:()=>attemptCloseOrNewQuotes("close"),style:{padding:"6px 14px",fontSize:12,fontWeight:600,borderRadius:5,border:"none",background:colors.danger,color:"#fff",cursor:"pointer"}},"Close")
@@ -14585,7 +14610,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             // this one does not move.
             h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4",marginRight:8,display:"inline-block",verticalAlign:"top"}},
               h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"CART"),
-              h("button",{onClick:()=>setShowCart(true),disabled:!quoteExportRef,style:{...btnSmall,fontSize:11.5,width:"100%"}},"Go to Cart"),
+              h("button",{onClick:openCartScreen,disabled:cartUnavailable,style:{...btnSmall,fontSize:11.5,width:"100%"}},"Go to Cart"),
               h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginTop:5}},"always here")),
             h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"BOM ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(per Sl No)")),
             h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:colors.muted,marginBottom:6,cursor:"pointer"}},
@@ -14788,7 +14813,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 )
             )
             ),
-            showPricingPanel && h(PricingDescriptionPanel,{ openRef, openLines, user, itemOptions:dpItemOptions, onSaved:()=>{ openEstimate(openRef); refreshReadiness(openRef.reference_number); }, onViewBom:()=>setShowBomOverride(true), hasRealBom:openLinesHaveRealBom }),
+            showPricingPanel && h(PricingDescriptionPanel,{ openRef, openLines, user, sessionCompany, itemOptions:dpItemOptions, onSaved:()=>{ openEstimate(openRef); refreshReadiness(openRef.reference_number); }, onViewBom:()=>setShowBomOverride(true), hasRealBom:openLinesHaveRealBom }),
             showDetailPanel&&h("div",{style:fullScreenBOM?{position:"fixed",inset:0,zIndex:1000,background:"#f4f2ea",padding:20,overflowY:"auto"}:{}},
               h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},
                 h("div",{style:{fontSize:13,fontWeight:700}}, fullScreenBOM?("BOM — "+(openRef?openRef.reference_number+" · Sl No "+openRef.item_sl_no:"")):""),
@@ -15163,7 +15188,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
-    showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, onClose:()=>{ setShowDatasheet(false); refreshAll(); } }),
+    showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, sessionCompany, onClose:()=>{ setShowDatasheet(false); refreshAll(); } }),
     historyOpen && refFilter && h(QuoteHistoryPanel,{ referenceNumber:refFilter, onClose:()=>setHistoryOpen(false) }),
     quotesCloseAction && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:260}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 22px",width:400,maxWidth:"94vw"}},
@@ -18996,6 +19021,10 @@ const MANUAL_SECTIONS = [
           {
             "type": "tip",
             "text": "If generation fails you get a pop-up starting \"Could not generate the PDF:\" followed by the exact reason. Nothing is saved or damaged when this happens \u2014 the quote is untouched and you can simply try again. Note the wording down (or use Report an issue, which captures the screen and the build version for you) rather than re-typing it from memory: the exact wording is what identifies the cause."
+          },
+          {
+            "type": "p",
+            "text": "There are two \"Go to Cart\" buttons on the Quotes screen and they do exactly the same thing: one in the toolbar row alongside Close, and one in the CART block that always stays in the same place. Both open the same Cart screen and both become available at the same moment \u2014 as soon as a quote is selected. Use whichever is nearer."
           }
         ]
       },
@@ -20594,6 +20623,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"7 Sep 2026 (53)", summary:"Three dead buttons fixed, all the same underlying fault: a name the code referred to that did not exist anywhere, which throws and leaves the button looking like it simply does nothing. (1) \"Go to Cart\" in the fixed CART block called setShowCart, which was never declared — the working state is showCartScreen. The two Go to Cart buttons on the Quotes screen had drifted apart: different handlers, and different rules about when they were available. Both now call ONE shared openCartScreen with ONE shared cartUnavailable test, so they cannot disagree again — the same one-definition principle already applied to computeCost/computeSalesPrice. Any future Go to Cart button uses those two and does not roll its own. (2) The PDF button inside the Datasheet modal read sessionCompany for its letterhead and footer, but DatasheetModal was never passed that prop. It is now threaded in at both places the modal is opened, including through PricingDescriptionPanel. The Datasheet Excel export was not touched. (3) That PDF export is now wrapped so a failure shows a message naming the reason instead of failing silently — a dead-looking button is the hardest kind of fault to report. Verified by resolving every identifier in the shipped script against its scopes: there are now ZERO unresolved names in the whole file, where before this class of bug had produced three in a week. That scan is now part of the build check, since node --check cannot see any of them." },
   { date:"7 Sep 2026 (52)", summary:"URGENT fix — Generate Quote PDF was broken for every quote: \"quoteIsInr is not defined\". Root cause: quoteCurrency, quoteIsInr and quoteFx were declared inside buildDoc, the inner function that draws the document, but the 3 Sep \"Grand Total as printed\" work (grandTotalPrinted) sits outside buildDoc in the enclosing block and reads quoteIsInr and quoteFx to convert each Sl No total into the display currency. buildDoc's scope is not visible from there, so the names were never in scope at that point at all — a plain ReferenceError, not the \"cannot access before initialization\" ordering fault fixed on 31 Aug, though it is the same family and equally invisible to node --check because the code is valid JavaScript. Fixed by declaring the three constants once, in the enclosing block immediately after first, and deleting the copies inside buildDoc, which now reads them from the outer scope. Verified by parsing the shipped script with a real JavaScript parser and resolving scopes, then re-running that check to confirm no other name declared inside buildDoc is read from outside it — quoteIsInr and quoteFx were the only two. Also removed pfQuoteIsInr and pfQuoteFx, a dead local duplicate of the same two values left behind when the 3 Sep lumpsum change stopped converting Packing & Forwarding. No calculation, layout or wording changed: the same figures, printed the same way." },
   { date:"31 Aug 2026 (51)", summary:"Sale Order document carry-forward, with a real bug fixed along the way. Real bug found: cloneQuoteIntoContract (creates a Contract from a Won Quote) was already attempting to carry documents over, but only cloned the parent \"shell\" row, never the actual revision/link/status data — a carried document had nothing real to show, effectively broken rather than genuinely absent, which is why Contracts looked like they started with a clean empty list. Fixed by extracting the ALREADY-PROVEN complete mechanism from startAmendment's own Quote-amendment document carry-forward (parent + a fresh Rev-0/Out history row carrying the prior link forward) into a new shared carryForwardDocuments() helper, used by both startAmendment (unchanged behavior, just de-duplicated) and the new Contract flow. New: when creating a Contract, if the source Quote has documents, a picker shows them (select-all by default, matching the amendment area-picker's own precedent) before the Contract is created — pick which ones actually belong on the Sale Order rather than an all-or-nothing carry. Kept entity_type=\"quote\" for carried documents even though they're headed for a Contract — the Documents panel everywhere in this app already queries that value unconditionally (an existing, deliberate convention), so anything else would make carried documents silently invisible." },
   { date:"31 Aug 2026 (50)", summary:"Fixed the Sale Order picker's Browse-by-Customer bug (Zeeco had a real Contract but didn't show up there) and replaced its native browser datalist with a genuinely live-filtering dropdown. Root cause: a Contract's customer_name is copied once at creation time from the source Quote — if the real Companies record has since been renamed/corrected even slightly (casing, spacing), an exact match against sale_order_tbl silently found nothing, same bug class as the UAE/legacy-customer mismatches found earlier this session. Fixed by matching case-insensitively (.ilike) rather than exact (.eq) — kept pulling the FULL Companies list for the predictive options, not narrowed to only customers with existing contracts, per what was actually asked. Separately: native <input list><datalist> (used here and via LimitToListCombo generally) is inconsistent across browsers about actually filtering as you type — some only show/filter once you click the dropdown arrow. Built a new PredictiveTextField (client-side filter on every keystroke, own suggestion list, onMouseDown so it fires before blur closes it) and swapped it into all three text fields on this screen — Contract Number, the Add flow's Quote search, and Customer — for a consistent, real predictive-search feel across the whole picker." },
@@ -27632,7 +27662,7 @@ function SalesOverdueCallsScreen({ user, onGoLog }){
 // same direct-price-excels bucket/policy as everywhere else. Editing a
 // Validated line's sales price reverts it to Pending, matching the same
 // guard already used elsewhere in this app when a validated price changes.
-function PricingDescriptionPanel({ openRef, openLines, user, itemOptions, onSaved, onViewBom, hasRealBom }){
+function PricingDescriptionPanel({ openRef, openLines, user, sessionCompany, itemOptions, onSaved, onViewBom, hasRealBom }){
   const dpLines = openLines.filter(l=>l.is_direct_price===true);
   const draftFor = (l)=>({ item:l.item||"", description:l.component||"", qty:String(l.qty_required||1), uom:l.uom||"Nos", cost_price:l.cost?String(l.cost):"", sales_price:l.sales_price?String(l.sales_price):"" });
   const [drafts,setDrafts] = useState(()=>{ const d={}; dpLines.forEach(l=>{ d[l.id]=draftFor(l); }); return d; });
@@ -27777,7 +27807,7 @@ function PricingDescriptionPanel({ openRef, openLines, user, itemOptions, onSave
       );
     }),
     showDatasheet && h(DatasheetModal,{
-      openRef, openLines, model:(openLines[0]&&openLines[0].model)||"", user,
+      openRef, openLines, model:(openLines[0]&&openLines[0].model)||"", user, sessionCompany,
       onClose:()=>{ setShowDatasheet(false); checkDatasheet(); onSaved(); }
     })
   );
