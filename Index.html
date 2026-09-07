@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-05T02:30:00Z";
+  var APP_BUILD_VERSION = "2026-09-07T04:10:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -12989,14 +12989,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // between the old and new position depends on anything not yet
       // available this early.
       const first = estimatesRows[0];
+      // 7 Sep fix — "quoteIsInr is not defined" when generating a quote PDF.
+      // These three were declared INSIDE buildDoc, but grandTotalPrinted (3 Sep)
+      // sits out here in the try block and reads quoteIsInr and quoteFx.
+      // buildDoc's scope is not visible from here, so this was a plain
+      // ReferenceError, not a use-before-initialization — the names were never
+      // in scope at this point at all. Same class of fault as the 31-Aug `first`
+      // hoist above, and node --check cannot see either: both are valid
+      // JavaScript that is simply wrong at runtime.
+      // Declared once, here, and read by both the outer block and buildDoc.
+      const quoteCurrency = first.currency||"INR";
+      const quoteIsInr = quoteCurrency==="INR";
+      const quoteFx = Number(first.conversion_rate)||1;
       const pfBasicPriceTotal = estimatesRows.reduce((s,est)=>s+slNoBaseTotalInr(est),0);
-      // Lumpsum P&F is always entered in INR (30 Aug), regardless of the
-      // quote's own currency — converted here for display, same as
-      // everywhere else money crosses currencies in this app. Computed
-      // locally rather than reusing quoteIsInr/quoteFx below, since
-      // those aren't declared yet at this point in the function.
-      const pfQuoteIsInr = (first.currency||"INR")==="INR";
-      const pfQuoteFx = Number(first.conversion_rate)||1;
+      // pfQuoteIsInr / pfQuoteFx were removed here on 7 Sep. They were a local
+      // duplicate of quoteIsInr/quoteFx for the old lumpsum conversion, and that
+      // conversion went away on 3 Sep when a lumpsum became a figure already in
+      // the quote currency — nothing had read them since.
       // A LUMPSUM IS ALREADY IN THE QUOTE CURRENCY (3 Sep) — it is no longer
       // divided by the rate. Before this it was always stored in INR and
       // converted here, which is what made "which currency do I type in"
@@ -13229,9 +13238,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         doc.setFont("times","bold"); doc.text("Sub:",12,y); doc.setFont("times","normal");
         doc.text("Our Techno Commercial offer for the above",24,y); y+=14;
       }
-      const quoteCurrency = first.currency||"INR";
-      const quoteIsInr = quoteCurrency==="INR";
-      const quoteFx = Number(first.conversion_rate)||1;
+      // quoteCurrency / quoteIsInr / quoteFx are declared in the enclosing
+      // try block (hoisted 7 Sep) and read from there. Do NOT redeclare them
+      // here — grandTotalPrinted, which lives outside buildDoc, needs them.
       let closeY;
       if(isContract){
         // Plain, borderless paragraph (24 Aug, final version) — no
@@ -18983,6 +18992,10 @@ const MANUAL_SECTIONS = [
               "If it's not ready, click the badge for the list, fix what's missing, and it re-checks automatically.",
               "Once it shows Ready to go, click Generate PDF \u2014 it refuses to run on an incomplete quote rather than producing a half-finished document."
             ]
+          },
+          {
+            "type": "tip",
+            "text": "If generation fails you get a pop-up starting \"Could not generate the PDF:\" followed by the exact reason. Nothing is saved or damaged when this happens \u2014 the quote is untouched and you can simply try again. Note the wording down (or use Report an issue, which captures the screen and the build version for you) rather than re-typing it from memory: the exact wording is what identifies the cause."
           }
         ]
       },
@@ -20581,6 +20594,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"7 Sep 2026 (52)", summary:"URGENT fix — Generate Quote PDF was broken for every quote: \"quoteIsInr is not defined\". Root cause: quoteCurrency, quoteIsInr and quoteFx were declared inside buildDoc, the inner function that draws the document, but the 3 Sep \"Grand Total as printed\" work (grandTotalPrinted) sits outside buildDoc in the enclosing block and reads quoteIsInr and quoteFx to convert each Sl No total into the display currency. buildDoc's scope is not visible from there, so the names were never in scope at that point at all — a plain ReferenceError, not the \"cannot access before initialization\" ordering fault fixed on 31 Aug, though it is the same family and equally invisible to node --check because the code is valid JavaScript. Fixed by declaring the three constants once, in the enclosing block immediately after first, and deleting the copies inside buildDoc, which now reads them from the outer scope. Verified by parsing the shipped script with a real JavaScript parser and resolving scopes, then re-running that check to confirm no other name declared inside buildDoc is read from outside it — quoteIsInr and quoteFx were the only two. Also removed pfQuoteIsInr and pfQuoteFx, a dead local duplicate of the same two values left behind when the 3 Sep lumpsum change stopped converting Packing & Forwarding. No calculation, layout or wording changed: the same figures, printed the same way." },
   { date:"31 Aug 2026 (51)", summary:"Sale Order document carry-forward, with a real bug fixed along the way. Real bug found: cloneQuoteIntoContract (creates a Contract from a Won Quote) was already attempting to carry documents over, but only cloned the parent \"shell\" row, never the actual revision/link/status data — a carried document had nothing real to show, effectively broken rather than genuinely absent, which is why Contracts looked like they started with a clean empty list. Fixed by extracting the ALREADY-PROVEN complete mechanism from startAmendment's own Quote-amendment document carry-forward (parent + a fresh Rev-0/Out history row carrying the prior link forward) into a new shared carryForwardDocuments() helper, used by both startAmendment (unchanged behavior, just de-duplicated) and the new Contract flow. New: when creating a Contract, if the source Quote has documents, a picker shows them (select-all by default, matching the amendment area-picker's own precedent) before the Contract is created — pick which ones actually belong on the Sale Order rather than an all-or-nothing carry. Kept entity_type=\"quote\" for carried documents even though they're headed for a Contract — the Documents panel everywhere in this app already queries that value unconditionally (an existing, deliberate convention), so anything else would make carried documents silently invisible." },
   { date:"31 Aug 2026 (50)", summary:"Fixed the Sale Order picker's Browse-by-Customer bug (Zeeco had a real Contract but didn't show up there) and replaced its native browser datalist with a genuinely live-filtering dropdown. Root cause: a Contract's customer_name is copied once at creation time from the source Quote — if the real Companies record has since been renamed/corrected even slightly (casing, spacing), an exact match against sale_order_tbl silently found nothing, same bug class as the UAE/legacy-customer mismatches found earlier this session. Fixed by matching case-insensitively (.ilike) rather than exact (.eq) — kept pulling the FULL Companies list for the predictive options, not narrowed to only customers with existing contracts, per what was actually asked. Separately: native <input list><datalist> (used here and via LimitToListCombo generally) is inconsistent across browsers about actually filtering as you type — some only show/filter once you click the dropdown arrow. Built a new PredictiveTextField (client-side filter on every keystroke, own suggestion list, onMouseDown so it fires before blur closes it) and swapped it into all three text fields on this screen — Contract Number, the Add flow's Quote search, and Customer — for a consistent, real predictive-search feel across the whole picker." },
   { date:"31 Aug 2026 (49)", summary:"Sale Order landing screen rebuilt around Contract Number instead of Offer/Quote Number. SaleOrderOfferPicker replaced by SaleOrderContractPicker: a limit-to-list Contract Number combo (Contract# — Customer) opens an existing Contract directly; typing something that matches nothing offers \"+ Add new contract\", which still requires picking a source Won Quote to clone from (unchanged mechanism, just reached from the other direction now) — the Contract Number field pre-fills with the existing suggested-next-number logic (untouched, still 7 digits/YY+5-digit sequence, still advances by whatever number actually gets used). Duplicate Contract Numbers are refused at two points: immediately when typed/confirmed in the Add flow (offers a direct link to the real Contract instead), and again as a defensive check inside cloneQuoteIntoContract itself, protecting every caller against a same-moment creation race, not just this screen. New: a separate Browse-by-Customer side panel — predictive limit-to-list search off the real Companies master, lists every Contract under that customer, double-click a row to open it. The old single mixed Offer-Number-or-customer-text box is gone, replaced by these two clearly separate flows." },
