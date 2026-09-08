@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-08T02:40:00Z";
+  var APP_BUILD_VERSION = "2026-09-08T04:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -9960,7 +9960,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           const qty = Number(l.qty_required)||0;
           const rate = Number(l.rate)||0;
           const sf = Number(l.sf)||3.1;
-          clean.cost = computeCost(qty, Number(newQty), rate);
+          // PER UNIT: order qty is 1 here, not the clone's order quantity.
+          // Stored cost does not contain the order quantity — see the note
+          // on the manual line adder. A clone at a different order qty
+          // therefore needs no rescale at all; this stays only to normalise
+          // rounding, and writes the same value it read.
+          clean.cost = computeCost(qty, 1, rate);
           clean.sales_price = computeSalesPrice(clean.cost, sf);
         }
         return clean;
@@ -10134,7 +10139,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const qty = Number(line.qty_required)||0;
         const rate = Number(line.rate)||0;
         const sf = Number(line.sf)||3.1;
-        const cost = computeCost(qty, n, rate);
+        // PER UNIT — stored cost does not move when the order quantity does.
+        // This whole rescale is now a no-op by design; it is kept because it
+        // also repairs a row previously written the other way.
+        const cost = computeCost(qty, 1, rate);
         const sales_price = computeSalesPrice(cost, sf);
         if(Number(line.cost)===cost && Number(line.sales_price)===sales_price) continue;
         await sb.from("estimate_lines").update({cost,sales_price}).eq("id",line.id);
@@ -11530,7 +11538,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const qty=Number(edits.qty_required!==undefined?edits.qty_required:line.qty_required)||0;
       const rate=Number(edits.rate!==undefined?edits.rate:line.rate)||0;
       const sf=Number(edits.sf!==undefined?edits.sf:line.sf)||3.1;
-      const cost=computeCost(qty, orderQty, rate);
+      const cost=computeCost(qty, 1, rate);   // PER UNIT
       const sales_price=computeSalesPrice(cost, sf);
       const payload={...edits,cost,sales_price};
       // A Validated Direct Price line whose price actually changes on a
@@ -11577,7 +11585,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const applyRefreshedLine = async(line, newRate)=>{
     const qty = Number(getLineVal(line,"qty_required"))||0;
     const sf = Number(getLineVal(line,"sf"))||3.1;
-    const cost = computeCost(qty, orderQty, newRate);
+    const cost = computeCost(qty, 1, newRate);   // PER UNIT
     const sales_price = computeSalesPrice(cost, sf);
     if(Number(line.rate)===Number(newRate)) return false; // already current, nothing to write
     const payload = {rate:newRate, cost, sales_price};
@@ -12254,7 +12262,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const qty = Number(getLineVal(line,"qty_required"))||0;
         const rate = Number(getLineVal(line,"rate"))||0;
         const sf = Number(getLineVal(line,"sf"))||3.1;
-        const cost = computeCost(qty, n, rate);
+        const cost = computeCost(qty, 1, rate);   // PER UNIT
         const sales_price = computeSalesPrice(cost, sf);
         if(Number(line.cost)===cost && Number(line.sales_price)===sales_price) continue; // already correct
         const payload = {cost, sales_price};
@@ -15081,8 +15089,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   const qtyReqd=Number(getLineVal(l,"qty_required"))||0;
                   const qtyByOrder=qtyReqd*(orderQty||1);
                   const sf=Number(getLineVal(l,"sf"))||3.1;
-                  // Through the shared helpers so the figure shown on the row
-                  // is exactly the figure a save writes, to the last decimal.
+                  // DISPLAY figure, deliberately EXTENDED — it sits beside the
+                  // qty-for-the-order column and matches the BOM export, so it
+                  // includes the order quantity. That is NOT what gets stored:
+                  // the stored cost is per unit. Do not "reconcile" the two.
                   const cost=computeCost(qtyReqd, orderQty, currentRate);
                   const sales=computeSalesPrice(cost, sf);
                   const isZero=!cost||cost===0;
@@ -19737,8 +19747,12 @@ const MANUAL_SECTIONS = [
             "text": "The price the customer sees does not come from that stored figure at all. The quote recomputes it live, every time, from quantity required, order quantity, rate and sales factor. So a stored cost can be stale or wrong without the quoted price being affected."
           },
           {
+            "type": "p",
+            "text": "Every path that writes a line now writes it the same way \u2014 the editor, the order-quantity change, the rate refresh, the clone and the manual line adder. One consequence is worth knowing: changing an Sl No's order quantity no longer alters any stored line cost, because the stored figure never contained the order quantity in the first place. Totals still move, as they always did; the line costs simply stay put."
+          },
+          {
             "type": "tip",
-            "text": "Known inconsistency, being fixed separately. Three paths \u2014 editing a line, changing the order quantity, and refreshing rates \u2014 write the stored cost the OTHER way, with the order quantity already multiplied in. So editing a line changes its stored cost by a factor of the order quantity, and the Cart Summary then multiplies it again. If a Cart Summary figure ever looks inflated by exactly the order quantity, this is why. The quoted price is not affected."
+            "text": "Until 8 September, editing a line multiplied its stored cost by the order quantity, and the Cart Summary then multiplied again \u2014 so the error was the order quantity SQUARED. On an Sl No of 200 that is 40,000 times. If you see a Cart Summary figure that is wildly too large, it is a line edited before that date. The quoted price was never affected, and a check exists to find and correct those rows."
           },
           {
             "type": "p",
@@ -20942,6 +20956,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"8 Sep 2026 (57)", summary:"Stored line cost is now PER UNIT everywhere. Five write paths still multiplied by the order quantity \u2014 the line editor, the order-quantity rescale, the rate refresh, the pending-edits rescale and the clone rescale \u2014 while the stored data, the manual adder and the Cart Summary are all per unit. The effect was worse than a simple mismatch: editing a line multiplied its stored cost by the order quantity, and the Cart Summary multiplies by the order quantity again when it works out a total, so the error was the order quantity SQUARED. On FXUS260001, order qty 200, one edited line would read forty thousand times too large. All five now pass an order quantity of 1, matching the adder. Two consequences by design: changing an Sl No order quantity no longer alters any stored line cost, because the stored figure never contained it, and the order-qty rescale is now a no-op kept only because it repairs a row previously written the other way. The BOM screen row and the BOM export still show an EXTENDED cost including the order quantity \u2014 that is a display figure sitting beside the qty-for-the-order column, it is not what gets stored, and a comment now says so to stop the two being reconciled by mistake. The quoted price was never affected at any point: slNoBaseTotalInr recomputes it live and does not read the stored cost. Four new tests pin the convention, including one asserting that the old behaviour inflated by order qty squared, so the symptom is recognisable rather than merely wrong. 34 of 34 pass. Rows already written wrongly are NOT touched by this build \u2014 find_inflated_line_costs.sql identifies them for review first." },
   { date:"8 Sep 2026 (56)", summary:"Cost is now worked out through one shared helper everywhere, and a WRONG FIX from the previous build is reverted before it ever shipped. What happened: computeCost had been written on 5 September and never actually called, so nine sites still did the arithmetic inline. Consolidating them was right. Deciding WHICH formula was the house rule was not: three paths (editing a line, changing the order quantity, refreshing rates) multiply by the order quantity, so the manual line adder was moved to match them. Reading the live data showed the opposite. Every line in every live quote stores cost as qty_required x rate, per unit, and the Cart Summary depends on that \u2014 it sums line costs into a unit cost and multiplies by order qty for the total, so a stored cost containing the order qty would be counted twice. The adder was already correct; it has been put back, passing an order quantity of 1 so it still routes through the shared helper rather than inlining the sum. The other eight sites keep the consolidation, which changes no value, only rounding. IMPORTANT AND UNCHANGED: the customer-facing price never reads the stored cost. slNoBaseTotalInr recomputes it live from qty, order qty, rate and sf. No quote has ever gone out mispriced because of any of this, and the 731 lines flagged by the earlier consistency check need no re-costing \u2014 that check measured against the wrong formula and should be discarded. The real remaining fault, deliberately left for a separate build rather than half fixed here, is that those three paths still write the other convention, so editing a line multiplies its stored cost by the order quantity and the Cart Summary inflates it again. A test now pins the per-unit convention so it cannot drift unnoticed." },
   { date:"7 Sep 2026 (54)", summary:"Sl No can now be corrected on a saved quote, and the Cart Summary is finished. SL NO RENAME: an Sl No typed wrongly was previously permanent \u2014 the only workaround was cloning to the right number and deleting the wrong one. Edit now sits on the Cart row. Because item_sl_no ties a unit together across NINE tables with no foreign key holding them to each other, this is not done as a series of updates from the browser: a dropped connection halfway would leave a BOM under one number and its datasheet under another, silently, surfacing as a wrong PDF weeks later. It runs as a database function (crm_phase45) in one transaction, which re-counts the old number afterwards and refuses to commit if anything is left behind. Asking for a number another Sl No already holds does NOT rename onto it \u2014 that would merge two units irreversibly \u2014 it offers a SWAP, which moves everything belonging to each unit with it. Tested against a real Postgres with item_sl_no deliberately numeric on some tables and text on others: 27 of 27, including that a refused call changes nothing and that a second quote sharing the same Sl No is never touched. CART SUMMARY: a currency switch between the quote currency and INR (a division by the quote own rate, never a retyped one; a missing or zero rate now falls back to INR rather than labelling rupees as dollars \u2014 caught by a test, not by reading); Total cost alongside Total price; an Include cost and Sf tick that strips the internal columns so the sheet can be forwarded; Excel and PDF with the expand option, specified on 5 September and missed; and the sort moved onto Sl No in Enq, numerically, blanks last \u2014 the column had always displayed one field and sorted on another. The grouping logic now lives in ONE top-level builder that the screen and both exports call, so a figure on screen cannot disagree with a figure in the document. Also: admin and super_admin can change a factor, not only the Sales Head, who was the only role able to use his own review screen; and the CART block is a sibling of the export blocks rather than nested inside the BOM block, which is what drew a box inside a box." },
   { date:"7 Sep 2026 (53)", summary:"Three dead buttons fixed, all the same underlying fault: a name the code referred to that did not exist anywhere, which throws and leaves the button looking like it simply does nothing. (1) \"Go to Cart\" in the fixed CART block called setShowCart, which was never declared — the working state is showCartScreen. The two Go to Cart buttons on the Quotes screen had drifted apart: different handlers, and different rules about when they were available. Both now call ONE shared openCartScreen with ONE shared cartUnavailable test, so they cannot disagree again — the same one-definition principle already applied to computeCost/computeSalesPrice. Any future Go to Cart button uses those two and does not roll its own. (2) The PDF button inside the Datasheet modal read sessionCompany for its letterhead and footer, but DatasheetModal was never passed that prop. It is now threaded in at both places the modal is opened, including through PricingDescriptionPanel. The Datasheet Excel export was not touched. (3) That PDF export is now wrapped so a failure shows a message naming the reason instead of failing silently — a dead-looking button is the hardest kind of fault to report. Verified by resolving every identifier in the shipped script against its scopes: there are now ZERO unresolved names in the whole file, where before this class of bug had produced three in a week. That scan is now part of the build check, since node --check cannot see any of them." },
