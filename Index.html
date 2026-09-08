@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-07T05:40:00Z";
+  var APP_BUILD_VERSION = "2026-09-08T02:40:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -608,7 +608,9 @@ async function saveQuoteValueSnapshot(referenceNumber, entityType, user){
     await sb.from("quote_value_snapshot_lines_tbl").delete().eq("snapshot_id",snapshotId);
     const lineRows = (lines||[]).map(l=>{
       const q = (Number(l.qty_required)||0) * (orderQtyBySl.get(l.item_sl_no)||1);
-      const lineValue = l.is_direct_price ? q*(Number(l.sales_price)||0) : q*(Number(l.rate)||0)*(Number(l.sf)||3.1);
+      const lineValue = l.is_direct_price
+        ? q*(Number(l.sales_price)||0)
+        : computeSalesPrice(computeCost(l.qty_required, orderQtyBySl.get(l.item_sl_no)||1, l.rate), l.sf);
       return { snapshot_id:snapshotId, item_sl_no:l.item_sl_no, material_shape:l.material_shape||null, material_spec:l.material_spec||null, material_grade:l.material_grade||null, qty:q, rate:Number(l.rate)||0, line_value:lineValue };
     });
     if(lineRows.length) await sb.from("quote_value_snapshot_lines_tbl").insert(lineRows);
@@ -9607,6 +9609,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [lineEdits,setLineEdits]=useState({}); // {refNum-slNo: {field:value}} — pending unsaved edits
   const [savingLine,setSavingLine]=useState({}); // {refNum-slNo: true} — saving in progress
   const [quoteExportRef,setQuoteExportRef]=useState(""); const [showCartSummary,setShowCartSummary]=useState(false);
+  const [cartSummaryIncludeCost,setCartSummaryIncludeCost]=useState(true);
+  const [cartSummaryExpand,setCartSummaryExpand]=useState(false);
   const [exportingQuote,setExportingQuote]=useState("");
   // PDF generation counter — reads the existing audit_log EXPORT entries
   // attemptGenerateQuotePdf already writes on every successful generation
@@ -9956,7 +9960,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           const qty = Number(l.qty_required)||0;
           const rate = Number(l.rate)||0;
           const sf = Number(l.sf)||3.1;
-          clean.cost = Number((qty*Number(newQty)*rate).toFixed(4));
+          clean.cost = computeCost(qty, Number(newQty), rate);
           clean.sales_price = computeSalesPrice(clean.cost, sf);
         }
         return clean;
@@ -10035,7 +10039,61 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [cartRowDraft,setCartRowDraft]=useState({});
   const startEditCartRow = (r)=>{
     setEditingCartRow(r.id);
-    setCartRowDraft({ sl_no_in_enq:r.sl_no_in_enq||"", tag_number:r.tag_number||"", location:r.location||"", order_qty:String(r.order_qty||1) });
+    setCartRowDraft({ item_sl_no:String(r.item_sl_no??""), sl_no_in_enq:r.sl_no_in_enq||"", tag_number:r.tag_number||"", location:r.location||"", order_qty:String(r.order_qty||1) });
+  };
+
+  // ---- Sl No rename (7 Sep) --------------------------------------
+  // item_sl_no ties a unit together across nine tables with no foreign
+  // key holding them to each other, so this is NEVER done as a series of
+  // updates from here. Both calls below go to database functions
+  // (crm_phase45) that do the whole thing in one transaction and refuse
+  // to commit a half-finished rename. If the function is missing, the
+  // rename fails loudly rather than falling back to a partial write.
+  const [slNoCollision,setSlNoCollision]=useState(null);  // {row, from, to, usage}
+  const [renamingSlNo,setRenamingSlNo]=useState(false);
+
+  const runSlNoRename = async(row, from, to, mode)=>{
+    setRenamingSlNo(true);
+    try{
+      const { data, error } = await sb.rpc("fmq_rename_sl_no",{
+        p_ref: row.reference_number, p_from: String(from), p_to: String(to),
+        p_mode: mode, p_actor: user?.username||"unknown"
+      });
+      if(error){
+        alert("Sl No not changed. Nothing was altered.\n\n"+error.message);
+        return false;
+      }
+      const moved = (data && data.rows) || 0;
+      // Logged AFTER the rename, against the NEW number, because the
+      // rename rewrites revision_changes too — logging first would move
+      // this very row and file it under the old Sl No.
+      await logRevisionChange(row.reference_number, "cart", "item_sl_no", String(from), String(to), mode==="swap"?String(from):String(to));
+      setSlNoCollision(null);
+      await refreshAll();
+      alert(mode==="swap"
+        ? ("Sl No "+from+" and "+to+" swapped. "+moved+" row(s) moved.")
+        : ("Sl No "+from+" is now "+to+". "+moved+" row(s) moved."));
+      return true;
+    } finally { setRenamingSlNo(false); }
+  };
+
+  const requestSlNoChange = async(row, to)=>{
+    const from = String(row.item_sl_no??"").trim();
+    const want = String(to).trim();
+    if(!want){ alert("Enter an Sl No."); return false; }
+    if(want===from) return true;
+    const { data, error } = await sb.rpc("fmq_sl_no_usage",{ p_ref: row.reference_number, p_sl: want });
+    if(error){
+      alert("Could not check whether Sl No "+want+" is free, so nothing was changed.\n\n"+error.message);
+      return false;
+    }
+    if(data && data.exists){
+      // Occupied. Never merge two Sl Nos silently — ask.
+      const usage = await sb.rpc("fmq_sl_no_usage",{ p_ref: row.reference_number, p_sl: from });
+      setSlNoCollision({ row, from, to:want, occupied:data, mine:(usage&&usage.data)||null });
+      return false;
+    }
+    return await runSlNoRename(row, from, want, "rename");
   };
   const cancelEditCartRow = ()=>{ setEditingCartRow(null); setCartRowDraft({}); };
   const [savingCartRowEdits,setSavingCartRowEdits]=useState(false);
@@ -10044,6 +10102,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(!(Number(d.order_qty)>=1)){ alert("Enter a qty greater than 0."); return; }
     setSavingCartRowEdits(true);
     try{
+      // Sl No goes FIRST and on its own. If it fails, or the user is sent
+      // to the collision dialog, we stop here rather than writing the
+      // other three fields against a row the user may be about to move.
+      if(String(d.item_sl_no??"").trim()!==String(r.item_sl_no??"").trim()){
+        const done = await requestSlNoChange(r, d.item_sl_no);
+        if(!done) return;
+      }
       if(d.sl_no_in_enq.trim()!==(r.sl_no_in_enq||"")) await updateCartRowText(r,"sl_no_in_enq",d.sl_no_in_enq);
       if(d.tag_number.trim()!==(r.tag_number||"")) await updateCartRowText(r,"tag_number",d.tag_number);
       if(d.location.trim()!==(r.location||"")) await updateCartRowText(r,"location",d.location);
@@ -10069,7 +10134,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const qty = Number(line.qty_required)||0;
         const rate = Number(line.rate)||0;
         const sf = Number(line.sf)||3.1;
-        const cost = Number((qty*n*rate).toFixed(4));
+        const cost = computeCost(qty, n, rate);
         const sales_price = computeSalesPrice(cost, sf);
         if(Number(line.cost)===cost && Number(line.sales_price)===sales_price) continue;
         await sb.from("estimate_lines").update({cost,sales_price}).eq("id",line.id);
@@ -11465,7 +11530,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const qty=Number(edits.qty_required!==undefined?edits.qty_required:line.qty_required)||0;
       const rate=Number(edits.rate!==undefined?edits.rate:line.rate)||0;
       const sf=Number(edits.sf!==undefined?edits.sf:line.sf)||3.1;
-      const cost=Number((qty*(orderQty||1)*rate).toFixed(4));
+      const cost=computeCost(qty, orderQty, rate);
       const sales_price=computeSalesPrice(cost, sf);
       const payload={...edits,cost,sales_price};
       // A Validated Direct Price line whose price actually changes on a
@@ -11512,7 +11577,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const applyRefreshedLine = async(line, newRate)=>{
     const qty = Number(getLineVal(line,"qty_required"))||0;
     const sf = Number(getLineVal(line,"sf"))||3.1;
-    const cost = Number((qty*(orderQty||1)*newRate).toFixed(4));
+    const cost = computeCost(qty, orderQty, newRate);
     const sales_price = computeSalesPrice(cost, sf);
     if(Number(line.rate)===Number(newRate)) return false; // already current, nothing to write
     const payload = {rate:newRate, cost, sales_price};
@@ -11570,12 +11635,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     return edits[field]!==undefined?edits[field]:line[field];
   };
 
-  const computedCost=(line)=>{
-    const qty=Number(getLineVal(line,"qty_required"))||0;
-    const rate=Number(getLineVal(line,"rate"))||0;
-    return qty*(orderQty||1)*rate;
-  };
-  const computedSales=(line)=>computedCost(line)*(Number(getLineVal(line,"sf"))||3.1);
+  // These two show a line's cost and price on screen BEFORE it is saved.
+  // They used to do the arithmetic unrounded and inline, so the figure you
+  // read here could differ in the fourth decimal from the figure the save
+  // then wrote. Same helpers as every other path now.
+  const computedCost=(line)=>computeCost(getLineVal(line,"qty_required"), orderQty, getLineVal(line,"rate"));
+  const computedSales=(line)=>computeSalesPrice(computedCost(line), Number(getLineVal(line,"sf"))||3.1);
   const [showAddLine,setShowAddLine]=useState(false);
   const [addLineMode,setAddLineMode]=useState("costed"); // "costed" | "direct_price"
   const [dpDescription,setDpDescription]=useState(""); const [dpQty,setDpQty]=useState("1");
@@ -11639,6 +11704,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [addComponent,setAddComponent]=useState("");
   const [addSpec,setAddSpec]=useState("");
   const [addGrade,setAddGrade]=useState("");
+  // Declared here, above every reader. It used to sit ~470 lines further
+  // down, which is fine while only later code reads it, but the manual
+  // line adder's cost preview runs during render and would have hit it
+  // before initialisation.
+  const [orderQty,setOrderQty]=useState(1);
   const [addQty,setAddQty]=useState("");
   const [addUom,setAddUom]=useState("");
   const [addSf,setAddSf]=useState(3.1);
@@ -11829,7 +11899,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const hit=rateBySpecGrade.get(addSpec+"||"+addGrade);
     return hit?hit.rate:null;
   },[rateBySpecGrade,addSpec,addGrade]);
-  const previewCost = useMemo(()=>(Number(addQty)||0)*(lookedUpRate||0),[addQty,lookedUpRate]);
+  // STORED LINE COST IS A PER-UNIT FIGURE. It is qty_required x rate, with
+  // the order quantity applied LATER, by whatever works out a total. Read
+  // the data before changing this: every line in the live quotes is written
+  // this way, and the Cart Summary depends on it -- it sums line costs into
+  // a unit cost and then multiplies by order qty, so a stored cost that
+  // already contained the order qty would be counted twice.
+  // The order quantity is passed as 1 rather than dropped, so this still
+  // goes through the one shared helper instead of inlining the sum.
+  // KNOWN INCONSISTENCY, deliberately not touched here: saveLineEdit,
+  // updateOrderQty and the rate refresh write qty x order_qty x rate, which
+  // is the OTHER convention. Editing a line therefore changes its stored
+  // cost by a factor of the order quantity. That is a real fault and it is
+  // older than this comment; it is being fixed separately rather than half
+  // fixed here. The customer-facing price is unaffected either way --
+  // slNoBaseTotalInr recomputes from qty, order qty, rate and sf and never
+  // reads the stored cost at all.
+  const previewCost = useMemo(()=>computeCost(addQty, 1, lookedUpRate||0),[addQty,lookedUpRate]);
   const previewSales = useMemo(()=>previewCost*(Number(addSf)||3.1),[previewCost,addSf]);
 
   // Auto-fill qty/uom from BOM when component selected
@@ -11912,8 +11998,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         material_shape:materialShape,
         cutting_plan_layout_size:addCuttingPlan||"", cutting_plan_qty:Number(addCutPlanQty)||0, cutting_plan_uom:addCuttingUom||"",
         material_spec:addSpec, grade:addGrade, qty_required:Number(addQty)||0,
-        uom:addUom, rate, cost:(Number(addQty)||0)*rate, sf:Number(addSf)||3.1,
-        sales_price:computeSalesPrice((Number(addQty)||0)*rate, Number(addSf)||3.1)
+        uom:addUom, rate, cost:computeCost(addQty, 1, rate), sf:Number(addSf)||3.1,
+        sales_price:computeSalesPrice(computeCost(addQty, 1, rate), Number(addSf)||3.1)
       };
       const{data,error:err}=await sb.from("estimate_lines").insert(payload).select().single();
       if(err) throw err;
@@ -12116,7 +12202,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     doConfirmDeleteQuote();
   };
 
-  const [orderQty,setOrderQty]=useState(1);
+  // orderQty is declared near the top of this component, above the manual
+  // line adder that reads it during render.
   // Same gap fixed twice already elsewhere (Annexure II, Datasheet Price
   // Data) — a Direct Price line has no rate/sf, its real contribution is
   // qty × its own cost/sales_price instead.
@@ -12167,7 +12254,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const qty = Number(getLineVal(line,"qty_required"))||0;
         const rate = Number(getLineVal(line,"rate"))||0;
         const sf = Number(getLineVal(line,"sf"))||3.1;
-        const cost = Number((qty*n*rate).toFixed(4));
+        const cost = computeCost(qty, n, rate);
         const sales_price = computeSalesPrice(cost, sf);
         if(Number(line.cost)===cost && Number(line.sales_price)===sales_price) continue; // already correct
         const payload = {cost, sales_price};
@@ -14151,6 +14238,129 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     } finally { setExportingQuote(""); }
   };
 
+  /* ---- CART SUMMARY EXPORTS (7 Sep) ------------------------------
+     Specified on 5 Sep ("The excel and PDF can also have an expand
+     option") and missed. Both build their rows from the SAME
+     buildCartSummaryRows the screen uses, so a figure can never differ
+     between what is on screen and what is sent out.
+
+     opts: { includeCost, expand, inr }
+     - includeCost off strips unit cost, Sf and total cost, leaving a
+       sheet that is safe to forward to a customer.
+     - expand adds one indented line per sub-assembly under any Sl No
+       whose factors differ. It is IGNORED when includeCost is off,
+       because a sub-assembly breakdown with no factor and no cost on it
+       carries nothing.
+     - inr shows stored rupees; otherwise figures are divided by the
+       quote's conversion rate, the same division the quote PDF makes.
+  --------------------------------------------------------------- */
+  const cartSummaryDoc = (ests, rows, opts)=>{
+    const o = opts||{};
+    const fx = cartSummaryFx(ests, o.inr);
+    const expand = !!o.expand && !!o.includeCost;
+    const c = (v)=> (Number(v)||0)/(fx.div||1);
+    const head = o.includeCost
+      ? ["Sl No in Enq","Item","Description","Unit cost","Sf","Unit price","Qty","Total cost","Total price"]
+      : ["Sl No in Enq","Item","Description","Unit price","Qty","Total price"];
+    const body = [];
+    (rows||[]).forEach(r=>{
+      const eff = r.cost ? r.sale/r.cost : 0;
+      const enq = (r.est && r.est.sl_no_in_enq) || r.slNo;
+      if(o.includeCost){
+        body.push([enq, (r.est&&r.est.item)||"", (r.est&&r.est.description)||"",
+                   c(r.cost), Number(eff.toFixed(2)), c(r.sale), r.qty, c(r.cost*r.qty), c(r.sale*r.qty)]);
+        if(expand && r.mixed){
+          r.groups.forEach(G=>{
+            body.push(["", "", "    \u21b3 "+G.name+" ("+G.lines.length+" line"+(G.lines.length>1?"s":"")+")",
+                       c(G.cost), Number(Number(G.sf).toFixed(2)), c(computeSalesPrice(G.cost,G.sf)), "", "", ""]);
+          });
+        }
+      } else {
+        body.push([enq, (r.est&&r.est.item)||"", (r.est&&r.est.description)||"",
+                   c(r.sale), r.qty, c(r.sale*r.qty)]);
+      }
+    });
+    const gCost = (rows||[]).reduce((s,r)=>s+r.cost*r.qty,0);
+    const gSale = (rows||[]).reduce((s,r)=>s+r.sale*r.qty,0);
+    const foot = o.includeCost
+      ? ["","","","","","","Total "+fx.code, c(gCost), c(gSale)]
+      : ["","","","","Total "+fx.code, c(gSale)];
+    return { head, body, foot, fx, gCost:c(gCost), gSale:c(gSale) };
+  };
+
+  const cartSummaryData = async(quoteRef, ests, rows, opts)=>{
+    if(ests && rows) return { ests, rows };
+    const [{data:e},{data:l}] = await Promise.all([
+      sb.from("estimates").select("*").eq("reference_number",quoteRef),
+      sb.from("estimate_lines").select("*").eq("reference_number",quoteRef),
+    ]);
+    return { ests: e||[], rows: buildCartSummaryRows(e||[], l||[], {}) };
+  };
+
+  const exportCartSummaryExcel = async(quoteRef, ests0, rows0, opts)=>{
+    if(!quoteRef) return;
+    try{
+      const { ests, rows } = await cartSummaryData(quoteRef, ests0, rows0, opts);
+      const D = cartSummaryDoc(ests, rows, opts);
+      const n2 = (v)=> typeof v==="number" ? Number(v.toFixed(2)) : v;
+      const aoa = [D.head, ...D.body.map(r=>r.map(n2)), D.foot.map(n2)];
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!cols"] = D.head.map((hh,i)=>({wch: i===2?60 : i===1?18 : 14}));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Cart Summary");
+      XLSX.writeFile(wb, quoteRef.replace(/\s+/g,"_")+"_CartSummary.xlsx");
+    } catch(e){
+      console.error("Cart Summary Excel failed", e);
+      alert("Could not generate the Cart Summary Excel: "+(e.message||e));
+    }
+  };
+
+  const exportCartSummaryPDF = async(quoteRef, ests0, rows0, opts)=>{
+    if(!quoteRef) return;
+    try{
+      const { ests, rows } = await cartSummaryData(quoteRef, ests0, rows0, opts);
+      const D = cartSummaryDoc(ests, rows, opts);
+      const customer = (ests[0] && ests[0].customer_name) || "";
+      const money = (v)=> (Number(v)||0).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+      const cell = (v,i)=> typeof v==="number" ? (i===4&&opts&&opts.includeCost ? v.toFixed(2) : money(v)) : String(v==null?"":v);
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
+      const W = doc.internal.pageSize.getWidth();
+      const neutral=[244,242,234]; const dark=[28,31,26];
+      let letterheadPage = 0;
+      const ensureLetterhead = ()=>{
+        const p = doc.internal.getNumberOfPages();
+        if(p !== letterheadPage){ drawQuoteLetterhead(doc,W,"CART SUMMARY",quoteRef,customer); letterheadPage = p; }
+      };
+      ensureLetterhead();
+      doc.setFontSize(8); doc.setTextColor(110,106,95);
+      doc.text("Figures in "+D.fx.code+(D.fx.code==="INR"?"":" at "+D.fx.rate)
+               +(opts&&opts.includeCost?"":"  \u00b7  cost and sales factor withheld"), 12, 31);
+      doc.autoTable({
+        startY:34,
+        head:[D.head],
+        body: D.body.map(r=>r.map(cell)),
+        foot:[D.foot.map(cell)],
+        theme:"grid",
+        headStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8,lineColor:[216,212,197],lineWidth:0.2},
+        footStyles:{fillColor:neutral,textColor:dark,fontStyle:"bold",fontSize:8},
+        bodyStyles:{fontSize:7.5,textColor:dark},
+        columnStyles: (function(){
+          const cs={0:{halign:"left",cellWidth:22},1:{halign:"left",cellWidth:30},2:{halign:"left"}};
+          for(let i=3;i<D.head.length;i++) cs[i]={halign:"right",cellWidth:24};
+          return cs;
+        })(),
+        margin:{left:12,right:12},
+        didDrawPage: ensureLetterhead
+      });
+      numberQuotePages(doc,W);
+      setPdfPreview({doc, filename:quoteRef.replace(/\s+/g,"_")+"_CartSummary.pdf"});
+    } catch(e){
+      console.error("Cart Summary PDF failed", e);
+      alert("Could not generate the Cart Summary PDF: "+(e.message||e));
+    }
+  };
+
   const READINESS_SEGMENTS = [["terms","Commercial Terms"],["datasheets","Datasheets"],["descriptions","Descriptions"],["bomComplete","BOM Complete"],["validation","Validation"]];
   const THREE_STATE_SEGMENTS = new Set(["datasheets","descriptions","bomComplete"]);
   const segmentIsDone = (key,val)=> THREE_STATE_SEGMENTS.has(key) ? val==="all" : !!val;
@@ -14603,15 +14813,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           )
         ),
         h("div",{style:{display:"flex",gap:16,flexWrap:"wrap"}},
+          // CART, as a fixed block. The Go to Cart button used to move about
+          // the toolbar depending on which warning banners were showing, so it
+          // was never in the same place twice. The old button stays where it
+          // is; this one does not move. It is a SIBLING of the export blocks --
+          // until 7 Sep it sat nested INSIDE the BOM block, which is why it
+          // drew a bordered box inside a bordered box.
           h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
-            // CART, as a fixed block. The Go to Cart button used to move about
-            // the toolbar depending on which warning banners were showing, so it
-            // was never in the same place twice. The old button stays where it is;
-            // this one does not move.
-            h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4",marginRight:8,display:"inline-block",verticalAlign:"top"}},
-              h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"CART"),
-              h("button",{onClick:openCartScreen,disabled:cartUnavailable,style:{...btnSmall,fontSize:11.5,width:"100%"}},"Go to Cart"),
-              h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginTop:5}},"always here")),
+            h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"CART"),
+            h("button",{onClick:openCartScreen,disabled:cartUnavailable,style:{...btnSmall,fontSize:11.5,width:"100%"}},"Go to Cart"),
+            h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginTop:5}},"always here")),
+          h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
             h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},"BOM ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(per Sl No)")),
             h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:colors.muted,marginBottom:6,cursor:"pointer"}},
               h("input",{type:"checkbox",checked:includeSalesPrice,onChange:e=>setIncludeSalesPrice(e.target.checked)}),
@@ -14653,13 +14865,29 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"8px 10px",background:"#faf9f4"}},
             h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",marginBottom:6}},
               "Cart Summary ",h("span",{style:{fontWeight:400,color:colors.mutedLight}},"(whole estimator sheet)")),
-            h("button",{onClick:()=>setShowCartSummary(true),disabled:!quoteExportRef,style:{...btnSmall,width:"100%"}},"Open")
+            h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:colors.muted,marginBottom:5,cursor:"pointer"}},
+              h("input",{type:"checkbox",checked:cartSummaryIncludeCost,onChange:e=>setCartSummaryIncludeCost(e.target.checked)}),
+              "Include cost and Sf"),
+            h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:10.5,color:cartSummaryIncludeCost?colors.muted:colors.mutedLight,marginBottom:6,cursor:cartSummaryIncludeCost?"pointer":"default"}},
+              h("input",{type:"checkbox",checked:cartSummaryExpand&&cartSummaryIncludeCost,disabled:!cartSummaryIncludeCost,onChange:e=>setCartSummaryExpand(e.target.checked)}),
+              "Expand sub-assemblies"),
+            h("div",{style:{display:"flex",gap:6,marginBottom:6}},
+              h("button",{disabled:!quoteExportRef||!!exportingQuote,style:btnSmall,
+                onClick:async()=>{ setExportingQuote("cs-xlsx");
+                  try{ await exportCartSummaryExcel(quoteExportRef,null,null,{includeCost:cartSummaryIncludeCost,expand:cartSummaryExpand,inr:false}); }
+                  finally{ setExportingQuote(""); } }}, exportingQuote==="cs-xlsx"?"Working":"Excel"),
+              h("button",{disabled:!quoteExportRef||!!exportingQuote,style:btnSmall,
+                onClick:async()=>{ setExportingQuote("cs-pdf");
+                  try{ await exportCartSummaryPDF(quoteExportRef,null,null,{includeCost:cartSummaryIncludeCost,expand:cartSummaryExpand,inr:false}); }
+                  finally{ setExportingQuote(""); } }}, exportingQuote==="cs-pdf"?"Working":"PDF")),
+            h("button",{onClick:()=>setShowCartSummary(true),disabled:!quoteExportRef,style:{...btnSmall,width:"100%"}},"Open"),
+            h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginTop:5}},"exports in the quote currency")
           )
         )
       ),
       showCartSummary && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1150,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"24px 16px",overflow:"auto"}},
         h("div",{style:{background:"#fff",borderRadius:8,width:1200,maxWidth:"100%"}},
-          h(CartSummaryScreen,{user,quoteRef:quoteExportRef}),
+          h(CartSummaryScreen,{user,quoteRef:quoteExportRef,exportCartSummaryExcel,exportCartSummaryPDF}),
           h("div",{style:{display:"flex",justifyContent:"flex-end",padding:"0 24px 18px"}},
             h("button",{onClick:()=>setShowCartSummary(false),style:btnPrimary},"Close")))),
             refFilter && h(QuoteNotesPanel,{referenceNumber:refFilter,user}),
@@ -14852,9 +15080,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   const isManualRate=isDirty&&lineEdits[key]?.rate!==undefined&&autoRate!==null&&Number(lineEdits[key].rate)!==autoRate;
                   const qtyReqd=Number(getLineVal(l,"qty_required"))||0;
                   const qtyByOrder=qtyReqd*(orderQty||1);
-                  const cost=qtyByOrder*currentRate;
                   const sf=Number(getLineVal(l,"sf"))||3.1;
-                  const sales=cost*sf;
+                  // Through the shared helpers so the figure shown on the row
+                  // is exactly the figure a save writes, to the last decimal.
+                  const cost=computeCost(qtyReqd, orderQty, currentRate);
+                  const sales=computeSalesPrice(cost, sf);
                   const isZero=!cost||cost===0;
                   const isChangedInRevision = bomChangedRows.has(l.item_sl_no+"|"+l.sl_no);
                   const rowBg=isZero?"#fdecea":(isChangedInRevision?"#fff8e1":"transparent");
@@ -15188,6 +15418,27 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
+    // Sl No collision. The requested number is already in use on this
+    // quote, so there is no safe silent answer: renaming onto it would
+    // merge two units into one. Swap is the only non-destructive move,
+    // and it is offered explicitly rather than assumed.
+    slNoCollision && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1300,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%",maxHeight:"88vh",overflow:"auto"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Sl No "+slNoCollision.to+" is already in use"),
+        h("div",{style:{fontSize:12.5,color:colors.muted,lineHeight:1.7,marginBottom:14}},
+          "This quote already has an Sl No ",h("b",null,slNoCollision.to),
+          ", carrying ",h("b",null,String((slNoCollision.occupied&&slNoCollision.occupied.rows)||0))," row(s) of its own \u2014 its BOM, datasheet, options and testing. ",
+          "Renaming ",h("b",null,slNoCollision.from)," onto it would merge the two into one unit and there would be no way back."),
+        h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"11px 13px",marginBottom:16,background:"#faf9f4",fontSize:12.5,lineHeight:1.8}},
+          h("b",null,"Swapping them")," gives Sl No ",h("b",null,slNoCollision.from)," the number ",h("b",null,slNoCollision.to),
+          ", and the unit currently numbered ",h("b",null,slNoCollision.to)," takes ",h("b",null,slNoCollision.from),". ",
+          "Everything belonging to each unit travels with it. Nothing is deleted and nothing is combined."),
+        h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap"}},
+          h("button",{disabled:renamingSlNo,
+            onClick:()=>runSlNoRename(slNoCollision.row, slNoCollision.from, slNoCollision.to, "swap"),
+            style:btnPrimary}, renamingSlNo?"Swapping\u2026":("Swap "+slNoCollision.from+" and "+slNoCollision.to)),
+          h("button",{disabled:renamingSlNo,onClick:()=>setSlNoCollision(null),style:btnSmall},"Cancel")))),
+
     showDatasheet && openRef && h(DatasheetModal,{ openRef, openLines, model:headerModel, modelItemMap, user, sessionCompany, onClose:()=>{ setShowDatasheet(false); refreshAll(); } }),
     historyOpen && refFilter && h(QuoteHistoryPanel,{ referenceNumber:refFilter, onClose:()=>setHistoryOpen(false) }),
     quotesCloseAction && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:260}},
@@ -15379,7 +15630,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 : refs.filter(r=>r.reference_number===refFilter).sort((a,b)=>a.item_sl_no-b.item_sl_no).map(r=>{
                     const isEditing = editingCartRow===r.id;
                     return h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
-                    h("td",{style:{padding:"8px 10px",fontWeight:700,color:"#0f6e56"}},r.item_sl_no),
+                    h("td",{style:{padding:"8px 10px",fontWeight:700,color:"#0f6e56"}},
+                      isEditing
+                        ? h("input",{type:"text",value:cartRowDraft.item_sl_no??"",
+                            onChange:e=>setCartRowDraft(d=>({...d,item_sl_no:e.target.value})),
+                            title:"Changing this moves the BOM, datasheet, options and testing with it",
+                            style:{width:56,padding:"4px 6px",fontSize:12,fontWeight:700,color:"#0f6e56",border:"1px solid "+colors.border,borderRadius:4}})
+                        : r.item_sl_no),
                     h("td",{style:{padding:"8px 10px"}},
                       isEditing
                         ? h("input",{type:"text",placeholder:"—",value:cartRowDraft.sl_no_in_enq,onChange:e=>setCartRowDraft(d=>({...d,sl_no_in_enq:e.target.value})),style:{width:80,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4}})
@@ -19467,10 +19724,72 @@ const MANUAL_SECTIONS = [
     "group": "Admin",
     "articles": [
       {
+        "key": "line_cost_formula",
+        "title": "How a BOM line's cost is worked out",
+        "tag": "Sales",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A BOM line's stored cost is a PER-UNIT figure: quantity required times rate. The order quantity is applied afterwards, by whatever works out a total. The Cart Summary, for instance, adds the line costs into a unit cost and then multiplies by the order quantity, which is why unit price times quantity equals the total on every row."
+          },
+          {
+            "type": "p",
+            "text": "The price the customer sees does not come from that stored figure at all. The quote recomputes it live, every time, from quantity required, order quantity, rate and sales factor. So a stored cost can be stale or wrong without the quoted price being affected."
+          },
+          {
+            "type": "tip",
+            "text": "Known inconsistency, being fixed separately. Three paths \u2014 editing a line, changing the order quantity, and refreshing rates \u2014 write the stored cost the OTHER way, with the order quantity already multiplied in. So editing a line changes its stored cost by a factor of the order quantity, and the Cart Summary then multiplies it again. If a Cart Summary figure ever looks inflated by exactly the order quantity, this is why. The quoted price is not affected."
+          },
+          {
+            "type": "p",
+            "text": "One deliberate exception. The printed BOM export computes its cost from the rate AS PRINTED, rounded to two decimals, rather than the raw stored rate. That is on purpose: it makes the document add up in the reader's hands. It can differ from the stored figure in the last decimal, and that difference is the rounding you can see, not an error."
+          }
+        ]
+      },
+      {
+        "key": "change_sl_no",
+        "title": "Changing an Sl No on a saved quote",
+        "tag": "Quotes",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "An Sl No typed wrongly used to be permanent: the only way round it was to clone the unit to the right number and delete the wrong one. It can now be corrected directly. Open the Cart, press Edit on the row, change the Sl No and Save."
+          },
+          {
+            "type": "p",
+            "text": "An Sl No is not just a label. It is what ties a unit's BOM, datasheet, options, testing, job attributes, BOM exceptions, revision history and value snapshots together across nine tables. Changing it moves all of them at once, in a single database operation that either completes in full or does nothing at all. There is no state in which half the unit has moved."
+          },
+          {
+            "type": "tip",
+            "text": "If you ask for a number that another Sl No on the same quote already uses, the app stops and offers to SWAP the two instead. It will not rename one onto the other, because that would merge two units into one with no way back. Swapping moves everything belonging to each unit with it; nothing is deleted and nothing is combined."
+          },
+          {
+            "type": "p",
+            "text": "The change is recorded in the quote's Revision History as an item_sl_no change, showing the old and new numbers and who made it."
+          }
+        ]
+      },
+      {
         "key": "cart_summary",
         "title": "Cart Summary and the sales factor",
         "tag": "Sales",
         "blocks": [
+          {
+            "type": "p",
+            "text": "Currency. If the quote is in a currency other than rupees, a switch in the header prints every figure either in the quote currency or in INR. The conversion is a division by the quote's own conversion rate \u2014 the same one the quote PDF uses, never a separately typed one. The effective sales factor is a ratio, so it reads the same in either currency; switching the display can never appear to change a factor. On a rupee quote the switch is hidden rather than shown pointlessly."
+          },
+          {
+            "type": "p",
+            "text": "Include cost and Sf. Unit cost, the sales factor and total cost are internal figures. Untick that box and the sheet keeps only description, quantity, unit price and total price, which is what makes it safe to forward to a customer. The tick governs the screen and both exports alike."
+          },
+          {
+            "type": "p",
+            "text": "Excel and PDF. Both are available from inside this screen and from the Cart Summary block in the export row. Expand sub-assemblies adds an indented line under any Sl No whose factors differ, showing each sub-assembly with its own factor. That option does nothing when cost and Sf are excluded, because a breakdown with no factor and no cost on it carries nothing, and it is greyed out to say so."
+          },
+          {
+            "type": "tip",
+            "text": "Rows are ordered by Sl No in Enq \u2014 the customer's own numbering, which is what this sheet is usually read against \u2014 ascending, and numerically where the values are numbers, so 10 lands after 2 rather than after 1. Sl Nos with no Sl No in Enq have nothing to sort on, so they sit at the end in your own Sl No order."
+          },
           {
             "type": "p",
             "text": "One row per Sl No across the whole estimator sheet, with the description, cost, sales factor, quantity and total. Open it from the Cart Summary block in Export full quote."
@@ -20623,6 +20942,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"8 Sep 2026 (56)", summary:"Cost is now worked out through one shared helper everywhere, and a WRONG FIX from the previous build is reverted before it ever shipped. What happened: computeCost had been written on 5 September and never actually called, so nine sites still did the arithmetic inline. Consolidating them was right. Deciding WHICH formula was the house rule was not: three paths (editing a line, changing the order quantity, refreshing rates) multiply by the order quantity, so the manual line adder was moved to match them. Reading the live data showed the opposite. Every line in every live quote stores cost as qty_required x rate, per unit, and the Cart Summary depends on that \u2014 it sums line costs into a unit cost and multiplies by order qty for the total, so a stored cost containing the order qty would be counted twice. The adder was already correct; it has been put back, passing an order quantity of 1 so it still routes through the shared helper rather than inlining the sum. The other eight sites keep the consolidation, which changes no value, only rounding. IMPORTANT AND UNCHANGED: the customer-facing price never reads the stored cost. slNoBaseTotalInr recomputes it live from qty, order qty, rate and sf. No quote has ever gone out mispriced because of any of this, and the 731 lines flagged by the earlier consistency check need no re-costing \u2014 that check measured against the wrong formula and should be discarded. The real remaining fault, deliberately left for a separate build rather than half fixed here, is that those three paths still write the other convention, so editing a line multiplies its stored cost by the order quantity and the Cart Summary inflates it again. A test now pins the per-unit convention so it cannot drift unnoticed." },
+  { date:"7 Sep 2026 (54)", summary:"Sl No can now be corrected on a saved quote, and the Cart Summary is finished. SL NO RENAME: an Sl No typed wrongly was previously permanent \u2014 the only workaround was cloning to the right number and deleting the wrong one. Edit now sits on the Cart row. Because item_sl_no ties a unit together across NINE tables with no foreign key holding them to each other, this is not done as a series of updates from the browser: a dropped connection halfway would leave a BOM under one number and its datasheet under another, silently, surfacing as a wrong PDF weeks later. It runs as a database function (crm_phase45) in one transaction, which re-counts the old number afterwards and refuses to commit if anything is left behind. Asking for a number another Sl No already holds does NOT rename onto it \u2014 that would merge two units irreversibly \u2014 it offers a SWAP, which moves everything belonging to each unit with it. Tested against a real Postgres with item_sl_no deliberately numeric on some tables and text on others: 27 of 27, including that a refused call changes nothing and that a second quote sharing the same Sl No is never touched. CART SUMMARY: a currency switch between the quote currency and INR (a division by the quote own rate, never a retyped one; a missing or zero rate now falls back to INR rather than labelling rupees as dollars \u2014 caught by a test, not by reading); Total cost alongside Total price; an Include cost and Sf tick that strips the internal columns so the sheet can be forwarded; Excel and PDF with the expand option, specified on 5 September and missed; and the sort moved onto Sl No in Enq, numerically, blanks last \u2014 the column had always displayed one field and sorted on another. The grouping logic now lives in ONE top-level builder that the screen and both exports call, so a figure on screen cannot disagree with a figure in the document. Also: admin and super_admin can change a factor, not only the Sales Head, who was the only role able to use his own review screen; and the CART block is a sibling of the export blocks rather than nested inside the BOM block, which is what drew a box inside a box." },
   { date:"7 Sep 2026 (53)", summary:"Three dead buttons fixed, all the same underlying fault: a name the code referred to that did not exist anywhere, which throws and leaves the button looking like it simply does nothing. (1) \"Go to Cart\" in the fixed CART block called setShowCart, which was never declared — the working state is showCartScreen. The two Go to Cart buttons on the Quotes screen had drifted apart: different handlers, and different rules about when they were available. Both now call ONE shared openCartScreen with ONE shared cartUnavailable test, so they cannot disagree again — the same one-definition principle already applied to computeCost/computeSalesPrice. Any future Go to Cart button uses those two and does not roll its own. (2) The PDF button inside the Datasheet modal read sessionCompany for its letterhead and footer, but DatasheetModal was never passed that prop. It is now threaded in at both places the modal is opened, including through PricingDescriptionPanel. The Datasheet Excel export was not touched. (3) That PDF export is now wrapped so a failure shows a message naming the reason instead of failing silently — a dead-looking button is the hardest kind of fault to report. Verified by resolving every identifier in the shipped script against its scopes: there are now ZERO unresolved names in the whole file, where before this class of bug had produced three in a week. That scan is now part of the build check, since node --check cannot see any of them." },
   { date:"7 Sep 2026 (52)", summary:"URGENT fix — Generate Quote PDF was broken for every quote: \"quoteIsInr is not defined\". Root cause: quoteCurrency, quoteIsInr and quoteFx were declared inside buildDoc, the inner function that draws the document, but the 3 Sep \"Grand Total as printed\" work (grandTotalPrinted) sits outside buildDoc in the enclosing block and reads quoteIsInr and quoteFx to convert each Sl No total into the display currency. buildDoc's scope is not visible from there, so the names were never in scope at that point at all — a plain ReferenceError, not the \"cannot access before initialization\" ordering fault fixed on 31 Aug, though it is the same family and equally invisible to node --check because the code is valid JavaScript. Fixed by declaring the three constants once, in the enclosing block immediately after first, and deleting the copies inside buildDoc, which now reads them from the outer scope. Verified by parsing the shipped script with a real JavaScript parser and resolving scopes, then re-running that check to confirm no other name declared inside buildDoc is read from outside it — quoteIsInr and quoteFx were the only two. Also removed pfQuoteIsInr and pfQuoteFx, a dead local duplicate of the same two values left behind when the 3 Sep lumpsum change stopped converting Packing & Forwarding. No calculation, layout or wording changed: the same figures, printed the same way." },
   { date:"31 Aug 2026 (51)", summary:"Sale Order document carry-forward, with a real bug fixed along the way. Real bug found: cloneQuoteIntoContract (creates a Contract from a Won Quote) was already attempting to carry documents over, but only cloned the parent \"shell\" row, never the actual revision/link/status data — a carried document had nothing real to show, effectively broken rather than genuinely absent, which is why Contracts looked like they started with a clean empty list. Fixed by extracting the ALREADY-PROVEN complete mechanism from startAmendment's own Quote-amendment document carry-forward (parent + a fresh Rev-0/Out history row carrying the prior link forward) into a new shared carryForwardDocuments() helper, used by both startAmendment (unchanged behavior, just de-duplicated) and the new Contract flow. New: when creating a Contract, if the source Quote has documents, a picker shows them (select-all by default, matching the amendment area-picker's own precedent) before the Contract is created — pick which ones actually belong on the Sale Order rather than an all-or-nothing carry. Kept entity_type=\"quote\" for carried documents even though they're headed for a Contract — the Documents panel everywhere in this app already queries that value unconditionally (an existing, deliberate convention), so anything else would make carried documents silently invisible." },
@@ -30553,6 +30874,108 @@ function computeSalesPrice(cost, sf){
   return Number(((Number(cost)||0) * (Number(sf)||3.1)).toFixed(4));
 }
 
+/* ---- CART SUMMARY ROW BUILDER (7 Sep) -------------------------------
+   ONE definition of what a Cart Summary row is, used by the on-screen
+   table AND by the Excel and PDF exports. Written as a top-level
+   function on purpose: when the screen owned this logic privately, the
+   exports would have had to reimplement it, and a reimplementation is
+   how the four sales_price formulas happened. If the grouping rule ever
+   changes it changes here, once, and all three follow.
+
+   CART_SUMMARY_OTHERS is the label for lines carrying the quote's base
+   factor. The base is the factor on the MOST LINES, not the most cost:
+   a tweak is the minority by count.
+--------------------------------------------------------------------- */
+const CART_SUMMARY_OTHERS = "Others";
+
+function buildCartSummaryRows(ests, lines, staged){
+  staged = staged || {};
+  const bySl = new Map();
+  (ests||[]).forEach(e=>bySl.set(String(e.item_sl_no), {est:e, lines:[]}));
+  (lines||[]).forEach(l=>{
+    const k = String(l.item_sl_no);
+    if(!bySl.has(k)) bySl.set(k, {est:null, lines:[]});   // never drop a line
+    bySl.get(k).lines.push(l);
+  });
+  const out = [];
+  bySl.forEach((v,slNo)=>{
+    const cnt = new Map();
+    v.lines.forEach(l=>{ const f=String(Number(l.sf)||3.1); cnt.set(f,(cnt.get(f)||0)+1); });
+    let baseF = null, best = -1;
+    cnt.forEach((n,f)=>{ if(n>best){best=n; baseF=f;} });
+    const groupNameOf = (l)=>{
+      const sa = (l.sub_assembly||"").trim();
+      return (String(Number(l.sf)||3.1) === baseF || !sa) ? CART_SUMMARY_OTHERS : sa;
+    };
+    const groups = new Map();
+    v.lines.forEach(l=>{
+      const g = groupNameOf(l);
+      if(!groups.has(g)) groups.set(g, {name:g, lines:[], cost:0, sf:Number(l.sf)||3.1});
+      const G = groups.get(g);
+      G.lines.push(l); G.cost += Number(l.cost)||0;
+    });
+    const gl = [...groups.values()].map(G=>({ ...G, sf: staged[slNo+"||"+G.name] ?? G.sf }));
+    gl.sort((a,b)=> a.name===CART_SUMMARY_OTHERS ? 1 : b.name===CART_SUMMARY_OTHERS ? -1 : a.name.localeCompare(b.name));
+    const cost = gl.reduce((s,G)=>s+G.cost,0);
+    const sale = gl.reduce((s,G)=>s+computeSalesPrice(G.cost,G.sf),0);
+    // ORPHAN CHECK — grouped cost must equal ungrouped cost exactly.
+    const raw = v.lines.reduce((s,l)=>s+(Number(l.cost)||0),0);
+    const lost = Math.abs(raw-cost) > 0.005;
+    out.push({slNo, est:v.est, groups:gl, cost, sale,
+              qty: Number(v.est?.order_qty)||1,
+              mixed: gl.length>1, lost, lineCount:v.lines.length});
+  });
+  sortCartSummaryRows(out);
+  return out;
+}
+
+/* Sort on Sl No in Enq — the CUSTOMER's numbering, which is what this
+   sheet is read against — ascending, numerically where the values are
+   numbers so 10 lands after 2 rather than after 1. Rows with no Sl No in
+   Enq have nothing to sort on, so they go last in our own Sl No order
+   instead of being scattered through the middle. Before 7 Sep the column
+   showed Sl No in Enq but the sort ran on item_sl_no, so wherever the two
+   disagreed the column simply looked unsorted. */
+function cartSummarySortKey(r){
+  const enq = String((r.est && r.est.sl_no_in_enq) || "").trim();
+  return { has: !!enq, enq, own: String(r.slNo||"") };
+}
+function sortCartSummaryRows(rows){
+  const cmp = (a,b)=>{
+    const na=Number(a), nb=Number(b);
+    if(isFinite(na)&&isFinite(nb)&&a!==""&&b!=="") return na-nb;
+    return String(a).localeCompare(String(b));
+  };
+  rows.sort((x,y)=>{
+    const A=cartSummarySortKey(x), B=cartSummarySortKey(y);
+    if(A.has!==B.has) return A.has ? -1 : 1;      // blanks last
+    if(A.has && B.has){ const c=cmp(A.enq,B.enq); if(c) return c; }
+    return cmp(A.own,B.own);
+  });
+  return rows;
+}
+
+/* Currency. Costs and sales prices are stored in INR throughout. A quote
+   in another currency divides by its conversion rate — the SAME division
+   the quote PDF applies, never a separately-typed rate. inr:true shows
+   the stored rupee figures untouched. */
+function cartSummaryFx(ests, inr){
+  const first = (ests||[])[0] || {};
+  const cur = (first.currency || "INR");
+  // Read the rate RAW. Collapsing a missing or zero rate to 1 up here was
+  // caught by the tests: it left the figures in rupees while the heading
+  // still said USD, which is the worst of both — a document that looks
+  // converted and is not. With no usable rate we show INR and say so.
+  const raw = Number(first.conversion_rate);
+  const hasRate = isFinite(raw) && raw > 0;
+  const useInr = inr || cur === "INR" || !hasRate;
+  return { code: useInr ? "INR" : cur,
+           div: useInr ? 1 : raw,
+           quoteCurrency: cur,
+           rate: hasRate ? raw : 1,
+           convertible: cur !== "INR" && hasRate };
+}
+
 /* ---- CART SUMMARY / SALES FACTOR REVIEW (5 Sep) ----
    One row per Sl No across the whole estimator sheet, with the
    EFFECTIVE sales factor — total sale over total cost — because a
@@ -30573,7 +30996,7 @@ function computeSalesPrice(cost, sf){
    every other gateway now uses. sf and sales_price are always written
    together; a factor is never stored without its price being
    recomputed in the same statement. */
-function CartSummaryScreen({ user, quoteRef }){
+function CartSummaryScreen({ user, quoteRef, exportCartSummaryExcel, exportCartSummaryPDF }){
   const [lines,setLines] = useState([]);
   const [ests,setEsts] = useState([]);
   const [loading,setLoading] = useState(true);
@@ -30584,8 +31007,19 @@ function CartSummaryScreen({ user, quoteRef }){
   const [saving,setSaving] = useState(false);
   const [msg,setMsg] = useState("");
   const [salesHead,setSalesHead] = useState(false);
+  const [showInr,setShowInr] = useState(false);      // false = quote currency
+  const [includeCost,setIncludeCost] = useState(true);
+  const [expandAll,setExpandAll] = useState(false);
+  const [exporting,setExporting] = useState("");
 
-  const OTHERS = "Others";
+  // One label, from the shared builder, so the screen and the exports
+  // cannot end up calling the base group different things.
+  const OTHERS = CART_SUMMARY_OTHERS;
+
+  // Who may change a sales factor here (7 Sep): the Sales Head, and now
+  // also admin and super_admin — the MD was locked out of his own review
+  // screen and could only look at it.
+  const canEditSf = salesHead || user?.role==="admin" || user?.role==="super_admin";
 
   const load = useCallback(async()=>{
     if(!quoteRef){ setLoading(false); return; }
@@ -30603,63 +31037,25 @@ function CartSummaryScreen({ user, quoteRef }){
   },[quoteRef,user]);
   useEffect(()=>{ load(); },[load]);
 
-  // ---- grouping, with the orphan guard ----
-  const rows = useMemo(()=>{
-    const bySl = new Map();
-    (ests||[]).forEach(e=>bySl.set(String(e.item_sl_no), {est:e, lines:[]}));
-    (lines||[]).forEach(l=>{
-      const k = String(l.item_sl_no);
-      if(!bySl.has(k)) bySl.set(k, {est:null, lines:[]});   // never drop a line
-      bySl.get(k).lines.push(l);
-    });
-    const out = [];
-    bySl.forEach((v,slNo)=>{
-      const sfOf = (l)=> staged[slNo+"||"+groupNameOf(l)] ?? (Number(l.sf)||3.1);
-      // count lines per sub-assembly factor to find the BASE — the factor on
-      // the MOST LINES, not the most cost. A tweak is the minority by count.
-      const cnt = new Map();
-      v.lines.forEach(l=>{ const f=String(Number(l.sf)||3.1); cnt.set(f,(cnt.get(f)||0)+1); });
-      let baseF = null, best = -1;
-      cnt.forEach((n,f)=>{ if(n>best){best=n; baseF=f;} });
-      function groupNameOf(l){
-        const sa = (l.sub_assembly||"").trim();
-        return (String(Number(l.sf)||3.1) === baseF || !sa) ? OTHERS : sa;
-      }
-      const groups = new Map();
-      v.lines.forEach(l=>{
-        const g = groupNameOf(l);
-        if(!groups.has(g)) groups.set(g, {name:g, lines:[], cost:0, sf:Number(l.sf)||3.1});
-        const G = groups.get(g);
-        G.lines.push(l); G.cost += Number(l.cost)||0;
-      });
-      const gl = [...groups.values()].map(G=>({
-        ...G, sf: staged[slNo+"||"+G.name] ?? G.sf,
-      }));
-      gl.sort((a,b)=> a.name===OTHERS ? 1 : b.name===OTHERS ? -1 : a.name.localeCompare(b.name));
-      const cost = gl.reduce((s,G)=>s+G.cost,0);
-      const sale = gl.reduce((s,G)=>s+computeSalesPrice(G.cost,G.sf),0);
-      // ORPHAN CHECK — grouped cost must equal ungrouped cost exactly.
-      const raw = v.lines.reduce((s,l)=>s+(Number(l.cost)||0),0);
-      const lost = Math.abs(raw-cost) > 0.005;
-      out.push({slNo, est:v.est, groups:gl, cost, sale,
-                qty: Number(v.est?.order_qty)||1,
-                mixed: gl.length>1, lost, lineCount:v.lines.length});
-    });
-    out.sort((a,b)=>{
-      const na=Number(a.slNo), nb=Number(b.slNo);
-      if(isFinite(na)&&isFinite(nb)) return na-nb;         // 1,2,3,10 not 1,10,2
-      return String(a.slNo).localeCompare(String(b.slNo));
-    });
-    return out;
-  },[ests,lines,staged]);
+  // Grouping, the orphan guard and the sort all live in the shared
+  // top-level builder so the exports below produce the same rows as this
+  // table. See buildCartSummaryRows.
+  const rows = useMemo(()=>buildCartSummaryRows(ests, lines, staged),[ests,lines,staged]);
+
+  const fxInfo = useMemo(()=>cartSummaryFx(ests, showInr),[ests,showInr]);
+  const conv = (v)=> (Number(v)||0) / (fxInfo.div||1);
 
   const gCost = rows.reduce((s,r)=>s+r.cost*r.qty,0);
   const gSale = rows.reduce((s,r)=>s+r.sale*r.qty,0);
   const dirty = Object.keys(staged).length>0;
+  // The effective factor is a RATIO, so it is identical in either
+  // currency — deliberately computed off the rupee figures so switching
+  // the display can never appear to change the factor.
   const fmt=(v)=> (Number(v)||0).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+  const fmtC=(v)=> fmt(conv(v));
 
   const openEdit = (row,G)=>{
-    if(!salesHead){ setMsg("Only the Sales Head can change a sales factor here."); return; }
+    if(!canEditSf){ setMsg("Only the Sales Head, an admin or the super admin can change a sales factor here."); return; }
     setMsg(""); setEdit({slNo:row.slNo, group:G.name, from:G.sf, lines:G.lines});
     setToVal(String(G.sf));
   };
@@ -30727,10 +31123,41 @@ function CartSummaryScreen({ user, quoteRef }){
       h("span",{style:{fontSize:12.5}},"Effective sales factor ",
         h("b",{style:{fontSize:15}}, gCost? (gSale/gCost).toFixed(2) : "\u2014")),
       h("span",{style:{fontSize:11.5,color:colors.mutedLight}},"total sale \u00f7 total cost, whole sheet"),
-      salesHead
-        ? h("span",{style:{fontSize:11.5,background:"#e6f4f1",color:"#0f6e56",padding:"2px 9px",borderRadius:9}},"Sales Head \u2014 editable")
+      canEditSf
+        ? h("span",{style:{fontSize:11.5,background:"#e6f4f1",color:"#0f6e56",padding:"2px 9px",borderRadius:9}},
+            salesHead?"Sales Head \u2014 editable":"Admin \u2014 editable")
         : h("span",{style:{fontSize:11.5,color:colors.mutedLight,border:"1px solid "+colors.border,padding:"2px 9px",borderRadius:9}},"read only"),
       dirty?h("span",{style:{fontSize:11.5,background:"#fff4d6",color:"#854f0b",padding:"2px 9px",borderRadius:9}},"unsaved"):null),
+
+    // Currency, the cost switch, expand, and the exports. The currency
+    // control only appears when there is a second currency to show —
+    // on a rupee quote an INR/INR toggle would be noise.
+    h("div",{style:{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap",marginBottom:12}},
+      fxInfo.convertible
+        ? h("span",{style:{display:"flex",alignItems:"center",gap:7}},
+            h("span",{style:{fontSize:11,color:colors.muted}},"Show in"),
+            h("span",{style:{display:"flex",border:"1px solid "+colors.border,borderRadius:5,overflow:"hidden"}},
+              h("button",{onClick:()=>setShowInr(false),style:{padding:"3px 11px",fontSize:11,border:"none",cursor:"pointer",
+                background:!showInr?colors.text:"transparent",color:!showInr?"#fff":colors.text}},fxInfo.quoteCurrency),
+              h("button",{onClick:()=>setShowInr(true),style:{padding:"3px 11px",fontSize:11,border:"none",cursor:"pointer",
+                background:showInr?colors.text:"transparent",color:showInr?"#fff":colors.text}},"INR")),
+            h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"at "+fxInfo.rate))
+        : h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"Quote is in INR"),
+      h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:11.5,color:colors.muted,cursor:"pointer"}},
+        h("input",{type:"checkbox",checked:includeCost,onChange:e=>setIncludeCost(e.target.checked)}),
+        "Include cost and Sf"),
+      h("label",{style:{display:"flex",alignItems:"center",gap:5,fontSize:11.5,color:colors.muted,cursor:"pointer"}},
+        h("input",{type:"checkbox",checked:expandAll,onChange:e=>setExpandAll(e.target.checked)}),
+        "Expand sub-assemblies"),
+      h("span",{style:{marginLeft:"auto",display:"flex",gap:6}},
+        h("button",{disabled:!!exporting,style:btnSmall,
+          onClick:async()=>{ setExporting("xlsx");
+            try{ await exportCartSummaryExcel(quoteRef,ests,rows,{includeCost,expand:expandAll,inr:showInr}); }
+            finally{ setExporting(""); } }}, exporting==="xlsx"?"Working\u2026":"Excel"),
+        h("button",{disabled:!!exporting,style:btnSmall,
+          onClick:async()=>{ setExporting("pdf");
+            try{ await exportCartSummaryPDF(quoteRef,ests,rows,{includeCost,expand:expandAll,inr:showInr}); }
+            finally{ setExporting(""); } }}, exporting==="pdf"?"Working\u2026":"PDF"))),
 
     msg?h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},msg):null,
 
@@ -30741,7 +31168,10 @@ function CartSummaryScreen({ user, quoteRef }){
         h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.border,background:"#faf9f4"}},
           h("th",{style:{width:28}}),
           ["Sl No in Enq","Item","Description"].map(x=>h("th",{key:x,style:{textAlign:"left",padding:"8px 6px",fontWeight:600}},x)),
-          ["Unit cost","Sf","Unit price","Qty","Total"].map(x=>h("th",{key:x,style:{textAlign:"right",padding:"8px 6px",fontWeight:600}},x)))),
+          // Cost, Sf and Total cost are the internal columns. With the tick
+          // off the sheet is safe to forward to a customer.
+          (includeCost?["Unit cost","Sf"]:[]).concat(["Unit price","Qty"]).concat(includeCost?["Total cost"]:[]).concat(["Total price"])
+            .map(x=>h("th",{key:x,style:{textAlign:"right",padding:"8px 6px",fontWeight:600}},x)))),
         h("tbody",null, rows.flatMap(r=>{
           const eff = r.cost ? r.sale/r.cost : 0;
           const main = h("tr",{key:r.slNo,style:{borderBottom:"1px solid "+colors.border}},
@@ -30755,26 +31185,29 @@ function CartSummaryScreen({ user, quoteRef }){
               (r.est?.description||"").slice(0,90),
               r.lost?h("span",{title:"Some lines could not be grouped. Figures may be short — tell whoever maintains the app.",
                 style:{marginLeft:6,fontSize:10.5,background:"#fdecea",color:"#a32b1c",padding:"1px 7px",borderRadius:9}},"grouping gap"):null),
-            h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmt(r.cost)),
-            h("td",{style:{padding:"8px 6px",textAlign:"right",fontStyle:r.mixed?"italic":"normal"}},eff.toFixed(2)+(r.mixed?" *":"")),
-            h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmt(r.sale)),
+            includeCost?h("td",{key:"uc",style:{padding:"8px 6px",textAlign:"right"}},fmtC(r.cost)):null,
+            includeCost?h("td",{key:"sf",style:{padding:"8px 6px",textAlign:"right",fontStyle:r.mixed?"italic":"normal"}},eff.toFixed(2)+(r.mixed?" *":"")):null,
+            h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmtC(r.sale)),
             h("td",{style:{padding:"8px 6px",textAlign:"right"}},r.qty),
-            h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmt(r.sale*r.qty)));
-          if(!open[r.slNo]) return [main];
+            includeCost?h("td",{key:"tc",style:{padding:"8px 6px",textAlign:"right"}},fmtC(r.cost*r.qty)):null,
+            h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmtC(r.sale*r.qty)));
+          if(!(open[r.slNo]||expandAll)) return [main];
           const det = h("tr",{key:r.slNo+"-d",style:{background:"#faf9f4"}},
-            h("td",null), h("td",{colSpan:8,style:{padding:"9px 6px 12px"}},
+            h("td",null), h("td",{colSpan:includeCost?9:6,style:{padding:"9px 6px 12px"}},
               h("div",{style:{display:"flex",flexDirection:"column",gap:5,maxWidth:470}},
                 r.groups.map(G=>h("div",{key:G.name,style:{display:"flex",alignItems:"center",gap:10,
                     borderTop:G.name===OTHERS?"1px solid "+colors.border:"none",paddingTop:G.name===OTHERS?6:0}},
                   h("span",{style:{flex:1,fontSize:12,color:G.name===OTHERS?colors.text:"#854f0b"}},
                     G.name, h("span",{style:{color:colors.mutedLight,fontSize:11}}," ("+G.lines.length+")")),
                   h("span",{style:{fontSize:12,width:44,textAlign:"right"}},Number(G.sf).toFixed(2)),
-                  salesHead?h("button",{onClick:()=>openEdit(r,G),style:{...btnSmall,fontSize:11,padding:"2px 9px"}},"Edit"):null)))));
+                  canEditSf?h("button",{onClick:()=>openEdit(r,G),style:{...btnSmall,fontSize:11,padding:"2px 9px"}},"Edit"):null)))));
           return [main,det];
         })),
         h("tfoot",null,h("tr",{style:{fontWeight:700,borderTop:"2px solid "+colors.border}},
-          h("td",null),h("td",{colSpan:7,style:{padding:"9px 6px"}},"Total"),
-          h("td",{style:{padding:"9px 6px",textAlign:"right"}},fmt(gSale)))))),
+          h("td",null),
+          h("td",{colSpan:includeCost?7:5,style:{padding:"9px 6px"}},"Total "+fxInfo.code),
+          includeCost?h("td",{key:"ftc",style:{padding:"9px 6px",textAlign:"right"}},fmtC(gCost)):null,
+          h("td",{style:{padding:"9px 6px",textAlign:"right"}},fmtC(gSale)))))),
 
     edit ? h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:600,maxWidth:"100%",maxHeight:"88vh",overflow:"auto"}},
