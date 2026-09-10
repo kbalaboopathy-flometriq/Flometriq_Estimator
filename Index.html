@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-08T04:00:00Z";
+  var APP_BUILD_VERSION = "2026-09-08T06:10:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -9505,7 +9505,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const doMarkLineValidated = async(line)=>{
     setPendingValidateBusy(line.id);
     try{
-      await sb.from("estimate_lines").update({validation_status:"Validated",validated_by:user?.username||"unknown",validated_at:new Date().toISOString()}).eq("id",line.id);
+      await byLine(sb.from("estimate_lines").update({validation_status:"Validated",validated_by:user?.username||"unknown",validated_at:new Date().toISOString()}), line);
       await logAudit("UPDATE","estimate_lines",refFilter+"-"+line.item_sl_no,"Marked Direct Price line \""+(line.component||"")+"\" as Validated (from quote readiness check)",user?.username||"unknown",{validation_status:"Pending"},{validation_status:"Validated"});
       setValidatedLines(s=>new Set([...s,line.id]));
       refreshReadiness(refFilter);
@@ -9522,7 +9522,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     setPendingValidateBusy(line.id); setPendingValidateCodeError("");
     const res = await verifyAndConsumeGatedPin("validate_pending_line", pendingValidateCodeInput, user?.username||"unknown", "estimate_lines", refFilter+"-"+line.item_sl_no, "Validated Direct Price line \""+(line.component||"")+"\" via one-time code");
     if(!res.ok){ setPendingValidateCodeError(res.message||"That code didn't work."); setPendingValidateBusy(null); return; }
-    await sb.from("estimate_lines").update({validation_status:"Validated",validated_by:user?.username||"unknown",validated_at:new Date().toISOString()}).eq("id",line.id);
+    await byLine(sb.from("estimate_lines").update({validation_status:"Validated",validated_by:user?.username||"unknown",validated_at:new Date().toISOString()}), line);
     await logAudit("UPDATE","estimate_lines",refFilter+"-"+line.item_sl_no,"Marked Direct Price line \""+(line.component||"")+"\" as Validated via one-time code (from quote readiness check)",user?.username||"unknown",{validation_status:"Pending"},{validation_status:"Validated"});
     setValidatedLines(s=>new Set([...s,line.id]));
     setPendingValidateCodeTarget(null); setPendingValidateCodeInput("");
@@ -10145,7 +10145,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const cost = computeCost(qty, 1, rate);
         const sales_price = computeSalesPrice(cost, sf);
         if(Number(line.cost)===cost && Number(line.sales_price)===sales_price) continue;
-        await sb.from("estimate_lines").update({cost,sales_price}).eq("id",line.id);
+        await byLine(sb.from("estimate_lines").update({cost,sales_price}), line);
         if(openRef && openRef.id===ref.id) setOpenLines(ls=>ls.map(l=>l.id===line.id?{...l,cost,sales_price}:l));
         changed++;
       }
@@ -11458,8 +11458,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     try{
       const { estRow, itemName, willAdd, willRemove, maxSlNo } = bomRefreshPreview;
       if(willRemove.length){
-        const { error:delErr } = await sb.from("estimate_lines").delete().in("id",willRemove.map(l=>l.id));
-        if(delErr) throw delErr;
+        // Was .in("id", ...) on a table with no id column, so Refresh BOM
+        // never actually removed anything -- it added the new lines and
+        // left the old ones in place. There is no composite IN, so each
+        // line is deleted by its own key and any failure stops the run
+        // rather than leaving a half-refreshed BOM.
+        for(const rm of willRemove){
+          const { error:delErr } = await byLine(sb.from("estimate_lines").delete(), rm);
+          if(delErr) throw delErr;
+        }
       }
       if(willAdd.length){
         const newRows = willAdd.map((m,idx)=>({
@@ -12914,7 +12921,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const line = (lines||[]).find(l=>(l.component||l.sub_assembly||"line")===targetComponent);
         if(line){
           const [spec,grade] = miss.a.split(", ");
-          await sb.from("estimate_lines").update({material_spec:spec||line.material_spec, grade:grade||line.grade}).eq("id",line.id);
+          await byLine(sb.from("estimate_lines").update({material_spec:spec||line.material_spec, grade:grade||line.grade}), line);
           await logAudit("UPDATE","estimate_lines",quoteExportRef+"-"+miss.slNoB,"Fixed near-miss on \""+targetComponent+"\" — set to match Sl No "+miss.slNoA+" (\""+miss.a+"\") for datasheet summarising",user?.username||"unknown",{value:miss.b},{value:miss.a});
         }
       } else {
@@ -20956,6 +20963,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"8 Sep 2026 (58)", summary:"Ten writes to estimate_lines were addressing a column that does not exist. The table has NO id column, yet ten calls filtered on .eq(\"id\", line.id), which sends id=eq.undefined and returns \"column estimate_lines.id does not exist\". Most did not check the returned error, so they reported success and changed nothing. What was silently failing: validating a Direct Price line (two paths), the Cart Summary sales-factor save, the stale-cost sweep, the MOC spec and grade write-back, both Excel attachment writes, and the Direct Price validate-and-attach pair. Worst of the set was Refresh BOM, whose delete used .in(\"id\", ...) -- so it added the new lines and never removed the old ones, quietly leaving both in the BOM. All ten now address a line by reference_number + item_sl_no + sl_no, the key the app's other line writes already used, through a single byLine helper so there is one definition of \"this line\" instead of ten. The delete loops per line, since there is no composite IN, and stops on the first failure rather than leaving a half-refreshed BOM. Note for whoever comes next: this also explains why only some lines had ever been converted to the per-order cost convention -- several of the paths that would have converted them were never writing at all." },
   { date:"8 Sep 2026 (57)", summary:"Stored line cost is now PER UNIT everywhere. Five write paths still multiplied by the order quantity \u2014 the line editor, the order-quantity rescale, the rate refresh, the pending-edits rescale and the clone rescale \u2014 while the stored data, the manual adder and the Cart Summary are all per unit. The effect was worse than a simple mismatch: editing a line multiplied its stored cost by the order quantity, and the Cart Summary multiplies by the order quantity again when it works out a total, so the error was the order quantity SQUARED. On FXUS260001, order qty 200, one edited line would read forty thousand times too large. All five now pass an order quantity of 1, matching the adder. Two consequences by design: changing an Sl No order quantity no longer alters any stored line cost, because the stored figure never contained it, and the order-qty rescale is now a no-op kept only because it repairs a row previously written the other way. The BOM screen row and the BOM export still show an EXTENDED cost including the order quantity \u2014 that is a display figure sitting beside the qty-for-the-order column, it is not what gets stored, and a comment now says so to stop the two being reconciled by mistake. The quoted price was never affected at any point: slNoBaseTotalInr recomputes it live and does not read the stored cost. Four new tests pin the convention, including one asserting that the old behaviour inflated by order qty squared, so the symptom is recognisable rather than merely wrong. 34 of 34 pass. Rows already written wrongly are NOT touched by this build \u2014 find_inflated_line_costs.sql identifies them for review first." },
   { date:"8 Sep 2026 (56)", summary:"Cost is now worked out through one shared helper everywhere, and a WRONG FIX from the previous build is reverted before it ever shipped. What happened: computeCost had been written on 5 September and never actually called, so nine sites still did the arithmetic inline. Consolidating them was right. Deciding WHICH formula was the house rule was not: three paths (editing a line, changing the order quantity, refreshing rates) multiply by the order quantity, so the manual line adder was moved to match them. Reading the live data showed the opposite. Every line in every live quote stores cost as qty_required x rate, per unit, and the Cart Summary depends on that \u2014 it sums line costs into a unit cost and multiplies by order qty for the total, so a stored cost containing the order qty would be counted twice. The adder was already correct; it has been put back, passing an order quantity of 1 so it still routes through the shared helper rather than inlining the sum. The other eight sites keep the consolidation, which changes no value, only rounding. IMPORTANT AND UNCHANGED: the customer-facing price never reads the stored cost. slNoBaseTotalInr recomputes it live from qty, order qty, rate and sf. No quote has ever gone out mispriced because of any of this, and the 731 lines flagged by the earlier consistency check need no re-costing \u2014 that check measured against the wrong formula and should be discarded. The real remaining fault, deliberately left for a separate build rather than half fixed here, is that those three paths still write the other convention, so editing a line multiplies its stored cost by the order quantity and the Cart Summary inflates it again. A test now pins the per-unit convention so it cannot drift unnoticed." },
   { date:"7 Sep 2026 (54)", summary:"Sl No can now be corrected on a saved quote, and the Cart Summary is finished. SL NO RENAME: an Sl No typed wrongly was previously permanent \u2014 the only workaround was cloning to the right number and deleting the wrong one. Edit now sits on the Cart row. Because item_sl_no ties a unit together across NINE tables with no foreign key holding them to each other, this is not done as a series of updates from the browser: a dropped connection halfway would leave a BOM under one number and its datasheet under another, silently, surfacing as a wrong PDF weeks later. It runs as a database function (crm_phase45) in one transaction, which re-counts the old number afterwards and refuses to commit if anything is left behind. Asking for a number another Sl No already holds does NOT rename onto it \u2014 that would merge two units irreversibly \u2014 it offers a SWAP, which moves everything belonging to each unit with it. Tested against a real Postgres with item_sl_no deliberately numeric on some tables and text on others: 27 of 27, including that a refused call changes nothing and that a second quote sharing the same Sl No is never touched. CART SUMMARY: a currency switch between the quote currency and INR (a division by the quote own rate, never a retyped one; a missing or zero rate now falls back to INR rather than labelling rupees as dollars \u2014 caught by a test, not by reading); Total cost alongside Total price; an Include cost and Sf tick that strips the internal columns so the sheet can be forwarded; Excel and PDF with the expand option, specified on 5 September and missed; and the sort moved onto Sl No in Enq, numerically, blanks last \u2014 the column had always displayed one field and sorted on another. The grouping logic now lives in ONE top-level builder that the screen and both exports call, so a figure on screen cannot disagree with a figure in the document. Also: admin and super_admin can change a factor, not only the Sales Head, who was the only role able to use his own review screen; and the CART block is a sibling of the export blocks rather than nested inside the BOM block, which is what drew a box inside a box." },
@@ -28032,7 +28040,7 @@ function PricingDescriptionPanel({ openRef, openLines, user, sessionCompany, ite
       const path = "quote_"+openRef.reference_number+"_"+Date.now()+"_"+file.name.replace(/[^a-zA-Z0-9._-]/g,"_");
       const { error:err } = await sb.storage.from("direct-price-excels").upload(path,file);
       if(err) throw err;
-      const { error:updErr } = await sb.from("estimate_lines").update({excel_file_name:file.name,excel_file_path:path}).eq("id",line.id);
+      const { error:updErr } = await byLine(sb.from("estimate_lines").update({excel_file_name:file.name,excel_file_path:path}), line);
       if(updErr) throw updErr;
       setFileState(f=>({...f,[line.id]:{name:file.name,path}}));
       onSaved();
@@ -28064,7 +28072,7 @@ function PricingDescriptionPanel({ openRef, openLines, user, sessionCompany, ite
       if(line.validation_status==="Validated" && Number(line.sales_price)!==newSalesPrice){
         payload.validation_status="Pending"; payload.validated_by=null; payload.validated_at=null;
       }
-      const { error } = await sb.from("estimate_lines").update(payload).eq("id",line.id);
+      const { error } = await byLine(sb.from("estimate_lines").update(payload), line);
       if(error) throw error;
       await logAudit("UPDATE","estimate_lines",openRef.reference_number+"-"+openRef.item_sl_no,"Updated Direct Price line \""+draft.description.trim()+"\"",user?.username||"unknown",null,payload);
       onSaved();
@@ -28173,7 +28181,7 @@ function PendingValidationScreen({ user, onOpenQuote }){
     if(!isAdminOrAbove) return;
     setBusyId(row.id);
     try{
-      await sb.from("estimate_lines").update({validation_status:"Validated",validated_by:user.username,validated_at:new Date().toISOString()}).eq("id",row.id);
+      await byLine(sb.from("estimate_lines").update({validation_status:"Validated",validated_by:user.username,validated_at:new Date().toISOString()}), row);
       await logAudit("UPDATE","estimate_lines",row.reference_number+"-"+row.item_sl_no,"Marked Direct Price line \""+row.component+"\" as Validated",user.username,{validation_status:"Pending"},{validation_status:"Validated"});
       setRows(rs=>rs.filter(r=>r.id!==row.id));
     } finally { setBusyId(null); }
@@ -28185,7 +28193,7 @@ function PendingValidationScreen({ user, onOpenQuote }){
       const path = "quote_"+row.reference_number+"_"+Date.now()+"_"+file.name.replace(/[^a-zA-Z0-9._-]/g,"_");
       const { error:err } = await sb.storage.from("direct-price-excels").upload(path, file);
       if(err) throw err;
-      await sb.from("estimate_lines").update({excel_file_name:file.name, excel_file_path:path}).eq("id",row.id);
+      await byLine(sb.from("estimate_lines").update({excel_file_name:file.name, excel_file_path:path}), row);
       setRows(rs=>rs.map(r=>r.id===row.id?{...r,excel_file_name:file.name,excel_file_path:path}:r));
     } catch(e){ alert("Upload failed: "+e.message); }
     finally { setUploadingId(null); }
@@ -30882,6 +30890,23 @@ function IssueTracker({ user }){
 //
 // computeCost and computeSalesPrice are now the ONLY way either is
 // worked out. Any new gateway calls these; none rolls its own.
+/* ---- ADDRESSING ONE BOM LINE (8 Sep) --------------------------------
+   estimate_lines HAS NO id COLUMN. Ten places called .eq("id", line.id)
+   on it, which sends id=eq.undefined and comes back "column
+   estimate_lines.id does not exist" -- so those writes never once landed.
+   Most did not check the error, so they failed in silence: validating a
+   Direct Price line, the MOC spec/grade write-back, the Excel attachment
+   fields, and the Cart Summary's own sales-factor save.
+   A line is identified by reference_number + item_sl_no + sl_no, which is
+   what the app's other line writes already use. Do not reintroduce an id
+   filter on this table. */
+function byLine(query, line){
+  return query
+    .eq("reference_number", line.reference_number)
+    .eq("item_sl_no",       line.item_sl_no)
+    .eq("sl_no",            line.sl_no);
+}
+
 function computeCost(qtyRequired, orderQty, rate){
   return Number(((Number(qtyRequired)||0) * (Number(orderQty)||1) * (Number(rate)||0)).toFixed(4));
 }
@@ -31111,7 +31136,7 @@ function CartSummaryScreen({ user, quoteRef, exportCartSummaryExcel, exportCartS
         for(const l of G.lines){
           // sf and sales_price ALWAYS written together, through the one helper.
           const sales_price = computeSalesPrice(l.cost, v);
-          await sb.from("estimate_lines").update({sf:v, sales_price}).eq("id",l.id);
+          await byLine(sb.from("estimate_lines").update({sf:v, sales_price}), l);
         }
         await logAudit("UPDATE","estimate_lines",quoteRef+" Sl "+slNo,
           "Sales factor "+group+": "+Number(G.sf).toFixed(2)+" \u2192 "+Number(v).toFixed(2)+
