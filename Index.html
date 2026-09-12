@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-08T06:10:00Z";
+  var APP_BUILD_VERSION = "2026-09-10T18:20:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -8925,12 +8925,118 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
   // deliberately three-state: a boolean defaulting to false would be
   // indistinguishable from "no advance", which silently loses the delivery
   // trigger that counts days from receipt of advance.
+  // ---- CONTRACTUAL DELIVERY DATE (10 Sep, phases 47/48) ----
+  // Delivery is not one date. Four contractual options exist and which
+  // applies is per order; under three of them the date is a clock that
+  // starts LATER. So the contract stores days + which trigger + the date
+  // each trigger fired, and the date itself is DERIVED, never stored --
+  // read from v_contract_delivery so the panel, the board and any report
+  // give the same answer.
+  //
+  // Automation is deliberately partial: the app DETECTS and PROPOSES, a
+  // person COMMITS. A delivery date is contractual, so every move records
+  // who, when and why in delivery_date_history_tbl.
+  const [delOpen,setDelOpen] = useState(false);
+  const [delTriggers,setDelTriggers] = useState([]);
+  const [delView,setDelView] = useState(null);      // row from v_contract_delivery
+  const [holdOpen,setHoldOpen] = useState(null);    // row from v_full_hold_outstanding
+  const [delDays,setDelDays] = useState("");
+  const [delTrig,setDelTrig] = useState("");
+  const [delOrderAt,setDelOrderAt] = useState("");
+  const [delCode2At,setDelCode2At] = useState("");
+  const [delAdvAt,setDelAdvAt] = useState("");
+  const [delReason,setDelReason] = useState("");
+  const [delErr,setDelErr] = useState("");
+  const [delBusy,setDelBusy] = useState(false);
+
+  const loadDelivery = useCallback(async()=>{
+    if(!contractInfo?.contract_number) return;
+    const [{data:trg},{data:v},{data:hold}] = await Promise.all([
+      sb.from("delivery_trigger_tbl").select("*").order("sort_order"),
+      sb.from("v_contract_delivery").select("*").eq("contract_number",contractInfo.contract_number).maybeSingle(),
+      sb.from("v_full_hold_outstanding").select("*").eq("contract_number",contractInfo.contract_number).maybeSingle(),
+    ]);
+    setDelTriggers(trg||[]);
+    setDelView(v||null);
+    setHoldOpen(hold||null);
+    if(v){
+      setDelDays(v.delivery_days==null?"":String(v.delivery_days));
+      setDelTrig(v.delivery_trigger||"");
+      setDelOrderAt(v.trigger_order_at||"");
+      setDelCode2At(v.trigger_code2_at||"");
+      setDelAdvAt(v.trigger_advance_at||"");
+    }
+  },[contractInfo?.contract_number]);
+  useEffect(()=>{ loadDelivery(); },[loadDelivery]);
+
+  const trigNeeds = (key)=> delTriggers.find(t=>t.trigger_key===key) || {};
+  // Rule settled 10 Sep: a Code 2 clock-start date cannot be entered
+  // while any Full Hold document is still short of Code 2. Admin and
+  // super admin only may override, with a reason.
+  const code2Blocked = !!(holdOpen && holdOpen.full_hold_docs_open > 0);
+
   const [advOpen,setAdvOpen] = useState(false);
   const [advPct,setAdvPct] = useState("");
   const [advAmt,setAdvAmt] = useState("");
   const [advReason,setAdvReason] = useState("");
   const [advErr,setAdvErr] = useState("");
   const [advBusy,setAdvBusy] = useState(false);
+  // Save the delivery terms. Every field that moves is written to
+  // delivery_date_history_tbl with the before/after date and state, so a
+  // date that has moved three times never looks like one that never did.
+  const saveDelivery = async(override)=>{
+    setDelErr("");
+    const days = String(delDays).trim()===""? null : Number(delDays);
+    if(days!==null && (!isFinite(days) || days<=0)){ setDelErr("Days must be a number above zero."); return; }
+    if(!delTrig){ setDelErr("Choose which event starts the delivery clock."); return; }
+    const needs = trigNeeds(delTrig);
+    if(needs.needs_code2 && delCode2At && code2Blocked && !isAdminOrAbove){
+      setDelErr("Full Hold documents are still short of Code 2 ("+(holdOpen.documents||"")+
+                "). Only an admin can set the Code 2 date before they clear."); return; }
+    if(needs.needs_code2 && delCode2At && code2Blocked && !String(delReason).trim()){
+      setDelErr("Overriding the Code 2 block needs a reason."); return; }
+    setDelBusy(true);
+    const before = delView || {};
+    const patch = {
+      delivery_days: days,
+      delivery_trigger: delTrig,
+      trigger_order_at:   delOrderAt || null,
+      trigger_code2_at:   delCode2At || null,
+      trigger_advance_at: delAdvAt   || null,
+      delivery_answered_by: user?.username||"unknown",
+      delivery_answered_at: new Date().toISOString(),
+    };
+    const { error } = await sb.from("sale_order_tbl").update(patch)
+      .eq("contract_number", contractInfo.contract_number);
+    if(error){ setDelBusy(false); setDelErr("Could not save: "+error.message); return; }
+    // Re-read the VIEW rather than recompute here -- one definition of
+    // what the delivery date is, and this is not it.
+    const { data: after } = await sb.from("v_contract_delivery").select("*")
+      .eq("contract_number", contractInfo.contract_number).maybeSingle();
+    const moved = (before.delivery_date && after?.delivery_date)
+      ? Math.round((new Date(after.delivery_date)-new Date(before.delivery_date))/86400000) : null;
+    await sb.from("delivery_date_history_tbl").insert({
+      contract_number: contractInfo.contract_number,
+      event_type: (before.delivery_trigger && before.delivery_trigger!==delTrig) ? "trigger_changed"
+                : (String(before.delivery_days??"")!==String(days??"")) ? "days_changed" : "trigger_fired",
+      date_before: before.delivery_date||null, date_after: after?.delivery_date||null,
+      state_before: before.delivery_state||null, state_after: after?.delivery_state||null,
+      field_changed: "delivery terms",
+      value_before: before.delivery_trigger ? (before.delivery_days+" days from "+before.delivery_trigger) : null,
+      value_after: days+" days from "+delTrig,
+      days_moved: moved, stages_shifted: 0,
+      reason: String(delReason).trim()||null,
+      changed_by: user?.username||"unknown",
+    });
+    await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,
+      "Delivery: "+days+" days from "+delTrig+
+      (after?.delivery_date?("  ->  "+after.delivery_date+" ("+after.delivery_state+")"):""),
+      user?.username||"unknown",null,null);
+    setDelBusy(false); setDelOpen(false); setDelReason("");
+    await loadDelivery();
+    onChanged && onChanged();
+  };
+
   const advSmell = paymentTermSmellsOfAdvance(quoteHeaderRow?.payment_term || contractInfo?.payment_term);
   const advAnswered = contractInfo && contractInfo.has_advance !== null && contractInfo.has_advance !== undefined;
 
@@ -9110,6 +9216,47 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     );
   };
   const df = (key,placeholder,width)=>h("input",{value:draft[key],onChange:e=>setDraft(d=>({...d,[key]:e.target.value})),placeholder,style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:width||"100%"}});
+  const delPanel = delOpen && h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"12px 14px",marginBottom:8}},
+    h("div",{style:{fontWeight:700,fontSize:12.5,marginBottom:2}},"Contractual delivery"),
+    h("div",{style:{fontSize:11,color:colors.muted,marginBottom:10,lineHeight:1.6}},
+      "Enter the number of days and what starts the clock. The date is worked out from those \u2014 it is not typed, "+
+      "so it cannot go stale when a trigger date is corrected. Until every trigger the option depends on has actually "+
+      "happened, the date shown is a projection and is marked anticipated."),
+    h("div",{style:{display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap",marginBottom:10}},
+      h("label",{style:{fontSize:11,color:colors.muted}},"Days",
+        h("input",{type:"number",value:delDays,onChange:e=>setDelDays(e.target.value),
+          style:{display:"block",width:80,padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}})),
+      h("label",{style:{fontSize:11,color:colors.muted,flex:"1 1 320px"}},"Counted from",
+        h("select",{value:delTrig,onChange:e=>setDelTrig(e.target.value),
+          style:{display:"block",width:"100%",padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}},
+          h("option",{value:""},"\u2014 choose \u2014"),
+          delTriggers.map(t=>h("option",{key:t.trigger_key,value:t.trigger_key},t.label))))),
+    // Only the dates this option actually depends on are shown, so nobody
+    // fills in a date that has no effect on the answer.
+    (delTrig==="receipt_of_order") && h("label",{style:{fontSize:11,color:colors.muted,display:"block",marginBottom:8}},"Order received on",
+      h("input",{type:"date",value:delOrderAt,onChange:e=>setDelOrderAt(e.target.value),
+        style:{display:"block",padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}})),
+    (trigNeeds(delTrig).needs_code2) && h("div",{style:{marginBottom:8}},
+      h("label",{style:{fontSize:11,color:colors.muted}},"Full Hold documents cleared to Code 2 on",
+        h("input",{type:"date",value:delCode2At,onChange:e=>setDelCode2At(e.target.value),
+          style:{display:"block",padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}})),
+      code2Blocked ? h("div",{style:{fontSize:10.5,color:"#8a2d2d",marginTop:4}},
+        "Still short of Code 2: "+(holdOpen.documents||"")+
+        (isAdminOrAbove ? " \u2014 you may set it anyway, with a reason." : " \u2014 only an admin can set the date before these clear.")) : null),
+    (trigNeeds(delTrig).needs_advance) && h("label",{style:{fontSize:11,color:colors.muted,display:"block",marginBottom:8}},"Advance received on",
+      h("input",{type:"date",value:delAdvAt,onChange:e=>setDelAdvAt(e.target.value),
+        style:{display:"block",padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}})),
+    (code2Blocked && trigNeeds(delTrig).needs_code2 && delCode2At) && h("label",{style:{fontSize:11,color:colors.muted,display:"block",marginBottom:8}},"Reason",
+      h("input",{type:"text",value:delReason,onChange:e=>setDelReason(e.target.value),placeholder:"Why the date is being set before the documents clear",
+        style:{display:"block",width:"100%",padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}})),
+    delView && delView.delivery_date ? h("div",{style:{fontSize:11.5,marginBottom:8}},
+      "Currently: ",h("b",null,delView.delivery_date)," \u00b7 ",delView.delivery_state.toLowerCase(),
+      delView.clock_starts ? (" \u00b7 clock started "+delView.clock_starts) : " \u00b7 clock has not started") : null,
+    delErr ? h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},delErr) : null,
+    h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
+      h("button",{disabled:delBusy,onClick:()=>saveDelivery(false),style:btnPrimary},delBusy?"Saving\u2026":"Save"),
+      h("button",{disabled:delBusy,onClick:()=>{setDelOpen(false); setDelErr(""); setDelReason("");},style:btnSmall},"Close")));
+
   const advPanel = advOpen && h("div",{style:{background:"#fff8e1",border:"1px solid #f0c060",borderRadius:6,padding:"12px 14px",marginBottom:8}},
     h("div",{style:{fontSize:12,fontWeight:700,color:"#7a5000",marginBottom:4}},"Does this order carry an advance?"),
     h("div",{style:{fontSize:11.5,color:"#7a5000",marginBottom:8}},
@@ -9141,6 +9288,7 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
   );
 
   return h("div",{style:{marginTop:10}},
+    delPanel,
     advPanel,
     (otherMissing.length>0 || billingMissing) && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"10px 12px",marginBottom:8}},
       h("div",{style:{fontSize:12,fontWeight:700,color:"#a3312a",marginBottom:6}},"Required before this Sale Order can be approved:"),
@@ -9179,6 +9327,24 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     h("div",{style:{display:"flex",gap:14,flexWrap:"wrap",alignItems:"center",padding:"8px 12px",background:"#fff",border:"1px solid "+colors.border,borderRadius:6}},
       h("span",{style:{fontSize:12,fontWeight:700}},"Contract "+contractInfo.contract_number),
       h("span",{style:{fontSize:11,color:colors.muted}},"from Quote "+contractInfo.quote_reference_number),
+      // Delivery date. ANTICIPATED is amber because the date WILL move --
+      // it is a projection from today, not a commitment.
+      h("span",{onClick:()=>setDelOpen(v=>!v),title:"Set or change the contractual delivery terms",
+        style:{fontSize:10.5,cursor:"pointer",borderRadius:9,padding:"2px 8px",
+          background: !delView||delView.delivery_state==="NOT SET" ? "#fff4d6"
+                     : delView.delivery_state==="FIRM" ? "#e6f4f1"
+                     : delView.delivery_state==="OVERRIDDEN" ? "#ede7f6" : "#fff4d6",
+          color: !delView||delView.delivery_state==="NOT SET" ? "#854f0b"
+                : delView.delivery_state==="FIRM" ? "#0f6e56"
+                : delView.delivery_state==="OVERRIDDEN" ? "#4a3b8c" : "#854f0b"}},
+        (!delView || delView.delivery_state==="NOT SET")
+          ? "Delivery not set"
+          : ("Delivery "+(delView.delivery_date||"?")+
+             (delView.delivery_state==="FIRM" ? "" : "  \u00b7 "+delView.delivery_state.toLowerCase()))),
+      (code2Blocked && delView && delView.delivery_trigger && trigNeeds(delView.delivery_trigger).needs_code2)
+        ? h("span",{title:holdOpen.documents,style:{fontSize:10.5,color:"#8a2d2d",background:"#fdeaea",padding:"2px 8px",borderRadius:9}},
+            holdOpen.full_hold_docs_open+" Full Hold doc"+(holdOpen.full_hold_docs_open>1?"s":"")+" not at Code 2")
+        : null,
       row("Commercial Terms (Accounts Admin)","commercial_approved"),
       // Advance state, shown beside the approval it gates.
       advAnswered ? h("span",{style:{fontSize:10.5,color:contractInfo.has_advance?"#0f6e56":colors.mutedLight,
@@ -14275,32 +14441,35 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const expand = !!o.expand && !!o.includeCost;
     const c = (v)=> (Number(v)||0)/(fx.div||1);
     const head = o.includeCost
-      ? ["Sl No in Enq","Item","Description","Unit cost","Sf","Unit price","Qty","Total cost","Total price"]
-      : ["Sl No in Enq","Item","Description","Unit price","Qty","Total price"];
+      ? ["Sl No in Enq","Item","Description","Unit cost","Sf","Unit price","As printed","Qty","Total cost","Total price","Total as printed"]
+      : ["Sl No in Enq","Item","Description","Unit price","As printed","Qty","Total price","Total as printed"];
     const body = [];
     (rows||[]).forEach(r=>{
       const eff = r.cost ? r.sale/r.cost : 0;
       const enq = (r.est && r.est.sl_no_in_enq) || r.slNo;
+      const pr = cartSummaryPrinted(c(r.sale), r.qty);
       if(o.includeCost){
         body.push([enq, (r.est&&r.est.item)||"", (r.est&&r.est.description)||"",
-                   c(r.cost), Number(eff.toFixed(2)), c(r.sale), r.qty, c(r.cost*r.qty), c(r.sale*r.qty)]);
+                   c(r.cost), Number(eff.toFixed(2)), c(r.sale), pr.unit, r.qty,
+                   c(r.cost*r.qty), c(r.sale*r.qty), pr.total]);
         if(expand && r.mixed){
           r.groups.forEach(G=>{
             body.push(["", "", "    \u21b3 "+G.name+" ("+G.lines.length+" line"+(G.lines.length>1?"s":"")+")",
-                       c(G.cost), Number(Number(G.sf).toFixed(2)), c(computeSalesPrice(G.cost,G.sf)), "", "", ""]);
+                       c(G.cost), Number(Number(G.sf).toFixed(2)), c(computeSalesPrice(G.cost,G.sf)), "", "", "", "", ""]);
           });
         }
       } else {
         body.push([enq, (r.est&&r.est.item)||"", (r.est&&r.est.description)||"",
-                   c(r.sale), r.qty, c(r.sale*r.qty)]);
+                   c(r.sale), pr.unit, r.qty, c(r.sale*r.qty), pr.total]);
       }
     });
     const gCost = (rows||[]).reduce((s,r)=>s+r.cost*r.qty,0);
     const gSale = (rows||[]).reduce((s,r)=>s+r.sale*r.qty,0);
+    const gPrinted = (rows||[]).reduce((s,r)=>s+cartSummaryPrinted(c(r.sale), r.qty).total, 0);
     const foot = o.includeCost
-      ? ["","","","","","","Total "+fx.code, c(gCost), c(gSale)]
-      : ["","","","","Total "+fx.code, c(gSale)];
-    return { head, body, foot, fx, gCost:c(gCost), gSale:c(gSale) };
+      ? ["","","","","","","","Total "+fx.code, c(gCost), c(gSale), gPrinted]
+      : ["","","","","","Total "+fx.code, c(gSale), gPrinted];
+    return { head, body, foot, fx, gCost:c(gCost), gSale:c(gSale), gPrinted };
   };
 
   const cartSummaryData = async(quoteRef, ests, rows, opts)=>{
@@ -19768,6 +19937,41 @@ const MANUAL_SECTIONS = [
         ]
       },
       {
+        "key": "contract_delivery",
+        "title": "The contractual delivery date",
+        "tag": "Sale Order",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Delivery is not one date. Four contractual options exist and which one applies is decided per order: so many days from receipt of order; from Code 2 approval of the Full Hold documents; from receipt of the advance; or the later of those last two. Under three of them the date is not known when the contract is raised \u2014 it is a clock that starts later."
+          },
+          {
+            "type": "p",
+            "text": "So you enter the number of days and what starts the clock, and the app works the date out. You never type the date itself. That is deliberate: a typed date would quietly go stale the moment somebody corrected a trigger date, and nothing would tell you."
+          },
+          {
+            "type": "tip",
+            "text": "The chip on the contract header reads FIRM when every event the option depends on has happened, and ANTICIPATED when one has not. An anticipated date is projected from today and WILL move \u2014 it is there so the board has something to sort on, not as a commitment to anybody."
+          },
+          {
+            "type": "p",
+            "text": "Code 1 and both Code 2 states count as cleared. Code 3, and anything still showing our action pending, do not. A document counts on its LATEST revision only: a drawing that reached Code 2 at Rev 1 and is now back out at Rev 2 has not cleared, even though a Code 2 sits in its history."
+          },
+          {
+            "type": "tip",
+            "text": "The Code 2 clock-start date cannot be entered while a Full Hold document is still short of Code 2 \u2014 the header says how many. Admin and super admin may set it anyway, with a reason, and that reason is recorded."
+          },
+          {
+            "type": "p",
+            "text": "If a document falls back to Code 3 after reaching Code 2, the delivery date does NOT reset by itself. It is flagged to whoever owns the contract, who decides. Resetting a contractual date because one document regressed is too large a consequence to happen automatically."
+          },
+          {
+            "type": "p",
+            "text": "Every change to the delivery terms is recorded \u2014 the date before and after, what changed, how many days it moved and who did it. Once the order board exists, downstream stage due dates shift with the delivery date, and each shift is recorded the same way."
+          }
+        ]
+      },
+      {
         "key": "change_sl_no",
         "title": "Changing an Sl No on a saved quote",
         "tag": "Quotes",
@@ -19806,6 +20010,14 @@ const MANUAL_SECTIONS = [
           {
             "type": "p",
             "text": "Excel and PDF. Both are available from inside this screen and from the Cart Summary block in the export row. Expand sub-assemblies adds an indented line under any Sl No whose factors differ, showing each sub-assembly with its own factor. That option does nothing when cost and Sf are excluded, because a breakdown with no factor and no cost on it carries nothing, and it is greyed out to say so."
+          },
+          {
+            "type": "p",
+            "text": "Two price columns, on purpose. \"Unit price\" is the computed figure \u2014 cost times the sales factor \u2014 and it is what the effective sales factor is measured against. \"As printed\" is what the customer will actually see, because the Offer PDF's Price Summary rounds every unit price to the nearest 5 and then works the total out from that rounded figure. A computed 251.75 is offered at 250.00, and 418.51 at 420.00. Both columns are shown so the screen and the offer can be reconciled line by line instead of appearing to disagree."
+          },
+          {
+            "type": "tip",
+            "text": "If the header shows a second factor marked \"as printed\", that is the factor you actually achieve once the offer rounds. It appears only when it differs from the computed one. Rounding to the nearest 5 moves each unit price slightly, and on small values it moves the factor with it \u2014 which is worth seeing before an offer goes out, not after."
           },
           {
             "type": "tip",
@@ -20963,6 +21175,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"10 Sep 2026 (60)", summary:"Contractual delivery date on the Contract \u2014 step 1 of the order-board build, closing OA SOP clause 8.5. Captured at CONTRACT level. Delivery is not one date: four contractual options exist and under three of them the date is a clock that starts later, so the contract stores DAYS plus WHICH TRIGGER plus the date each trigger fired, and the date is DERIVED. It is never stored: a typed date goes stale the moment a trigger date is corrected and nothing says so. The derivation lives in one view, v_contract_delivery, so the contract panel, the board and any report give the same answer rather than three implementations drifting apart. There is a fired-date column PER trigger because the fourth option depends on two of them and must know which arrived last. State reads FIRM when every dependency has happened, ANTICIPATED when one has not \u2014 anticipated projects from today so the board still has something to sort on. Automation is deliberately partial, settled with the user: the app DETECTS and PROPOSES, a person COMMITS, because a delivery date is contractual and every move must carry who, when and why. Rules settled: Code 1 and BOTH Code 2 states clear the clock, Code 3 and our-action-pending do not, and this is stored as a flag on doc_status_tbl so a status added later defaults to not-cleared, the safe direction. A document counts on its LATEST revision only \u2014 universal_documents_tbl carries no status at all, it lives per revision, so a drawing that reached Code 2 at Rev 1 and is now out again at Rev 2 has NOT cleared; reading the parent would have shown a firm date the contract had not earned. The Code 2 clock-start date is blocked while any Full Hold document is short of Code 2, overridable by admin and super admin with a mandatory reason. A fall back to Code 3 does NOT reset the clock; it is flagged to the contract owner. Every change writes to delivery_date_history_tbl with date and state before and after, days moved and a stages_shifted count that is NOT NULL so nothing-moved never reads the same as not-recorded. Needs crm_phase47 and crm_phase48." },
+  { date:"9 Sep 2026 (59)", summary:"Cart Summary now shows the price AS PRINTED beside the computed price, resolving a reported mismatch between the Cart Summary and the Offer PDF's Price Summary. Neither was wrong: the Offer PDF has always rounded each unit price to the nearest 5 and derived the total from that rounded unit (roundedUnitTotal), so a computed 251.75 is offered at 250.00 and 418.51 at 420.00, while the Cart Summary showed the computed figure to two decimals. Every row therefore looked like it disagreed. The 5 September specification did say the rounding should follow the Price Summary rule and that was missed when the screen was built. Rather than simply rounding the screen, both figures are shown: the computed price, which is what the sales factor is genuinely measured against, and the printed price the customer will see. Same two columns on the totals, and in the Excel and PDF exports. The header gains a second effective factor marked as printed, shown only when it differs from the computed one, because rounding each unit to the nearest 5 shifts the achieved factor and that is worth seeing before an offer goes out. Rounding is applied AFTER currency conversion, which is where the PDF applies it -- rounding the rupee figure first gives a different answer. One shared helper, cartSummaryPrinted, is used by the screen and both exports, and a test asserts it against eight real figures read off an actual offer, that the total comes from the rounded unit rather than a rounded total, and that it agrees with the PDF's own roundedUnitTotal." },
   { date:"8 Sep 2026 (58)", summary:"Ten writes to estimate_lines were addressing a column that does not exist. The table has NO id column, yet ten calls filtered on .eq(\"id\", line.id), which sends id=eq.undefined and returns \"column estimate_lines.id does not exist\". Most did not check the returned error, so they reported success and changed nothing. What was silently failing: validating a Direct Price line (two paths), the Cart Summary sales-factor save, the stale-cost sweep, the MOC spec and grade write-back, both Excel attachment writes, and the Direct Price validate-and-attach pair. Worst of the set was Refresh BOM, whose delete used .in(\"id\", ...) -- so it added the new lines and never removed the old ones, quietly leaving both in the BOM. All ten now address a line by reference_number + item_sl_no + sl_no, the key the app's other line writes already used, through a single byLine helper so there is one definition of \"this line\" instead of ten. The delete loops per line, since there is no composite IN, and stops on the first failure rather than leaving a half-refreshed BOM. Note for whoever comes next: this also explains why only some lines had ever been converted to the per-order cost convention -- several of the paths that would have converted them were never writing at all." },
   { date:"8 Sep 2026 (57)", summary:"Stored line cost is now PER UNIT everywhere. Five write paths still multiplied by the order quantity \u2014 the line editor, the order-quantity rescale, the rate refresh, the pending-edits rescale and the clone rescale \u2014 while the stored data, the manual adder and the Cart Summary are all per unit. The effect was worse than a simple mismatch: editing a line multiplied its stored cost by the order quantity, and the Cart Summary multiplies by the order quantity again when it works out a total, so the error was the order quantity SQUARED. On FXUS260001, order qty 200, one edited line would read forty thousand times too large. All five now pass an order quantity of 1, matching the adder. Two consequences by design: changing an Sl No order quantity no longer alters any stored line cost, because the stored figure never contained it, and the order-qty rescale is now a no-op kept only because it repairs a row previously written the other way. The BOM screen row and the BOM export still show an EXTENDED cost including the order quantity \u2014 that is a display figure sitting beside the qty-for-the-order column, it is not what gets stored, and a comment now says so to stop the two being reconciled by mistake. The quoted price was never affected at any point: slNoBaseTotalInr recomputes it live and does not read the stored cost. Four new tests pin the convention, including one asserting that the old behaviour inflated by order qty squared, so the symptom is recognisable rather than merely wrong. 34 of 34 pass. Rows already written wrongly are NOT touched by this build \u2014 find_inflated_line_costs.sql identifies them for review first." },
   { date:"8 Sep 2026 (56)", summary:"Cost is now worked out through one shared helper everywhere, and a WRONG FIX from the previous build is reverted before it ever shipped. What happened: computeCost had been written on 5 September and never actually called, so nine sites still did the arithmetic inline. Consolidating them was right. Deciding WHICH formula was the house rule was not: three paths (editing a line, changing the order quantity, refreshing rates) multiply by the order quantity, so the manual line adder was moved to match them. Reading the live data showed the opposite. Every line in every live quote stores cost as qty_required x rate, per unit, and the Cart Summary depends on that \u2014 it sums line costs into a unit cost and multiplies by order qty for the total, so a stored cost containing the order qty would be counted twice. The adder was already correct; it has been put back, passing an order quantity of 1 so it still routes through the shared helper rather than inlining the sum. The other eight sites keep the consolidation, which changes no value, only rounding. IMPORTANT AND UNCHANGED: the customer-facing price never reads the stored cost. slNoBaseTotalInr recomputes it live from qty, order qty, rate and sf. No quote has ever gone out mispriced because of any of this, and the 731 lines flagged by the earlier consistency check need no re-costing \u2014 that check measured against the wrong formula and should be discarded. The real remaining fault, deliberately left for a separate build rather than half fixed here, is that those three paths still write the other convention, so editing a line multiplies its stored cost by the order quantity and the Cart Summary inflates it again. A test now pins the per-unit convention so it cannot drift unnoticed." },
@@ -30999,6 +31213,24 @@ function sortCartSummaryRows(rows){
    in another currency divides by its conversion rate — the SAME division
    the quote PDF applies, never a separately-typed rate. inr:true shows
    the stored rupee figures untouched. */
+/* ---- "AS PRINTED" PRICE (9 Sep) -------------------------------------
+   The Offer PDF's Price Summary does NOT print the computed unit price.
+   It rounds the unit to the nearest 5 and then derives the total from
+   that rounded unit -- roundedUnitTotal, the same helper the PDF uses.
+   So a computed 251.75 is offered at 250.00, and 418.51 at 420.00.
+
+   The Cart Summary showed the computed figure only, so every row looked
+   like it disagreed with the offer. It now shows both: the computed
+   price, which is what the sales factor is actually measured against,
+   and the price as the customer will see it.
+
+   Rounding happens AFTER currency conversion, because that is where the
+   PDF does it -- it rounds the display figure, not the rupee one. */
+function cartSummaryPrinted(unitInDisplayCurrency, qty){
+  const unit = roundTo5(Number(unitInDisplayCurrency)||0);
+  return { unit, total: unit * (Number(qty)||0) };
+}
+
 function cartSummaryFx(ests, inr){
   const first = (ests||[])[0] || {};
   const cur = (first.currency || "INR");
@@ -31087,6 +31319,12 @@ function CartSummaryScreen({ user, quoteRef, exportCartSummaryExcel, exportCartS
 
   const gCost = rows.reduce((s,r)=>s+r.cost*r.qty,0);
   const gSale = rows.reduce((s,r)=>s+r.sale*r.qty,0);
+  // Sum of what the offer will actually print, in the display currency.
+  const gPrinted = rows.reduce((s,r)=>s+cartSummaryPrinted((Number(r.sale)||0)/(cartSummaryFx(ests,showInr).div||1), r.qty).total, 0);
+  // The factor actually achieved once the offer rounds. Cost converted to
+  // the same currency so the ratio is comparable.
+  const gCostDisp = gCost / (cartSummaryFx(ests,showInr).div||1);
+  const effPrinted = gCostDisp ? gPrinted/gCostDisp : 0;
   const dirty = Object.keys(staged).length>0;
   // The effective factor is a RATIO, so it is identical in either
   // currency — deliberately computed off the rupee figures so switching
@@ -31163,6 +31401,13 @@ function CartSummaryScreen({ user, quoteRef, exportCartSummaryExcel, exportCartS
       h("span",{style:{fontSize:12.5}},"Effective sales factor ",
         h("b",{style:{fontSize:15}}, gCost? (gSale/gCost).toFixed(2) : "\u2014")),
       h("span",{style:{fontSize:11.5,color:colors.mutedLight}},"total sale \u00f7 total cost, whole sheet"),
+      // What the factor actually comes to once the offer rounds each unit
+      // price to the nearest 5. Shown only when it differs, so it is a
+      // signal rather than clutter.
+      (gCost && Math.abs(effPrinted - (gSale/gCost)) > 0.005)
+        ? h("span",{style:{fontSize:11.5,color:colors.muted,border:"1px solid "+colors.border,padding:"2px 9px",borderRadius:9}},
+            effPrinted.toFixed(2)+" as printed")
+        : null,
       canEditSf
         ? h("span",{style:{fontSize:11.5,background:"#e6f4f1",color:"#0f6e56",padding:"2px 9px",borderRadius:9}},
             salesHead?"Sales Head \u2014 editable":"Admin \u2014 editable")
@@ -31210,10 +31455,12 @@ function CartSummaryScreen({ user, quoteRef, exportCartSummaryExcel, exportCartS
           ["Sl No in Enq","Item","Description"].map(x=>h("th",{key:x,style:{textAlign:"left",padding:"8px 6px",fontWeight:600}},x)),
           // Cost, Sf and Total cost are the internal columns. With the tick
           // off the sheet is safe to forward to a customer.
-          (includeCost?["Unit cost","Sf"]:[]).concat(["Unit price","Qty"]).concat(includeCost?["Total cost"]:[]).concat(["Total price"])
+          (includeCost?["Unit cost","Sf"]:[]).concat(["Unit price","As printed","Qty"]).concat(includeCost?["Total cost"]:[]).concat(["Total price","Total as printed"])
             .map(x=>h("th",{key:x,style:{textAlign:"right",padding:"8px 6px",fontWeight:600}},x)))),
         h("tbody",null, rows.flatMap(r=>{
           const eff = r.cost ? r.sale/r.cost : 0;
+          // Rounded AFTER conversion, exactly where the Offer PDF rounds.
+          const pr = cartSummaryPrinted(conv(r.sale), r.qty);
           const main = h("tr",{key:r.slNo,style:{borderBottom:"1px solid "+colors.border}},
             h("td",{style:{padding:"8px 5px"}},
               r.mixed
@@ -31228,12 +31475,14 @@ function CartSummaryScreen({ user, quoteRef, exportCartSummaryExcel, exportCartS
             includeCost?h("td",{key:"uc",style:{padding:"8px 6px",textAlign:"right"}},fmtC(r.cost)):null,
             includeCost?h("td",{key:"sf",style:{padding:"8px 6px",textAlign:"right",fontStyle:r.mixed?"italic":"normal"}},eff.toFixed(2)+(r.mixed?" *":"")):null,
             h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmtC(r.sale)),
+            h("td",{style:{padding:"8px 6px",textAlign:"right",color:colors.muted}},fmt(pr.unit)),
             h("td",{style:{padding:"8px 6px",textAlign:"right"}},r.qty),
             includeCost?h("td",{key:"tc",style:{padding:"8px 6px",textAlign:"right"}},fmtC(r.cost*r.qty)):null,
-            h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmtC(r.sale*r.qty)));
+            h("td",{style:{padding:"8px 6px",textAlign:"right"}},fmtC(r.sale*r.qty)),
+            h("td",{style:{padding:"8px 6px",textAlign:"right",color:colors.muted}},fmt(pr.total)));
           if(!(open[r.slNo]||expandAll)) return [main];
           const det = h("tr",{key:r.slNo+"-d",style:{background:"#faf9f4"}},
-            h("td",null), h("td",{colSpan:includeCost?9:6,style:{padding:"9px 6px 12px"}},
+            h("td",null), h("td",{colSpan:includeCost?11:8,style:{padding:"9px 6px 12px"}},
               h("div",{style:{display:"flex",flexDirection:"column",gap:5,maxWidth:470}},
                 r.groups.map(G=>h("div",{key:G.name,style:{display:"flex",alignItems:"center",gap:10,
                     borderTop:G.name===OTHERS?"1px solid "+colors.border:"none",paddingTop:G.name===OTHERS?6:0}},
@@ -31245,9 +31494,10 @@ function CartSummaryScreen({ user, quoteRef, exportCartSummaryExcel, exportCartS
         })),
         h("tfoot",null,h("tr",{style:{fontWeight:700,borderTop:"2px solid "+colors.border}},
           h("td",null),
-          h("td",{colSpan:includeCost?7:5,style:{padding:"9px 6px"}},"Total "+fxInfo.code),
+          h("td",{colSpan:includeCost?8:6,style:{padding:"9px 6px"}},"Total "+fxInfo.code),
           includeCost?h("td",{key:"ftc",style:{padding:"9px 6px",textAlign:"right"}},fmtC(gCost)):null,
-          h("td",{style:{padding:"9px 6px",textAlign:"right"}},fmtC(gSale)))))),
+          h("td",{style:{padding:"9px 6px",textAlign:"right"}},fmtC(gSale)),
+          h("td",{style:{padding:"9px 6px",textAlign:"right",color:colors.muted}},fmt(gPrinted)))))),
 
     edit ? h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:600,maxWidth:"100%",maxHeight:"88vh",overflow:"auto"}},
