@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-16T07:50:00Z";
+  var APP_BUILD_VERSION = "2026-09-16T08:40:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -11751,17 +11751,34 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // customer PO and an approved drawing behind it, so the item is settled.
   const [freshBom,setFreshBom]=useState(null); // {row, item, models:[], choice}
   const startFreshBom = async(row)=>{
-    const item = modelItemMap.get(row.model) || "";
-    if(!item){
-      alert("Sl No "+row.item_sl_no+" has no item on record (its model \""+(row.model||"—")+"\" is not in the Model master), so there is nothing to lock the fresh BOM to.\n\nAdd the model to Master Data first — the item must be settled before the BOM is rebuilt.");
-      return;
-    }
     setBusyBom(row.item_sl_no);
     try{
+      // The item comes from the Model master where the model is registered,
+      // and falls back to the item already recorded on the Sl No's own
+      // lines — the same fallback DatasheetModal uses. A legacy contract
+      // whose model was never added to the master (260135's
+      // OPA-R-SERIES-A600 is one) still has its item on every line, and
+      // that is a perfectly good thing to lock to. Refusing outright just
+      // forced a master-data edit to unblock a contract that already knows
+      // what it is.
+      let item = modelItemMap.get(row.model) || "";
+      let itemSource = item ? "the Model master" : "";
+      if(!item){
+        const { data: lineRows } = await sb.from("estimate_lines")
+          .select("item").eq("reference_number",row.reference_number)
+          .eq("item_sl_no",row.item_sl_no).limit(5);
+        const fromLines = (lineRows||[]).map(l=>(l.item||"").trim()).filter(Boolean);
+        if(fromLines.length){ item = fromLines[0]; itemSource = "this Sl No's existing lines"; }
+      }
+      if(!item){
+        alert("Sl No "+row.item_sl_no+" has no item on record — its model \""+(row.model||"—")+"\" is not in the Model master and its lines carry no item either.\n\nThere is nothing to lock the fresh BOM to. Add the model to Master Data first.");
+        return;
+      }
       const rows = await fetchAll("model_tbl","item,model");
-      const models = (rows||[]).filter(x=>x.item===item && x.model).map(x=>x.model).sort();
-      setFreshBom({ row, item, models, choice: row.model||"" });
-    } catch(e){ alert("Couldn't load the models for this item: "+e.message); }
+      const models = (rows||[]).filter(x=>(x.item||"").trim().toLowerCase()===item.trim().toLowerCase() && x.model)
+                               .map(x=>x.model).sort();
+      setFreshBom({ row, item, itemSource, models, choice: models.includes(row.model)?row.model:"" });
+    } catch(e){ alert("Couldn't start a fresh BOM: "+e.message); }
     finally{ setBusyBom(null); }
   };
 
@@ -15602,6 +15619,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                       : {...btnSmall,border:"1px solid #0f6e56",color:"#0f6e56",opacity:refreshingPrice?0.6:1}
                   }, refreshingPrice?"Refreshing…":"Refresh price"),
                   h("button",{onClick:()=>setShowBomRefreshConfirm(true),style:{...btnSmall,border:"1px solid #a3312a",color:"#a3312a"}},"Refresh BOM from master"),
+                  // Same Fresh BOM / Restore pair as the Cart screen. Put here
+                  // too because this is where you are standing when you decide
+                  // the BOM is wrong -- having to go back out to the Cart to
+                  // act on that is the kind of detour nobody takes twice.
+                  mode==="contract" && h("button",{onClick:()=>startFreshBom(openRef),disabled:busyBom===openRef.item_sl_no,
+                    title:"Rebuild this Sl No's BOM from scratch. The current BOM is saved first and can be restored.",
+                    style:{...btnSmall,border:"1px solid #7a5000",color:"#7a5000",opacity:busyBom===openRef.item_sl_no?0.5:1}},
+                    busyBom===openRef.item_sl_no?"…":"Fresh BOM"),
+                  mode==="contract" && baselineBySl[openRef.item_sl_no] && h("button",{onClick:()=>restoreBom(openRef),disabled:busyBom===openRef.item_sl_no,
+                    title:"Put back the BOM that was here before the fresh BOM was started",
+                    style:{...btnSmall,border:"1px solid "+colors.border,opacity:busyBom===openRef.item_sl_no?0.5:1}},
+                    "Restore BOM"),
                   h("button",{onClick:refreshMasterData,title:"Pull the latest Shapes, Specs, Grades, Rates, UOM and Item options — useful if you (or someone else, in another tab) just added or fixed one",style:{...btnSmall,border:"1px solid "+colors.border,color:colors.text}},"↻ Refresh master data"),
                   isAdmin && h("button",{onClick:()=>deleteSlNo(openRef),disabled:deletingSlNo===openRef.id,style:{...btnSmall,border:"1px solid "+colors.danger,color:colors.danger,opacity:deletingSlNo===openRef.id?0.5:1}},deletingSlNo===openRef.id?"Deleting…":"Delete this Sl No"),
                   h("button",{onClick:()=>setFullScreenBOM(f=>!f),style:{...btnSecondary,fontSize:11,padding:"4px 10px"}}, fullScreenBOM?"Esc · Close full screen":"⛶ Full screen BOM")
@@ -16573,15 +16602,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           "The current BOM is saved first and can be restored exactly as it is now. At Sale Order level the BOM sets COST only — the sales price stays whatever was entered from the PO."),
         h("div",{style:{background:"#f4f2ea",borderRadius:6,padding:"8px 10px",marginBottom:12}},
           h("div",{style:{fontSize:10,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:2}},"Item — cannot be changed"),
-          h("div",{style:{fontSize:13,fontWeight:700}},freshBom.item)),
+          h("div",{style:{fontSize:13,fontWeight:700}},freshBom.item),
+          freshBom.itemSource ? h("div",{style:{fontSize:10,color:colors.mutedLight,marginTop:2}},"from "+freshBom.itemSource) : null),
         h("div",{style:{marginBottom:14}},
           h("div",{style:{fontSize:11,color:colors.muted,marginBottom:4}},"Build against"),
           h("select",{value:freshBom.choice,onChange:e=>setFreshBom(f=>({...f,choice:e.target.value})),
             style:{...inputStyle,width:"100%",fontSize:12.5}},
             freshBom.models.map(m=>h("option",{key:m,value:m},m + (m===freshBom.row.model?"  (current)":""))),
             h("option",{value:""},"Custom build — no model template")),
-          h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:4}},
-            freshBom.models.length+" model"+(freshBom.models.length===1?"":"s")+" available for this item")),
+          h("div",{style:{fontSize:10.5,color:freshBom.models.length?colors.mutedLight:"#7a5000",marginTop:4}},
+            freshBom.models.length
+              ? (freshBom.models.length+" model"+(freshBom.models.length===1?"":"s")+" registered for this item")
+              : "No models registered for this item — a custom build is the only option here.")),
         h("div",{style:{fontSize:11.5,color:"#7a5000",background:"#fffbea",border:"1px solid #e0b325",borderRadius:6,padding:"8px 10px",marginBottom:14}},
           "Every line currently on this Sl No is cleared. Restore BOM on the Cart screen puts them back."),
         h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
@@ -21444,7 +21476,7 @@ const MANUAL_SECTIONS = [
           },
           {
             "type": "p",
-            "text": "Fresh BOM. At Sale Order level you can rebuild an Sl No's BOM from scratch, ignoring whatever was done at estimation \u2014 the \"Fresh BOM\" button on the Cart screen. The BOM at this level sets the COST only; it never touches the sales price, which stays whatever was entered from the PO. Before anything is deleted the existing BOM is saved, and a \"Restore BOM\" button then appears to put it back exactly as it was. The saved copy is taken once, the first time you start a fresh BOM on that Sl No, so Restore always means \"as it was before anyone started\", however many attempts follow."
+            "text": "Fresh BOM. At Sale Order level you can rebuild an Sl No's BOM from scratch, ignoring whatever was done at estimation \u2014 the \"Fresh BOM\" button, on the Cart screen and on the BOM screen itself. The BOM at this level sets the COST only; it never touches the sales price, which stays whatever was entered from the PO. Before anything is deleted the existing BOM is saved, and a \"Restore BOM\" button then appears to put it back exactly as it was. The saved copy is taken once, the first time you start a fresh BOM on that Sl No, so Restore always means \"as it was before anyone started\", however many attempts follow."
           },
           {
             "type": "p",
@@ -21452,7 +21484,7 @@ const MANUAL_SECTIONS = [
           },
           {
             "type": "warn",
-            "text": "If the Sl No's model is not in the Model master there is no item to lock to, and Fresh BOM will refuse to start. Add the model to Master Data first."
+            "text": "The item is taken from the Model master where the model is registered. If it is not registered \u2014 which is common on older contracts \u2014 the item recorded on the Sl No's own BOM lines is used instead, and the box tells you which it used. Only if neither exists does Fresh BOM refuse to start. If no models are registered for that item, a custom build is the only option offered, which is correct rather than a fault."
           },
           {
             "type": "bullets",
