@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-16T05:15:00Z";
+  var APP_BUILD_VERSION = "2026-09-16T07:50:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -11653,11 +11653,26 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       }
     });
     const bomCompleteState = bomCheckedCount===0 ? "all" : bomDoneCount===bomCheckedCount ? "all" : bomDoneCount===0 ? "none" : "some";
-    return { ready: missing.length===0, missing, incompleteBomDetails, categories:{ terms:termsDone, datasheets:datasheetsState, descriptions:descriptionsState, bomComplete:bomCompleteState, validation:validationDone } };
-  },[modelItemMap]);
-  const [readiness,setReadiness]=useState({ready:false,missing:[],loading:true,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false}});
+    // 16 Sep -- PO PRICING GATE, contracts only. No PDF at all, not even a
+    // Draft, until every Sl No has its sales price entered from the PO. It
+    // rides on the existing readiness mechanism rather than a new check,
+    // so the Draft block comes for free: the PDF path already refuses on
+    // ready === false. On a quote this is not evaluated and nothing changes.
+    let poPricingDone = true;
+    if(mode==="contract"){
+      const { data:poRows } = await sb.from("estimates").select("item_sl_no,po_sales_price").eq("reference_number",refNumber);
+      const noPrice = (poRows||[]).filter(r=>r.po_sales_price===null||r.po_sales_price===undefined||Number(r.po_sales_price)<=0)
+                                  .map(r=>"Sl No "+r.item_sl_no);
+      if(noPrice.length){
+        missing.push({section:"PO Sales Price", items:noPrice.concat(["Enter each from the customer PO on the Cart screen"])});
+        poPricingDone = false;
+      }
+    }
+    return { ready: missing.length===0, missing, incompleteBomDetails, categories:{ terms:termsDone, datasheets:datasheetsState, descriptions:descriptionsState, bomComplete:bomCompleteState, validation:validationDone, poPricing:poPricingDone } };
+  },[modelItemMap,mode]);
+  const [readiness,setReadiness]=useState({ready:false,missing:[],loading:true,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false,poPricing:true}});
   const refreshReadiness=useCallback(async(refNumber)=>{
-    if(!refNumber){ setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false}}); return; }
+    if(!refNumber){ setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false,poPricing:true}}); return; }
     setReadiness(r=>({...r,loading:true}));
     try {
       const result = await checkQuoteReadiness(refNumber);
@@ -11671,10 +11686,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       }
     } catch(e){
       console.error("Readiness check failed",e);
-      setReadiness({ready:false,missing:[{section:"Readiness check",items:["Couldn't check — "+(e.message||"unknown error")]}],loading:false,error:true,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false}});
+      setReadiness({ready:false,missing:[{section:"Readiness check",items:["Couldn't check — "+(e.message||"unknown error")]}],loading:false,error:true,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false,poPricing:true}});
     }
   },[checkQuoteReadiness]);
-  useEffect(()=>{ if(refFilter) refreshReadiness(refFilter); else setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false}}); },[refFilter]);
+  useEffect(()=>{ if(refFilter) refreshReadiness(refFilter); else setReadiness({ready:false,missing:[],loading:false,categories:{terms:false,datasheets:"none",descriptions:"none",bomComplete:"none",validation:false,poPricing:true}}); },[refFilter]);
 
   // Quote-level totals for the frozen Quotes toolbar — Total Cost / Total
   // Sales Price / Material % (Cost ÷ Sales × 100) across every Sl No on the
@@ -11683,6 +11698,132 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // matching what was actually asked for. Refetches on refFilter change and
   // via the manual refresh button next to the totals, since line edits
   // inside one open Sl No don't otherwise signal a whole-quote change.
+  // ---- PO SALES PRICE + FRESH BOM (16 Sep, contracts only) ----
+  // po_sales_price lives on estimates, per Sl No, per unit, in INR. Edited
+  // from the Cart screen only -- there is deliberately no second place to
+  // change it.
+  const [poPriceDraft,setPoPriceDraft]=useState({});   // {item_sl_no: string}
+  const [savingPoPrice,setSavingPoPrice]=useState(null);
+  const [baselineBySl,setBaselineBySl]=useState({});   // {item_sl_no: true} where a pre-fresh-BOM snapshot exists
+  const [busyBom,setBusyBom]=useState(null);
+
+  const loadBaselines = useCallback(async(refNumber)=>{
+    if(!refNumber || mode!=="contract"){ setBaselineBySl({}); return; }
+    const { data } = await sb.from("contract_bom_baseline_tbl").select("item_sl_no").eq("reference_number",refNumber);
+    const m={}; (data||[]).forEach(r=>{ m[r.item_sl_no]=true; });
+    setBaselineBySl(m);
+  },[mode]);
+
+  const savePoPrice = async(row)=>{
+    const raw = poPriceDraft[row.item_sl_no];
+    if(raw===undefined) return;
+    const val = raw===""? null : Number(raw);
+    if(val!==null && !(val>0)){ alert("Enter the PO sales price as a positive number in INR, or clear it."); return; }
+    setSavingPoPrice(row.item_sl_no);
+    try{
+      const { error } = await sb.from("estimates").update({
+        po_sales_price: val,
+        po_price_entered_by: val===null?null:(user?.username||"unknown"),
+        po_price_entered_at: val===null?null:new Date().toISOString()
+      }).eq("reference_number",row.reference_number).eq("item_sl_no",row.item_sl_no);
+      if(error) throw error;
+      await logAudit("SAVE","estimates",row.reference_number+"-"+row.item_sl_no,
+        val===null?"PO sales price cleared":("PO sales price set to "+val+" (INR, per unit)"),
+        user?.username||"unknown",null,{po_sales_price:val});
+      await load();
+      refreshQuoteTotals(row.reference_number);
+      refreshReadiness(row.reference_number);
+    } catch(e){ alert("Couldn't save the PO sales price: "+e.message); }
+    finally{ setSavingPoPrice(null); }
+  };
+
+  // Fresh BOM. Snapshots the Sl No's lines BEFORE anything is deleted --
+  // the estimator's save path deletes every line for the Sl No and
+  // re-inserts from the cart, which is the same shape as Refresh BOM, the
+  // one that doubled FEX260461. capture_contract_bom_baseline is a no-op
+  // on a second call, so the baseline always means "before anyone started".
+  // Fresh BOM is chosen in a dialog, not a bare confirm, because the ITEM
+  // is locked and that has to be visible rather than merely enforced. The
+  // Sl No's item comes from its current model via model_tbl; the only
+  // choices offered are the models that belong to that same item, or a
+  // custom build for it. There is deliberately no control anywhere in this
+  // flow that can change the item -- an Sl No under a Sale Order has a
+  // customer PO and an approved drawing behind it, so the item is settled.
+  const [freshBom,setFreshBom]=useState(null); // {row, item, models:[], choice}
+  const startFreshBom = async(row)=>{
+    const item = modelItemMap.get(row.model) || "";
+    if(!item){
+      alert("Sl No "+row.item_sl_no+" has no item on record (its model \""+(row.model||"—")+"\" is not in the Model master), so there is nothing to lock the fresh BOM to.\n\nAdd the model to Master Data first — the item must be settled before the BOM is rebuilt.");
+      return;
+    }
+    setBusyBom(row.item_sl_no);
+    try{
+      const rows = await fetchAll("model_tbl","item,model");
+      const models = (rows||[]).filter(x=>x.item===item && x.model).map(x=>x.model).sort();
+      setFreshBom({ row, item, models, choice: row.model||"" });
+    } catch(e){ alert("Couldn't load the models for this item: "+e.message); }
+    finally{ setBusyBom(null); }
+  };
+
+  const confirmFreshBom = async()=>{
+    if(!freshBom) return;
+    const { row, choice } = freshBom;
+    setBusyBom(row.item_sl_no);
+    try{
+      // Snapshot BEFORE anything is deleted. No-op on a second call, so the
+      // baseline always means "before anyone started".
+      const { error: capErr } = await sb.rpc("capture_contract_bom_baseline",{
+        p_reference_number: row.reference_number, p_item_sl_no: row.item_sl_no,
+        p_captured_by: user?.username||"unknown",
+        p_reason: "Fresh BOM at Sale Order level" + (choice?(" against model "+choice):" (custom build)")
+      });
+      if(capErr) throw capErr;
+
+      if(choice && choice!==row.model){
+        const { error: mErr } = await sb.from("estimates").update({model:choice})
+          .eq("reference_number",row.reference_number).eq("item_sl_no",row.item_sl_no);
+        if(mErr) throw mErr;
+      }
+      const { error: dErr } = await sb.from("estimate_lines").delete()
+        .eq("reference_number",row.reference_number).eq("item_sl_no",row.item_sl_no);
+      if(dErr) throw dErr;
+
+      await logAudit("UPDATE","estimate_lines",row.reference_number+"-"+row.item_sl_no,
+        "Fresh BOM started at Sale Order level"+(choice?(" against model "+choice):" (custom build)")+" — previous lines snapshotted and cleared",
+        user?.username||"unknown",null,{model:choice||null});
+
+      await loadBaselines(row.reference_number);
+      await load();
+      setFreshBom(null);
+      setShowCartScreen(false);
+      await openEstimate({...row, model: choice||row.model});
+      refreshQuoteTotals(row.reference_number);
+      refreshReadiness(row.reference_number);
+      alert(choice
+        ? ("Sl No "+row.item_sl_no+" is now empty and set to model "+choice+".\n\nUse \"Refresh BOM from master\" to pull that model's template, then adjust. Restore BOM on the Cart puts back what was here before.")
+        : ("Sl No "+row.item_sl_no+" is now empty for a custom build.\n\nAdd lines manually. Restore BOM on the Cart puts back what was here before."));
+    } catch(e){ alert("Couldn't start a fresh BOM: "+e.message); }
+    finally{ setBusyBom(null); }
+  };
+
+  const restoreBom = async(row)=>{
+    if(!confirm("Restore Sl No "+row.item_sl_no+" to the BOM that was there before the fresh BOM was started?\n\nEverything currently on this Sl No is replaced.")) return;
+    setBusyBom(row.item_sl_no);
+    try{
+      const { data, error } = await sb.rpc("restore_contract_bom_baseline",{
+        p_reference_number: row.reference_number, p_item_sl_no: row.item_sl_no,
+        p_restored_by: user?.username||"unknown"
+      });
+      if(error) throw error;
+      await logAudit("RESTORE","estimate_lines",row.reference_number+"-"+row.item_sl_no,
+        "BOM restored to the pre-fresh-BOM baseline ("+(data||0)+" line(s))",user?.username||"unknown",null,null);
+      alert("Restored "+(data||0)+" line(s) to Sl No "+row.item_sl_no+".");
+      refreshQuoteTotals(row.reference_number);
+      refreshReadiness(row.reference_number);
+    } catch(e){ alert("Couldn't restore: "+e.message); }
+    finally{ setBusyBom(null); }
+  };
+
   const [quoteTotals,setQuoteTotals]=useState(null); // {cost, salesPrice, materialPct} | null
   const [quoteTotalsLoading,setQuoteTotalsLoading]=useState(false);
   const refreshQuoteTotals = useCallback(async(refNumber)=>{
@@ -11700,17 +11841,26 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // sides scale together) but is recomputed from the corrected values.
       const [{ data },{ data: estRows }] = await Promise.all([
         sb.from("estimate_lines").select("item_sl_no,cost,sales_price").eq("reference_number",refNumber),
-        sb.from("estimates").select("item_sl_no,order_qty").eq("reference_number",refNumber)
+        sb.from("estimates").select("item_sl_no,order_qty,po_sales_price").eq("reference_number",refNumber)
       ]);
       const qtyBySl = new Map((estRows||[]).map(r=>[r.item_sl_no, Number(r.order_qty)||1]));
       const oq = (l)=> qtyBySl.get(l.item_sl_no) || 1;
       const cost = (data||[]).reduce((s,l)=>s+((Number(l.cost)||0)*oq(l)),0);
-      const salesPrice = (data||[]).reduce((s,l)=>s+((Number(l.sales_price)||0)*oq(l)),0);
+      // 16 Sep -- on a CONTRACT the sales figure is the PO price, not the
+      // quoted cost x sf. Between estimate and PO there are discounts, so
+      // the quoted number overstates what we actually get and flatters the
+      // margin. po_sales_price is per unit in INR, like every other stored
+      // price, so the Sl No value is price x order qty. Quotes are
+      // unchanged and still sum the line sales_price.
+      const salesPrice = mode==="contract"
+        ? (estRows||[]).reduce((s,r)=>s+((Number(r.po_sales_price)||0)*(Number(r.order_qty)||1)),0)
+        : (data||[]).reduce((s,l)=>s+((Number(l.sales_price)||0)*oq(l)),0);
       setQuoteTotals({ cost, salesPrice, materialPct: salesPrice>0 ? (cost/salesPrice*100) : null });
     } catch(e){ console.error("Couldn't load quote totals",e); setQuoteTotals(null); }
     finally{ setQuoteTotalsLoading(false); }
   },[]);
   useEffect(()=>{ refreshQuoteTotals(refFilter); },[refFilter,refreshQuoteTotals]);
+  useEffect(()=>{ loadBaselines(refFilter); setPoPriceDraft({}); },[refFilter,loadBaselines]);
 
   // Measures the app-wide sticky header (#app-sticky-header in App) so this
   // screen's own toolbar can stick right below it instead of at a hardcoded
@@ -16055,11 +16205,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,overflowX:"auto"}},
           h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1100}},
             h("thead",null,h("tr",{style:{background:"#faf9f4",borderBottom:"2px solid "+colors.dark,textAlign:"left"}},
-              h("th",{style:{padding:"8px 10px"}},"Sl No"),h("th",{style:{padding:"8px 10px"}},"Sl No in Enq"),h("th",{style:{padding:"8px 10px"}},"Tag no."),h("th",{style:{padding:"8px 10px"}},"Location"),h("th",{style:{padding:"8px 10px"}},"Item"),h("th",{style:{padding:"8px 10px"}},"Size"),h("th",{style:{padding:"8px 10px"}},"Model"),h("th",{style:{padding:"8px 10px"}},"Qty"),h("th",{style:{padding:"8px 10px"}},"")
+              h("th",{style:{padding:"8px 10px"}},"Sl No"),h("th",{style:{padding:"8px 10px"}},"Sl No in Enq"),h("th",{style:{padding:"8px 10px"}},"Tag no."),h("th",{style:{padding:"8px 10px"}},"Location"),h("th",{style:{padding:"8px 10px"}},"Item"),
+              mode==="contract" && h("th",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},"PO Sales Price (INR/unit)"),h("th",{style:{padding:"8px 10px"}},"Size"),h("th",{style:{padding:"8px 10px"}},"Model"),h("th",{style:{padding:"8px 10px"}},"Qty"),h("th",{style:{padding:"8px 10px"}},"")
             )),
             h("tbody",null,
               refs.filter(r=>r.reference_number===refFilter).length===0
-                ? h("tr",null,h("td",{colSpan:9,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},mode==="contract"?"No Sl Nos on this Sale Order yet.":"No Sl Nos on this quote yet."))
+                ? h("tr",null,h("td",{colSpan:mode==="contract"?10:9,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},mode==="contract"?"No Sl Nos on this Sale Order yet.":"No Sl Nos on this quote yet."))
                 : refs.filter(r=>r.reference_number===refFilter).sort((a,b)=>a.item_sl_no-b.item_sl_no).map(r=>{
                     const isEditing = editingCartRow===r.id;
                     return h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
@@ -16093,6 +16244,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                         ? h("input",{type:"number",min:1,value:cartRowDraft.order_qty,onChange:e=>setCartRowDraft(d=>({...d,order_qty:e.target.value})),style:{width:60,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4}})
                         : h("span",null,r.order_qty||1)
                     ),
+                    // PO sales price. Contracts only. Saved on blur or Enter;
+                    // amber while empty because an empty one blocks the PDF.
+                    mode==="contract" && h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
+                      h("input",{type:"number",min:0,step:"0.01",
+                        value: poPriceDraft[r.item_sl_no]!==undefined ? poPriceDraft[r.item_sl_no] : (r.po_sales_price??""),
+                        placeholder:"from PO",
+                        disabled: savingPoPrice===r.item_sl_no,
+                        onChange:e=>{ const v=e.target.value; setPoPriceDraft(d=>({...d,[r.item_sl_no]:v})); },
+                        onBlur:()=>savePoPrice(r),
+                        onKeyDown:e=>{ if(e.key==="Enter") e.target.blur(); },
+                        title: r.po_price_entered_by ? ("Entered by "+r.po_price_entered_by) : "Not entered yet — the PDF is blocked until it is",
+                        style:{width:110,padding:"4px 6px",fontSize:12.5,textAlign:"right",
+                          border:"1px solid "+((r.po_sales_price===null||r.po_sales_price===undefined)?"#e0b325":colors.border),
+                          background:(r.po_sales_price===null||r.po_sales_price===undefined)?"#fffbea":"#fff",borderRadius:4}}),
+                      r.po_sales_price>0 ? h("div",{style:{fontSize:10,color:colors.mutedLight,marginTop:2}},
+                        "Sl No value "+(Number(r.po_sales_price)*(Number(r.order_qty)||1)).toFixed(2)) : null
+                    ),
                     h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
                       isEditing
                         ? h(React.Fragment,null,
@@ -16104,6 +16272,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                             h("button",{onClick:async()=>{ setShowCartScreen(false); await openEstimate(r); },style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Goto BOM"),
                             h("button",{onClick:()=>{ setShowCartScreen(false); openEstimate(r); setShowDatasheet(true); },style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6}},"Datasheet"),
                             h("button",{onClick:()=>openCloneSlNo(r),style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6,borderColor:"#1c8c75",color:"#0f6e56"}},"Clone Sl No"),
+                            // Fresh BOM at Sale Order level -- snapshots first,
+                            // then hands over to the normal estimator. Restore
+                            // only appears once a snapshot exists to go back to.
+                            mode==="contract" && h("button",{onClick:()=>startFreshBom(r),disabled:busyBom===r.item_sl_no,
+                              title:"Rebuild this Sl No's BOM from scratch. The current BOM is saved first.",
+                              style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6,borderColor:"#7a5000",color:"#7a5000",opacity:busyBom===r.item_sl_no?0.5:1}},
+                              busyBom===r.item_sl_no?"…":"Fresh BOM"),
+                            mode==="contract" && baselineBySl[r.item_sl_no] && h("button",{onClick:()=>restoreBom(r),disabled:busyBom===r.item_sl_no,
+                              title:"Put back the BOM that was here before the fresh BOM was started",
+                              style:{...btnSecondary,padding:"4px 9px",fontSize:11.5,marginRight:6,opacity:busyBom===r.item_sl_no?0.5:1}},
+                              "Restore BOM"),
                             isAdmin && h("button",{onClick:()=>deleteSlNo(r),disabled:deletingSlNo===r.id,style:{border:"none",background:"transparent",color:colors.danger,cursor:"pointer",fontSize:12}},deletingSlNo===r.id?"…":"Remove")
                           )
                     )
@@ -16383,6 +16562,33 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("button",{onClick:()=>setBomFixUnlocked(null),style:btnSecondary},"Cancel"),
           h("button",{onClick:submitBomFixLine,disabled:savingBomFix,style:{...btnPrimary,opacity:savingBomFix?0.6:1}},savingBomFix?"Saving…":"Save to BOM Master")
         )
+      )
+    ),
+    // Fresh BOM chooser (16 Sep). The item is shown, not offered: it is the
+    // one thing on a Sale Order Sl No that is not up for discussion.
+    freshBom && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:460,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Fresh BOM — Sl No "+freshBom.row.item_sl_no),
+        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},
+          "The current BOM is saved first and can be restored exactly as it is now. At Sale Order level the BOM sets COST only — the sales price stays whatever was entered from the PO."),
+        h("div",{style:{background:"#f4f2ea",borderRadius:6,padding:"8px 10px",marginBottom:12}},
+          h("div",{style:{fontSize:10,color:colors.mutedLight,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:2}},"Item — cannot be changed"),
+          h("div",{style:{fontSize:13,fontWeight:700}},freshBom.item)),
+        h("div",{style:{marginBottom:14}},
+          h("div",{style:{fontSize:11,color:colors.muted,marginBottom:4}},"Build against"),
+          h("select",{value:freshBom.choice,onChange:e=>setFreshBom(f=>({...f,choice:e.target.value})),
+            style:{...inputStyle,width:"100%",fontSize:12.5}},
+            freshBom.models.map(m=>h("option",{key:m,value:m},m + (m===freshBom.row.model?"  (current)":""))),
+            h("option",{value:""},"Custom build — no model template")),
+          h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:4}},
+            freshBom.models.length+" model"+(freshBom.models.length===1?"":"s")+" available for this item")),
+        h("div",{style:{fontSize:11.5,color:"#7a5000",background:"#fffbea",border:"1px solid #e0b325",borderRadius:6,padding:"8px 10px",marginBottom:14}},
+          "Every line currently on this Sl No is cleared. Restore BOM on the Cart screen puts them back."),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
+          h("button",{onClick:confirmFreshBom,disabled:busyBom===freshBom.row.item_sl_no,
+            style:{...btnPrimary,opacity:busyBom===freshBom.row.item_sl_no?0.6:1}},
+            busyBom===freshBom.row.item_sl_no?"Working…":"Start fresh BOM"),
+          h("button",{onClick:()=>setFreshBom(null),style:btnSecondary},"Close"))
       )
     ),
     showBomRefreshConfirm && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
@@ -21227,6 +21433,26 @@ const MANUAL_SECTIONS = [
           {
             "type": "p",
             "text": "From 16 September 2026 these fields are behind a button on the contract line rather than always open. The button reads \"N to fix before approval\" and appears only while something is genuinely outstanding \u2014 click it to open the form, click again to fold it away. Hovering it lists exactly which fields are still blank. Once nothing is missing the button disappears on its own."
+          },
+          {
+            "type": "p",
+            "text": "PO Sales Price. On a Sale Order the sales price is NOT the quoted price. Between the estimate and the purchase order there are discounts and concessions, so the PO value is the true sales price \u2014 and it is typed in by hand, per Sl No, on the Cart screen. Enter it per unit in INR, exactly like every other price in the app; the Sl No value (price x order qty) is worked out for you and shown under the box. The quoted price is left untouched on the BOM lines, so quoted-against-sold stays comparable."
+          },
+          {
+            "type": "warn",
+            "text": "No Sale Order PDF will generate \u2014 not even a Draft \u2014 until every Sl No has its PO Sales Price entered. An empty box is outlined in amber so it is obvious which Sl No is holding it up."
+          },
+          {
+            "type": "p",
+            "text": "Fresh BOM. At Sale Order level you can rebuild an Sl No's BOM from scratch, ignoring whatever was done at estimation \u2014 the \"Fresh BOM\" button on the Cart screen. The BOM at this level sets the COST only; it never touches the sales price, which stays whatever was entered from the PO. Before anything is deleted the existing BOM is saved, and a \"Restore BOM\" button then appears to put it back exactly as it was. The saved copy is taken once, the first time you start a fresh BOM on that Sl No, so Restore always means \"as it was before anyone started\", however many attempts follow."
+          },
+          {
+            "type": "p",
+            "text": "The Fresh BOM box shows the Sl No's ITEM and does not let you change it \u2014 an Sl No on a Sale Order has a customer PO and an approved drawing behind it, so the item is settled. You choose either a MODEL belonging to that same item, or a custom build for it. Picking a model clears the lines and sets the Sl No to that model; use \"Refresh BOM from master\" on the BOM screen to pull its template, then adjust. Choosing custom leaves the Sl No empty for you to add lines by hand."
+          },
+          {
+            "type": "warn",
+            "text": "If the Sl No's model is not in the Model master there is no item to lock to, and Fresh BOM will refuse to start. Add the model to Master Data first."
           },
           {
             "type": "bullets",
