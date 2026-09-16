@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-10T18:20:00Z";
+  var APP_BUILD_VERSION = "2026-09-16T04:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -1428,6 +1428,11 @@ function MenuTabs({ user, active, onChange }) {
     ]},
     { label:"Reports", subgroups:[
       { label:"General", tabs:[
+        // Pending Actions. Standing instruction, 10 Sep: ONE surface for
+        // everything in the app that waits on a human, role-aware.
+        // Anything built later that waits on somebody joins it here
+        // without being asked.
+        {key:"pending_actions",label:"Pending Actions"},
         {key:"reports",label:"BOM Coverage"},
         {key:"reports_activity",label:"Activity by User"},
         {key:"reports_quotes",label:"Quotes"},
@@ -8936,6 +8941,73 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
   // Automation is deliberately partial: the app DETECTS and PROPOSES, a
   // person COMMITS. A delivery date is contractual, so every move records
   // who, when and why in delivery_date_history_tbl.
+  // ---- OA ISSUANCE (10 Sep, phase 49) ----
+  // Without a mail gateway the app cannot know when the OA actually went
+  // out, so this is a DECLARATION, not a detection.
+  //
+  // Two facts, kept apart. oa_issued_on is CONTRACTUAL and the user owns
+  // it -- an OA sent Monday evening and recorded Wednesday must carry
+  // Monday, or the deviation window and the delivery clock both start on
+  // the wrong day. oa_recorded_by/at is the audit fact and the user does
+  // not own it. Where the two differ, that difference is visible.
+  //
+  // Generating the PDF deliberately does NOT mark it issued: drafts get
+  // generated, regenerated and generated again just to check formatting.
+  const [oaOpen,setOaOpen] = useState(false);
+  const [oaDate,setOaDate] = useState("");
+  const [oaWho,setOaWho] = useState("");
+  const [oaLink,setOaLink] = useState("");
+  const [oaNote,setOaNote] = useState("");
+  const [oaErr,setOaErr] = useState("");
+  const [oaBusy,setOaBusy] = useState(false);
+  const allApproved = !!(contractInfo.commercial_approved_by && contractInfo.testing_approved_by && contractInfo.technical_approved_by);
+  const oaIssued = !!contractInfo.oa_issued_on;
+  useEffect(()=>{
+    setOaDate(contractInfo.oa_issued_on || new Date().toISOString().slice(0,10));
+    setOaWho(contractInfo.oa_issued_by || user?.username || "");
+    setOaLink(contractInfo.oa_evidence_link||""); setOaNote(contractInfo.oa_issue_note||"");
+  },[contractInfo.contract_number, contractInfo.oa_issued_on]);
+
+  const recordIssued = async()=>{
+    setOaErr("");
+    if(!oaDate){ setOaErr("Enter the date the OA actually went out."); return; }
+    if(oaDate > new Date().toISOString().slice(0,10)){ setOaErr("That date is in the future."); return; }
+    if(!allApproved){ setOaErr("All three approvals must be in before the OA can be issued."); return; }
+    setOaBusy(true);
+    const { error } = await sb.from("sale_order_tbl").update({
+      oa_issued_on: oaDate,
+      oa_issued_by: String(oaWho).trim() || (user?.username||"unknown"),
+      oa_recorded_by: user?.username||"unknown",
+      oa_recorded_at: new Date().toISOString(),
+      oa_evidence_link: String(oaLink).trim()||null,
+      oa_issue_note: String(oaNote).trim()||null,
+      status: "Issued",
+    }).eq("id", contractInfo.id);
+    setOaBusy(false);
+    if(error){ setOaErr("Could not save: "+error.message); return; }
+    await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,
+      "OA issued "+oaDate+" by "+(String(oaWho).trim()||user?.username)+
+      (oaDate!==new Date().toISOString().slice(0,10) ? "  (recorded "+new Date().toISOString().slice(0,10)+")" : ""),
+      user?.username||"unknown",null,null);
+    setOaOpen(false);
+    onChanged && onChanged();
+  };
+
+  // Un-issuing is admin only and needs a reason. Issuance is the point
+  // after which changes become amendments, so reversing it quietly would
+  // let that boundary move without trace.
+  const unissue = async()=>{
+    if(!isAdminOrAbove){ alert("Only an admin can reverse an issued OA."); return; }
+    const why = prompt("Why is this OA being un-issued?");
+    if(!why || !why.trim()) return;
+    await sb.from("sale_order_tbl").update({
+      oa_issued_on:null, oa_issued_by:null, oa_recorded_by:null, oa_recorded_at:null,
+    }).eq("id", contractInfo.id);
+    await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,
+      "OA UN-ISSUED. Reason: "+why.trim(), user?.username||"unknown",null,null);
+    onChanged && onChanged();
+  };
+
   const [delOpen,setDelOpen] = useState(false);
   const [delTriggers,setDelTriggers] = useState([]);
   const [delView,setDelView] = useState(null);      // row from v_contract_delivery
@@ -9182,8 +9254,28 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
       return;
     }
     if(!canApproveAtAll){ alert("Can't approve yet — still missing: "+[...otherMissing, billingMissing?"Billing Address":null].filter(Boolean).join(", ")); return; }
-    if(!isAdminOrAbove && user.role!==roleFor[field]){
-      alert("Only "+roleLabel[roleFor[field]]+" (or an Admin/Super Admin) can approve this section.");
+    // ---- WHO MAY APPROVE (14 Sep) ----
+    // Until today this read !isAdminOrAbove, so ANY admin could approve
+    // all three sections. Six of the seven logins were admin, including
+    // two telecallers, so the three-way separation did not exist.
+    //
+    // The deeper cause was in the database, not here: a CHECK constraint
+    // on app_users.role permitted only user, admin, super_admin and
+    // hr_admin, while the Add User screen offered accounts_admin, qc and
+    // technical_head. Those three roles could never be SAVED, so the
+    // gate had only ever passed on the admin bypass. crm_phase50 widened
+    // the constraint and assigned them, which is what makes this
+    // possible -- it is a new control, not a repaired one.
+    //
+    // Now: the matching role only. Admin keeps everything else it had --
+    // BOM overrides, the readiness bypass, master data -- and loses just
+    // this. The Super Admin Deletion Code override still unlocks all
+    // three together and is logged, so there is a way through when
+    // somebody is away, WITH a trace.
+    const mayApprove = (user.role === roleFor[field]) || overrideActive || user.role === "super_admin";
+    if(!mayApprove){
+      alert("Only "+roleLabel[roleFor[field]]+" can approve this section."+
+            (isAdminOrAbove ? "\n\nBeing an admin no longer approves contract sections \u2014 each one belongs to its own role." : ""));
       return;
     }
     const patch = {}; patch[field+"_by"] = user?.username||"unknown"; patch[field+"_at"] = new Date().toISOString();
@@ -9216,6 +9308,40 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     );
   };
   const df = (key,placeholder,width)=>h("input",{value:draft[key],onChange:e=>setDraft(d=>({...d,[key]:e.target.value})),placeholder,style:{...inputStyle,padding:"5px 8px",fontSize:11.5,width:width||"100%"}});
+  const oaPanel = oaOpen && h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"12px 14px",marginBottom:8}},
+    h("div",{style:{fontWeight:700,fontSize:12.5,marginBottom:2}},"Record the OA as issued"),
+    h("div",{style:{fontSize:11,color:colors.muted,marginBottom:10,lineHeight:1.6}},
+      "The app cannot see your outbox, so this is something you tell it. Enter the date the OA actually went "+
+      "out \u2014 not today's date, if they differ. That date is contractual: the deviation window closes from it, "+
+      "and where delivery counts from receipt of order, the clock starts from it. Who recorded it, and when, is "+
+      "kept separately and automatically."),
+    h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}},
+      h("label",{style:{fontSize:11,color:colors.muted}},"Issued on",
+        h("input",{type:"date",value:oaDate,onChange:e=>setOaDate(e.target.value),
+          style:{display:"block",padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}})),
+      h("label",{style:{fontSize:11,color:colors.muted,flex:"1 1 200px"}},"Sent by",
+        h("input",{type:"text",value:oaWho,onChange:e=>setOaWho(e.target.value),
+          style:{display:"block",width:"100%",padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}}))),
+    h("label",{style:{fontSize:11,color:colors.muted,display:"block",marginBottom:8}},
+      "Link to the sent copy ",h("span",{style:{color:colors.mutedLight}},"(optional \u2014 evidence, not a requirement)"),
+      h("input",{type:"text",value:oaLink,onChange:e=>setOaLink(e.target.value),placeholder:"https://\u2026",
+        style:{display:"block",width:"100%",padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}})),
+    h("label",{style:{fontSize:11,color:colors.muted,display:"block",marginBottom:8}},"Note",
+      h("input",{type:"text",value:oaNote,onChange:e=>setOaNote(e.target.value),
+        style:{display:"block",width:"100%",padding:"5px 7px",fontSize:12,border:"1px solid "+colors.border,borderRadius:4}})),
+    (oaDate && oaDate !== new Date().toISOString().slice(0,10))
+      ? h("div",{style:{fontSize:11,color:colors.muted,marginBottom:8}},
+          "Issued ",h("b",null,oaDate),", recorded today. Both are kept.") : null,
+    oaIssued ? h("div",{style:{fontSize:11,color:colors.muted,marginBottom:8}},
+      "Recorded by ",h("b",null,contractInfo.oa_recorded_by||"?"),
+      contractInfo.oa_recorded_at?(" on "+String(contractInfo.oa_recorded_at).slice(0,10)):"") : null,
+    oaErr ? h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},oaErr) : null,
+    h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap"}},
+      h("button",{disabled:oaBusy,onClick:recordIssued,style:btnPrimary},
+        oaBusy?"Saving\u2026":(oaIssued?"Update":"Record as issued")),
+      (oaIssued && isAdminOrAbove) ? h("button",{onClick:unissue,style:btnSmall},"Un-issue") : null,
+      h("button",{onClick:()=>{setOaOpen(false); setOaErr("");},style:btnSmall},"Close")));
+
   const delPanel = delOpen && h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:6,padding:"12px 14px",marginBottom:8}},
     h("div",{style:{fontWeight:700,fontSize:12.5,marginBottom:2}},"Contractual delivery"),
     h("div",{style:{fontSize:11,color:colors.muted,marginBottom:10,lineHeight:1.6}},
@@ -9288,6 +9414,7 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
   );
 
   return h("div",{style:{marginTop:10}},
+    oaPanel,
     delPanel,
     advPanel,
     (otherMissing.length>0 || billingMissing) && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"10px 12px",marginBottom:8}},
@@ -9329,6 +9456,14 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
       h("span",{style:{fontSize:11,color:colors.muted}},"from Quote "+contractInfo.quote_reference_number),
       // Delivery date. ANTICIPATED is amber because the date WILL move --
       // it is a projection from today, not a commitment.
+      // OA issuance chip. Only appears once all three approvals are in --
+      // before that there is nothing to issue and the chip would only be
+      // one more thing to ignore.
+      allApproved ? h("span",{onClick:()=>setOaOpen(v=>!v),
+        title: oaIssued ? "Issued "+contractInfo.oa_issued_on : "Record when the OA was sent",
+        style:{fontSize:10.5,cursor:"pointer",borderRadius:9,padding:"2px 8px",
+          background: oaIssued?"#e6f4f1":"#fff4d6", color: oaIssued?"#0f6e56":"#854f0b"}},
+        oaIssued ? ("OA issued "+contractInfo.oa_issued_on) : "OA not issued") : null,
       h("span",{onClick:()=>setDelOpen(v=>!v),title:"Set or change the contractual delivery terms",
         style:{fontSize:10.5,cursor:"pointer",borderRadius:9,padding:"2px 8px",
           background: !delView||delView.delivery_state==="NOT SET" ? "#fff4d6"
@@ -10399,7 +10534,42 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     await sb.from("estimates").update({abandoned_flag:true, abandoned_at:new Date().toISOString(), abandoned_by:user?.username||"unknown"}).eq("reference_number",ref);
     await logAudit("FLAG","estimates",ref,"Flagged "+ref+" as abandoned-incomplete — closed while not Ready",user?.username||"unknown",null,null);
   };
-  const handleMakeNewQuoteClick = ()=>{
+  // ---- STALE OA BLOCK (10 Sep) ----
+  // At 3 overdue days this stops you STARTING SOMETHING NEW. It does not
+  // block the app or the login.
+  //
+  // Why not the login: "issued" is a self-declaration nobody can verify.
+  // Punish not declaring it and the cheapest move becomes marking it
+  // issued and sending the OA later -- which gives a clean board and a
+  // contractual date that is quietly wrong. The delivery clock depends on
+  // that date being honest, so the control must not make honesty costly.
+  //
+  // Self-service by design: a typed reason releases it for another three
+  // days. No PIN, nobody to wait for. Somebody on leave must not be able
+  // to stop a colleague working.
+  const [staleBlock,setStaleBlock] = useState(null);
+  const [staleWhy,setStaleWhy] = useState("");
+  // The registry names the PERSON who owes an item (it resolves the post
+  // to whoever currently holds it), so matching needs this user's
+  // employee name, not their username. There is no existing variable for
+  // that here -- the first draft invented one, which is the same fault as
+  // the dead Go to Cart button earlier today.
+  const [myEmployeeName,setMyEmployeeName] = useState("");
+  useEffect(()=>{
+    if(!user?.username) return;
+    sb.from("app_users").select("employee_name").eq("username",user.username).maybeSingle()
+      .then(({data})=>setMyEmployeeName((data&&data.employee_name)||""));
+  },[user?.username]);
+  const checkStaleOA = async()=>{
+    if(!myEmployeeName) return null;   // unknown who I am -> never block
+    const { data } = await sb.from("v_pending_actions").select("*")
+      .eq("source","oa_issue").eq("urgency","overdue");
+    const mine = (data||[]).filter(r=>r.owed_by_person===myEmployeeName);
+    return mine.length ? mine : null;
+  };
+  const handleMakeNewQuoteClick = async()=>{
+    const stale = await checkStaleOA();
+    if(stale){ setStaleBlock(stale); setStaleWhy(""); return; }
     if(!refFilter){ setAddNewInput(""); setAddNewMsg(null); setShowAddNewModal(true); return; }
     setNewQuoteConfirm({ready:readiness.ready, missing:readiness.missing||[]});
   };
@@ -11500,9 +11670,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(!refNumber){ setQuoteTotals(null); return; }
     setQuoteTotalsLoading(true);
     try{
-      const { data } = await sb.from("estimate_lines").select("cost,sales_price").eq("reference_number",refNumber);
-      const cost = (data||[]).reduce((s,l)=>s+(Number(l.cost)||0),0);
-      const salesPrice = (data||[]).reduce((s,l)=>s+(Number(l.sales_price)||0),0);
+      // 16 Sep FIX -- this summed the stored cost/sales_price columns raw,
+      // on the stated assumption that each was "already order-qty-scaled
+      // per line". It is not: stored line cost is PER UNIT (qty x rate),
+      // which is the whole basis of the 10 Sep correction across 109 Sl
+      // Nos. So these totals understated by a factor of order_qty on every
+      // Sl No with a quantity above 1 -- a Contract of 2 Sl Nos x 3 Nos x
+      // 41 read 82 instead of 246. Order qty now comes from estimates and
+      // is applied per Sl No. Material % is unaffected in principle (both
+      // sides scale together) but is recomputed from the corrected values.
+      const [{ data },{ data: estRows }] = await Promise.all([
+        sb.from("estimate_lines").select("item_sl_no,cost,sales_price").eq("reference_number",refNumber),
+        sb.from("estimates").select("item_sl_no,order_qty").eq("reference_number",refNumber)
+      ]);
+      const qtyBySl = new Map((estRows||[]).map(r=>[r.item_sl_no, Number(r.order_qty)||1]));
+      const oq = (l)=> qtyBySl.get(l.item_sl_no) || 1;
+      const cost = (data||[]).reduce((s,l)=>s+((Number(l.cost)||0)*oq(l)),0);
+      const salesPrice = (data||[]).reduce((s,l)=>s+((Number(l.sales_price)||0)*oq(l)),0);
       setQuoteTotals({ cost, salesPrice, materialPct: salesPrice>0 ? (cost/salesPrice*100) : null });
     } catch(e){ console.error("Couldn't load quote totals",e); setQuoteTotals(null); }
     finally{ setQuoteTotalsLoading(false); }
@@ -14586,7 +14770,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const showPricingPanel = !showSummarySaved && !showCuttingPlan && openLinesHaveDirectPrice && !showBomOverride;
 
   return h(React.Fragment,null,
-    h("div",{style:{position:"sticky",top:appHeaderHeight,zIndex:55,background:colors.bg,padding:"20px 24px 14px",borderBottom:"1px solid "+colors.border}},
+    h("div",{style:{position:"sticky",top:appHeaderHeight,zIndex:55,background:colors.bg,padding:"20px 24px 14px",borderBottom:"1px solid "+colors.border,
+      // 16 Sep -- this frozen region had no height limit. It holds the
+      // title row, the search, and (on a Contract) the whole
+      // ContractStatusBanner: OA panel, delivery panel, advance panel and
+      // the red required-fields block. On an unapproved Contract that came
+      // to roughly two-thirds of the window, leaving about two lines of
+      // the actual list scrolling underneath. Capping it means the frozen
+      // area can never eat the page: past the cap it scrolls inside
+      // itself, and anything added to the banner later inherits the same
+      // ceiling instead of reintroducing the problem.
+      maxHeight:"45vh",overflowY:"auto"}},
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}},
         h("h2",{style:{margin:0,fontSize:18,fontWeight:700}}, mode==="contract" ? "Sale Order" : "Quotes"),
         h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}},
@@ -15604,6 +15798,40 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         )
       )
     ),
+    staleBlock && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1250,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:560,maxWidth:"100%"}},
+      h("div",{style:{fontWeight:700,fontSize:13.5,marginBottom:6}},
+        staleBlock.length+" order acknowledgement"+(staleBlock.length>1?"s have":" has")+" been approved but not issued"),
+      h("div",{style:{fontSize:12,color:colors.muted,lineHeight:1.7,marginBottom:12}},
+        "These were approved more than three days ago and have not been recorded as sent. Please deal with "+
+        "them before starting something new. If one is genuinely waiting on somebody else, put it on hold with "+
+        "a reason and the clock stops."),
+      h("ul",{style:{fontSize:12,margin:"0 0 12px",paddingLeft:18}},
+        staleBlock.slice(0,6).map((r,i)=>h("li",{key:i,style:{marginBottom:3}},
+          h("b",null,r.entity_key)," \u00b7 ",r.days_waiting," days"))),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:6}},
+        "Or carry on for another three days, with a reason:"),
+      h("input",{type:"text",value:staleWhy,onChange:e=>setStaleWhy(e.target.value),
+        placeholder:"Why these are still open",
+        style:{width:"100%",padding:"7px 9px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4,marginBottom:12}}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap"}},
+        h("button",{disabled:!String(staleWhy).trim(),
+          onClick:async()=>{
+            for(const r of staleBlock){
+              await sb.from("pending_action_hold_tbl").insert({
+                source:"oa_issue", entity_key:r.entity_key, detail_key:"",
+                held_from:new Date().toISOString(),
+                held_to:new Date(Date.now()+3*86400000).toISOString(),
+                reason:String(staleWhy).trim(), held_by:user?.username||"unknown"});
+            }
+            await logAudit("UPDATE","sale_order_tbl",staleBlock.map(r=>r.entity_key).join(", "),
+              "Stale OA block deferred 3 days. Reason: "+String(staleWhy).trim(),
+              user?.username||"unknown",null,null);
+            setStaleBlock(null); setStaleWhy("");
+          },
+          style:btnSmall},"Carry on for 3 more days"),
+        h("button",{onClick:()=>{setStaleBlock(null); setStaleWhy("");},style:btnPrimary},"Go and deal with them")))),
+
     // Sl No collision. The requested number is already in use on this
     // quote, so there is no safe silent answer: renaming onto it would
     // merge two units into one. Swap is the only non-destructive move,
@@ -19193,6 +19421,14 @@ const MANUAL_SECTIONS = [
           {
             "type": "p",
             "text": "\"Tour\" is a short guided walkthrough of every screen, with narrated slides you can step through with Next/Back or the arrow keys. \"User Manual\" (this screen) has a \"Download manual PDF\" button at the top of the sidebar \u2014 one click downloads the whole manual as a PDF, generated fresh from the same content you're reading here."
+          },
+          {
+            "type": "p",
+            "text": "Just under the menu bar you may see a single amber strip of reminder chips \u2014 quotes still sitting in Draft, follow-ups logged late, and (for a super admin) abandoned incomplete quotes. Each chip is clickable and takes you straight to the screen where you can deal with it. Chips only appear when they apply, and the strip disappears entirely when nothing needs attention. Until 16 September 2026 each of these was a full-width band of its own, which could take four lines off the top of every screen."
+          },
+          {
+            "type": "tip",
+            "text": "On the Quotes and Sale Order screens the frozen top section \u2014 the title, the search box, and on a Sale Order the contract banner with its delivery, advance and approval panels \u2014 is now limited to just under half the window height. If it needs more room than that it scrolls within itself, so the list underneath always has usable space."
           }
         ]
       }
@@ -19933,6 +20169,87 @@ const MANUAL_SECTIONS = [
           {
             "type": "p",
             "text": "One deliberate exception. The printed BOM export computes its cost from the rate AS PRINTED, rounded to two decimals, rather than the raw stored rate. That is on purpose: it makes the document add up in the reader's hands. It can differ from the stored figure in the last decimal, and that difference is the rounding you can see, not an error."
+          }
+        ]
+      },
+      {
+        "key": "who_approves",
+        "title": "Who can approve a contract",
+        "tag": "Sale Order",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "A contract has three approvals and each belongs to one role. Commercial Terms is the Accounts Head. Testing is the QC Head. Technical is the Technical Head. Nobody else can give an approval that is not theirs."
+          },
+          {
+            "type": "tip",
+            "text": "Being an admin no longer approves contract sections. That changed on 14 September. Admin still covers everything else it always did \u2014 BOM overrides, the readiness bypass, master data \u2014 but an approval now belongs to the person whose job it is."
+          },
+          {
+            "type": "p",
+            "text": "Why it changed: until now ANY admin could approve all three, and six of the seven logins were admin, including two telecallers. The separation the contract relies on did not exist. The reason ran deeper than the app \u2014 the database would not store the three roles at all, so the approval check had only ever passed by treating admins as everybody."
+          },
+          {
+            "type": "tip",
+            "text": "If one of the three is away, a Super Admin can unlock all three with a Deletion Code. That is logged against the contract and shows as an override, so the record says who really approved it. Signing in as somebody else also works, but then the contract says THEY approved it \u2014 which is not what happened."
+          }
+        ]
+      },
+      {
+        "key": "pending_actions",
+        "title": "Pending Actions",
+        "tag": "Reports",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "One screen for everything in the app that is waiting on a person: contract approvals not yet given, order acknowledgements approved but not sent, the advance question unanswered, documents sitting with us, and Direct Price lines awaiting validation. Reports \u2192 Pending Actions."
+          },
+          {
+            "type": "p",
+            "text": "Everyone sees what is waiting on them. Admin, super admin and the Sales Head also get an Everyone view, which is the chase list \u2014 it shows who owes what and for how long, by name rather than by role."
+          },
+          {
+            "type": "tip",
+            "text": "The clock starts when an item can ACTUALLY be acted on, not when the record was created. An order acknowledgement ages from the last of the three approvals, so nobody is chased for a wait that belonged to somebody else."
+          },
+          {
+            "type": "p",
+            "text": "Hold stops the clock. If something is genuinely waiting on the customer or on another department, hold it with a reason and the days stop counting. It stays on the list with the reason showing \u2014 a hold is not a way to make something disappear, it is a way to say why it is waiting."
+          },
+          {
+            "type": "tip",
+            "text": "After three overdue days, an unissued OA stops you starting a NEW quote until it is dealt with. It does not block the app or your login, and you can carry on for another three days by typing a reason \u2014 no PIN, nobody to wait for. Somebody being on leave must never stop a colleague working."
+          },
+          {
+            "type": "p",
+            "text": "A dash in the Days column means there is nothing to measure from: the item predates the timestamps that make ageing possible. It will show a real figure once it next moves."
+          }
+        ]
+      },
+      {
+        "key": "oa_issuance",
+        "title": "Recording the OA as issued",
+        "tag": "Sale Order",
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The app cannot see your outbox, so it cannot know when the OA actually went to the customer. You tell it. Once all three approvals are in, a chip appears on the contract header reading \"OA not issued\" \u2014 open it, enter the date it went out, and record it."
+          },
+          {
+            "type": "tip",
+            "text": "Enter the date the OA ACTUALLY went out, not today's date, if they differ. That date is contractual: where delivery counts from receipt of order the clock runs from it, and the window for raising a deviation closes on it. Who recorded it and when is kept separately and filled in automatically, so an OA sent on Monday evening and recorded on Wednesday carries Monday and still shows honestly as recorded on Wednesday."
+          },
+          {
+            "type": "p",
+            "text": "Generating the OA PDF does NOT mark it issued, on purpose. Drafts get generated, corrected and regenerated just to check the formatting, and any of those would otherwise issue the contract by accident."
+          },
+          {
+            "type": "p",
+            "text": "A link to the sent copy is optional. It is there so the evidence sits with the contract rather than in somebody's memory \u2014 but it is not required, because making it compulsory only teaches people to paste anything into the box."
+          },
+          {
+            "type": "tip",
+            "text": "Un-issuing is admin only and asks for a reason. Issuance is the point after which changes become amendments, so reversing it quietly would move that boundary with no trace."
           }
         ]
       },
@@ -21175,6 +21492,9 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"14 Sep 2026 (63)", summary:"Contract approvals are segregated by role for the first time. Commercial belongs to accounts_admin, Testing to qc, Technical to technical_head, and nobody else can give an approval that is not theirs. Until now the gate read !isAdminOrAbove, so ANY admin could approve all three \u2014 and six of the seven logins were admin, including two telecallers, so the separation the contract relies on did not exist in practice. The cause ran deeper than the app: a CHECK constraint on app_users.role permitted only user, admin, super_admin and hr_admin while the Add User screen offered accounts_admin, qc and technical_head, so those three roles could NEVER BE SAVED. Anyone who tried got a constraint error and settled for admin. crm_phase50 widens that constraint, creates Sunil and Thangavignesh, corrects Ganesh's existing login rather than duplicating it, moves Veenai Vimal to technical_head and Deepak to super_admin, and fills five of the seven posts, which were all empty \u2014 meaning Pending Actions had nobody to name and the stale-OA block could never fire. So this is a NEW control, not a repaired one, and it should be tried on a test contract before being trusted. Admin keeps everything else: BOM overrides, the readiness bypass, master data. The Super Admin Deletion Code override still unlocks all three together and is logged, which is the way through when somebody is away WITH a trace \u2014 signing in as them also works but records the wrong approver. Nine assertions cover the matrix, including that an admin and a plain user can approve nothing." },
+  { date:"10 Sep 2026 (62)", summary:"Pending Actions screen, and the stale-OA block. ONE surface under Reports for everything in the app waiting on a person, reading the phase 49 registry: contract approvals, order acknowledgements approved but not issued, the unanswered advance question, documents awaiting our action, and Direct Price lines pending validation. Role aware \u2014 everyone sees what is waiting on them, while admin, super admin and the Sales Head also get an Everyone view naming the person rather than the post. Standing instruction from the user: anything built later that waits on a human joins this screen without being asked. Hold stops the clock and keeps the item listed with its reason, because a control that punishes an honest hold gets routed around and the reason \u2014 the useful part \u2014 is lost. After three overdue days an unissued OA blocks starting a NEW quote, NOT the app and NOT the login: issued is a self-declaration nobody can verify, so punishing non-declaration would make marking it issued early the cheapest move, and the delivery clock depends on that date being honest. Deferring is self-service, a typed reason for three more days, so somebody on leave cannot stop a colleague working. Two faults caught before shipping, both by the scope scan rather than by use: the block referenced a sessionEmployeeName that does not exist \u2014 the registry names the employee, not the username, so it now looks that up \u2014 and the block dialog was written into the contract banner while its state lives in the quotes component, which the scan reported as four unresolved names. Also corrected: the DRAFT watermark on the Sale Order already existed and needed nothing." },
+  { date:"10 Sep 2026 (61)", summary:"OA issuance recorded as an event, and the foundation for one shared Pending Actions surface. Without a mail gateway the app cannot detect when an OA went out, so issuance is a DECLARATION: a chip appears on the contract once all three approvals are in, and the date entered is the date it ACTUALLY went out. Two facts are kept apart on purpose \u2014 oa_issued_on is contractual and the user owns it, because the deviation window and the receipt-of-order delivery clock both run from it, while oa_recorded_by and oa_recorded_at are the audit fact and are filled automatically; an OA sent Monday evening and recorded Wednesday carries Monday and still shows as recorded Wednesday. Generating the PDF deliberately does NOT issue it, since drafts are generated and regenerated just to check formatting. Evidence link is optional by design \u2014 compulsory only teaches people to paste anything into the box. Un-issuing is admin only with a mandatory reason, because issuance is the boundary after which changes become amendments. Needs crm_phase49, which also builds the registry behind the Pending Actions screen: five sources (contract approvals, stale OA drafts, unanswered advance, documents awaiting our action, price validation) in one view with one shape, so the next kind of wait is added as a block rather than a new screen. Its clock starts when an item becomes ACTIONABLE, not when it was created \u2014 the OA ages from the LAST approval, so nobody is chased for an approval sitting with someone else \u2014 and a recorded hold PAUSES it, because a control that punishes honesty gets routed around. Correction to the 5 Sep note: the approve handler ALREADY writes the approval timestamps, so ageing works without any change there." },
   { date:"10 Sep 2026 (60)", summary:"Contractual delivery date on the Contract \u2014 step 1 of the order-board build, closing OA SOP clause 8.5. Captured at CONTRACT level. Delivery is not one date: four contractual options exist and under three of them the date is a clock that starts later, so the contract stores DAYS plus WHICH TRIGGER plus the date each trigger fired, and the date is DERIVED. It is never stored: a typed date goes stale the moment a trigger date is corrected and nothing says so. The derivation lives in one view, v_contract_delivery, so the contract panel, the board and any report give the same answer rather than three implementations drifting apart. There is a fired-date column PER trigger because the fourth option depends on two of them and must know which arrived last. State reads FIRM when every dependency has happened, ANTICIPATED when one has not \u2014 anticipated projects from today so the board still has something to sort on. Automation is deliberately partial, settled with the user: the app DETECTS and PROPOSES, a person COMMITS, because a delivery date is contractual and every move must carry who, when and why. Rules settled: Code 1 and BOTH Code 2 states clear the clock, Code 3 and our-action-pending do not, and this is stored as a flag on doc_status_tbl so a status added later defaults to not-cleared, the safe direction. A document counts on its LATEST revision only \u2014 universal_documents_tbl carries no status at all, it lives per revision, so a drawing that reached Code 2 at Rev 1 and is now out again at Rev 2 has NOT cleared; reading the parent would have shown a firm date the contract had not earned. The Code 2 clock-start date is blocked while any Full Hold document is short of Code 2, overridable by admin and super admin with a mandatory reason. A fall back to Code 3 does NOT reset the clock; it is flagged to the contract owner. Every change writes to delivery_date_history_tbl with date and state before and after, days moved and a stages_shifted count that is NOT NULL so nothing-moved never reads the same as not-recorded. Needs crm_phase47 and crm_phase48." },
   { date:"9 Sep 2026 (59)", summary:"Cart Summary now shows the price AS PRINTED beside the computed price, resolving a reported mismatch between the Cart Summary and the Offer PDF's Price Summary. Neither was wrong: the Offer PDF has always rounded each unit price to the nearest 5 and derived the total from that rounded unit (roundedUnitTotal), so a computed 251.75 is offered at 250.00 and 418.51 at 420.00, while the Cart Summary showed the computed figure to two decimals. Every row therefore looked like it disagreed. The 5 September specification did say the rounding should follow the Price Summary rule and that was missed when the screen was built. Rather than simply rounding the screen, both figures are shown: the computed price, which is what the sales factor is genuinely measured against, and the printed price the customer will see. Same two columns on the totals, and in the Excel and PDF exports. The header gains a second effective factor marked as printed, shown only when it differs from the computed one, because rounding each unit to the nearest 5 shifts the achieved factor and that is worth seeing before an offer goes out. Rounding is applied AFTER currency conversion, which is where the PDF applies it -- rounding the rupee figure first gives a different answer. One shared helper, cartSummaryPrinted, is used by the screen and both exports, and a test asserts it against eight real figures read off an actual offer, that the total comes from the rounded unit rather than a rounded total, and that it agrees with the PDF's own roundedUnitTotal." },
   { date:"8 Sep 2026 (58)", summary:"Ten writes to estimate_lines were addressing a column that does not exist. The table has NO id column, yet ten calls filtered on .eq(\"id\", line.id), which sends id=eq.undefined and returns \"column estimate_lines.id does not exist\". Most did not check the returned error, so they reported success and changed nothing. What was silently failing: validating a Direct Price line (two paths), the Cart Summary sales-factor save, the stale-cost sweep, the MOC spec and grade write-back, both Excel attachment writes, and the Direct Price validate-and-attach pair. Worst of the set was Refresh BOM, whose delete used .in(\"id\", ...) -- so it added the new lines and never removed the old ones, quietly leaving both in the BOM. All ten now address a line by reference_number + item_sl_no + sl_no, the key the app's other line writes already used, through a single byLine helper so there is one definition of \"this line\" instead of ten. The delete loops per line, since there is no composite IN, and stops on the first failure rather than leaving a half-refreshed BOM. Note for whoever comes next: this also explains why only some lines had ever been converted to the per-order cost convention -- several of the paths that would have converted them were never writing at all." },
@@ -33331,18 +33651,45 @@ function App() {
     // Mounted at app level so it can be opened from any screen, and captures
     // the tab the user was actually on rather than the one they navigated to.
     reportOpen && h(ReportIssueDialog,{user,screenContext:tab,recordRef:null,onClose:()=>setReportOpen(false)}),
-    draftCount>0 && h("div",{onClick:()=>setShowDraftPanel(true),style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
-      "⚠ "+draftCount+" quote"+(draftCount===1?"":"s")+" still in Draft — click to review and update status"
-    ),
-    myLateCount>0 && h("div",{onClick:()=>{setTab("followup_entry");},style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
-      "⚠ You logged "+myLateCount+" follow-up"+(myLateCount===1?"":"s")+" more than a day after the visit date — click to review"
-    ),
-    (user.role==="admin"||user.role==="super_admin") && teamLateCount>0 && h("div",{onClick:()=>{setTab("followup_entry");},style:{cursor:"pointer",background:"#fff4d6",borderBottom:"1px solid #f0d9a8",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#854f0b"}},
-      "⚠ "+teamLateCount+" follow-up entr"+(teamLateCount===1?"y":"ies")+" logged late across the team — click to review"
-    ),
-    user.role==="super_admin" && abandonedCount>0 && h("div",{onClick:()=>setTab("abandoned_quotes_cleanup"),style:{cursor:"pointer",background:"#fdecea",borderBottom:"1px solid #f0997b",padding:"6px 24px",fontSize:12.5,fontWeight:600,color:"#a3312a"}},
-      "⚠ "+abandonedCount+" abandoned incomplete quote"+(abandonedCount===1?"":"s")+" — click to review"
-    ),
+    // 16 Sep -- these four notices each rendered as their own full-width
+    // strip, so up to four lines of every screen in the app were spent on
+    // nags with nothing to do with the screen being used. They are now one
+    // line of clickable chips: same targets, same wording, same colours
+    // (the abandoned-quotes notice keeps its red). A notice that does not
+    // apply is not rendered, and when none apply the strip disappears
+    // entirely, exactly as before.
+    (function(){
+      var notices = [];
+      if(draftCount>0) notices.push({key:"draft",tone:"warn",
+        label:"\u26a0 "+draftCount+" quote"+(draftCount===1?"":"s")+" still in Draft",
+        title:"Click to review and update status",
+        onClick:function(){ setShowDraftPanel(true); }});
+      if(myLateCount>0) notices.push({key:"mylate",tone:"warn",
+        label:"\u26a0 "+myLateCount+" of your follow-up"+(myLateCount===1?"":"s")+" logged late",
+        title:"Logged more than a day after the visit date \u2014 click to review",
+        onClick:function(){ setTab("followup_entry"); }});
+      if((user.role==="admin"||user.role==="super_admin") && teamLateCount>0) notices.push({key:"teamlate",tone:"warn",
+        label:"\u26a0 "+teamLateCount+" team follow-up entr"+(teamLateCount===1?"y":"ies")+" logged late",
+        title:"Click to review",
+        onClick:function(){ setTab("followup_entry"); }});
+      if(user.role==="super_admin" && abandonedCount>0) notices.push({key:"abandoned",tone:"danger",
+        label:"\u26a0 "+abandonedCount+" abandoned incomplete quote"+(abandonedCount===1?"":"s"),
+        title:"Click to review",
+        onClick:function(){ setTab("abandoned_quotes_cleanup"); }});
+      if(notices.length===0) return null;
+      var hasDanger = notices.some(function(n){ return n.tone==="danger"; });
+      return h("div",{style:{display:"flex",flexWrap:"wrap",alignItems:"center",gap:8,
+        background: hasDanger?"#fdecea":"#fff4d6",
+        borderBottom:"1px solid "+(hasDanger?"#f0997b":"#f0d9a8"),
+        padding:"5px 24px",fontSize:12}},
+        notices.map(function(n){
+          return h("span",{key:n.key,onClick:n.onClick,title:n.title,
+            style:{cursor:"pointer",fontWeight:600,borderRadius:9,padding:"2px 9px",
+              background: n.tone==="danger"?"#fdd8d3":"#ffe9b8",
+              color: n.tone==="danger"?"#a3312a":"#854f0b"}}, n.label);
+        })
+      );
+    })(),
     h("div",{style:{display:tab==="estimator"?"block":"none"}},h(Estimator,{user,masterData,sessionCompanyId,sessionCompany,onRefresh:refresh,onOpenQuote:(ref,slNo,openDatasheet)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo,openDatasheet:!!openDatasheet});setTab("saved");},initialModel:openModelTarget,onConsumedInitialModel:()=>setOpenModelTarget(null),pendingNewSlNo,onConsumedPendingNewSlNo:()=>setPendingNewSlNo(null),onGoToTab:setTab})),
     tab==="saved"?h(SavedEstimates,{user,sessionCompany,openTarget:quoteToOpen,onConsumedTarget:()=>setQuoteToOpen(null),onGoToTab:setTab,onNewSlNo:(ref,slNo,headerFields)=>{setPendingNewSlNo({reference_number:ref,item_sl_no:slNo,headerFields:headerFields||null});setTab("estimator");},onOpenContract:openContract,cameFromQuotesReport,onBackToQuotesReport:()=>{setCameFromQuotesReport(false); setTab("quotes_report");}}):
     tab==="sale_order_entry"?h(SaleOrderContractPicker,{user,onOpenContract:openContract}):
@@ -33368,6 +33715,7 @@ function App() {
     tab==="reports_pending_validation"?h(PendingValidationScreen,{user,onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}}):
     tab==="reports_status_history"?h(StatusChangeHistoryReport,null):
     tab==="reports_po_register"?h(PoRegisterReport,null):
+    tab==="pending_actions"?h(PendingActionsScreen,{user}):
     tab==="reports_grn_status"?h(GrnStatusReport,null):
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="authorization_codes"?h(AuthorizationCodesScreen,{user}):
@@ -34606,6 +34954,134 @@ function StatusKanban({ statuses, items, getStatus, getTitle, getSubtitle, onMov
       );
     })
   );
+}
+
+/* ---- PENDING ACTIONS (10 Sep, phase 49) ----------------------------
+   ONE surface for everything in the app that is waiting on a human.
+   Reads v_pending_actions, which unions five sources into one shape --
+   contract approvals, stale OA drafts, the unanswered advance question,
+   documents awaiting our action, and Direct Price lines pending
+   validation. A sixth source is a block in that view, not a new screen.
+
+   ROLE AWARE. Everyone lands on "Waiting on me". Super admin, admin and
+   the Sales Head also get "Everyone", which is the chase list.
+
+   The clock starts when an item becomes ACTIONABLE, not when it was
+   created, and a recorded hold PAUSES it. Held items stay on the list
+   with their reason showing -- a hold is not a hiding place, it is a
+   thing that gets questioned.
+------------------------------------------------------------------- */
+function PendingActionsScreen({ user }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [mine,setMine] = useState(true);
+  const [holdFor,setHoldFor] = useState(null);
+  const [holdWhy,setHoldWhy] = useState("");
+  const [err,setErr] = useState("");
+  const [me,setMe] = useState("");
+
+  const canSeeAll = user?.role==="super_admin" || user?.role==="admin";
+  const [isSalesHead,setIsSalesHead] = useState(false);
+
+  const load = useCallback(async()=>{
+    setLoading(true);
+    const [{data},{data:emp},{data:sh}] = await Promise.all([
+      sb.from("v_pending_actions").select("*"),
+      sb.from("app_users").select("employee_name").eq("username",user?.username||"").maybeSingle(),
+      sb.from("post_holder_tbl").select("employee_name").eq("post_key","sales_head"),
+    ]);
+    const myName = (emp&&emp.employee_name)||"";
+    setMe(myName);
+    setIsSalesHead((sh||[]).some(r=>r.employee_name===myName));
+    setRows(data||[]);
+    setLoading(false);
+  },[user?.username]);
+  useEffect(()=>{ load(); },[load]);
+
+  const seeAll = canSeeAll || isSalesHead;
+  // Two cases only. "Waiting on me" is always just mine; "Everyone" is
+  // only offered to those who can see it. The first version of this line
+  // chained two filters with a mixed ternary and was unreadable, which on
+  // a permission check is a fault whether or not it happened to work.
+  const shown = (rows||[]).filter(r => (mine || !seeAll) ? (r.owed_by_person === me) : true);
+
+  const placeHold = async()=>{
+    if(!String(holdWhy).trim()){ setErr("A hold needs a reason \u2014 the reason is the point of it."); return; }
+    const { error } = await sb.from("pending_action_hold_tbl").insert({
+      source: holdFor.source, entity_key: holdFor.entity_key,
+      detail_key: holdFor.detail_key||"", reason: String(holdWhy).trim(),
+      held_by: user?.username||"unknown",
+    });
+    if(error){ setErr("Could not save the hold: "+error.message); return; }
+    setHoldFor(null); setHoldWhy(""); setErr(""); load();
+  };
+  const releaseHold = async(r)=>{
+    const { error } = await sb.from("pending_action_hold_tbl")
+      .update({held_to:new Date().toISOString(), released_by:user?.username||"unknown", released_at:new Date().toISOString()})
+      .eq("source",r.source).eq("entity_key",r.entity_key)
+      .eq("detail_key",r.detail_key||"").is("held_to",null);
+    if(error){ setErr("Could not release: "+error.message); return; }
+    load();
+  };
+
+  const tone = (u)=> u==="overdue" ? {bg:"#fdeaea",fg:"#8a2d2d"}
+                   : u==="on hold" ? {bg:"#eef0f4",fg:"#4a5568"}
+                   : u==="due"     ? {bg:"#fff4d6",fg:"#854f0b"}
+                   : {bg:"#f2f0e9",fg:colors.muted};
+  const counts = {
+    overdue: shown.filter(r=>r.urgency==="overdue").length,
+    due:     shown.filter(r=>r.urgency==="due").length,
+    hold:    shown.filter(r=>r.on_hold).length,
+  };
+
+  return h("div",{style:{padding:"14px 18px"}},
+    h("h2",{style:{margin:"0 0 2px",fontSize:16}},"Pending Actions"),
+    h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:12}},
+      "Everything waiting on a person. The clock starts when an item can actually be acted on \u2014 an OA ages from "+
+      "the last approval, not from when the contract was raised \u2014 and a hold pauses it."),
+    seeAll ? h("div",{style:{display:"flex",gap:6,marginBottom:12}},
+      h("button",{onClick:()=>setMine(true), style:mine?btnPrimary:btnSmall},"Waiting on me"),
+      h("button",{onClick:()=>setMine(false),style:!mine?btnPrimary:btnSmall},"Everyone")) : null,
+    h("div",{style:{display:"flex",gap:14,fontSize:11.5,marginBottom:10}},
+      h("span",{style:{color:"#8a2d2d"}},counts.overdue+" overdue"),
+      h("span",{style:{color:"#854f0b"}},counts.due+" due"),
+      h("span",{style:{color:colors.muted}},counts.hold+" on hold")),
+    err?h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},err):null,
+    loading ? h("div",{style:{fontSize:12,color:colors.muted}},"Loading\u2026")
+    : shown.length===0 ? h("div",{style:{fontSize:12.5,color:colors.muted,padding:"18px 0"}},
+        mine?"Nothing is waiting on you.":"Nothing is waiting on anybody.")
+    : h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12}},
+        h("thead",null,h("tr",{style:{borderBottom:"2px solid "+colors.border,background:"#faf9f4"}},
+          ["What","Reference","Waiting on","Days","",""].map((x,i)=>
+            h("th",{key:i,style:{textAlign:i>2?"right":"left",padding:"8px 6px",fontWeight:600}},x)))),
+        h("tbody",null, shown
+          .slice().sort((a,b)=>(b.days_waiting||0)-(a.days_waiting||0))
+          .map((r,i)=>h("tr",{key:i,style:{borderBottom:"1px solid "+colors.border}},
+            h("td",{style:{padding:"8px 6px"}},r.what,
+              r.on_hold?h("div",{style:{fontSize:10.5,color:colors.muted}},"On hold: "+(r.hold_reason||"")):null),
+            h("td",{style:{padding:"8px 6px"}},r.entity_key),
+            h("td",{style:{padding:"8px 6px"}},r.owed_by_person||r.owed_by_role||"\u2014"),
+            h("td",{style:{padding:"8px 6px",textAlign:"right"}},
+              r.days_waiting==null?h("span",{style:{color:colors.mutedLight},title:"Nothing to measure from \u2014 this predates the timestamps"},"\u2014"):r.days_waiting),
+            h("td",{style:{padding:"8px 6px",textAlign:"right"}},
+              h("span",{style:{fontSize:10.5,borderRadius:9,padding:"2px 8px",
+                background:tone(r.urgency).bg,color:tone(r.urgency).fg}},r.urgency)),
+            h("td",{style:{padding:"8px 6px",textAlign:"right"}},
+              r.on_hold ? h("button",{onClick:()=>releaseHold(r),style:btnSmall},"Release")
+                        : h("button",{onClick:()=>{setHoldFor(r); setHoldWhy(""); setErr("");},style:btnSmall},"Hold")))))),
+    holdFor ? h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      h("div",{style:{background:"#fff",borderRadius:8,padding:"18px 22px",width:480,maxWidth:"100%"}},
+        h("div",{style:{fontWeight:700,fontSize:13,marginBottom:4}},"Put this on hold"),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:12,lineHeight:1.6}},
+          "The clock stops while it is held, so a wait that is not yours does not count against you. "+
+          "It stays on this list with the reason showing."),
+        h("input",{type:"text",value:holdWhy,onChange:e=>setHoldWhy(e.target.value),autoFocus:true,
+          placeholder:"Why is this waiting?",
+          style:{width:"100%",padding:"7px 9px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4,marginBottom:12}}),
+        err?h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:8}},err):null,
+        h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
+          h("button",{onClick:placeHold,style:btnPrimary},"Hold"),
+          h("button",{onClick:()=>{setHoldFor(null); setErr("");},style:btnSmall},"Cancel")))) : null);
 }
 
 function GrnStatusReport(){
