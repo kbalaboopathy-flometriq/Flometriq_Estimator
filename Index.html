@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-18T04:10:00Z";
+  var APP_BUILD_VERSION = "2026-09-19T06:05:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -120,6 +120,11 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
   const [draft,setDraft]=useState({lost_reason:"",competitor_name:"",competitor_price:"",po_number:"",po_date:"",po_value:""});
   const [loading,setLoading]=useState(true);
   const [saving,setSaving]=useState(false);
+  // Win credit (19 Sep). Resolved from the customer's Territory Rules;
+  // when nothing resolves to an FSE the user picks one here and the win
+  // cannot be saved until they do. PO details stay optional — they often
+  // are not to hand at the moment the customer says yes.
+  const [credit,setCredit]=useState({ctx:null, fseOptions:[], chosen:"", alsoSetRule:false, loading:false});
   // Deferred and Went Cold (29 Aug) reuse this same modal and the same
   // lost_reason field/table — semantically it's "why this landed on a
   // negative/stalled outcome," not something specific to Lost. Each
@@ -138,8 +143,28 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
     });
     return ()=>{ cancelled=true; };
   },[referenceNumber]);
+  useEffect(()=>{
+    if(newStatus!=="Won") return;
+    let cancelled=false;
+    setCredit(c=>({...c, loading:true}));
+    (async()=>{
+      const ctx = await resolveWinCreditContext(referenceNumber);
+      const fseOptions = ctx.resolvedIsFse ? [] : await fetchFseNames();
+      if(cancelled) return;
+      setCredit(c=>({...c, ctx, fseOptions, chosen: ctx.resolvedIsFse ? ctx.resolved : "", loading:false}));
+    })();
+    return ()=>{ cancelled=true; };
+  },[referenceNumber,newStatus]);
   const save = async()=>{
     if(needsReason && !draft.lost_reason){ alert("Pick a reason before saving."); return; }
+    // The one thing a win must carry. PO number/date/value are not
+    // checked — they can be filled in later from this same modal.
+    if(newStatus==="Won" && !credit.chosen){
+      alert(credit.ctx && credit.ctx.customerName
+        ? "Pick the FSE this win is credited to. No Territory Rule covers "+(credit.ctx.company ? (credit.ctx.company.billing_state||credit.ctx.company.billing_country||"this customer's area") : "this customer's area")+" yet."
+        : "Pick the FSE this win is credited to.");
+      return;
+    }
     setSaving(true);
     try{
       const payload = {
@@ -156,6 +181,29 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
       const { data: existing } = await sb.from("quote_outcomes").select("id").eq("reference_number",referenceNumber).maybeSingle();
       if(existing) await sb.from("quote_outcomes").update(payload).eq("id",existing.id);
       else await sb.from("quote_outcomes").insert(payload);
+      if(newStatus==="Won" && credit.chosen){
+        // Written as its own update, deliberately: if the credit columns
+        // are not in the database yet, the win itself still saves and the
+        // status still changes — only the credit is missed, and it says
+        // so in the console rather than failing the whole outcome.
+        const creditPayload = {
+          credited_fse: credit.chosen,
+          credited_source: (credit.ctx && credit.ctx.resolvedIsFse) ? "Territory rule" : "Picked at win",
+          credited_at: new Date().toISOString(),
+          credited_by: user?.username||"unknown"
+        };
+        const { error: credErr } = await sb.from("quote_outcomes").update(creditPayload).eq("reference_number",referenceNumber);
+        if(credErr) console.error("Win credit not saved for "+referenceNumber+" — run the credited_fse columns SQL", credErr);
+        // Writing the missing Territory Rule is opt-in and separate again:
+        // it changes who future wins and new companies in that whole area
+        // resolve to, so it never happens silently.
+        if(credit.alsoSetRule && credit.ctx && credit.ctx.ruleScope){
+          const sc = credit.ctx.ruleScope;
+          const { error: ruleErr } = await sb.from(sc.table).insert({[sc.column]: sc.value, employee_name: credit.chosen});
+          if(ruleErr) alert("The win was saved, but the Territory Rule for "+sc.label+" could not be added: "+ruleErr.message);
+          else await logAudit("INSERT",sc.table,sc.value,"Territory Rule added from a win: "+sc.label+" \u2192 "+credit.chosen,user?.username||"unknown",null,null);
+        }
+      }
       // 31 Aug fix — this used to hardcode source as "status change"
       // regardless of which of the four screens actually triggered it,
       // which meant the owner-alert banner (gated on real source
@@ -180,7 +228,33 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
         h("input",{type:"date",value:draft.po_date,onChange:e=>setDraft(d=>({...d,po_date:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:8}}),
         h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"PO value"),
         h("input",{type:"number",value:draft.po_value,onChange:e=>setDraft(d=>({...d,po_value:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:4}}),
-        h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:12}},"Attach the PO document itself under the Documents card once saved.")
+        h("div",{style:{fontSize:10,color:colors.mutedLight,marginBottom:12}},"PO number, date and value are optional \u2014 leave them empty, the button becomes \"Set Won without PO\", and you can add them later by setting the status to Won again. Attach the PO document itself under the Documents card."),
+        // Credit block — the only thing a win is required to carry.
+        h("div",{style:{borderTop:"1px solid "+colors.border,paddingTop:10,marginBottom:4}},
+          h("div",{style:{fontSize:11.5,fontWeight:700,marginBottom:6}},"Credit for this win"),
+          credit.loading
+            ? h("div",{style:{fontSize:11,color:colors.mutedLight}},"Looking up the territory\u2026")
+            : (credit.ctx && credit.ctx.resolvedIsFse)
+              ? h("div",{style:{fontSize:12}},
+                  h("span",{style:{fontWeight:700}},credit.chosen),
+                  h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:2}},
+                    "From the Territory Rule for "+((credit.ctx.company && (credit.ctx.company.billing_state||credit.ctx.company.billing_country))||"this area")+"."))
+              : h(React.Fragment,null,
+                  h("div",{style:{fontSize:10.5,color:"#7a5000",marginBottom:6}},
+                    credit.ctx && credit.ctx.company
+                      ? "No FSE is set for "+((credit.ctx.company.billing_state||credit.ctx.company.billing_country)||"this customer's area")+(credit.ctx.resolved?" \u2014 it maps to "+credit.ctx.resolved+", who is not an FSE.":".")+" Pick who gets the credit."
+                      : "This customer has no CRM record to resolve a territory from. Pick who gets the credit."),
+                  h("select",{value:credit.chosen,onChange:e=>setCredit(c=>({...c,chosen:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:6}},
+                    h("option",{value:""},"Select an FSE\u2026"),
+                    credit.fseOptions.map(n=>h("option",{key:n,value:n},n))
+                  ),
+                  credit.ctx && credit.ctx.ruleScope && credit.chosen && h("label",{style:{display:"flex",alignItems:"flex-start",gap:6,fontSize:10.5,color:colors.muted,marginBottom:4}},
+                    h("input",{type:"checkbox",checked:credit.alsoSetRule,onChange:e=>setCredit(c=>({...c,alsoSetRule:e.target.checked}))}),
+                    h("span",null,"Also set ",h("b",null,credit.chosen)," as the FSE for ",h("b",null,credit.ctx.ruleScope.label),", so future quotes in that area resolve on their own.")
+                  ),
+                  !credit.fseOptions.length && h("div",{style:{fontSize:10.5,color:"#8a2f2f"}},"No employee is marked as an FSE in Employees \u2014 set someone's CRM Role to FSE first.")
+                )
+        )
       ) : h(React.Fragment,null,
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:10}},"Why was "+referenceNumber+" marked "+newStatus+"?"),
         h("select",{value:draft.lost_reason,onChange:e=>setDraft(d=>({...d,lost_reason:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:8}},
@@ -195,8 +269,16 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
         )
       ),
       !loading && h("div",{style:{display:"flex",gap:8,marginTop:10}},
-        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,flex:1,opacity:saving?0.6:1}},saving?"Saving…":"Save and set "+newStatus),
-        h("button",{onClick:onCancel,disabled:saving,style:{...btnSecondary,flex:1}},"Cancel")
+        h("button",{onClick:save,disabled:saving,style:{...btnPrimary,flex:1,opacity:saving?0.6:1}},
+          saving?"Saving…":(newStatus==="Won" && !draft.po_number && !draft.po_date && !draft.po_value ? "Set Won without PO" : "Save and set "+newStatus)),
+        // Cancel here does NOT just skip these fields — it abandons the
+        // status change altogether, and used to do it silently, which is
+        // why the PO prompt read as compulsory: the only visible way past
+        // it was to fill it in. It now says what it is about to do.
+        h("button",{onClick:()=>{
+          if(!confirm("Leave "+referenceNumber+" at its current status?\n\n"+newStatus+" will NOT be applied. The follow-up entry itself is already saved."+(newStatus==="Won"?"\n\nTo set Won without the PO, close this and use \"Set Won without PO\" instead — the PO can be added later.":""))) return;
+          onCancel();
+        },disabled:saving,style:{...btnSecondary,flex:1}},"Cancel")
       )
     )
   );
@@ -15301,20 +15383,38 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 ? h("span",{style:{fontSize:14,fontWeight:800,color:(contractInfo?.status==="Draft")?"#0f6e3f":"#0c447c"}},(contractInfo?.status||"Draft").toUpperCase())
               : !readiness.ready
                 ? h("span",{style:{fontSize:14,fontWeight:800,color:"#7a5000"}},"🔒 "+(quoteHeaderRow.quote_status||"Draft").toUpperCase())
-                // Directly settable here only up to Offer Sent (27-28 Aug)
-                // — everything past that (Budgetary, Under Tech
-                // Evaluation, Purchase Requirement, Deferred, Lost, Won)
-                // is driven entirely by the Log Follow-ups screen's
-                // Outcome field, and shows read-only here so a quote
-                // can't quietly advance through the funnel without an
-                // actual logged follow-up behind it.
-                : !["Draft","Offer Sent"].includes(quoteHeaderRow.quote_status||"Draft")
+                // Settable here: Draft, Offer Sent and — since 19 Sep —
+                // Won, because an order often lands before anyone gets to
+                // log the call, and the OA cannot be raised until the
+                // quote is Won. Won still goes through the same
+                // WonLostOutcomeModal as everywhere else, so the PO
+                // capture and the FSE credit happen either way. The rest
+                // of the funnel (Under Tech Evaluation, Commercial
+                // Discussion, Deferred, Went Cold, Lost) is still driven
+                // by Log Follow-ups' Outcome field and shows read-only
+                // here, so a quote can't drift through the middle of the
+                // funnel with no follow-up behind it.
+                : !["Draft","Offer Sent","Won"].includes(quoteHeaderRow.quote_status||"Draft")
                 ? h("span",{style:{fontSize:14,fontWeight:800,color:"#0c447c"}},"🔒 "+(quoteHeaderRow.quote_status||"Draft").toUpperCase())
                 : h("select",{
                     value:quoteHeaderRow.quote_status||"Draft",
                     onChange:e=>{
                       const newStatus=e.target.value;
                       const doChange=async()=>{
+                        // Won hands off to the shared outcome modal — it
+                        // captures the PO and the FSE credit and applies
+                        // the status itself, so it must not be applied
+                        // here as well.
+                        if(newStatus==="Won"){ setOutcomeTarget({referenceNumber:refFilter,newStatus:"Won"}); return; }
+                        // Moving a Won quote back is now possible from
+                        // this dropdown, so it is guarded: a quote that
+                        // already has a Sale Order against it cannot be
+                        // un-won, or the contract would be orphaned.
+                        if((quoteHeaderRow.quote_status||"")==="Won"){
+                          const { data: so } = await sb.from("sale_order_tbl").select("contract_number").eq("quote_reference_number",refFilter).maybeSingle();
+                          if(so){ alert("Can't move "+refFilter+" out of Won \u2014 Sale Order "+so.contract_number+" was raised from it. Cancel the Sale Order first."); return; }
+                          if(!confirm("Move "+refFilter+" from Won back to "+newStatus+"?\n\nThe PO details and the FSE credit already captured stay on record.")) return;
+                        }
                         const result = await updateQuoteStatusForQuote(refFilter,newStatus,user.username,"Quote form");
                         if(result && result.blocked) return;
                         setOpenRef(r=>({...r,quote_status:newStatus}));
@@ -15340,7 +15440,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   // (see comment above) — fixed alongside, since the new
                   // gating logic would have nothing to actually test
                   // otherwise.
-                  },["Draft","Offer Sent"].map(s=>h("option",{key:s,value:s},s)))
+                  },["Draft","Offer Sent","Won"].map(s=>h("option",{key:s,value:s},s)))
             ),
             // Nature of Quote (29 Aug) — independent of Status Funnel;
             // unlike Status, this one IS directly settable here, not
@@ -17950,6 +18050,54 @@ async function applyOutcomeStatus(referenceNumber, newStatus, changedBy, source,
     return { oldStatus: legacyRow.quote_status };
   }
   return { oldStatus:null, notFound:true };
+}
+// ---- FSE CREDIT FOR A WIN (19 Sep) ------------------------------------
+// Every Won quote is credited to an FSE. The credit is resolved from the
+// customer's own Territory Rules — the same resolveOwnerForAddress the
+// app already uses to assign ownership — so the person credited is the
+// one whose area the customer sits in, not whoever happened to click.
+// When no rule covers that area, the modal makes the user pick an FSE
+// before the win can be saved, and offers to write the missing rule at
+// the same time so the next win in that area resolves by itself.
+// Returns everything the modal needs to either confirm or prompt:
+//   {customerName, company, resolved, resolvedIsFse, ruleScope}
+// ruleScope is the rule that is MISSING (state first, country second),
+// or null when the customer has no address to hang a rule on.
+async function resolveWinCreditContext(referenceNumber){
+  const out = { customerName:"", company:null, resolved:"", resolvedIsFse:false, ruleScope:null };
+  try{
+    let customerName = "";
+    const { data: est } = await sb.from("estimates").select("customer_name").eq("reference_number",referenceNumber).limit(1).maybeSingle();
+    if(est) customerName = est.customer_name||"";
+    if(!customerName){
+      const { data: leg } = await sb.from("legacy_quotes_tbl").select("customer_name").eq("reference_number",referenceNumber).maybeSingle();
+      if(leg) customerName = leg.customer_name||"";
+    }
+    out.customerName = customerName;
+    if(!customerName) return out;
+    const { data: co } = await sb.from("companies").select("*").ilike("company_name",customerName.trim()).limit(1).maybeSingle();
+    if(!co) return out;                       // quote raised to a customer with no CRM company record
+    out.company = co;
+    const owner = await resolveOwnerForAddress(co.billing_state, co.billing_country);
+    if(owner){
+      const { data: emp } = await sb.from("employee_tbl").select("crm_role").eq("employee_name",owner).limit(1).maybeSingle();
+      out.resolved = owner;
+      // A Telecaller or BDE can own the account, but the WIN is credited
+      // to an FSE — so a non-FSE owner still sends the user to the picker.
+      out.resolvedIsFse = !!(emp && emp.crm_role==="FSE");
+    }
+    if(!out.resolvedIsFse){
+      if((co.billing_state||"").trim()) out.ruleScope = { table:"territory_rule_state_tbl", column:"state", value:co.billing_state.trim(), label:co.billing_state.trim() };
+      else if((co.billing_country||"").trim()) out.ruleScope = { table:"territory_rule_country_tbl", column:"country", value:co.billing_country.trim(), label:co.billing_country.trim() };
+    }
+  }catch(e){ console.error("resolveWinCreditContext failed", e); }
+  return out;
+}
+async function fetchFseNames(){
+  try{
+    const { data } = await sb.from("employee_tbl").select("employee_name,crm_role").eq("crm_role","FSE").order("employee_name");
+    return (data||[]).map(r=>r.employee_name).filter(Boolean);
+  }catch(e){ return []; }
 }
 async function applyOutcomeNature(referenceNumber, nature, changedBy, changedAt){
   const now = changedAt || new Date().toISOString();
@@ -21596,6 +21744,25 @@ const MANUAL_SECTIONS = [
             "text": "The Review tab (next to Log Entries) shows past entries for a date range you pick \u2014 From and To start blank, nothing loads until both are set. Admin and Super Admin can filter by Owner to see anyone's history \u2014 a plain user only ever sees their own."
           },
           {
+            "type": "p",
+            "text": "Updated 19 September 2026. Won can now also be set directly on the Quote screen's own Status control, alongside Draft and Offer Sent \u2014 an order often lands before anyone gets to log the call, and the Order Acceptance cannot be raised until the quote is Won. It goes through exactly the same Won capture as Log Follow-ups and the Funnel board, so nothing is skipped by taking the short route. The middle of the funnel \u2014 Under Tech Evaluation, Commercial Discussion, Deferred, Went Cold, Lost \u2014 is still set only through Log Follow-ups."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "PO number, date and value are OPTIONAL on a win. Leave them empty and the button reads \u201cSet Won without PO\u201d; fill them in later by setting the status to Won again, and the box reopens with whatever was saved.",
+              "Cancel on that box does NOT mean \u201cskip the PO\u201d \u2014 it abandons the status change, so the quote stays where it was. It now says so before it does it. The follow-up entry itself is already saved either way.",
+              "The FSE credit is NOT optional. Every win is credited to an FSE before it saves.",
+              "The credit is resolved from the customer's Territory Rule. If that area maps to an FSE, the modal shows who and why, and you just save.",
+              "If no rule covers the area, or it maps to someone who is not an FSE, you pick the FSE there and then. A tick box offers to write the missing Territory Rule at the same time, so the next quote in that area resolves on its own \u2014 leave it unticked to credit this one win only.",
+              "A Won quote can be moved back to Draft or Offer Sent from the Quote screen, unless a Sale Order has already been raised from it. The PO details and the credit stay on record either way."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "Nobody marked as an FSE in Employees means nothing to pick from. Set the CRM Role of at least one employee to FSE in Master Data \u2192 Employees first."
+          },
+          {
             "type": "bullets",
             "items": [
               "Results are grouped by date with a thin date-only divider between days \u2014 only days with real entries appear, there's no row for an empty day.",
@@ -22156,6 +22323,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"19 Sep 2026 (66)", summary:"Won is now settable from the Quote screen, and every win is credited to an FSE. QUOTE SCREEN: the Status control offers Draft, Offer Sent and Won (was Draft/Offer Sent only). Won hands off to the shared WonLostOutcomeModal, which applies the status itself \u2014 the direct updateQuoteStatusForQuote path is skipped for Won so it cannot be applied twice. The rest of the funnel stays read-only here and driven by Log Follow-ups. Moving a quote OUT of Won is blocked when a Sale Order exists against it, and confirmed otherwise. Plain users still need an authorization code for any change made from this screen; admins unchanged. FSE CREDIT (all three surfaces, since they share the modal): resolveWinCreditContext looks up the quote's customer in companies and runs resolveOwnerForAddress over its billing state/country; the credit is accepted automatically only when that resolves to someone whose employee_tbl.crm_role is FSE. Otherwise the modal shows an FSE picker (fetchFseNames) and the win CANNOT be saved until one is chosen \u2014 the only hard requirement on a win. An opt-in tick box writes the missing Territory Rule (state rule first, country second) so the next quote in that area resolves by itself; never silent, since it changes who future companies in that area are assigned to. Credit is written as its own update (credited_fse, credited_source, credited_at, credited_by on quote_outcomes) so a database missing those columns still saves the win and the status change \u2014 it logs to console instead. NEEDS SQL: quote_outcomes_credit_columns_20260919_v1.sql. PO DETAILS: confirmed by reading the code that PO number/date/value were NEVER enforced on a win \u2014 only Lost/Deferred/Went Cold ever had a required field (the reason). What made it FEEL compulsory: Cancel abandons the status change entirely and did so silently, so filling the PO in was the only visible way past the box. Fixed: with all three PO fields empty the primary button reads \u201cSet Won without PO\u201d, and Cancel now confirms that the status will not be applied. Applies to every surface that uses the modal." },
   { date:"18 Sep 2026 (65)", summary:"Generate PDF now asks which template to print, and the Classic bordered template is built. CHOOSER: askPdfTemplate runs first in attemptGenerateQuotePdf, before the approval/readiness/extra-price/document gates; the choice threads through generateQuotePdf(testingMode, watermark, summarised, template) and through both resume paths (summary near-miss review, no-documents confirm) via pendingAfterReview.template and pdfTemplate. Cancel generates nothing. CLASSIC: drawClassicPdfFrame + drawClassicPdfFooter are global helpers; the quote builder's letterhead() branches to the frame, so EVERY page gets it \u2014 cover, Annexure I/IB/II/III, datasheets, index and any continuation page. Content anchors move with the frame through topY()/botM() against CLASSIC_CONTENT_TOP 52 and CLASSIC_CONTENT_BOTTOM 27 instead of per-table hand-tuned numbers. Page numbers move into the footer bar (numberQuotePages is skipped in classic). Annexure II's grand-total line moves to H-28 to clear the bar. CLASSIC COVER (quotes): customer box left, quote no/date/revision box right, both autoTable so every row is sized from its own content \u2014 the fix for text running through the rules \u2014 and the two boxes are independent. Closing block anchored at H-95 so the 30mm signature gap clears the footer bar. Letterhead reads factory_address, pan_no, email, phone from company_master plus the default row of company_gstin_tbl (fetchDefaultGstin); missing fields print nothing. NOT CARRIED OVER from the printed original: the QR code and the ISO 9001 footer line \u2014 neither is a field anywhere, so the footer prints company.footer_note or the website. Contracts in classic mode keep their existing cover content inside the new frame. The revision-history annexure (contracts only) keeps its doc-control banner and is not framed." },
   { date:"17 Sep 2026 (64)", summary:"The PO Sales Price now carries through to every price the app shows or prints, the Commercial Terms basic price is fixed, a currency fault in Packing & Forwarding is fixed, and Contract Numbers are 6 digits. PRICE: slNoBaseSalesInr and computeSlNoPricing are the shared formula; an Sl No with estimates.po_sales_price is priced from it (x order qty) in Annexure II, Cover Letter Total Basic Price, Grand Total, Annexure III Price Data, DatasheetModal, value snapshot, BOM screen summary, Cart Summary As printed and its exports, and the testing-percentage unit price. Two rules: all-in (no Sl No Extra Price or pro-rata testing on top; quote-level Extra Price and separate testing still print as lines) and exact (2 dp, never roundTo5 \u2014 USD 41 printed as 40 otherwise). A Sale Order with PO prices formats all its PDF money exactly; offers keep round-to-5 unchanged. CORRECTIONS TO THE 16 SEP HANDOVER, from reading the code: ctBasicPrice never reached the PDF \u2014 it fed only the Computed: line in Commercial Terms, which read 0.00; the PDF's Total Basic Price has always read grandTotalPrinted. The value snapshot header was always written; only the line breakdown failed (select of material_grade, which is grade). NEW FAULT FOUND AND FIXED: pfBasicPriceTotal was an INR sum used directly on non-INR PDFs, so a percentage P&F printed rupees on a USD offer. Now converted to display currency. NUMBERING: 6 digits (YY + 4) at all five entry points; suggestion is max(valid config, highest 6-digit contract + 1), so SQL-loaded legacy contracts are never re-suggested; the old 7-digit config value is ignored; advance never moves backwards. Office Use Only renamed Deviations / Suggestions (the 16 Sep 11:10 build change, redone on the 10:05 base). NOT VERIFIED: quote_value_snapshot_lines_tbl column names \u2014 the line insert has never once run, so its columns come from code, not schema; failures now log by name." },
   { date:"14 Sep 2026 (63)", summary:"Contract approvals are segregated by role for the first time. Commercial belongs to accounts_admin, Testing to qc, Technical to technical_head, and nobody else can give an approval that is not theirs. Until now the gate read !isAdminOrAbove, so ANY admin could approve all three \u2014 and six of the seven logins were admin, including two telecallers, so the separation the contract relies on did not exist in practice. The cause ran deeper than the app: a CHECK constraint on app_users.role permitted only user, admin, super_admin and hr_admin while the Add User screen offered accounts_admin, qc and technical_head, so those three roles could NEVER BE SAVED. Anyone who tried got a constraint error and settled for admin. crm_phase50 widens that constraint, creates Sunil and Thangavignesh, corrects Ganesh's existing login rather than duplicating it, moves Veenai Vimal to technical_head and Deepak to super_admin, and fills five of the seven posts, which were all empty \u2014 meaning Pending Actions had nobody to name and the stale-OA block could never fire. So this is a NEW control, not a repaired one, and it should be tried on a test contract before being trusted. Admin keeps everything else: BOM overrides, the readiness bypass, master data. The Super Admin Deletion Code override still unlocks all three together and is logged, which is the way through when somebody is away WITH a trace \u2014 signing in as them also works but records the wrong approver. Nine assertions cover the matrix, including that an admin and a plain user can approve nothing." },
