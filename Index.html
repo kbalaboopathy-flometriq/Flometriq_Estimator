@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-19T06:05:00Z";
+  var APP_BUILD_VERSION = "2026-09-20T07:15:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -684,12 +684,17 @@ function fmt2(n){ const x=r2(n); return x.toLocaleString("en-IN",{minimumFractio
 // Rate is the per-unit sales price (total sales value across all of this
 // Sl No's BOM lines, divided by its order qty); Total Price is that value
 // back out again (Rate x Qty), shown as an explicit check figure.
-function buildPriceDataSection(currency, orderQty, totalSalesValue, conversionRate, exact){
+// paidUnit (19 Sep): the PO price per unit, in this document's currency,
+// when there is one — printed as it stands instead of a rupee value
+// converted back at today's rate.
+function buildPriceDataSection(currency, orderQty, totalSalesValue, conversionRate, exact, paidUnit){
   const cur = currency || "INR";
   const isInr = cur === "INR";
   const fx = Number(conversionRate)||1;
   const qty = r2(orderQty)||0;
-  const totalDisplay = isInr ? Number(totalSalesValue)||0 : (fx>0 ? (Number(totalSalesValue)||0)/fx : 0);
+  const totalDisplay = (paidUnit!==null && paidUnit!==undefined)
+    ? Number(paidUnit)*qty
+    : (isInr ? Number(totalSalesValue)||0 : (fx>0 ? (Number(totalSalesValue)||0)/fx : 0));
   const { unit, total } = priceUnitTotal(totalDisplay, qty, !!exact);   // exact = PO price, see poUnitPriceInr
   const rows = [
     { key:"price-rate", label:"Rate - "+cur, value: fmt2(unit) },
@@ -738,9 +743,45 @@ function buildPriceDataSection(currency, orderQty, totalSalesValue, conversionRa
 //     PO price is the customer's figure and prints exactly, to 2 decimals.
 // Returns null when the Sl No has no PO price, so callers fall back to the
 // quote formula unchanged. A quote never has one.
+// 19 Sep — the PO price is now stored AS THE PO STATES IT: the figure,
+// its currency, and the rate used when it was entered (po_price_value /
+// po_price_currency / po_price_fx on estimates). That figure is the
+// contractual fact and never moves. The rupee value is DERIVED from the
+// three, never typed, and is used in exactly two places: the BOM screen's
+// cost-versus-sale comparison and the stored value snapshot the reports
+// read — both of which are in rupees for every other quote in the system.
+// Everywhere a customer can see — Annexure II, the Cover Letter total,
+// the grand total, datasheet Price Data, P&F, the Cart and its Summary —
+// prints the PO figure in the PO's own currency.
+// po_sales_price is still written, as the derived rupee value, so nothing
+// that reads it breaks; it is no longer the source of truth.
+function poPricePaid(est){
+  if(!est) return null;
+  const v = Number(est.po_price_value);
+  if(isFinite(v) && v>0){
+    const fx = Number(est.po_price_fx);
+    return { value:v, currency:(est.po_price_currency||"INR"), fx:(isFinite(fx)&&fx>0?fx:1), legacy:false };
+  }
+  // Priced before 19 Sep: a bare rupee figure with no currency or rate
+  // against it. Treated as rupees, which is what it was.
+  const legacy = Number(est.po_sales_price);
+  if(isFinite(legacy) && legacy>0) return { value:legacy, currency:"INR", fx:1, legacy:true };
+  return null;
+}
+// Per unit, in rupees, at the rate pinned to the price. BOM screen and
+// value snapshot only.
 function poUnitPriceInr(est){
-  const v = est ? Number(est.po_sales_price) : NaN;
-  return (isFinite(v) && v>0) ? v : null;
+  const po = poPricePaid(est);
+  return po ? po.value*po.fx : null;
+}
+// Per unit, as the PO states it, but only when the document being printed
+// is in that same currency — otherwise null, and the caller falls back to
+// its own conversion rather than printing a USD figure under a EUR label.
+function poUnitPriceIn(est, currency){
+  const po = poPricePaid(est);
+  if(!po) return null;
+  const want = String(currency||"INR").trim().toUpperCase();
+  return String(po.currency||"INR").trim().toUpperCase()===want ? po.value : null;
 }
 // Unit and total for display. exact=true (a PO price): unit rounded to 2
 // decimals only. exact=false: the offer's round-to-5, unchanged.
@@ -765,6 +806,19 @@ function slNoBaseSalesInr(est, allLines){
     return s+qr*(Number(l.rate)||0)*(Number(l.sf)||3.1);
   },0);
 }
+// The Sl No's base sales value IN THE DOCUMENT'S OWN CURRENCY. A PO-priced
+// Sl No returns the PO figure itself — not a rupee value converted back,
+// which is what used to happen and what let an FX edit move a contracted
+// price. Falls back to converting the rupee value only when there is no
+// PO price, or when the PO was taken in some other currency than the one
+// being printed (in which case printing the PO figure would label a USD
+// number as EUR).
+function slNoBaseSalesDisplay(est, allLines, currency, fx){
+  const po = poUnitPriceIn(est, currency);
+  if(po!==null) return po*(Number(est.order_qty)||1);
+  const inr = slNoBaseSalesInr(est, allLines);
+  return String(currency||"INR").toUpperCase()==="INR" ? inr : (fx>0 ? inr/fx : 0);
+}
 async function computeSlNoFoldedSalesTotal(referenceNumber, itemSlNo, orderQty){
   return (await computeSlNoPricing(referenceNumber, itemSlNo, orderQty)).total;
 }
@@ -777,7 +831,7 @@ async function computeSlNoPricing(referenceNumber, itemSlNo, orderQty){
     sb.from("quote_testing_mode_tbl").select("mode").eq("reference_number",referenceNumber).maybeSingle(),
     sb.from("quote_sl_extra_price_tbl").select("price").eq("reference_number",referenceNumber).eq("item_sl_no",itemSlNo),
     sb.from("quote_sl_testing_tbl").select("price").eq("reference_number",referenceNumber).eq("item_sl_no",itemSlNo),
-    sb.from("estimates").select("item_sl_no,order_qty,po_sales_price").eq("reference_number",referenceNumber),
+    sb.from("estimates").select("item_sl_no,order_qty,po_sales_price,po_price_value,po_price_currency,po_price_fx").eq("reference_number",referenceNumber),
     sb.from("estimate_lines").select("item_sl_no,qty_required,rate,sf,is_direct_price,sales_price").eq("reference_number",referenceNumber),
     sb.from("quote_global_testing_tbl").select("test_name,rate").eq("reference_number",referenceNumber)
   ]);
@@ -797,7 +851,12 @@ async function computeSlNoPricing(referenceNumber, itemSlNo, orderQty){
   // contract weights by what is actually being charged.
   const baseForEst = (est)=>{ const po = poUnitPriceInr(est); return po!==null ? po*(Number(est.order_qty)||1) : liveGrandTotal(est.item_sl_no, est.order_qty); };
   const thisPo = poUnitPriceInr(thisEst);
-  if(thisPo!==null) return { total: thisPo*(Number(thisEst.order_qty)||1), exact:true };
+  if(thisPo!==null){
+    const paid = poPricePaid(thisEst);
+    // total stays in rupees (the BOM screen's currency); paid carries the
+    // PO figure itself so a document can print that instead of converting.
+    return { total: thisPo*(Number(thisEst.order_qty)||1), exact:true, paid };
+  }
   const baseGrandTotal = liveGrandTotal(itemSlNo, thisEst ? thisEst.order_qty : qty);
   const testingMode = modeRow ? modeRow.mode : "separate";
   const slExtraTotal = (slExtraRows||[]).reduce((s,r)=>s+(Number(r.price)||0),0);
@@ -814,7 +873,7 @@ async function computeSlNoPricing(referenceNumber, itemSlNo, orderQty){
       globalFoldShare += combined*share;
     });
   }
-  return { total: baseGrandTotal + slExtraTotal + (testingMode==="prorata" ? slTestingTotal + globalFoldShare : 0), exact:false };
+  return { total: baseGrandTotal + slExtraTotal + (testingMode==="prorata" ? slTestingTotal + globalFoldShare : 0), exact:false, paid:null };
 }
 // Value snapshot (30 Aug) — captured on leaving a Quote or Sale Order
 // screen (React unmount), upserted per reference_number. Header total
@@ -826,14 +885,27 @@ async function computeSlNoPricing(referenceNumber, itemSlNo, orderQty){
 async function saveQuoteValueSnapshot(referenceNumber, entityType, user){
   if(!referenceNumber) return;
   try{
-    const { data: ests } = await sb.from("estimates").select("item_sl_no,order_qty,currency").eq("reference_number",referenceNumber);
+    const { data: ests } = await sb.from("estimates").select("item_sl_no,order_qty,currency,conversion_rate,po_sales_price,po_price_value,po_price_currency,po_price_fx").eq("reference_number",referenceNumber);
     if(!ests || !ests.length) return;
     let total = 0;
     for(const est of ests){ total += await computeSlNoFoldedSalesTotal(referenceNumber, est.item_sl_no, est.order_qty); }
+    // The same total in the order's own currency. A PO-priced Sl No
+    // contributes the PO figure itself; anything else is converted at the
+    // header rate. On an INR order the two values are identical.
+    const snapCcy = (ests[0].currency||"INR").toUpperCase();
+    const snapFx  = Number(ests[0].conversion_rate)||1;
+    const totalInCcy = snapCcy==="INR" ? total : (snapFx>0 ? total/snapFx : 0);
     const orderQtyBySl = new Map(ests.map(e=>[e.item_sl_no,e.order_qty||1]));
 
     const { data: existing } = await sb.from("quote_value_snapshot_tbl").select("id").eq("reference_number",referenceNumber).maybeSingle();
-    const headerPayload = { reference_number:referenceNumber, entity_type:entityType, total_value:total, currency:ests[0].currency||"INR", computed_at:new Date().toISOString(), computed_by:user?.username||"unknown" };
+    // 20 Sep — the snapshot now carries BOTH: the rupee total, because
+    // every other quote in this table is in rupees and the CRM Dashboards
+    // cards add them up; and the same value in the order's own currency,
+    // so a single quote shown on its own reads as the customer sees it.
+    const headerPayload = { reference_number:referenceNumber, entity_type:entityType,
+      total_value:total,                                   // rupees — what the dashboards add up
+      total_value_in_currency:Number(totalInCcy.toFixed(2)),// the same figure as the customer sees it
+      currency:snapCcy, computed_at:new Date().toISOString(), computed_by:user?.username||"unknown" };
     let snapshotId;
     if(existing){ await sb.from("quote_value_snapshot_tbl").update(headerPayload).eq("id",existing.id); snapshotId = existing.id; }
     else { const { data: inserted } = await sb.from("quote_value_snapshot_tbl").insert(headerPayload).select("id").single(); snapshotId = inserted?.id; }
@@ -7473,6 +7545,13 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, session
   },[openRef.reference_number, openRef.item_sl_no, openRef.order_qty, openRef.po_sales_price]);
   const totalSalesValueFolded = foldedPricing ? foldedPricing.total : baseUnitPriceInrLive;
   const priceIsExact = !!(foldedPricing && foldedPricing.exact);
+  // The PO figure, but only if this datasheet is being shown in that same
+  // currency — otherwise the rupee value is converted as before.
+  const pricePaidUnit = (()=>{
+    const paid = foldedPricing && foldedPricing.paid;
+    if(!paid) return null;
+    return String(paid.currency||"INR").toUpperCase()===String(openRef.currency||"INR").toUpperCase() ? paid.value : null;
+  })();
 
   // Which sub-assemblies are relevant for this item's Material Data — from
   // Item MOC Rules (set once per item under Master Data), not a per-line
@@ -7748,7 +7827,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, session
       rows.push([]);
     });
     const totalSalesValue = totalSalesValueFolded;
-    const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate, priceIsExact);
+    const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate, priceIsExact, pricePaidUnit);
     rows.push([priceSection.title]);
     priceSection.rows.forEach(row=>rows.push([row.label, row.value, "", ""]));
     const ws = XLSX.utils.aoa_to_sheet(rows);
@@ -7793,7 +7872,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, session
       filledRows.forEach(row=>body.push([row.label, row.value]));
     });
     const totalSalesValue = totalSalesValueFolded;
-    const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate, priceIsExact);
+    const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate, priceIsExact, pricePaidUnit);
     body.push([{content:priceSection.title, colSpan:2, styles:{fontStyle:"bold", font:"times", fontSize:11}}]);
     priceSection.rows.forEach(row=>body.push([row.label, row.value]));
     doc.autoTable({
@@ -7909,7 +7988,7 @@ function DatasheetModal({ openRef, openLines, model, modelItemMap, user, session
         }),
         (()=>{
           const totalSalesValue = totalSalesValueFolded;
-          const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate, priceIsExact);
+          const priceSection = buildPriceDataSection(openRef.currency, openRef.order_qty, totalSalesValue, openRef.conversion_rate, priceIsExact, pricePaidUnit);
           return h("div",{style:{marginBottom:10,border:"1px solid "+colors.border,borderRadius:6,overflow:"hidden"}},
             h("div",{style:{background:"#1c8c75",color:"#fff",padding:"6px 14px",fontSize:12,fontWeight:700}},"Price Data"),
             priceSection.rows.map(row=>h("div",{key:row.key,style:{display:"flex",alignItems:"center",gap:8,padding:"6px 14px",fontSize:12.5,borderTop:"1px solid #f0efe8"}},
@@ -9444,6 +9523,17 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
   useEffect(()=>{
     sb.from("sale_order_status_tbl").select("status").order("sort_order").then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
   },[]);
+  // Mandatory documents (20 Sep). Everything on the order's mandatory
+  // list except the PO blocks approval here; the PO blocks the Order
+  // Acceptance PDF instead, on the Quote screen, so it is excluded from
+  // this check rather than counted twice.
+  const [outstandingDocs,setOutstandingDocs]=useState([]);
+  const loadOutstandingDocs = useCallback(async()=>{
+    if(!contractInfo?.contract_number){ setOutstandingDocs([]); return; }
+    const reqs = await fetchDocumentRequirements(contractInfo.contract_number);
+    setOutstandingDocs(outstandingMandatory(reqs).filter(r=>!isPoDocRequirement(r)));
+  },[contractInfo?.contract_number]);
+  useEffect(()=>{ loadOutstandingDocs(); },[loadOutstandingDocs]);
 
   // Mandatory-before-approval fields. Dispatch Through / Dispatch To
   // removed entirely (24 Aug follow-up) — dropped from the schema, so
@@ -9461,6 +9551,7 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     !contractInfo.late_delivery && "Late Delivery",
     !contractInfo.signatory_name && "Signatory Name",
     !contractInfo.signatory_designation && "Signatory Designation",
+    outstandingDocs.length>0 && ("Mandatory documents ("+outstandingDocs.map(r=>r.category).join(", ")+")"),
   ].filter(Boolean);
   const billingMissing = !contractInfo.billing_address && !contractInfo.billing_address_overridden;
   const canApproveAtAll = (otherMissing.length===0 && !billingMissing) || overrideActive;
@@ -10360,7 +10451,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       return;
     }
     const { data: existing } = await sb.from("sale_order_tbl").select("*").eq("quote_reference_number",refFilter).maybeSingle();
-    if(existing){ if(onOpenContract) onOpenContract(existing); return; }
+    if(existing){
+      // Older contracts, created before 20 Sep, get the PO requirement the
+      // first time anyone opens them this way.
+      await ensurePoDocumentRequirement(existing.contract_number, user?.username);
+      if(onOpenContract) onOpenContract(existing);
+      return;
+    }
 
     const suggested = await suggestNextContractNumber();
     if(!suggested){
@@ -10473,7 +10570,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // this is the same "is a quote selected" test the toolbar button already
   // applied through its render condition — no button loses availability.
   const cartUnavailable = !quoteExportRef;
-  const openCartScreen = ()=>setShowCartScreen(true);
+  // On a Sale Order the Cart takes PO prices, which are meaningless
+  // without the currency they are in — so it asks once, here, before the
+  // Cart opens. Quotes are unaffected.
+  const openCartScreen = ()=>{
+    if(mode==="contract" && !orderCurrencyReady){
+      setCurrencyPrompt({currency: orderCurrency==="INR"?"":orderCurrency, rate: orderFx>1?String(orderFx):"", saving:false, error:""});
+      return;
+    }
+    setShowCartScreen(true);
+  };
   const [newSlNoInput,setNewSlNoInput]=useState("");
   const [newSlNoError,setNewSlNoError]=useState("");
   const [newSlNoStep,setNewSlNoStep]=useState("input"); // "input" | "confirm"
@@ -11004,8 +11110,46 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     }catch(e){ return false; }
   };
 
+  // A PO price is stored with the currency and rate it was entered
+  // against (19 Sep). Changing either afterwards has to be deliberate:
+  // the CURRENCY is blocked outright — a USD figure printed under a EUR
+  // label on an Order Acceptance is not a small error — and the RATE asks
+  // whether the pinned prices should move with it. The customer's figure
+  // never changes either way; only the rupee value the BOM screen
+  // compares cost against.
+  const pricedSlNos = ()=> refs.filter(r=>r.reference_number===refFilter && poPricePaid(r)!==null);
+  const guardCurrencyChange = async()=>{
+    if(mode!=="contract") return true;
+    const priced = pricedSlNos();
+    if(!priced.length) return true;
+    const newCcy = (headerDraft.currency||"").trim().toUpperCase();
+    const newFx  = Number(headerDraft.conversion_rate)||0;
+    const curCcy = (quoteHeaderRow?.currency||"INR").trim().toUpperCase();
+    const curFx  = Number(quoteHeaderRow?.conversion_rate)||0;
+    if(newCcy && newCcy!==curCcy){
+      alert("Can't change the currency of "+refFilter+" — "+priced.length+" Sl No"+(priced.length>1?"s have":" has")+" a PO price already entered in "+curCcy+".\n\nClear those prices in the Cart first, then change the currency and enter them again in the new one.");
+      return false;
+    }
+    if(newFx>0 && curFx>0 && Math.abs(newFx-curFx)>0.00005){
+      const repin = confirm(
+        "The rate on "+refFilter+" is pinned to "+priced.length+" PO price"+(priced.length>1?"s":"")+" entered at "+curFx+".\n\n"+
+        "What the customer pays does not change either way \u2014 only the rupee value the BOM screen compares cost against.\n\n"+
+        "OK \u2014 re-pin those PO prices to "+newFx+"\nCancel \u2014 change the header rate only, leave the prices pinned at "+curFx);
+      if(repin){
+        for(const r of priced){
+          const po = poPricePaid(r);
+          if(!po || po.legacy) continue;   // a legacy rupee price has no currency to re-pin
+          await sb.from("estimates").update({ po_price_fx:newFx, po_sales_price:Number((po.value*newFx).toFixed(2)) })
+            .eq("reference_number",refFilter).eq("item_sl_no",r.item_sl_no);
+        }
+        await logAudit("UPDATE","estimates",refFilter,"PO prices re-pinned from rate "+curFx+" to "+newFx,user?.username||"unknown",null,null);
+      }
+    }
+    return true;
+  };
   const doSaveQuoteHeader = async()=>{
     if(!refFilter) return;
+    if(!(await guardCurrencyChange())) return;
     const effCurrency = (headerDraft.currency||"").trim()!=="" ? headerDraft.currency : (quoteHeaderRow?quoteHeaderRow.currency:"INR");
     const currencyChanged = (headerDraft.currency||"").trim()!=="" && headerDraft.currency!==(quoteHeaderRow?quoteHeaderRow.currency:"INR");
     if(currencyChanged && await lumpsumBlocksCurrencyChange()){
@@ -11143,24 +11287,55 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // convention as universal_documents_tbl.
   const [documentRequests,setDocumentRequests]=useState([]);
   const [newRequestCategory,setNewRequestCategory]=useState("");
+  const [newRequestMandatory,setNewRequestMandatory]=useState(false);
+  // Any change to the mandatory list goes through the same one-time
+  // authorization code as every other gated action; Admins and Super
+  // Admins save straight through, as they do everywhere else. Adding
+  // and removing are both gated — an obligation appearing out of
+  // nowhere is as worth a record as one disappearing.
+  const [mandatoryGate,setMandatoryGate]=useState(null);   // {run}
   const loadDocumentRequests = useCallback(async(ref)=>{
     if(!ref) return;
-    const { data } = await sb.from("document_requests_tbl").select("*").eq("entity_id",ref).order("requested_at");
-    setDocumentRequests(data||[]);
+    setDocumentRequests(await fetchDocumentRequirements(ref));
   },[]);
   useEffect(()=>{ if(quoteExportRef) loadDocumentRequests(quoteExportRef); },[quoteExportRef,loadDocumentRequests]);
+  // Runs now for an Admin/Super Admin, otherwise behind the code.
+  const withMandatoryAuth = (run)=>{ if(isAdminOrAbove) return run(); setMandatoryGate({run}); };
   const addDocumentRequest = async()=>{
     if(!newRequestCategory){ alert("Pick a category first."); return; }
-    const { error } = await sb.from("document_requests_tbl").insert({entity_type:"quote", entity_id:quoteExportRef, category:newRequestCategory, requested_by:user?.username||"unknown"});
-    if(error){ alert("Failed: "+error.message); return; }
-    setNewRequestCategory("");
-    await loadDocumentRequests(quoteExportRef);
+    const mandatory = mode==="contract" && newRequestMandatory;
+    const doInsert = async()=>{
+      const { error } = await sb.from("document_requests_tbl").insert({
+        entity_type: mode==="contract"?"contract":"quote", entity_id:quoteExportRef, category:newRequestCategory,
+        is_mandatory: mandatory, source: mandatory?"Sale Order":"Customer request",
+        requested_by:user?.username||"unknown"
+      });
+      if(error){ alert("Failed: "+error.message); return; }
+      if(mandatory) await logAudit("INSERT","document_requests_tbl",quoteExportRef,"Mandatory document added: "+newRequestCategory,user?.username||"unknown",null,null);
+      setNewRequestCategory(""); setNewRequestMandatory(false);
+      await loadDocumentRequests(quoteExportRef);
+    };
+    if(mandatory) withMandatoryAuth(doInsert); else await doInsert();
+  };
+  const setRequirementMandatory = (reqRow, makeMandatory)=>{
+    withMandatoryAuth(async()=>{
+      const { error } = await sb.from("document_requests_tbl").update({ is_mandatory:makeMandatory, source: makeMandatory?"Sale Order":(reqRow.source||"Customer request") }).eq("id",reqRow.id);
+      if(error){ alert("Failed: "+error.message); return; }
+      await logAudit("UPDATE","document_requests_tbl",quoteExportRef,
+        (makeMandatory?"Marked mandatory: ":"No longer mandatory: ")+reqRow.category, user?.username||"unknown",null,null);
+      await loadDocumentRequests(quoteExportRef);
+    });
   };
   const deleteDocumentRequest = async(reqRow)=>{
-    if(!confirm("Remove this request for \""+reqRow.category+"\"?")) return;
-    await sb.from("document_requests_tbl").delete().eq("id",reqRow.id);
-    await loadDocumentRequests(quoteExportRef);
+    if(!confirm((reqRow.is_mandatory?"Remove the MANDATORY document \"":"Remove this request for \"")+reqRow.category+"\"?")) return;
+    const doDelete = async()=>{
+      await sb.from("document_requests_tbl").delete().eq("id",reqRow.id);
+      if(reqRow.is_mandatory) await logAudit("DELETE","document_requests_tbl",quoteExportRef,"Mandatory document removed: "+reqRow.category,user?.username||"unknown",null,null);
+      await loadDocumentRequests(quoteExportRef);
+    };
+    if(reqRow.is_mandatory) withMandatoryAuth(doDelete); else await doDelete();
   };
+  const outstandingMandatoryDocs = outstandingMandatory(documentRequests);
   const loadQuoteDocuments = useCallback(async(ref)=>{
     if(!ref) return;
     const { data: parents } = await sb.from("universal_documents_tbl").select("*").eq("entity_type","quote").eq("entity_id",ref);
@@ -11777,11 +11952,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // computes its own basis. Now both use slNoBaseSalesInr, so they agree,
       // and a Sale Order uses its PO prices. Held in INR; shown converted.
       const [{ data: estRows, error: estErr }, { data: lineRows, error: lineErr }] = await Promise.all([
-        sb.from("estimates").select("item_sl_no,order_qty,po_sales_price").eq("reference_number",quoteExportRef),
+        sb.from("estimates").select("item_sl_no,order_qty,po_sales_price,po_price_value,po_price_currency,po_price_fx").eq("reference_number",quoteExportRef),
         sb.from("estimate_lines").select("item_sl_no,qty_required,rate,sf,is_direct_price,sales_price").eq("reference_number",quoteExportRef)
       ]);
       if(estErr||lineErr) console.error("Commercial terms basic price failed", estErr||lineErr);
-      setCtBasicPrice((estRows||[]).reduce((s,est)=>s+slNoBaseSalesInr(est, lineRows),0));
+      // 19 Sep — summed in the quote's own currency (PO figure where there
+      // is one), so the "Computed:" line matches the PDF exactly.
+      const ctCcy = (quoteHeaderRow?.currency||"INR");
+      const ctFx  = Number(quoteHeaderRow?.conversion_rate)||1;
+      setCtBasicPrice((estRows||[]).reduce((s,est)=>s+slNoBaseSalesDisplay(est, lineRows, ctCcy, ctFx),0));
     } catch(e){ console.error("Load commercial terms failed",e); setCtData({reference_number:quoteExportRef,jurisdiction:CT_DEFAULTS.jurisdiction,force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges}); }
     finally { setCtLoading(false); }
   };
@@ -11987,6 +12166,32 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // change it.
   const [poPriceDraft,setPoPriceDraft]=useState({});   // {item_sl_no: string}
   const [savingPoPrice,setSavingPoPrice]=useState(null);
+  // One currency and one rate for the whole order — PO prices are entered
+  // in it, so the Cart cannot open until both are set.
+  const orderCurrency = (quoteHeaderRow?.currency||"INR").trim().toUpperCase();
+  const orderFx = Number(quoteHeaderRow?.conversion_rate)||0;
+  // "Not set" is: no currency at all, or a foreign currency with no usable
+  // rate. A rate of exactly 1 on a foreign currency is the default nobody
+  // changed, not a real rate. On an INR order the rate is 1 and correct.
+  const orderCurrencyReady = orderCurrency==="INR" ? true : (orderFx>1);
+  const [currencyPrompt,setCurrencyPrompt]=useState(null); // {currency, rate, saving, error}
+  const saveOrderCurrency = async()=>{
+    const ccy = (currencyPrompt.currency||"").trim().toUpperCase();
+    const rate = ccy==="INR" ? 1 : Number(currencyPrompt.rate);
+    if(!ccy){ setCurrencyPrompt(c=>({...c,error:"Pick the currency the PO is in."})); return; }
+    if(ccy!=="INR" && !(rate>1)){ setCurrencyPrompt(c=>({...c,error:"Enter the rate as 1 "+ccy+" = ? INR."})); return; }
+    setCurrencyPrompt(c=>({...c,saving:true,error:""}));
+    try{
+      const { error } = await sb.from("estimates").update({currency:ccy, conversion_rate:rate, updated_at:new Date().toISOString()}).eq("reference_number",refFilter);
+      if(error) throw error;
+      await logAudit("SAVE","estimates",refFilter,"Order currency set to "+ccy+" at "+rate+" (from the Cart)",user?.username||"unknown",null,{currency:ccy,conversion_rate:rate});
+      setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,currency:ccy,conversion_rate:rate}:r));
+      if(openRef && openRef.reference_number===refFilter) setOpenRef(r=>({...r,currency:ccy,conversion_rate:rate}));
+      setCurrencyPrompt(null);
+      setShowCartScreen(true);
+      await load();
+    }catch(e){ setCurrencyPrompt(c=>({...c,saving:false,error:"Couldn't save: "+e.message})); }
+  };
   const [baselineBySl,setBaselineBySl]=useState({});   // {item_sl_no: true} where a pre-fresh-BOM snapshot exists
   const [busyBom,setBusyBom]=useState(null);
 
@@ -12001,18 +12206,27 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const raw = poPriceDraft[row.item_sl_no];
     if(raw===undefined) return;
     const val = raw===""? null : Number(raw);
-    if(val!==null && !(val>0)){ alert("Enter the PO sales price as a positive number in INR, or clear it."); return; }
+    const ccy = orderCurrency, fx = orderFx;
+    if(val!==null && !(val>0)){ alert("Enter the PO price as a positive number in "+ccy+", or clear it."); return; }
+    // Can't happen through the Cart, which prompts for both before it
+    // opens — but the price must never be stored without the currency and
+    // rate it was entered against.
+    if(val!==null && (!ccy || !(fx>0))){ alert("Set the order currency and conversion rate on the Sale Order header first."); return; }
     setSavingPoPrice(row.item_sl_no);
     try{
       const { error } = await sb.from("estimates").update({
-        po_sales_price: val,
+        po_price_value: val,
+        po_price_currency: val===null?null:ccy,
+        po_price_fx: val===null?null:fx,
+        // Derived, for the BOM screen and the snapshot. Never entered.
+        po_sales_price: val===null?null:Number((val*fx).toFixed(2)),
         po_price_entered_by: val===null?null:(user?.username||"unknown"),
         po_price_entered_at: val===null?null:new Date().toISOString()
       }).eq("reference_number",row.reference_number).eq("item_sl_no",row.item_sl_no);
       if(error) throw error;
       await logAudit("SAVE","estimates",row.reference_number+"-"+row.item_sl_no,
-        val===null?"PO sales price cleared":("PO sales price set to "+val+" (INR, per unit)"),
-        user?.username||"unknown",null,{po_sales_price:val});
+        val===null?"PO price cleared":("PO price set to "+val+" "+ccy+" per unit (rate "+fx+", = "+(val*fx).toFixed(2)+" INR)"),
+        user?.username||"unknown",null,{po_price_value:val,po_price_currency:ccy,po_price_fx:fx});
       await load();
       refreshQuoteTotals(row.reference_number);
       refreshReadiness(row.reference_number);
@@ -13670,7 +13884,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           // immediately follow make a pointer line redundant.
           if(hasAttachment) dsRows.push({key:"custom-pdf",label:"Reference",value:"Attached — see following page(s)"});
           const customSections = [ { title:"Datasheet", rows: dsRows } ];
-          customSections.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate, poUnitPriceInr(est)!==null));
+          customSections.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate, poUnitPriceIn(est, est.currency)!==null, poUnitPriceIn(est, est.currency)));
           // itemNameForTemplate is now already the real typed Item (see fix
           // above) — no separate display-name fallback needed here anymore.
           list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: itemNameForTemplate, sectionsRows: customSections,
@@ -13695,7 +13909,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         .map(sec=>({ ...sec, rows: sec.rows.filter(r=> r.value!==undefined && r.value!==null && String(r.value).trim()!=="") }))
         .filter(sec=>sec.rows.length>0);
       const totalSalesValue = await computeSlNoFoldedSalesTotal(est.reference_number, est.item_sl_no, est.order_qty);
-      sectionsRows.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate, poUnitPriceInr(est)!==null));
+      sectionsRows.push(buildPriceDataSection(est.currency, est.order_qty, totalSalesValue, est.conversion_rate, poUnitPriceIn(est, est.currency)!==null, poUnitPriceIn(est, est.currency)));
       list.push({ slNo: est.item_sl_no, model: est.model||"", itemName: itemNameForTemplate, sectionsRows, renderOwnPdfPage:true });
     }
     list.sort((a,b)=>a.slNo-b.slNo);
@@ -13807,6 +14021,18 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     // Asked first, before the approval, readiness, extra-price and
     // document gates — those can all bounce the user back out, and there
     // is no point choosing a template for a PDF that never gets built.
+    // 20 Sep — on a Sale Order the PO document itself gates the Order
+    // Acceptance PDF, alongside the PO number and date that already gate
+    // approval. Checked before the template is chosen, so nobody picks a
+    // template for a PDF that is about to be refused.
+    if(mode==="contract"){
+      const reqs = await fetchDocumentRequirements(quoteExportRef);
+      const poReq = outstandingMandatory(reqs).find(isPoDocRequirement);
+      if(poReq){
+        alert("Can't generate the Order Acceptance yet — the customer's PO is not attached.\n\nOpen Documents on this order and add it against \""+poReq.category+"\". Any other mandatory documents block approval, not this PDF.");
+        return;
+      }
+    }
     const template = await askPdfTemplate();
     if(!template) return;   // closed the chooser — nothing generated
     setPdfTemplate(template);
@@ -13948,11 +14174,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // USD 246 order printed as 423.12 instead of 4.92. The basis is now
       // in the DISPLAY currency, which is what the comment on the lumpsum
       // branch already assumed it was.
-      const pfBasicPriceTotalInr = estimatesRows.reduce((s,est)=>s+slNoBaseTotalInr(est),0);
-      const pfBasicPriceTotal = quoteIsInr ? pfBasicPriceTotalInr : (quoteFx>0 ? pfBasicPriceTotalInr/quoteFx : 0);
+      // 19 Sep — summed in the printed currency, Sl No by Sl No, so a
+      // PO-priced Sl No contributes the PO figure itself.
+      const pfBasicPriceTotal = estimatesRows.reduce((s,est)=>s+slNoBaseSalesDisplay(est, linesRows, quoteCurrency, quoteFx),0);
       // A Sale Order priced from the PO prints its money exactly. An offer
       // keeps the round-to-5 on every figure, unchanged.
-      const exactPricing = estimatesRows.some(est=>poUnitPriceInr(est)!==null);
+      const exactPricing = estimatesRows.some(est=>poUnitPriceIn(est, quoteCurrency)!==null);
       const money = (v)=> exactPricing ? fmt(r2(v)) : fmtR(v);
       // pfQuoteIsInr / pfQuoteFx were removed here on 7 Sep. They were a local
       // duplicate of quoteIsInr/quoteFx for the old lumpsum conversion, and that
@@ -13976,7 +14203,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // individually-computed rate.
       const valueByItem = new Map();
       estimatesRows.forEach(est=>{
-        valueByItem.set(est.item_sl_no, slNoBaseTotalInr(est));
+        valueByItem.set(est.item_sl_no, slNoBaseTotalInr(est));   // rupees — this is only a weighting, never printed
       });
       const totalQuoteValue = Array.from(valueByItem.values()).reduce((s,v)=>s+v,0) || 1;
       const globalTestNames = Array.from(new Set((globalTestingAll||[]).map(r=>r.test_name)));
@@ -14014,15 +14241,22 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // found 10 Aug: it silently mixed an already-total base value with a
       // genuinely-per-unit folded share before re-multiplying, on top of
       // the stale-sales_price risk above).
-      const slNoFoldedTotalInr = (est)=>{
+      // Folded total in the PRINTED currency (19 Sep — was rupees, then
+      // divided at each call site).
+      const slNoFoldedTotalDisp = (est)=>{
+        const base = slNoBaseSalesDisplay(est, linesRows, quoteCurrency, quoteFx);
         // PO price is all-in: no Sl No-level Extra Price or pro-rata testing on top.
-        if(poUnitPriceInr(est)!==null) return slNoBaseTotalInr(est);
+        if(poUnitPriceIn(est, quoteCurrency)!==null) return base;
+        const toDisp = (inr)=> quoteIsInr ? inr : (quoteFx>0 ? inr/quoteFx : 0);
+        return base + toDisp(slNoFoldedExtrasInr(est));
+      };
+      const slNoFoldedExtrasInr = (est)=>{
+        if(poUnitPriceInr(est)!==null) return 0;
         const slExtraTotal = (slExtraByItem.get(est.item_sl_no)||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
         const slTestingTotal = (slTestingByItem.get(est.item_sl_no)||[]).reduce((s,l)=>s+(Number(l.price)||0),0);
         const testingFold = testingMode==="prorata" ? slTestingTotal + (globalFoldTotalByItem.get(est.item_sl_no)||0) : 0;
-        return slNoBaseTotalInr(est) + slExtraTotal + testingFold;
+        return slExtraTotal + testingFold;
       };
-      const grandTotalInr = estimatesRows.reduce((s,est)=>s+slNoFoldedTotalInr(est),0) + extraPriceTotal + testingSeparateTotal;
 
       // GRAND TOTAL AS PRINTED (3 Sep). Every Price Summary ROW is rounded by
       // roundedUnitTotal — the unit is rounded once and the row total derived
@@ -14042,9 +14276,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const grandTotalPrinted = (()=>{
         const slNoSum = estimatesRows.reduce((acc,est)=>{
           const q = est.order_qty||1;
-          const tInr = slNoFoldedTotalInr(est);
-          const tDisp = quoteIsInr ? tInr : (quoteFx>0 ? tInr/quoteFx : 0);
-          return acc + priceUnitTotal(tDisp, q, poUnitPriceInr(est)!==null).total;
+          return acc + priceUnitTotal(slNoFoldedTotalDisp(est), q, poUnitPriceIn(est, quoteCurrency)!==null).total;
         },0);
         const extrasInr = extraPriceTotal + testingSeparateTotal;
         const extrasDisp = quoteIsInr ? extrasInr : (quoteFx>0 ? extrasInr/quoteFx : 0);
@@ -14538,9 +14770,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       const annexureIITitle = "ANNEXURE II - PRICE SUMMARY";
       const summaryRows = estimatesRows.map(est=>{
         const qty = est.order_qty||1;
-        const totalInr = slNoFoldedTotalInr(est);
-        const totalDisplay = quoteIsInr ? totalInr : (quoteFx>0 ? totalInr/quoteFx : 0);
-        const { unit, total } = priceUnitTotal(totalDisplay, qty, poUnitPriceInr(est)!==null);
+        const { unit, total } = priceUnitTotal(slNoFoldedTotalDisp(est), qty, poUnitPriceIn(est, quoteCurrency)!==null);
         // A Direct Price line's real Item lives on the line itself, typed
         // by the user — est.model is "Custom" (or a typed model label),
         // never the Item. Real BOM Sl Nos are unaffected (no dpLine found).
@@ -15178,7 +15408,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     (rows||[]).forEach(r=>{
       const eff = r.cost ? r.sale/r.cost : 0;
       const enq = (r.est && r.est.sl_no_in_enq) || r.slNo;
-      const pr = cartSummaryPrinted(c(r.sale), r.qty, cartSummaryPoUnit(r, fx.div));
+      const pr = cartSummaryPrinted(c(r.sale), r.qty, cartSummaryPoUnit(r, fx.div, !!o.inr));
       if(o.includeCost){
         body.push([enq, (r.est&&r.est.item)||"", (r.est&&r.est.description)||"",
                    c(r.cost), Number(eff.toFixed(2)), c(r.sale), pr.unit, r.qty,
@@ -15196,7 +15426,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     });
     const gCost = (rows||[]).reduce((s,r)=>s+r.cost*r.qty,0);
     const gSale = (rows||[]).reduce((s,r)=>s+r.sale*r.qty,0);
-    const gPrinted = (rows||[]).reduce((s,r)=>s+cartSummaryPrinted(c(r.sale), r.qty, cartSummaryPoUnit(r, fx.div)).total, 0);
+    const gPrinted = (rows||[]).reduce((s,r)=>s+cartSummaryPrinted(c(r.sale), r.qty, cartSummaryPoUnit(r, fx.div, !!o.inr)).total, 0);
     const foot = o.includeCost
       ? ["","","","","","","","Total "+fx.code, c(gCost), c(gSale), gPrinted]
       : ["","","","","","Total "+fx.code, c(gSale), gPrinted];
@@ -16624,12 +16854,23 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,overflowX:"auto"}},
           h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1100}},
             h("thead",null,h("tr",{style:{background:"#faf9f4",borderBottom:"2px solid "+colors.dark,textAlign:"left"}},
+              // 19 Sep — these used to be in a different order from the
+              // cells below them: the PO price header sat 6th while its
+              // cell was written 9th, so every header from Size onwards
+              // was reading against the wrong column. The order here is
+              // now exactly the order of the cells, and both price
+              // columns sit at the end, after Qty.
               h("th",{style:{padding:"8px 10px"}},"Sl No"),h("th",{style:{padding:"8px 10px"}},"Sl No in Enq"),h("th",{style:{padding:"8px 10px"}},"Tag no."),h("th",{style:{padding:"8px 10px"}},"Location"),h("th",{style:{padding:"8px 10px"}},"Item"),
-              mode==="contract" && h("th",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},"PO Sales Price (INR/unit)"),h("th",{style:{padding:"8px 10px"}},"Size"),h("th",{style:{padding:"8px 10px"}},"Model"),h("th",{style:{padding:"8px 10px"}},"Qty"),h("th",{style:{padding:"8px 10px"}},"")
+              h("th",{style:{padding:"8px 10px"}},"Size"),h("th",{style:{padding:"8px 10px"}},"Model"),h("th",{style:{padding:"8px 10px"}},"Qty"),
+              mode==="contract" && h("th",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
+                h("div",null,"Unit Price in P.O."),h("div",{style:{color:"#0f6e56"}},orderCurrency)),
+              mode==="contract" && h("th",{style:{padding:"8px 10px",whiteSpace:"nowrap",textAlign:"right"}},
+                h("div",null,"Total"),h("div",{style:{color:"#0f6e56"}},orderCurrency)),
+              h("th",{style:{padding:"8px 10px"}},"")
             )),
             h("tbody",null,
               refs.filter(r=>r.reference_number===refFilter).length===0
-                ? h("tr",null,h("td",{colSpan:mode==="contract"?10:9,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},mode==="contract"?"No Sl Nos on this Sale Order yet.":"No Sl Nos on this quote yet."))
+                ? h("tr",null,h("td",{colSpan:mode==="contract"?11:9,style:{padding:"14px 10px",color:colors.mutedLight,fontSize:12.5}},mode==="contract"?"No Sl Nos on this Sale Order yet.":"No Sl Nos on this quote yet."))
                 : refs.filter(r=>r.reference_number===refFilter).sort((a,b)=>a.item_sl_no-b.item_sl_no).map(r=>{
                     const isEditing = editingCartRow===r.id;
                     return h("tr",{key:r.id,style:{borderBottom:"1px solid #eceae0"}},
@@ -16663,22 +16904,44 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                         ? h("input",{type:"number",min:1,value:cartRowDraft.order_qty,onChange:e=>setCartRowDraft(d=>({...d,order_qty:e.target.value})),style:{width:60,padding:"4px 6px",fontSize:12.5,border:"1px solid "+colors.border,borderRadius:4}})
                         : h("span",null,r.order_qty||1)
                     ),
-                    // PO sales price. Contracts only. Saved on blur or Enter;
-                    // amber while empty because an empty one blocks the PDF.
+                    // PO price. Contracts only, entered in the order's own
+                    // currency, saved on blur or Enter; amber while empty
+                    // because an empty one blocks the PDF. The rupee line
+                    // underneath is derived at the pinned rate and is for
+                    // the BOM screen's benefit, not the customer's.
                     mode==="contract" && h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
                       h("input",{type:"number",min:0,step:"0.01",
-                        value: poPriceDraft[r.item_sl_no]!==undefined ? poPriceDraft[r.item_sl_no] : (r.po_sales_price??""),
+                        value: poPriceDraft[r.item_sl_no]!==undefined ? poPriceDraft[r.item_sl_no] : ((poPricePaid(r)&&!poPricePaid(r).legacy) ? poPricePaid(r).value : ""),
                         placeholder:"from PO",
                         disabled: savingPoPrice===r.item_sl_no,
                         onChange:e=>{ const v=e.target.value; setPoPriceDraft(d=>({...d,[r.item_sl_no]:v})); },
                         onBlur:()=>savePoPrice(r),
                         onKeyDown:e=>{ if(e.key==="Enter") e.target.blur(); },
-                        title: r.po_price_entered_by ? ("Entered by "+r.po_price_entered_by) : "Not entered yet — the PDF is blocked until it is",
+                        title: r.po_price_entered_by ? ("Entered by "+r.po_price_entered_by+" in "+(r.po_price_currency||"INR")) : ("Not entered yet \u2014 in "+orderCurrency+", per unit. The PDF is blocked until it is"),
                         style:{width:110,padding:"4px 6px",fontSize:12.5,textAlign:"right",
-                          border:"1px solid "+((r.po_sales_price===null||r.po_sales_price===undefined)?"#e0b325":colors.border),
-                          background:(r.po_sales_price===null||r.po_sales_price===undefined)?"#fffbea":"#fff",borderRadius:4}}),
-                      r.po_sales_price>0 ? h("div",{style:{fontSize:10,color:colors.mutedLight,marginTop:2}},
-                        "Sl No value "+(Number(r.po_sales_price)*(Number(r.order_qty)||1)).toFixed(2)) : null
+                          border:"1px solid "+(poPricePaid(r)===null?"#e0b325":colors.border),
+                          background:poPricePaid(r)===null?"#fffbea":"#fff",borderRadius:4}}),
+                      (()=>{
+                        const po = poPricePaid(r);
+                        if(!po) return null;
+                        if(po.legacy) return h("div",{style:{fontSize:10,color:"#7a5000",marginTop:2}},
+                          "Entered in INR before 19 Sep \u2014 re-enter it in "+orderCurrency);
+                        return orderCurrency==="INR" ? null
+                          : h("div",{style:{fontSize:10,color:colors.mutedLight,marginTop:2}},
+                              "= "+fmt(r2(po.value*po.fx))+" INR at "+po.fx);
+                      })()
+                    ),
+                    // Total for this Sl No, in the same currency.
+                    mode==="contract" && h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap",textAlign:"right"}},
+                      (()=>{
+                        const po = poPricePaid(r);
+                        const qty = Number(r.order_qty)||1;
+                        if(!po) return h("span",{style:{color:colors.mutedLight}},"\u2014");
+                        return h(React.Fragment,null,
+                          h("div",{style:{fontWeight:700}},fmt(r2(po.value*qty))),
+                          orderCurrency==="INR" ? null : h("div",{style:{fontSize:10,color:colors.mutedLight}},"= "+fmt(r2(po.value*po.fx*qty))+" INR")
+                        );
+                      })()
                     ),
                     h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
                       isEditing
@@ -16708,6 +16971,53 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   );})
             )
           )
+        ),
+        // Order total (19 Sep) — the sum of the Sl No totals above, in the
+        // order's own currency. Only meaningful once every Sl No is
+        // priced, so it says so while any are still empty.
+        mode==="contract" && (()=>{
+          const rowsForRef = refs.filter(r=>r.reference_number===refFilter);
+          if(!rowsForRef.length) return null;
+          const priced = rowsForRef.filter(r=>poPricePaid(r)!==null);
+          const total = priced.reduce((acc,r)=>{ const po=poPricePaid(r); return acc + po.value*(Number(r.order_qty)||1); },0);
+          const totalInr = priced.reduce((acc,r)=>{ const po=poPricePaid(r); return acc + po.value*po.fx*(Number(r.order_qty)||1); },0);
+          const missing = rowsForRef.length - priced.length;
+          return h("div",{style:{marginTop:10,padding:"10px 14px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:8,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+            h("div",{style:{fontSize:12,color:colors.muted}},
+              missing>0 ? ("Order total \u2014 "+missing+" Sl No"+(missing>1?"s":"")+" still without a PO price") : "Order total"),
+            h("div",{style:{textAlign:"right"}},
+              h("div",{style:{fontSize:13,fontWeight:700}},orderCurrency+" "+fmt(r2(total))),
+              orderCurrency==="INR" ? null : h("div",{style:{fontSize:10.5,color:colors.mutedLight}},"= "+fmt(r2(totalInr))+" INR")
+            )
+          );
+        })()
+      )
+    ),
+    // Asked once, before the Cart opens on a Sale Order with no currency
+    // or no usable rate — PO prices are entered in that currency, so it
+    // cannot wait until after they are typed.
+    currencyPrompt && h("div",{style:{position:"fixed",inset:0,background:"rgba(20,20,20,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1200}},
+      h("div",{style:{background:"#fff",borderRadius:10,width:460,maxWidth:"94vw",padding:"20px 24px"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},"Set the order currency first"),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:4}},refFilter+(quoteHeaderRow?.customer_name?" — "+quoteHeaderRow.customer_name:"")),
+        h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14}},"PO prices are entered in the order's own currency, so this has to be set before the Cart can take them. One currency and one rate for the whole order."),
+        h("div",{style:{display:"flex",gap:12,alignItems:"flex-end",marginBottom:12}},
+          h("div",null,
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.mutedLight,marginBottom:3}},"PO currency"),
+            h("select",{value:currencyPrompt.currency,onChange:e=>setCurrencyPrompt(c=>({...c,currency:e.target.value,rate:e.target.value==="INR"?"1":c.rate})),style:{...inputStyle,width:130,padding:"6px 8px"}},
+              h("option",{value:""},"Select…"),
+              ["INR","USD","EUR","AED"].map(c=>h("option",{key:c,value:c},c))
+            )
+          ),
+          currencyPrompt.currency && currencyPrompt.currency!=="INR" && h("div",null,
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.mutedLight,marginBottom:3}},"1 "+currencyPrompt.currency+" = ? INR"),
+            h("input",{type:"number",step:"0.0001",value:currencyPrompt.rate,onChange:e=>setCurrencyPrompt(c=>({...c,rate:e.target.value})),placeholder:"on PO date",style:{...inputStyle,width:130,padding:"6px 8px"}})
+          )
+        ),
+        currencyPrompt.error && h("div",{style:{fontSize:11.5,color:colors.danger,marginBottom:10}},currencyPrompt.error),
+        h("div",{style:{display:"flex",gap:8}},
+          h("button",{onClick:saveOrderCurrency,disabled:currencyPrompt.saving,style:{...btnPrimary,opacity:currencyPrompt.saving?0.6:1}},currencyPrompt.saving?"Saving…":"Save and open Cart"),
+          h("button",{onClick:()=>setCurrencyPrompt(null),disabled:currencyPrompt.saving,style:btnSecondary},"Back")
         )
       )
     ),
@@ -17013,6 +17323,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("button",{onClick:()=>setFreshBom(null),style:btnSecondary},"Close"))
       )
     ),
+    mandatoryGate && h(AuthCodeGate,{requiredType:"edit",user,onClose:()=>setMandatoryGate(null),onAuthorized:async()=>{ const run=mandatoryGate.run; setMandatoryGate(null); await run(); }}),
     pdfTemplateAsk && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:430,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},"Which template?"),
@@ -17186,17 +17497,38 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         // shown regardless of docUploadStep so it's always visible
         // alongside the actual documents list.
         h("div",{style:{background:"#faf9f4",borderRadius:8,padding:"10px 12px",marginBottom:16}},
-          h("div",{style:{fontSize:11.5,fontWeight:700,marginBottom:8}},"Documents requested by customer"),
+          h("div",{style:{fontSize:11.5,fontWeight:700,marginBottom:8}}, mode==="contract" ? "Documents required on this order" : "Documents requested by customer"),
+          // 20 Sep — on a Sale Order the outstanding mandatory ones are
+          // called out first, because they are what stops the order
+          // moving. Nothing here blocks ADDING a document, ever.
+          mode==="contract" && outstandingMandatoryDocs.length>0 && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"7px 10px",marginBottom:8}},
+            h("div",{style:{fontSize:11,color:"#a3312a",fontWeight:700,marginBottom:2}},
+              outstandingMandatoryDocs.length+" mandatory document"+(outstandingMandatoryDocs.length>1?"s":"")+" outstanding"),
+            h("div",{style:{fontSize:10.5,color:"#a3312a"}},
+              outstandingMandatoryDocs.some(isPoDocRequirement)
+                ? "The Order Acceptance PDF is blocked until the PO is attached. The rest block contract approval."
+                : "Contract approval is blocked until these are attached.")
+          ),
           documentRequests.length===0 ? h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:8}},"Nothing on file yet.") :
           h("div",{style:{marginBottom:8}}, documentRequests.map(r=>h("div",{key:r.id,style:{display:"flex",alignItems:"center",gap:8,padding:"5px 0",borderBottom:"1px solid #eceae0"}},
             r.fulfilled_document_id
               ? h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:9,background:"#eaf9f4",color:"#085041"}},"Sent")
               : h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:9,background:"#fdecea",color:"#a3312a"}},"Initial submission pending"),
-            h("span",{style:{fontSize:12,flex:1}},r.category),
+            r.is_mandatory && h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:9,background:"#fff4d6",color:"#854f0b",fontWeight:700}},"Mandatory"),
+            h("span",{style:{fontSize:12,flex:1}},r.category,
+              r.source ? h("span",{style:{fontSize:10,color:colors.mutedLight,marginLeft:6}},r.source) : null),
+            // Marking mandatory, or clearing it, needs the authorization
+            // code (Admins straight through) — an obligation must not
+            // appear or vanish without a record.
+            mode==="contract" && !r.fulfilled_document_id && h("button",{onClick:()=>setRequirementMandatory(r,!r.is_mandatory),
+              style:{background:"none",border:"none",cursor:"pointer",color:colors.muted,fontSize:10.5,textDecoration:"underline",whiteSpace:"nowrap"}},
+              r.is_mandatory?"Not mandatory":"Make mandatory"),
             !r.fulfilled_document_id && h("button",{onClick:()=>deleteDocumentRequest(r),style:{background:"none",border:"none",cursor:"pointer",color:colors.mutedLight,fontSize:11}},"✕")
           ))),
-          h("div",{style:{display:"flex",gap:6}},
+          h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
             h(MasterSelect,{value:newRequestCategory,onChange:setNewRequestCategory,options:docCategoryOptions,table:"doc_category_tbl",valueCol:"value",fieldLabel:"Document Category",placeholder:"Select category to request…",style:{flex:1}}),
+            mode==="contract" && h("label",{style:{display:"flex",alignItems:"center",gap:4,fontSize:11,color:colors.muted,whiteSpace:"nowrap"}},
+              h("input",{type:"checkbox",checked:newRequestMandatory,onChange:e=>setNewRequestMandatory(e.target.checked)}),"Mandatory"),
             h("button",{onClick:addDocumentRequest,style:{...btnSmall,fontSize:11}},"+ Add")
           )
         ),
@@ -17472,9 +17804,8 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                     // was divided by the rate here and in the PDF.
                     return "Prints as: "+quoteCcy+" "+fmtR(v)+" — entered and shown in the same currency, no conversion.";
                   }
-                  // ctBasicPrice is INR; shown in the quote currency, the
-                  // same basis and the same rounding the PDF prints.
-                  const basicDisp = quoteCcy==="INR" ? ctBasicPrice : (quoteFxRate>0 ? ctBasicPrice/quoteFxRate : 0);
+                  // ctBasicPrice is already in the quote currency (19 Sep).
+                  const basicDisp = ctBasicPrice;
                   const amt = basicDisp*v/100;
                   const money = (x)=> mode==="contract" ? fmt(r2(x)) : fmtR(x);   // a Sale Order PDF only prints once every Sl No has its PO price
                   return "Computed: "+quoteCcy+" "+money(amt)+" ("+v+"% of "+quoteCcy+" "+money(basicDisp)+" basic)";
@@ -18063,6 +18394,49 @@ async function applyOutcomeStatus(referenceNumber, newStatus, changedBy, source,
 //   {customerName, company, resolved, resolvedIsFse, ruleScope}
 // ruleScope is the rule that is MISSING (state first, country second),
 // or null when the customer has no address to hang a rule on.
+// ---- MANDATORY DOCUMENTS (20 Sep) ------------------------------------
+// A row in document_requests_tbl is a REQUIREMENT: this entity needs a
+// document of this category, and an upload can mark it fulfilled. Since
+// 20 Sep a requirement can also be mandatory, which is what makes it
+// block. One table serves the customer-requested list, the Sale Order's
+// mandatory list and (later) the quote-stage checklist; is_mandatory and
+// source are what tell them apart.
+//   source: "Customer request" | "Sale Order" | "PO read" | "Quote checklist"
+// Two things block, and nothing else ever does:
+//   1. The PO document blocks the Order Acceptance PDF. The PO number and
+//      date already hard-block approval, so the document belongs with them.
+//   2. Every other mandatory document blocks CONTRACT APPROVAL — the point
+//      at which three people are meant to be looking.
+// The DC is deliberately never blocked: by then it is too late to help and
+// it would stop a lorry. Adding a document is never blocked either, at any
+// stage, by anything.
+const PO_DOC_CATEGORY = "Purchase Order";
+async function fetchDocumentRequirements(entityId){
+  if(!entityId) return [];
+  const { data, error } = await sb.from("document_requests_tbl").select("*").eq("entity_id",entityId).order("requested_at");
+  if(error){ console.error("Document requirements load failed for "+entityId, error); return []; }
+  return data||[];
+}
+// Outstanding = mandatory and nothing linked against it yet.
+function outstandingMandatory(requirements){
+  return (requirements||[]).filter(r=>r.is_mandatory && !r.fulfilled_document_id);
+}
+function isPoDocRequirement(r){
+  return String(r&&r.category||"").trim().toLowerCase()===PO_DOC_CATEGORY.toLowerCase();
+}
+// Raised automatically the moment a Sale Order is created. There is no such
+// thing as an order without a PO, so nobody has to remember to add it.
+async function ensurePoDocumentRequirement(contractNumber, username){
+  if(!contractNumber) return;
+  try{
+    const { data: existing } = await sb.from("document_requests_tbl").select("id,category").eq("entity_id",contractNumber);
+    if((existing||[]).some(isPoDocRequirement)) return;
+    await sb.from("document_requests_tbl").insert({
+      entity_type:"contract", entity_id:contractNumber, category:PO_DOC_CATEGORY,
+      is_mandatory:true, source:"Sale Order", requested_by:username||"unknown"
+    });
+  }catch(e){ console.error("Could not raise the PO document requirement for "+contractNumber, e); }
+}
 async function resolveWinCreditContext(referenceNumber){
   const out = { customerName:"", company:null, resolved:"", resolvedIsFse:false, ruleScope:null };
   try{
@@ -22006,6 +22380,43 @@ const MANUAL_SECTIONS = [
           },
           {
             "type": "p",
+            "text": "Mandatory documents (from 20 September 2026). A Sale Order can carry a list of documents it must have. The customer's PO is added to that list automatically the moment the Sale Order is created \u2014 there is no such thing as an order without one. Anything else is added by hand on the Documents panel, ticking Mandatory."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "The PO document blocks the ORDER ACCEPTANCE PDF. The PO number and date already block approval, so the document sits with them.",
+              "Every other mandatory document blocks CONTRACT APPROVAL, listed with the other missing fields. A Super Admin override still passes, as it does for the rest.",
+              "The DC is never blocked. By then it is too late to help and it would stop a lorry.",
+              "ADDING a document is never blocked, at any stage, by anything.",
+              "Marking something mandatory, clearing it, or deleting a mandatory row needs a one-time authorization code. Admins and Super Admins go straight through, as everywhere else, and every such change is written to the audit log.",
+              "At quote stage nothing is mandatory and nothing blocks \u2014 the list there is still just what the customer asked for."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "The Documents panel on a Sale Order shows outstanding mandatory documents in red at the top, and says which of the two gates each one is holding \u2014 the PDF or approval."
+          },
+          {
+            "type": "p",
+            "text": "Changed 19 September 2026 \u2014 the PO price is now entered in the ORDER'S OWN CURRENCY, not rupees. It is stored exactly as the PO states it, together with the currency and the conversion rate used at the time, and that figure never moves afterwards. The rupee value is worked out from those three and is used in only two places: the BOM screen's cost-against-sale comparison and the stored value snapshot the reports read. Everywhere a customer can see prints the PO figure itself."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "Opening the Cart on a Sale Order with no currency, or a foreign currency with no real rate, asks for both first. One currency and one rate for the whole order, so it is asked once.",
+              "The Cart shows Unit Price in P.O. and Total, both headed with the currency, with the rupee equivalent in small text underneath and an order total at the foot.",
+              "The currency CANNOT be changed once any Sl No has a PO price against it \u2014 clear the prices first. A USD figure printed under a EUR heading on an Order Acceptance is not a small mistake.",
+              "Changing the conversion rate asks whether the PO prices should be re-pinned to it. What the customer pays does not change either way; only the rupee figure the BOM screen compares cost against.",
+              "Prices entered before 19 September are rupee figures with no currency behind them. They are marked in the Cart and should be re-entered in the order's currency."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "The columns in the Cart were also out of step until this build: the PO price heading sat sixth while its box was drawn ninth, so Size, Model and Qty each read against the wrong heading. Headings and cells are now in the same order, with both price columns at the end."
+          },
+          {
+            "type": "p",
             "text": "Where the PO Sales Price is used (from 17 September 2026). Once an Sl No has a PO Sales Price, that figure IS its price everywhere a price appears: Annexure II Price Summary, the Cover Letter's Total Basic Price, the Grand Total, the Price Data on each datasheet, the Packing & Forwarding percentage, the value snapshot, the Unit/Total sale on the BOM screen and the \u201cAs printed\u201d column of the Cart Summary. Before this, the Sale Order PDF still printed the quoted BOM price even after the PO price was entered."
           },
           {
@@ -22323,6 +22734,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"20 Sep 2026 (68)", summary:"The three decisions of 20 Sep, built. MANDATORY DOCUMENTS: document_requests_tbl gains is_mandatory, source and carried_from \u2014 one table now serves the customer-requested list, the Sale Order's mandatory list and (later) the quote checklist, so the phase 53 structure is not needed. fetchDocumentRequirements / outstandingMandatory / isPoDocRequirement / ensurePoDocumentRequirement are global. The PO requirement (category \\\"Purchase Order\\\") is raised automatically when a Sale Order is created, and back-filled the first time an older contract is opened from its quote. GATE 1 \u2014 the PO document blocks the Order Acceptance PDF, checked in attemptGenerateQuotePdf before the template chooser. GATE 2 \u2014 every OTHER mandatory document blocks contract approval, joining otherMissing in the approval card (the PO is excluded there so it is not counted twice). The DC is deliberately never blocked, and adding a document is never blocked anywhere. PERMISSION: marking mandatory, clearing it, and deleting a mandatory row all run through AuthCodeGate (requiredType edit); Admins/Super Admins pass straight through per the app's existing convention, and every change is audited. SNAPSHOT: quote_value_snapshot_tbl now stores total_value (rupees, what the CRM Dashboards cards add up) AND total_value_in_currency with currency, so a single quote can be shown as the customer sees it. PO-priced Sl Nos contribute their PO figure; everything else converts at the header rate. NEEDS SQL: document_requirements_and_snapshot_20260920_v1.sql. NOT IN THIS BUILD, still to come: the quote-stage checklist at quote creation, carry-forward of ticked requirements from quote to Sale Order, the Documents history view on the SO screen and the report with its filters, the entity_type \\\"quote\\\" hardcoding on contract documents, and the PO read." },
+  { date:"19 Sep 2026 (67)", summary:"The PO price is now held in the order's own currency, and the Cart's columns line up with their headings. MODEL: estimates gains po_price_value / po_price_currency / po_price_fx \u2014 the PO figure, its currency, and the rate pinned when it was entered. po_sales_price is still written but is now DERIVED (value x fx) and no longer the source of truth. poPricePaid() reads the three with a legacy fallback to a bare po_sales_price (treated as rupees); poUnitPriceInr() = value x fx for the BOM screen and the snapshot; poUnitPriceIn(est, ccy) returns the PO figure only when the document is in that same currency. NEEDS SQL: estimates_po_price_currency_20260919_v1.sql. DISPLAY: new slNoBaseSalesDisplay(est, lines, ccy, fx) is the one path every printing surface uses. The Quote/Sale Order PDF now works in the printed currency throughout (slNoFoldedTotalDisp replaces the old rupees-then-divide chain) for Annexure II rows, the grand total, the Cover Letter's Total Basic Price and the P&F basis; datasheet Price Data takes a paidUnit; Cart Summary's As printed and Commercial Terms' basic price likewise. In rupees, deliberately: the BOM screen summary, the header totals card, the value snapshot (every other quote in it is in rupees, so a USD figure would not be comparable), and the global-testing weighting. CART: currency prompt before it opens on a Sale Order with no currency or no usable rate; price entered in that currency with the rupee equivalent underneath; new Total column; order total row; legacy rupee prices flagged for re-entry. GUARDS: the order currency cannot be changed while any Sl No is priced; changing the rate offers to re-pin the prices to it. COLUMN ALIGNMENT BUG FIXED: the Cart's header row listed the PO price 6th while the cell was written 9th, so every heading from Size onwards was one column out." },
   { date:"19 Sep 2026 (66)", summary:"Won is now settable from the Quote screen, and every win is credited to an FSE. QUOTE SCREEN: the Status control offers Draft, Offer Sent and Won (was Draft/Offer Sent only). Won hands off to the shared WonLostOutcomeModal, which applies the status itself \u2014 the direct updateQuoteStatusForQuote path is skipped for Won so it cannot be applied twice. The rest of the funnel stays read-only here and driven by Log Follow-ups. Moving a quote OUT of Won is blocked when a Sale Order exists against it, and confirmed otherwise. Plain users still need an authorization code for any change made from this screen; admins unchanged. FSE CREDIT (all three surfaces, since they share the modal): resolveWinCreditContext looks up the quote's customer in companies and runs resolveOwnerForAddress over its billing state/country; the credit is accepted automatically only when that resolves to someone whose employee_tbl.crm_role is FSE. Otherwise the modal shows an FSE picker (fetchFseNames) and the win CANNOT be saved until one is chosen \u2014 the only hard requirement on a win. An opt-in tick box writes the missing Territory Rule (state rule first, country second) so the next quote in that area resolves by itself; never silent, since it changes who future companies in that area are assigned to. Credit is written as its own update (credited_fse, credited_source, credited_at, credited_by on quote_outcomes) so a database missing those columns still saves the win and the status change \u2014 it logs to console instead. NEEDS SQL: quote_outcomes_credit_columns_20260919_v1.sql. PO DETAILS: confirmed by reading the code that PO number/date/value were NEVER enforced on a win \u2014 only Lost/Deferred/Went Cold ever had a required field (the reason). What made it FEEL compulsory: Cancel abandons the status change entirely and did so silently, so filling the PO in was the only visible way past the box. Fixed: with all three PO fields empty the primary button reads \u201cSet Won without PO\u201d, and Cancel now confirms that the status will not be applied. Applies to every surface that uses the modal." },
   { date:"18 Sep 2026 (65)", summary:"Generate PDF now asks which template to print, and the Classic bordered template is built. CHOOSER: askPdfTemplate runs first in attemptGenerateQuotePdf, before the approval/readiness/extra-price/document gates; the choice threads through generateQuotePdf(testingMode, watermark, summarised, template) and through both resume paths (summary near-miss review, no-documents confirm) via pendingAfterReview.template and pdfTemplate. Cancel generates nothing. CLASSIC: drawClassicPdfFrame + drawClassicPdfFooter are global helpers; the quote builder's letterhead() branches to the frame, so EVERY page gets it \u2014 cover, Annexure I/IB/II/III, datasheets, index and any continuation page. Content anchors move with the frame through topY()/botM() against CLASSIC_CONTENT_TOP 52 and CLASSIC_CONTENT_BOTTOM 27 instead of per-table hand-tuned numbers. Page numbers move into the footer bar (numberQuotePages is skipped in classic). Annexure II's grand-total line moves to H-28 to clear the bar. CLASSIC COVER (quotes): customer box left, quote no/date/revision box right, both autoTable so every row is sized from its own content \u2014 the fix for text running through the rules \u2014 and the two boxes are independent. Closing block anchored at H-95 so the 30mm signature gap clears the footer bar. Letterhead reads factory_address, pan_no, email, phone from company_master plus the default row of company_gstin_tbl (fetchDefaultGstin); missing fields print nothing. NOT CARRIED OVER from the printed original: the QR code and the ISO 9001 footer line \u2014 neither is a field anywhere, so the footer prints company.footer_note or the website. Contracts in classic mode keep their existing cover content inside the new frame. The revision-history annexure (contracts only) keeps its doc-control banner and is not framed." },
   { date:"17 Sep 2026 (64)", summary:"The PO Sales Price now carries through to every price the app shows or prints, the Commercial Terms basic price is fixed, a currency fault in Packing & Forwarding is fixed, and Contract Numbers are 6 digits. PRICE: slNoBaseSalesInr and computeSlNoPricing are the shared formula; an Sl No with estimates.po_sales_price is priced from it (x order qty) in Annexure II, Cover Letter Total Basic Price, Grand Total, Annexure III Price Data, DatasheetModal, value snapshot, BOM screen summary, Cart Summary As printed and its exports, and the testing-percentage unit price. Two rules: all-in (no Sl No Extra Price or pro-rata testing on top; quote-level Extra Price and separate testing still print as lines) and exact (2 dp, never roundTo5 \u2014 USD 41 printed as 40 otherwise). A Sale Order with PO prices formats all its PDF money exactly; offers keep round-to-5 unchanged. CORRECTIONS TO THE 16 SEP HANDOVER, from reading the code: ctBasicPrice never reached the PDF \u2014 it fed only the Computed: line in Commercial Terms, which read 0.00; the PDF's Total Basic Price has always read grandTotalPrinted. The value snapshot header was always written; only the line breakdown failed (select of material_grade, which is grade). NEW FAULT FOUND AND FIXED: pfBasicPriceTotal was an INR sum used directly on non-INR PDFs, so a percentage P&F printed rupees on a USD offer. Now converted to display currency. NUMBERING: 6 digits (YY + 4) at all five entry points; suggestion is max(valid config, highest 6-digit contract + 1), so SQL-loaded legacy contracts are never re-suggested; the old 7-digit config value is ignored; advance never moves backwards. Office Use Only renamed Deviations / Suggestions (the 16 Sep 11:10 build change, redone on the 10:05 base). NOT VERIFIED: quote_value_snapshot_lines_tbl column names \u2014 the line insert has never once run, so its columns come from code, not schema; failures now log by name." },
@@ -32389,10 +32802,17 @@ function cartSummaryPrinted(unitInDisplayCurrency, qty, poUnitInDisplayCurrency)
   const unit = roundTo5(Number(unitInDisplayCurrency)||0);
   return { unit, total: unit * (Number(qty)||0) };
 }
-// PO unit price of a Cart Summary row, in the row's display currency, or null.
-function cartSummaryPoUnit(row, div){
-  const po = poUnitPriceInr(row && row.est);
-  return po===null ? null : po/(div||1);
+// PO unit price of a Cart Summary row (19 Sep). When the row is being
+// shown in the PO's own currency the PO figure is used as it stands; when
+// the user has flipped the Summary to rupees it is the pinned rupee
+// value. Only if the two disagree does it fall back to dividing.
+function cartSummaryPoUnit(row, div, showInr){
+  const paid = poPricePaid(row && row.est);
+  if(!paid) return null;
+  if(showInr) return paid.value*paid.fx;
+  const rowCcy = String((row&&row.est&&row.est.currency)||"INR").toUpperCase();
+  if(String(paid.currency||"INR").toUpperCase()===rowCcy) return paid.value;
+  return (paid.value*paid.fx)/(div||1);
 }
 
 function cartSummaryFx(ests, inr){
@@ -32484,7 +32904,7 @@ function CartSummaryScreen({ user, quoteRef, exportCartSummaryExcel, exportCartS
   const gCost = rows.reduce((s,r)=>s+r.cost*r.qty,0);
   const gSale = rows.reduce((s,r)=>s+r.sale*r.qty,0);
   // Sum of what the offer will actually print, in the display currency.
-  const gPrinted = rows.reduce((s,r)=>s+cartSummaryPrinted((Number(r.sale)||0)/(cartSummaryFx(ests,showInr).div||1), r.qty, cartSummaryPoUnit(r, cartSummaryFx(ests,showInr).div)).total, 0);
+  const gPrinted = rows.reduce((s,r)=>s+cartSummaryPrinted((Number(r.sale)||0)/(cartSummaryFx(ests,showInr).div||1), r.qty, cartSummaryPoUnit(r, cartSummaryFx(ests,showInr).div, showInr)).total, 0);
   // The factor actually achieved once the offer rounds. Cost converted to
   // the same currency so the ratio is comparable.
   const gCostDisp = gCost / (cartSummaryFx(ests,showInr).div||1);
@@ -32624,7 +33044,7 @@ function CartSummaryScreen({ user, quoteRef, exportCartSummaryExcel, exportCartS
         h("tbody",null, rows.flatMap(r=>{
           const eff = r.cost ? r.sale/r.cost : 0;
           // Rounded AFTER conversion, exactly where the Offer PDF rounds.
-          const pr = cartSummaryPrinted(conv(r.sale), r.qty, cartSummaryPoUnit(r, fxInfo.div));
+          const pr = cartSummaryPrinted(conv(r.sale), r.qty, cartSummaryPoUnit(r, fxInfo.div, showInr));
           const main = h("tr",{key:r.slNo,style:{borderBottom:"1px solid "+colors.border}},
             h("td",{style:{padding:"8px 5px"}},
               r.mixed
