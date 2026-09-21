@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-20T07:15:00Z";
+  var APP_BUILD_VERSION = "2026-09-20T15:45:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -1760,6 +1760,7 @@ function MenuTabs({ user, active, onChange }) {
         {key:"reports_status_history",label:"Status Change History"},
         {key:"reports_po_register",label:"PO Register"},
         {key:"reports_grn_status",label:"GRN Status Report"},
+        {key:"reports_document_register",label:"Document Register"},
       ]},
       { label:"Employee", tabs:[
         {key:"reports_my_timesheet",label:"Timesheet"},
@@ -9335,6 +9336,39 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     onChanged && onChanged();
   };
 
+  // ---- Production go-ahead + work orders (20 Sep) ----
+  const [isSalesHead,setIsSalesHead] = useState(false);
+  const [goState,setGoState] = useState("Hold");
+  const [goBusy,setGoBusy] = useState(false);
+  const [workOrders,setWorkOrders] = useState([]);
+  const [woSlNos,setWoSlNos] = useState([]);        // rows: {item_sl_no, work_order_id}
+  const [contractSlNos,setContractSlNos] = useState([]);
+  const [woPick,setWoPick] = useState([]);          // Sl Nos ticked for a new work order
+  const [woOpen,setWoOpen] = useState(false);
+  useEffect(()=>{
+    if(!user?.id){ setIsSalesHead(false); return; }
+    (async()=>{
+      const [{data:emp},{data:holders}] = await Promise.all([
+        sb.from("employee_tbl").select("employee_name").eq("app_user_id",user.id).limit(1).maybeSingle(),
+        sb.from("post_holder_tbl").select("employee_name").eq("post_key","sales_head")
+      ]);
+      const me = emp && emp.employee_name;
+      setIsSalesHead(!!me && (holders||[]).some(hh=>hh.employee_name===me));
+    })();
+  },[user?.id]);
+  const loadGoAhead = useCallback(async()=>{
+    if(!contractInfo?.contract_number) return;
+    const [{data:so},{data:wos},{data:slRows},{data:ests}] = await Promise.all([
+      sb.from("sale_order_tbl").select("go_ahead_state").eq("contract_number",contractInfo.contract_number).maybeSingle(),
+      sb.from("work_order_tbl").select("*").eq("contract_number",contractInfo.contract_number).order("seq"),
+      sb.from("work_order_sl_no_tbl").select("item_sl_no,work_order_id").eq("contract_number",contractInfo.contract_number),
+      sb.from("estimates").select("item_sl_no,item,order_qty").eq("reference_number",contractInfo.contract_number).order("item_sl_no")
+    ]);
+    setGoState((so&&so.go_ahead_state)||"Hold");
+    setWorkOrders(wos||[]); setWoSlNos(slRows||[]); setContractSlNos(ests||[]);
+  },[contractInfo?.contract_number]);
+  useEffect(()=>{ loadGoAhead(); },[loadGoAhead]);
+
   const [delOpen,setDelOpen] = useState(false);
   const [delTriggers,setDelTriggers] = useState([]);
   const [delView,setDelView] = useState(null);      // row from v_contract_delivery
@@ -9367,6 +9401,42 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     }
   },[contractInfo?.contract_number]);
   useEffect(()=>{ loadDelivery(); },[loadDelivery]);
+
+  const unissuedSlNos = contractSlNos.filter(e=>!woSlNos.some(w=>String(w.item_sl_no)===String(e.item_sl_no)));
+  const readyForGoAhead = isReadyForGoAhead(holdOpen);
+  const releaseGoAhead = async(toState)=>{
+    if(!canReleaseGoAhead(user,isSalesHead)){ alert("Only the Sales Head or a Super Admin can release production."); return; }
+    const backward = GO_AHEAD_STATES.indexOf(toState) < GO_AHEAD_STATES.indexOf(goState||"Hold");
+    let reason = null;
+    if(backward){
+      reason = prompt("Moving "+contractInfo.contract_number+" back from "+goState+" to "+toState+".\n\nThis is flagged to every admin, and nothing already issued is unwound. Why?");
+      if(reason===null) return;
+      if(!String(reason).trim()){ alert("A backward move needs a reason."); return; }
+    } else if(toState.indexOf("Start Production")===0 && !readyForGoAhead){
+      if(!confirm("Full Hold documents are still short of Code 2"+(holdOpen&&holdOpen.documents?(" ("+holdOpen.documents+")"):"")+".\n\nRelease production anyway?")) return;
+    }
+    setGoBusy(true);
+    const res = await setGoAheadState(contractInfo.contract_number, goState, toState, user?.username, reason);
+    if(res.error){ setGoBusy(false); alert("Could not move the go-ahead: "+res.error); return; }
+    // The work order is raised automatically on the first release into
+    // production, covering every Sl No not already on one.
+    if(!backward && toState.indexOf("Start Production")===0 && unissuedSlNos.length){
+      const created = await createWorkOrder(contractInfo.contract_number, unissuedSlNos.map(e=>e.item_sl_no), user?.username, "Raised automatically on production release");
+      if(created.error) alert("Go-ahead saved, but the work order was not raised: "+created.error);
+    }
+    setGoBusy(false);
+    await loadGoAhead();
+    onChanged && onChanged();
+  };
+  const raiseWorkOrderForPicked = async()=>{
+    if(!woPick.length){ alert("Tick the Sl Nos this work order covers."); return; }
+    setGoBusy(true);
+    const created = await createWorkOrder(contractInfo.contract_number, woPick, user?.username, null);
+    setGoBusy(false);
+    if(created.error){ alert(created.error); return; }
+    setWoPick([]); setWoOpen(false);
+    await loadGoAhead();
+  };
 
   const trigNeeds = (key)=> delTriggers.find(t=>t.trigger_key===key) || {};
   // Rule settled 10 Sep: a Code 2 clock-start date cannot be entered
@@ -9838,6 +9908,33 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
         ? h("span",{title:holdOpen.documents,style:{fontSize:10.5,color:"#8a2d2d",background:"#fdeaea",padding:"2px 8px",borderRadius:9}},
             holdOpen.full_hold_docs_open+" Full Hold doc"+(holdOpen.full_hold_docs_open>1?"s":"")+" not at Code 2")
         : null,
+      // ---- Production go-ahead (20 Sep). Sits beside the approvals but
+      // is NOT one of them: approving a contract is a commercial act,
+      // releasing production is a separate instruction to the factory.
+      h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:9,fontWeight:600,
+        background: goState==="Hold" ? "#f1efe8" : goState==="Start Engineering" ? "#e6f1fb" : "#e6f4f1",
+        color: goState==="Hold" ? colors.muted : goState==="Start Engineering" ? "#0c447c" : "#0f6e56"}},
+        goState==="Hold" ? "Production on hold" : goState),
+      // Ready, but nobody has released it. Shown to everyone; only the
+      // Sales Head or a Super Admin can act on it.
+      goState==="Hold" && readyForGoAhead && h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:9,background:"#fff4d6",color:"#854f0b",fontWeight:600}},
+        "Ready for go-ahead"),
+      canReleaseGoAhead(user,isSalesHead) && h("select",{value:"",disabled:goBusy,
+        onChange:e=>{ const v=e.target.value; if(v) releaseGoAhead(v); },
+        title:"Only the Sales Head and Super Admins see this",
+        style:{...inputStyle,padding:"2px 6px",fontSize:10.5,width:150}},
+        h("option",{value:""},goBusy?"Working…":"Move go-ahead…"),
+        GO_AHEAD_STATES.filter(st=>st!==goState).map(st=>h("option",{key:st,value:st},st))
+      ),
+      // Work orders. Raised automatically on release; anything added to
+      // the order afterwards needs one of its own, so what is still
+      // unissued is stated rather than left to be noticed.
+      workOrders.length>0 && h("span",{style:{fontSize:10.5,color:colors.muted},title:workOrders.map(w=>w.wo_number).join(", ")},
+        workOrders.length+" work order"+(workOrders.length>1?"s":"")),
+      unissuedSlNos.length>0 && h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:9,background:"#fdecea",color:"#a3312a"},
+        title:"Sl No "+unissuedSlNos.map(e=>e.item_sl_no).join(", ")},
+        unissuedSlNos.length+" Sl No"+(unissuedSlNos.length>1?"s":"")+" not on any work order"),
+      unissuedSlNos.length>0 && goState.indexOf("Start Production")===0 && h("button",{onClick:()=>setWoOpen(true),style:{...btnSmall,fontSize:10,padding:"2px 8px"}},"Raise work order"),
       row("Commercial Terms (Accounts Admin)","commercial_approved"),
       // Advance state, shown beside the approval it gates.
       advAnswered ? h("span",{style:{fontSize:10.5,color:contractInfo.has_advance?"#0f6e56":colors.mutedLight,
@@ -9847,6 +9944,27 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
           : "No advance")
         : h("span",{style:{fontSize:10.5,color:"#854f0b",background:"#fff4d6",padding:"2px 8px",borderRadius:9}},
             advSmell ? "Advance? terms suggest yes" : "Advance? not answered"),
+      // Picker for a work order covering only some Sl Nos. Whole
+      // quantities only — a Sl No is on one work order or none, never
+      // split, so nothing can be made twice or quietly missed.
+      woOpen && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1300,display:"flex",alignItems:"center",justifyContent:"center"}},
+        h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 24px",width:520,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
+          h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Raise a work order — "+contractInfo.contract_number),
+          h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:12}},"Tick the Sl Nos it covers. Whole quantities only; each Sl No goes on one work order."),
+          unissuedSlNos.map(e=>h("label",{key:e.item_sl_no,style:{display:"flex",gap:8,alignItems:"center",padding:"5px 0",borderBottom:"1px solid #f0eee6",fontSize:12}},
+            h("input",{type:"checkbox",checked:woPick.some(n=>String(n)===String(e.item_sl_no)),
+              onChange:ev=>setWoPick(p=>ev.target.checked?[...p,e.item_sl_no]:p.filter(n=>String(n)!==String(e.item_sl_no)))}),
+            h("span",{style:{fontWeight:600,width:40}},"Sl "+e.item_sl_no),
+            h("span",{style:{flex:1,color:colors.muted}},e.item||"—"),
+            h("span",{style:{color:colors.mutedLight}},"Qty "+(e.order_qty||1))
+          )),
+          !unissuedSlNos.length && h("div",{style:{fontSize:12,color:colors.muted}},"Every Sl No on this order is already on a work order."),
+          h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:14}},
+            h("button",{onClick:()=>{ setWoOpen(false); setWoPick([]); },style:btnSecondary},"Cancel"),
+            h("button",{onClick:raiseWorkOrderForPicked,disabled:goBusy||!woPick.length,style:{...btnPrimary,opacity:(goBusy||!woPick.length)?0.6:1}},goBusy?"Raising…":"Raise work order")
+          )
+        )
+      ),
       row("NDE/Testing (QC)","testing_approved"),
       row("Everything else (Technical Head)","technical_approved"),
       h("div",{style:{display:"flex",alignItems:"center",gap:5,marginLeft:"auto"}},
@@ -10455,6 +10573,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // Older contracts, created before 20 Sep, get the PO requirement the
       // first time anyone opens them this way.
       await ensurePoDocumentRequirement(existing.contract_number, user?.username);
+      await carryRequirementsToContract(refFilter, existing.contract_number, user?.username);
       if(onOpenContract) onOpenContract(existing);
       return;
     }
@@ -10471,6 +10590,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     try{
       const newContract = await cloneQuoteIntoContract(refFilter, contractNumber, quoteHeaderRow.customer_name, user?.username);
       await advanceContractNumberSuggestion(contractNumber, user?.username);
+      // The order inherits what the customer asked for at quote stage,
+      // and the PO becomes a mandatory requirement on it straight away.
+      await carryRequirementsToContract(refFilter, contractNumber, user?.username);
+      await ensurePoDocumentRequirement(contractNumber, user?.username);
       if(onOpenContract) onOpenContract(newContract);
     } catch(e){ alert("Couldn't create the Sale Order: "+e.message); }
   };
@@ -11288,6 +11411,30 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [documentRequests,setDocumentRequests]=useState([]);
   const [newRequestCategory,setNewRequestCategory]=useState("");
   const [newRequestMandatory,setNewRequestMandatory]=useState(false);
+  // Quote-stage checklist (20 Sep). Ticked from the Category master, in
+  // one pass, instead of adding categories one at a time. Ticking creates
+  // a REQUIREMENT, never a document, and nothing here is mandatory or
+  // blocks anything — at quote stage documents are a courtesy. What is
+  // ticked carries into the Sale Order when the contract is created.
+  const [checklistOpen,setChecklistOpen]=useState(false);
+  const [checklistPick,setChecklistPick]=useState([]);
+  const [checklistBusy,setChecklistBusy]=useState(false);
+  const saveChecklist = async()=>{
+    if(!checklistPick.length){ setChecklistOpen(false); return; }
+    setChecklistBusy(true);
+    const have = new Set(documentRequests.map(r=>String(r.category||"").trim().toLowerCase()));
+    const rows = checklistPick
+      .filter(c=>!have.has(String(c).trim().toLowerCase()))
+      .map(c=>({ entity_type: mode==="contract"?"contract":"quote", entity_id:quoteExportRef, category:c,
+                 is_mandatory:false, source: mode==="contract"?"Sale Order":"Quote checklist",
+                 requested_by:user?.username||"unknown" }));
+    if(rows.length){
+      const { error } = await sb.from("document_requests_tbl").insert(rows);
+      if(error){ setChecklistBusy(false); alert("Failed: "+error.message); return; }
+    }
+    setChecklistBusy(false); setChecklistOpen(false); setChecklistPick([]);
+    await loadDocumentRequests(quoteExportRef);
+  };
   // Any change to the mandatory list goes through the same one-time
   // authorization code as every other gated action; Admins and Super
   // Admins save straight through, as they do everywhere else. Adding
@@ -15573,6 +15720,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           if(openRef && openRef.reference_number===contractInfo.contract_number) setOpenRef(r=>({...r,po_number,po_date}));
         }
       }),
+      // Documents, on the order screen itself. refreshKey is the count of
+      // requirement rows so the panel reloads when something is added or
+      // marked mandatory in the modal, without polling.
+      mode==="contract" && contractInfo && h(ContractDocumentsPanel,{
+        contractNumber: contractInfo.contract_number,
+        refreshKey: documentRequests.length+"|"+quoteDocuments.length
+      }),
       mode==="contract" && showEditContractDetails && h(SaleOrderHeaderModal,{
         contractRow: contractInfo,
         onCancel: ()=>setShowEditContractDetails(false),
@@ -17529,7 +17683,34 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             h(MasterSelect,{value:newRequestCategory,onChange:setNewRequestCategory,options:docCategoryOptions,table:"doc_category_tbl",valueCol:"value",fieldLabel:"Document Category",placeholder:"Select category to request…",style:{flex:1}}),
             mode==="contract" && h("label",{style:{display:"flex",alignItems:"center",gap:4,fontSize:11,color:colors.muted,whiteSpace:"nowrap"}},
               h("input",{type:"checkbox",checked:newRequestMandatory,onChange:e=>setNewRequestMandatory(e.target.checked)}),"Mandatory"),
-            h("button",{onClick:addDocumentRequest,style:{...btnSmall,fontSize:11}},"+ Add")
+            h("button",{onClick:addDocumentRequest,style:{...btnSmall,fontSize:11}},"+ Add"),
+            h("button",{onClick:()=>{ setChecklistPick([]); setChecklistOpen(true); },style:{...btnSmall,fontSize:11},
+              title:"Tick several categories at once from the master"},"Checklist")
+          )
+        ),
+
+        checklistOpen && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1400,display:"flex",alignItems:"center",justifyContent:"center",padding:16}},
+          h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 24px",width:480,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
+            h("div",{style:{fontWeight:700,fontSize:14,marginBottom:4}},"Document checklist — "+quoteExportRef),
+            h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:12}},
+              mode==="contract"
+                ? "Tick what this order needs. Nothing here is mandatory yet — mark that separately on the list."
+                : "Tick what the customer has asked for. Nothing blocks at quote stage, and what you tick carries into the Sale Order when the order lands."),
+            docCategoryOptions.map(cat=>{
+              const already = documentRequests.some(r=>String(r.category||"").trim().toLowerCase()===String(cat).trim().toLowerCase());
+              return h("label",{key:cat,style:{display:"flex",gap:8,alignItems:"center",padding:"4px 0",fontSize:12,opacity:already?0.5:1}},
+                h("input",{type:"checkbox",disabled:already,
+                  checked: already || checklistPick.includes(cat),
+                  onChange:e=>setChecklistPick(pk=>e.target.checked?[...pk,cat]:pk.filter(c=>c!==cat))}),
+                h("span",{style:{flex:1}},cat),
+                already ? h("span",{style:{fontSize:10,color:colors.mutedLight}},"already on the list") : null
+              );
+            }),
+            h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:14}},
+              h("button",{onClick:()=>{ setChecklistOpen(false); setChecklistPick([]); },style:btnSecondary},"Cancel"),
+              h("button",{onClick:saveChecklist,disabled:checklistBusy,style:{...btnPrimary,opacity:checklistBusy?0.6:1}},
+                checklistBusy?"Saving…":("Add "+(checklistPick.length||"")+" to the list"))
+            )
           )
         ),
 
@@ -18411,6 +18592,86 @@ async function applyOutcomeStatus(referenceNumber, newStatus, changedBy, source,
 // it would stop a lorry. Adding a document is never blocked either, at any
 // stage, by anything.
 const PO_DOC_CATEGORY = "Purchase Order";
+
+// ---- PRODUCTION GO-AHEAD + WORK ORDERS (20 Sep) ----------------------
+// Order status (commercial progress) and the production go-ahead are
+// different things and are deliberately not merged. Approving a contract
+// does not tell the factory to start; this does.
+// Four states, moved in either direction. A backward move is allowed but
+// flagged to every admin, and it never unwinds what already happened —
+// cards, work orders and history stay put.
+const GO_AHEAD_STATES = ["Hold","Start Engineering","Start Production Code 2","Start Production Code 1"];
+// What the app PROPOSES once the last Full Hold document clears. Code 1
+// is cleaner than Code 2 (nothing outstanding to resubmit), so the
+// proposal says which of the two it is rather than assuming.
+// Ready means every Full Hold document has reached Code 2 or better. The
+// app proposes the Code 2 state, never Code 1 — "nothing outstanding to
+// resubmit" is a judgement about documents the app cannot make on its
+// own, so the releaser picks Code 1 deliberately if that is the case.
+function isReadyForGoAhead(holdRow){
+  return !holdRow || (Number(holdRow.full_hold_docs_open)||0)===0;
+}
+// Only the Sales Head or a Super Admin releases. Everyone else sees the
+// state and can see it is ready; nobody else moves it.
+function canReleaseGoAhead(user, isSalesHead){
+  return !!(isSalesHead || user?.role==="super_admin");
+}
+// Work order number: contract number + WO + a running number within that
+// contract. 260150/WO1, 260150/WO2. "WO" is in the number deliberately —
+// 260150/2 would read on the shop floor as Sl No 2.
+function workOrderNumber(contractNumber, seq){ return contractNumber+"/WO"+seq; }
+// One Sl No belongs to exactly ONE work order, whole quantity. A part
+// quantity is never issued, so nothing can be made twice or missed.
+async function slNosOnWorkOrders(contractNumber){
+  const { data } = await sb.from("work_order_sl_no_tbl").select("item_sl_no,work_order_id").eq("contract_number",contractNumber);
+  return data||[];
+}
+// Every post gets a flag on a new work order and clears it individually,
+// so it is visible who has picked it up and who has not.
+async function createWorkOrder(contractNumber, slNos, username, note){
+  if(!contractNumber || !slNos || !slNos.length) return { error:"Pick at least one Sl No." };
+  const taken = new Set((await slNosOnWorkOrders(contractNumber)).map(r=>String(r.item_sl_no)));
+  const clash = slNos.filter(n=>taken.has(String(n)));
+  if(clash.length) return { error:"Already on a work order: Sl No "+clash.join(", ") };
+  const { data: existing } = await sb.from("work_order_tbl").select("seq").eq("contract_number",contractNumber).order("seq",{ascending:false}).limit(1);
+  const seq = ((existing&&existing[0]&&Number(existing[0].seq))||0) + 1;
+  const wo_number = workOrderNumber(contractNumber, seq);
+  const { data: wo, error } = await sb.from("work_order_tbl").insert({
+    contract_number:contractNumber, wo_number, seq, note:note||null, created_by:username||"unknown"
+  }).select("*").single();
+  if(error) return { error:error.message };
+  const { error: slErr } = await sb.from("work_order_sl_no_tbl").insert(
+    slNos.map(n=>({ work_order_id:wo.id, contract_number:contractNumber, item_sl_no:n }))
+  );
+  if(slErr) return { error:slErr.message };
+  // Flags. Posts route work in this app, so the flag goes to the post and
+  // whoever holds it sees it — a change of post-holder does not lose it.
+  try{
+    const { data: posts } = await sb.from("post_tbl").select("post_key").order("sort_order");
+    const rows = (posts||[]).map(p=>({ work_order_id:wo.id, post_key:p.post_key }));
+    if(rows.length) await sb.from("work_order_ack_tbl").insert(rows);
+  }catch(e){ console.error("Work order flags not raised for "+wo_number, e); }
+  await logAudit("CREATE","work_order_tbl",wo_number,"Work order raised for Sl No "+slNos.join(", "),username||"unknown",null,null);
+  return { workOrder:wo };
+}
+// Moves the state, writes the history row, and on a release raises the
+// work order for everything not yet issued.
+async function setGoAheadState(contractNumber, fromState, toState, username, reason){
+  const backward = GO_AHEAD_STATES.indexOf(toState) < GO_AHEAD_STATES.indexOf(fromState||"Hold");
+  const { error } = await sb.from("sale_order_tbl").update({
+    go_ahead_state:toState, go_ahead_by:username||"unknown", go_ahead_at:new Date().toISOString(),
+    go_ahead_note:reason||null
+  }).eq("contract_number",contractNumber);
+  if(error) return { error:error.message };
+  await sb.from("go_ahead_history_tbl").insert({
+    contract_number:contractNumber, from_state:fromState||"Hold", to_state:toState,
+    is_backward:backward, reason:reason||null, changed_by:username||"unknown"
+  });
+  await logAudit("UPDATE","sale_order_tbl",contractNumber,
+    (backward?"GO-AHEAD MOVED BACK: ":"Production go-ahead: ")+(fromState||"Hold")+" \u2192 "+toState+(reason?(" ("+reason+")"):""),
+    username||"unknown",null,null);
+  return { ok:true, backward };
+}
 async function fetchDocumentRequirements(entityId){
   if(!entityId) return [];
   const { data, error } = await sb.from("document_requests_tbl").select("*").eq("entity_id",entityId).order("requested_at");
@@ -18436,6 +18697,54 @@ async function ensurePoDocumentRequirement(contractNumber, username){
       is_mandatory:true, source:"Sale Order", requested_by:username||"unknown"
     });
   }catch(e){ console.error("Could not raise the PO document requirement for "+contractNumber, e); }
+}
+// Carried from the quote to its Sale Order when the contract is created
+// (20 Sep). What was ticked at quote stage is what the customer asked
+// for; the order inherits it rather than starting blank. Nothing becomes
+// mandatory by being carried — that is a decision taken on the order.
+// A requirement already fulfilled on the quote carries its link, so a
+// document already sent is not chased twice.
+async function carryRequirementsToContract(quoteRef, contractNumber, username){
+  if(!quoteRef || !contractNumber) return { carried:0 };
+  try{
+    const [{ data: fromQuote }, { data: already }] = await Promise.all([
+      sb.from("document_requests_tbl").select("*").eq("entity_id",quoteRef),
+      sb.from("document_requests_tbl").select("category").eq("entity_id",contractNumber)
+    ]);
+    const have = new Set((already||[]).map(r=>String(r.category||"").trim().toLowerCase()));
+    const rows = (fromQuote||[])
+      .filter(r=>!have.has(String(r.category||"").trim().toLowerCase()))
+      .map(r=>({
+        entity_type:"contract", entity_id:contractNumber, category:r.category,
+        is_mandatory:false, source:"Carried from quote", carried_from:quoteRef,
+        fulfilled_document_id:r.fulfilled_document_id||null,
+        requested_by:username||"unknown"
+      }));
+    if(!rows.length) return { carried:0 };
+    const { error } = await sb.from("document_requests_tbl").insert(rows);
+    if(error) return { carried:0, error:error.message };
+    await logAudit("INSERT","document_requests_tbl",contractNumber,
+      rows.length+" document requirement(s) carried from "+quoteRef, username||"unknown",null,null);
+    return { carried:rows.length };
+  }catch(e){ console.error("Requirement carry-forward failed", e); return { carried:0, error:String(e) }; }
+}
+// Every document on an entity with its full revision history, flattened
+// for the SO screen's panel and for the register report. One definition,
+// so the screen and the report can never disagree.
+async function fetchDocumentHistory(entityIds){
+  const ids = (Array.isArray(entityIds)?entityIds:[entityIds]).filter(Boolean);
+  if(!ids.length) return [];
+  const { data: parents } = await sb.from("universal_documents_tbl").select("*").in("entity_id",ids);
+  if(!parents || !parents.length) return [];
+  const { data: history } = await sb.from("universal_document_history_tbl").select("*").in("document_id",parents.map(p=>p.id)).order("rev_number",{ascending:false});
+  const byDoc = new Map();
+  (history||[]).forEach(hh=>{ if(!byDoc.has(hh.document_id)) byDoc.set(hh.document_id,[]); byDoc.get(hh.document_id).push(hh); });
+  return parents.map(p=>({
+    id:p.id, entity_id:p.entity_id, entity_type:p.entity_type, category:p.category,
+    doc_number:p.doc_number, doc_name:p.doc_name, is_archived:p.is_archived,
+    created_at:p.created_at, created_by:p.created_by,
+    revisions:(byDoc.get(p.id)||[])
+  }));
 }
 async function resolveWinCreditContext(referenceNumber){
   const out = { customerName:"", company:null, resolved:"", resolvedIsFse:false, ruleScope:null };
@@ -21418,6 +21727,38 @@ const MANUAL_SECTIONS = [
           },
           {
             "type": "p",
+            "text": "Production go-ahead and work orders (from 20 September 2026). Approving a contract is a commercial act; releasing production is a separate instruction to the factory, and the two are deliberately not merged. The go-ahead has four states \u2014 Hold, Start Engineering, Start Production Code 2, Start Production Code 1 \u2014 and moves in either direction."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "When every Full Hold document on an order clears to Code 2 or better, the order shows READY FOR GO-AHEAD by itself. The app finds it; a person still clicks.",
+              "Only the SALES HEAD or a SUPER ADMIN can move the go-ahead. Everyone else sees the state and sees that it is ready.",
+              "The app proposes the Code 2 state, never Code 1 \u2014 whether nothing is outstanding to resubmit is a judgement about documents, so Code 1 is chosen deliberately.",
+              "Releasing before the documents clear is possible, with a warning naming what is still short. A document falling back to Code 3 afterwards does NOT revoke the go-ahead; it is raised with the contract owner, as the delivery clock is.",
+              "A backward move needs a reason, is flagged to every admin, and unwinds nothing \u2014 work orders and history stay where they are.",
+              "The Sales Head and Super Admins are prompted once a day with every order waiting for a release."
+            ]
+          },
+          {
+            "type": "p",
+            "text": "Work orders are numbered CONTRACT/WO1, CONTRACT/WO2 \u2014 260150/WO1. The WO is in the number on purpose: 260150/2 would read on the shop floor as Sl No 2."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "One is raised automatically on the first release into production, covering every Sl No not already on a work order.",
+              "A Sl No goes on ONE work order, whole quantity. A part quantity is never issued, so nothing can be made twice or quietly missed.",
+              "Sl Nos added to the order later need a work order of their own \u2014 the contract header says how many are not on one yet, and Raise work order lets you pick them.",
+              "Every post is flagged when a work order is raised, and each post clears its own flag, so who has picked the job up is visible rather than assumed."
+            ]
+          },
+          {
+            "type": "tip",
+            "text": "The readiness test reads the Document Category master's Hold Level. A category left blank counts as not a hold \u2014 worth checking Admin \u2192 Document Categories has a level against every row, or an order will read as ready early."
+          },
+          {
+            "type": "p",
             "text": "If a document falls back to Code 3 after reaching Code 2, the delivery date does NOT reset by itself. It is flagged to whoever owns the contract, who decides. Resetting a contractual date because one document regressed is too large a consequence to happen automatically."
           },
           {
@@ -22399,6 +22740,19 @@ const MANUAL_SECTIONS = [
           },
           {
             "type": "p",
+            "text": "Document checklist, carry-forward and the register (20 September 2026). The Documents panel has a Checklist button: tick several categories from the master in one pass instead of adding them one at a time. Ticking creates a requirement, never a document. At quote stage nothing is mandatory and nothing blocks \u2014 it is a record of what the customer asked for."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "When the Sale Order is created, everything on the quote's checklist carries across to it, marked Carried from quote. Nothing becomes mandatory by being carried; that is decided on the order.",
+              "A requirement already fulfilled on the quote carries its link too, so a document already sent is not chased a second time.",
+              "The Sale Order screen now shows a Documents panel of its own \u2014 what is required, what is outstanding, and every document with its revisions. Click a document with more than one revision to open the whole Out/In history.",
+              "Reports \u2192 Document Register lists every document across all quotes and orders, filtered by customer, category, status, direction, who added it, quotes or orders, and date. Its second view, OUTSTANDING MANDATORY, is the list of what is holding orders up, with what each one blocks. Both views export to Excel and PDF."
+            ]
+          },
+          {
+            "type": "p",
             "text": "Changed 19 September 2026 \u2014 the PO price is now entered in the ORDER'S OWN CURRENCY, not rupees. It is stored exactly as the PO states it, together with the currency and the conversion rate used at the time, and that figure never moves afterwards. The rupee value is worked out from those three and is used in only two places: the BOM screen's cost-against-sale comparison and the stored value snapshot the reports read. Everywhere a customer can see prints the PO figure itself."
           },
           {
@@ -22734,6 +23088,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"20 Sep 2026 (70)", summary:"Documents: the quote-stage checklist, carry-forward into the Sale Order, the SO-screen panel and the register report. CHECKLIST: a Checklist button on the Documents panel ticks several categories from doc_category_tbl in one pass, creating requirement rows (source Quote checklist) \u2014 requirements, never documents, and nothing mandatory or blocking at quote stage. Categories already on the list are shown ticked and disabled. CARRY-FORWARD: carryRequirementsToContract runs on contract creation (both the new-contract path and the reopen-existing path), copying the quote's requirements with source Carried from quote and carried_from set, skipping any category already on the order; a fulfilled requirement carries its fulfilled_document_id so a document already sent is not chased twice. is_mandatory deliberately NOT carried \u2014 mandatory is a decision taken on the order. SO PANEL: new ContractDocumentsPanel on the Sale Order screen (not a modal) \u2014 requirement list with Sent/Pending and Mandatory badges, outstanding banner naming which gate each blocks, and every document with its latest revision; a document with more than one revision expands to its full Out/In history. Reads fetchDocumentHistory, the same function the register uses. REGISTER: Reports \u2192 Document Register. View 1, all documents across quotes and orders with filters (search, quotes/orders, customer, category, status, direction, added by, date range) and Excel/PDF export. View 2, Outstanding mandatory across all orders with what each blocks, the order's go-ahead state, and its own export. No SQL \u2014 this build uses the columns added by document_requirements_and_snapshot_20260920_v1.sql." },
+  { date:"20 Sep 2026 (69)", summary:"Production go-ahead and work orders \u2014 the last missing piece of the Sale Order itself. GO-AHEAD: four states on sale_order_tbl (Hold / Start Engineering / Start Production Code 2 / Start Production Code 1), moved in either direction, every move written to go_ahead_history_tbl with is_backward and a mandatory reason on a backward move. Auto-PROPOSE, not auto-release: an order whose Full Hold documents have all cleared (v_full_hold_outstanding) shows Ready for go-ahead, and only the Sales Head (post_holder_tbl sales_head) or a super_admin can move it \u2014 deliberately not automatic, because documents clearing is one precondition and the advance, the PO price and approval are others. Releasing early is allowed with a warning naming what is short. A fall back to Code 3 does not revoke, matching the delivery-clock rule. WORK ORDERS: work_order_tbl (contract_number, wo_number CONTRACT/WOn, seq), work_order_sl_no_tbl (one Sl No to one work order, whole quantity, uniqueness enforced in SQL and checked before insert), work_order_ack_tbl (a flag per post, each cleared individually). One is raised automatically on the first release into production covering all unissued Sl Nos; the contract header shows how many Sl Nos are on no work order and offers a picker for them. PROMPTS: GoAheadPendingPrompt (Sales Head + super admins, once a day) lists orders ready but unreleased; WorkOrderFlagPrompt shows each person the work orders flagged to their posts until they close them \u2014 no daily dedup, since the acknowledgement row is the real dismiss state. NEEDS SQL: crm_phase54_go_ahead_work_orders.sql. NOT BUILT: a printable work order sheet, and the phase 2 board the go-ahead is meant to trigger." },
   { date:"20 Sep 2026 (68)", summary:"The three decisions of 20 Sep, built. MANDATORY DOCUMENTS: document_requests_tbl gains is_mandatory, source and carried_from \u2014 one table now serves the customer-requested list, the Sale Order's mandatory list and (later) the quote checklist, so the phase 53 structure is not needed. fetchDocumentRequirements / outstandingMandatory / isPoDocRequirement / ensurePoDocumentRequirement are global. The PO requirement (category \\\"Purchase Order\\\") is raised automatically when a Sale Order is created, and back-filled the first time an older contract is opened from its quote. GATE 1 \u2014 the PO document blocks the Order Acceptance PDF, checked in attemptGenerateQuotePdf before the template chooser. GATE 2 \u2014 every OTHER mandatory document blocks contract approval, joining otherMissing in the approval card (the PO is excluded there so it is not counted twice). The DC is deliberately never blocked, and adding a document is never blocked anywhere. PERMISSION: marking mandatory, clearing it, and deleting a mandatory row all run through AuthCodeGate (requiredType edit); Admins/Super Admins pass straight through per the app's existing convention, and every change is audited. SNAPSHOT: quote_value_snapshot_tbl now stores total_value (rupees, what the CRM Dashboards cards add up) AND total_value_in_currency with currency, so a single quote can be shown as the customer sees it. PO-priced Sl Nos contribute their PO figure; everything else converts at the header rate. NEEDS SQL: document_requirements_and_snapshot_20260920_v1.sql. NOT IN THIS BUILD, still to come: the quote-stage checklist at quote creation, carry-forward of ticked requirements from quote to Sale Order, the Documents history view on the SO screen and the report with its filters, the entity_type \\\"quote\\\" hardcoding on contract documents, and the PO read." },
   { date:"19 Sep 2026 (67)", summary:"The PO price is now held in the order's own currency, and the Cart's columns line up with their headings. MODEL: estimates gains po_price_value / po_price_currency / po_price_fx \u2014 the PO figure, its currency, and the rate pinned when it was entered. po_sales_price is still written but is now DERIVED (value x fx) and no longer the source of truth. poPricePaid() reads the three with a legacy fallback to a bare po_sales_price (treated as rupees); poUnitPriceInr() = value x fx for the BOM screen and the snapshot; poUnitPriceIn(est, ccy) returns the PO figure only when the document is in that same currency. NEEDS SQL: estimates_po_price_currency_20260919_v1.sql. DISPLAY: new slNoBaseSalesDisplay(est, lines, ccy, fx) is the one path every printing surface uses. The Quote/Sale Order PDF now works in the printed currency throughout (slNoFoldedTotalDisp replaces the old rupees-then-divide chain) for Annexure II rows, the grand total, the Cover Letter's Total Basic Price and the P&F basis; datasheet Price Data takes a paidUnit; Cart Summary's As printed and Commercial Terms' basic price likewise. In rupees, deliberately: the BOM screen summary, the header totals card, the value snapshot (every other quote in it is in rupees, so a USD figure would not be comparable), and the global-testing weighting. CART: currency prompt before it opens on a Sale Order with no currency or no usable rate; price entered in that currency with the rupee equivalent underneath; new Total column; order total row; legacy rupee prices flagged for re-entry. GUARDS: the order currency cannot be changed while any Sl No is priced; changing the rate offers to re-pin the prices to it. COLUMN ALIGNMENT BUG FIXED: the Cart's header row listed the PO price 6th while the cell was written 9th, so every heading from Size onwards was one column out." },
   { date:"19 Sep 2026 (66)", summary:"Won is now settable from the Quote screen, and every win is credited to an FSE. QUOTE SCREEN: the Status control offers Draft, Offer Sent and Won (was Draft/Offer Sent only). Won hands off to the shared WonLostOutcomeModal, which applies the status itself \u2014 the direct updateQuoteStatusForQuote path is skipped for Won so it cannot be applied twice. The rest of the funnel stays read-only here and driven by Log Follow-ups. Moving a quote OUT of Won is blocked when a Sale Order exists against it, and confirmed otherwise. Plain users still need an authorization code for any change made from this screen; admins unchanged. FSE CREDIT (all three surfaces, since they share the modal): resolveWinCreditContext looks up the quote's customer in companies and runs resolveOwnerForAddress over its billing state/country; the credit is accepted automatically only when that resolves to someone whose employee_tbl.crm_role is FSE. Otherwise the modal shows an FSE picker (fetchFseNames) and the win CANNOT be saved until one is chosen \u2014 the only hard requirement on a win. An opt-in tick box writes the missing Territory Rule (state rule first, country second) so the next quote in that area resolves by itself; never silent, since it changes who future companies in that area are assigned to. Credit is written as its own update (credited_fse, credited_source, credited_at, credited_by on quote_outcomes) so a database missing those columns still saves the win and the status change \u2014 it logs to console instead. NEEDS SQL: quote_outcomes_credit_columns_20260919_v1.sql. PO DETAILS: confirmed by reading the code that PO number/date/value were NEVER enforced on a win \u2014 only Lost/Deferred/Went Cold ever had a required field (the reason). What made it FEEL compulsory: Cancel abandons the status change entirely and did so silently, so filling the PO in was the only visible way past the box. Fixed: with all three PO fields empty the primary button reads \u201cSet Won without PO\u201d, and Cancel now confirms that the status will not be applied. Applies to every surface that uses the modal." },
@@ -24381,6 +24737,205 @@ function SignatoryOverrideNoticesPopup({ notices, onAcknowledgeOne, onAcknowledg
 // deliberately overridden. Doesn't deep-link to the exact quote/
 // contract screen (documents can belong to either) — just names it, so
 // this stays a simple, low-risk reminder rather than more routing.
+// Shown once a day to the Sales Head and Super Admins: orders whose Full
+// Hold documents have all cleared but which nobody has released yet. The
+// app finds them; a person still clicks. (20 Sep)
+function GoAheadPendingPrompt({ user, onDone, onOpenContract }){
+  const [rows,setRows] = useState(null);
+  useEffect(()=>{
+    (async()=>{
+      try{
+        const [{data:sos},{data:holds}] = await Promise.all([
+          sb.from("sale_order_tbl").select("id,contract_number,customer_name,go_ahead_state,oa_issued_on"),
+          sb.from("v_full_hold_outstanding").select("contract_number,full_hold_docs_open")
+        ]);
+        const openBy = new Map((holds||[]).map(hh=>[hh.contract_number, Number(hh.full_hold_docs_open)||0]));
+        // Ready = documents clear AND still on Hold. An order whose
+        // documents are clear but which somebody already released is not
+        // pending anything.
+        setRows((sos||[]).filter(so=>(so.go_ahead_state||"Hold")==="Hold" && (openBy.get(so.contract_number)||0)===0));
+      }catch(e){ console.error("Go-ahead prompt failed", e); setRows([]); }
+    })();
+  },[]);
+  if(rows===null) return null;
+  if(!rows.length){ onDone(); return null; }
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.4)",zIndex:1350,display:"flex",alignItems:"center",justifyContent:"center",padding:16}},
+    h("div",{style:{background:"#fff",borderRadius:12,padding:"22px 26px",width:560,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},rows.length+" order"+(rows.length>1?"s":"")+" waiting for a production go-ahead"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Every Full Hold document on these has cleared to Code 2 or better. Production has not been released."),
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",marginBottom:14}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Contract"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Customer"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"")
+        )),
+        h("tbody",null, rows.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #f0eee6"}},
+          h("td",{style:{padding:"6px 8px",fontWeight:600}},r.contract_number),
+          h("td",{style:{padding:"6px 8px",color:colors.muted}},r.customer_name||"—"),
+          h("td",{style:{padding:"6px 8px",textAlign:"right"}},
+            h("button",{onClick:()=>{ onDone(); onOpenContract && onOpenContract(r); },style:{...btnSmall,fontSize:10.5}},"Open"))
+        )))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end"}},
+        h("button",{onClick:onDone,style:btnSecondary},"Later"))
+    )
+  );
+}
+// Every post gets flagged when a work order is raised and clears its own
+// flag, so it is visible who has picked the job up. Shown to whoever
+// holds a post with an open flag. (20 Sep)
+function WorkOrderFlagPrompt({ user, onDone }){
+  const [rows,setRows] = useState(null);
+  const [busy,setBusy] = useState(false);
+  const load = useCallback(async()=>{
+    try{
+      const { data: emp } = await sb.from("employee_tbl").select("employee_name").eq("app_user_id",user?.id||"").limit(1).maybeSingle();
+      const me = emp && emp.employee_name;
+      if(!me){ setRows([]); return; }
+      const { data: myPosts } = await sb.from("post_holder_tbl").select("post_key").eq("employee_name",me);
+      const keys = (myPosts||[]).map(p=>p.post_key);
+      if(!keys.length){ setRows([]); return; }
+      const { data: acks } = await sb.from("work_order_ack_tbl").select("*").in("post_key",keys).is("acknowledged_at",null);
+      if(!acks || !acks.length){ setRows([]); return; }
+      const { data: wos } = await sb.from("work_order_tbl").select("*").in("id",acks.map(a=>a.work_order_id));
+      const byId = new Map((wos||[]).map(w=>[w.id,w]));
+      setRows(acks.map(a=>({ ...a, wo:byId.get(a.work_order_id) })).filter(r=>r.wo));
+    }catch(e){ console.error("Work order flags failed", e); setRows([]); }
+  },[user?.id]);
+  useEffect(()=>{ load(); },[load]);
+  const close = async(row)=>{
+    setBusy(true);
+    await sb.from("work_order_ack_tbl").update({acknowledged_by:user?.username||"unknown", acknowledged_at:new Date().toISOString()}).eq("id",row.id);
+    setBusy(false);
+    await load();
+  };
+  if(rows===null) return null;
+  if(!rows.length){ onDone(); return null; }
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.4)",zIndex:1350,display:"flex",alignItems:"center",justifyContent:"center",padding:16}},
+    h("div",{style:{background:"#fff",borderRadius:12,padding:"22px 26px",width:600,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},rows.length+" work order"+(rows.length>1?"s":"")+" for you"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"Raised on a production release. Each post clears its own flag, so this stays here until you close it."),
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",marginBottom:14}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Work order"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"Contract"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"As"),
+          h("th",{style:{padding:"6px 8px",fontSize:10.5}},"")
+        )),
+        h("tbody",null, rows.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #f0eee6"}},
+          h("td",{style:{padding:"6px 8px",fontWeight:600}},r.wo.wo_number),
+          h("td",{style:{padding:"6px 8px",color:colors.muted}},r.wo.contract_number),
+          h("td",{style:{padding:"6px 8px",color:colors.mutedLight,fontSize:11}},r.post_key),
+          h("td",{style:{padding:"6px 8px",textAlign:"right"}},
+            h("button",{onClick:()=>close(r),disabled:busy,style:{...btnSmall,fontSize:10.5}},"Close"))
+        )))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end"}},
+        h("button",{onClick:onDone,style:btnSecondary},"Later"))
+    )
+  );
+}
+// Documents on the Sale Order screen itself (20 Sep). The modal is for
+// adding; this is for seeing — what is required, what is outstanding,
+// and every document with its revisions, without opening anything.
+function ContractDocumentsPanel({ contractNumber, refreshKey }){
+  const [reqs,setReqs] = useState([]);
+  const [docs,setDocs] = useState([]);
+  // Same three buckets the modal uses, read from the same master, so a
+  // status looks identical wherever it is shown.
+  const [statusRows,setStatusRows] = useState([]);
+  useEffect(()=>{ sb.from("doc_status_tbl").select("*").then(({data})=>setStatusRows(data||[])); },[]);
+  const statusColor = (label)=>{
+    const bucket = (statusRows.find(r=>r.status===label)||{}).action_type;
+    if(bucket==="our_action") return {background:"#fdecea",color:"#a3312a"};
+    if(bucket==="third_party_action") return {background:"#fff4d6",color:"#854f0b"};
+    return {background:"#eaf9f4",color:"#085041"};
+  };
+  const [open,setOpen] = useState(true);
+  const [expanded,setExpanded] = useState({});
+  useEffect(()=>{
+    let cancelled=false;
+    (async()=>{
+      const [r,d] = await Promise.all([
+        fetchDocumentRequirements(contractNumber),
+        fetchDocumentHistory(contractNumber)
+      ]);
+      if(cancelled) return;
+      setReqs(r); setDocs(d);
+    })();
+    return ()=>{ cancelled=true; };
+  },[contractNumber, refreshKey]);
+  if(!contractNumber) return null;
+  const outstanding = outstandingMandatory(reqs);
+  const live = docs.filter(d=>!d.is_archived);
+  const latest = (d)=> (d.revisions && d.revisions[0]) || {};
+  return h("div",{style:{border:"1px solid "+colors.border,borderRadius:10,padding:"12px 14px",marginBottom:12,background:"#fff"}},
+    h("div",{style:{display:"flex",alignItems:"center",gap:10,cursor:"pointer"},onClick:()=>setOpen(o=>!o)},
+      h("div",{style:{fontWeight:700,fontSize:13}},"Documents"),
+      h("span",{style:{fontSize:11,color:colors.mutedLight}},live.length+" on file · "+reqs.length+" required"),
+      outstanding.length>0 && h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:9,background:"#fdecea",color:"#a3312a",fontWeight:700}},
+        outstanding.length+" mandatory outstanding"),
+      h("span",{style:{marginLeft:"auto",fontSize:11,color:colors.mutedLight}}, open?"▾":"▸")
+    ),
+    open && h("div",{style:{marginTop:10}},
+      outstanding.length>0 && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"7px 10px",marginBottom:10,fontSize:11,color:"#a3312a"}},
+        "Outstanding: "+outstanding.map(r=>r.category).join(", ")+
+        (outstanding.some(isPoDocRequirement) ? " — the PO blocks the Order Acceptance PDF; the rest block approval." : " — these block contract approval.")),
+      reqs.length>0 && h("div",{style:{marginBottom:10}},
+        h("div",{style:{fontSize:10,fontWeight:700,color:colors.muted,textTransform:"uppercase",letterSpacing:"0.03em",marginBottom:4}},"Required"),
+        reqs.map(r=>h("div",{key:r.id,style:{display:"flex",gap:8,alignItems:"center",fontSize:11.5,padding:"3px 0"}},
+          r.fulfilled_document_id
+            ? h("span",{style:{fontSize:9.5,padding:"1px 6px",borderRadius:9,background:"#eaf9f4",color:"#085041"}},"Sent")
+            : h("span",{style:{fontSize:9.5,padding:"1px 6px",borderRadius:9,background:"#fdecea",color:"#a3312a"}},"Pending"),
+          r.is_mandatory && h("span",{style:{fontSize:9.5,padding:"1px 6px",borderRadius:9,background:"#fff4d6",color:"#854f0b",fontWeight:700}},"Mandatory"),
+          h("span",{style:{flex:1}},r.category),
+          h("span",{style:{fontSize:10,color:colors.mutedLight}},r.source||"")
+        ))
+      ),
+      live.length===0
+        ? h("div",{style:{fontSize:11.5,color:colors.mutedLight}},"No documents on this order yet.")
+        : h("table",{style:{width:"100%",fontSize:11.5,borderCollapse:"collapse"}},
+            h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+              h("th",{style:{padding:"5px 7px",fontSize:10}},"Document"),
+              h("th",{style:{padding:"5px 7px",fontSize:10}},"Category"),
+              h("th",{style:{padding:"5px 7px",fontSize:10}},"Rev"),
+              h("th",{style:{padding:"5px 7px",fontSize:10}},"Direction"),
+              h("th",{style:{padding:"5px 7px",fontSize:10}},"Status"),
+              h("th",{style:{padding:"5px 7px",fontSize:10}},"Last moved")
+            )),
+            h("tbody",null, live.map(d=>{
+              const L = latest(d);
+              const isOpen = !!expanded[d.id];
+              return h(React.Fragment,{key:d.id},
+                h("tr",{style:{borderTop:"1px solid #f0eee6",cursor:d.revisions.length>1?"pointer":"default"},
+                  onClick:()=>d.revisions.length>1 && setExpanded(e=>({...e,[d.id]:!isOpen}))},
+                  h("td",{style:{padding:"5px 7px",fontWeight:600}},
+                    (d.revisions.length>1 ? (isOpen?"▾ ":"▸ ") : "")+d.doc_number+(d.doc_name?" — "+d.doc_name:"")),
+                  h("td",{style:{padding:"5px 7px",color:colors.muted}},d.category),
+                  h("td",{style:{padding:"5px 7px"}},"Rev "+(L.rev_number??0)),
+                  h("td",{style:{padding:"5px 7px"}},L.direction||"—"),
+                  h("td",{style:{padding:"5px 7px"}},L.status
+                    ? h("span",{style:{fontSize:9.5,padding:"1px 6px",borderRadius:9,...statusColor(L.status)}},L.status) : "—"),
+                  h("td",{style:{padding:"5px 7px",color:colors.mutedLight}},
+                    (L.changed_at||d.created_at||"").slice(0,10)+" · "+(L.changed_by||d.created_by||"—"))
+                ),
+                // Every earlier revision, so the whole Out/In conversation
+                // with the client is readable without opening anything.
+                isOpen && d.revisions.slice(1).map(rv=>h("tr",{key:rv.id,style:{background:"#fcfbf7"}},
+                  h("td",{style:{padding:"3px 7px 3px 22px",color:colors.mutedLight,fontSize:11}},"Rev "+rv.rev_number),
+                  h("td",{style:{padding:"3px 7px"}}),
+                  h("td",{style:{padding:"3px 7px"}}),
+                  h("td",{style:{padding:"3px 7px",fontSize:11}},rv.direction||"—"),
+                  h("td",{style:{padding:"3px 7px",fontSize:11}},rv.status||"—"),
+                  h("td",{style:{padding:"3px 7px",color:colors.mutedLight,fontSize:11}},
+                    (rv.changed_at||"").slice(0,10)+" · "+(rv.changed_by||"—"))
+                ))
+              );
+            }))
+          )
+    )
+  );
+}
 function DocumentSequenceReminder({ onDone }){
   const [rows,setRows] = useState([]);
   const [loading,setLoading] = useState(true);
@@ -34851,6 +35406,34 @@ function App() {
   // an account owner can be a plain FSE/Telecaller, not just admin.
   const [showQuoteOwnerAlerts,setShowQuoteOwnerAlerts] = useState(true);
   // Document sequence-flag reminder (25 Aug) — same pattern.
+  // Production go-ahead prompt (20 Sep) — Sales Head and Super Admins,
+  // once a day, same pattern as the reminders above. Whether the person
+  // actually holds the sales_head post is resolved inside the component's
+  // query; the render below only keeps Super Admins and employees out of
+  // each other's way.
+  const [showGoAheadPrompt,setShowGoAheadPrompt]=useState(()=>{
+    try{ return sessionStorage.getItem("flometriq_go_ahead_prompt_date")!==new Date().toISOString().slice(0,10); }catch(e){ return true; }
+  });
+  const dismissGoAheadPrompt = ()=>{
+    setShowGoAheadPrompt(false);
+    try{ sessionStorage.setItem("flometriq_go_ahead_prompt_date",new Date().toISOString().slice(0,10)); }catch(e){}
+  };
+  // Work order flags — NO daily dedup on purpose: the real dismiss state
+  // is the acknowledgement row itself, and the component self-closes once
+  // nothing is left open for this person's posts.
+  const [showWorkOrderFlags,setShowWorkOrderFlags]=useState(true);
+  const [isSalesHeadUser,setIsSalesHeadUser]=useState(false);
+  useEffect(()=>{
+    if(!user?.id){ setIsSalesHeadUser(false); return; }
+    (async()=>{
+      const [{data:emp},{data:holders}] = await Promise.all([
+        sb.from("employee_tbl").select("employee_name").eq("app_user_id",user.id).limit(1).maybeSingle(),
+        sb.from("post_holder_tbl").select("employee_name").eq("post_key","sales_head")
+      ]);
+      const me = emp && emp.employee_name;
+      setIsSalesHeadUser(!!me && (holders||[]).some(hh=>hh.employee_name===me));
+    })();
+  },[user?.id]);
   const [showDocSequenceReminder,setShowDocSequenceReminder]=useState(()=>{
     try{ return sessionStorage.getItem("flometriq_doc_sequence_prompt_date")!==new Date().toISOString().slice(0,10); }catch(e){ return true; }
   });
@@ -34900,6 +35483,8 @@ function App() {
     }),
     (user.role==="admin"||user.role==="super_admin") && showBillingOverrideReminder && h(IncompleteSaleOrderReminder,{user,onDone:dismissBillingOverrideReminder,onOpenContract:openContract}),
     showQuoteOwnerAlerts && h(QuoteStatusOwnerAlerts,{user,onDone:()=>setShowQuoteOwnerAlerts(false)}),
+    (isSalesHeadUser||user.role==="super_admin") && showGoAheadPrompt && h(GoAheadPendingPrompt,{user,onDone:dismissGoAheadPrompt,onOpenContract:openContract}),
+    showWorkOrderFlags && h(WorkOrderFlagPrompt,{user,onDone:()=>setShowWorkOrderFlags(false)}),
     (user.role==="admin"||user.role==="super_admin") && showDocSequenceReminder && h(DocumentSequenceReminder,{onDone:dismissDocSequenceReminder}),
     showDraftPanel && h(DraftOfferReminder,{user,onDone:()=>{ setShowDraftPanel(false); refreshDraftCount(); }}),
     showSignatoryNoticesPopup && h(SignatoryOverrideNoticesPopup,{notices:signatoryNotices,onAcknowledgeOne:acknowledgeSignatoryNotice,onAcknowledgeAll:acknowledgeAllSignatoryNotices,onClose:()=>setShowSignatoryNoticesPopup(false)}),
@@ -34980,6 +35565,7 @@ function App() {
     tab==="reports_status_history"?h(StatusChangeHistoryReport,null):
     tab==="reports_po_register"?h(PoRegisterReport,null):
     tab==="pending_actions"?h(PendingActionsScreen,{user}):
+    tab==="reports_document_register"?h(DocumentRegisterReport,null):
     tab==="reports_grn_status"?h(GrnStatusReport,null):
     tab==="deletion_codes"?h(DeletionCodesScreen,{user}):
     tab==="authorization_codes"?h(AuthorizationCodesScreen,{user}):
@@ -36348,6 +36934,190 @@ function PendingActionsScreen({ user }){
           h("button",{onClick:()=>{setHoldFor(null); setErr("");},style:btnSmall},"Cancel")))) : null);
 }
 
+// Document Register (20 Sep) — every document in the app, across quotes
+// and orders, one row per document with its latest revision. The view
+// people will actually live in is Outstanding mandatory: what is holding
+// orders up. Reads through fetchDocumentHistory, the same function the
+// Sale Order screen's panel uses, so the two can never disagree.
+function DocumentRegisterReport(){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [statusRows,setStatusRows] = useState([]);
+  const [f,setF] = useState({ view:"documents", search:"", customer:"", category:"", status:"", direction:"", entity:"all", from:"", to:"", by:"" });
+  useEffect(()=>{
+    (async()=>{
+      const [{data:st},{data:reqs},{data:ests},{data:sos}] = await Promise.all([
+        sb.from("doc_status_tbl").select("*"),
+        sb.from("document_requests_tbl").select("*"),
+        sb.from("estimates").select("reference_number,customer_name"),
+        sb.from("sale_order_tbl").select("contract_number,customer_name")
+      ]);
+      // Customer by entity id, from both sides, so a document on a
+      // contract shows its customer as readily as one on a quote.
+      const custBy = new Map();
+      (ests||[]).forEach(e=>{ if(e.reference_number && !custBy.has(e.reference_number)) custBy.set(e.reference_number, e.customer_name||""); });
+      (sos||[]).forEach(o=>{ if(o.contract_number) custBy.set(o.contract_number, o.customer_name||""); });
+      const { data: parents } = await sb.from("universal_documents_tbl").select("*").order("created_at",{ascending:false});
+      const { data: history } = await sb.from("universal_document_history_tbl").select("*").order("rev_number",{ascending:false});
+      const byDoc = new Map();
+      (history||[]).forEach(hh=>{ if(!byDoc.has(hh.document_id)) byDoc.set(hh.document_id,[]); byDoc.get(hh.document_id).push(hh); });
+      const reqBy = new Map();
+      (reqs||[]).forEach(r=>{ if(r.fulfilled_document_id) reqBy.set(r.fulfilled_document_id, r); });
+      setStatusRows(st||[]);
+      setRows((parents||[]).map(p=>{
+        const revs = byDoc.get(p.id)||[];
+        const L = revs[0]||{};
+        const req = reqBy.get(p.id);
+        return {
+          id:p.id, entity_id:p.entity_id, entity_type:p.entity_type,
+          customer: custBy.get(p.entity_id)||"",
+          doc_number:p.doc_number, doc_name:p.doc_name, category:p.category,
+          is_archived:p.is_archived, revs:revs.length,
+          rev_number:L.rev_number??0, direction:L.direction||"", status:L.status||"",
+          changed_at:(L.changed_at||p.created_at||"").slice(0,10),
+          changed_by:L.changed_by||p.created_by||"",
+          mandatory: !!(req && req.is_mandatory),
+          requirements:(reqs||[])
+        };
+      }));
+      setLoading(false);
+    })();
+  },[]);
+  // The second view: requirements nobody has met, not documents.
+  const [outstanding,setOutstanding] = useState([]);
+  useEffect(()=>{
+    (async()=>{
+      const [{data:reqs},{data:sos}] = await Promise.all([
+        sb.from("document_requests_tbl").select("*"),
+        sb.from("sale_order_tbl").select("contract_number,customer_name,go_ahead_state")
+      ]);
+      const soBy = new Map((sos||[]).map(o=>[o.contract_number,o]));
+      setOutstanding(outstandingMandatory(reqs||[]).map(r=>({
+        ...r,
+        customer:(soBy.get(r.entity_id)||{}).customer_name||"",
+        go_ahead:(soBy.get(r.entity_id)||{}).go_ahead_state||""
+      })));
+    })();
+  },[]);
+
+  const uniq = (arr)=>[...new Set(arr.filter(Boolean))].sort();
+  const statusColor = (label)=>{
+    const bucket = (statusRows.find(r=>r.status===label)||{}).action_type;
+    if(bucket==="our_action") return {background:"#fdecea",color:"#a3312a"};
+    if(bucket==="third_party_action") return {background:"#fff4d6",color:"#854f0b"};
+    return {background:"#eaf9f4",color:"#085041"};
+  };
+  const filtered = rows.filter(r=>{
+    if(f.entity==="quote" && r.entity_type!=="quote") return false;
+    if(f.entity==="contract" && r.entity_type==="quote") return false;
+    if(f.customer && r.customer!==f.customer) return false;
+    if(f.category && r.category!==f.category) return false;
+    if(f.status && r.status!==f.status) return false;
+    if(f.direction && r.direction!==f.direction) return false;
+    if(f.by && r.changed_by!==f.by) return false;
+    if(f.from && r.changed_at && r.changed_at < f.from) return false;
+    if(f.to && r.changed_at && r.changed_at > f.to) return false;
+    if(f.search){
+      const q = f.search.toLowerCase();
+      const hay = [r.doc_number,r.doc_name,r.entity_id,r.customer,r.category].join(" ").toLowerCase();
+      if(hay.indexOf(q)===-1) return false;
+    }
+    return true;
+  });
+  const sel = (label, key, options)=> h("div",null,
+    h("label",{style:{display:"block",fontSize:10,color:colors.mutedLight,marginBottom:2}},label),
+    h("select",{value:f[key],onChange:e=>setF(x=>({...x,[key]:e.target.value})),style:{...inputStyle,padding:"4px 6px",fontSize:11.5,minWidth:130}},
+      h("option",{value:""},"All"), options.map(o=>h("option",{key:o,value:o},o)))
+  );
+  if(loading) return h("div",{style:{padding:20,color:colors.muted}},"Loading the register…");
+  return h("div",{style:{padding:"16px 20px"}},
+    h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:12}},
+      h("div",{style:{fontWeight:700,fontSize:16}},"Document Register"),
+      h("div",{style:{display:"flex",gap:6,marginLeft:12}},
+        ["documents","outstanding"].map(v=>h("button",{key:v,onClick:()=>setF(x=>({...x,view:v})),
+          style:{...(f.view===v?btnPrimary:btnSecondary),fontSize:11.5,padding:"4px 10px"}},
+          v==="documents"?"All documents":"Outstanding mandatory"))
+      ),
+      h("div",{style:{marginLeft:"auto"}},
+        f.view==="documents"
+          ? h(ExportButtons,{title:"Document Register",filenameBase:"document_register",rows:filtered,columns:[
+              {label:"Document",get:r=>r.doc_number},{label:"Name",get:r=>r.doc_name||""},
+              {label:"Quote/Contract",get:r=>r.entity_id},{label:"Customer",get:r=>r.customer},
+              {label:"Category",get:r=>r.category},{label:"Rev",get:r=>r.rev_number},
+              {label:"Direction",get:r=>r.direction},{label:"Status",get:r=>r.status},
+              {label:"Revisions",get:r=>r.revs},{label:"Last moved",get:r=>r.changed_at},{label:"By",get:r=>r.changed_by}]})
+          : h(ExportButtons,{title:"Outstanding mandatory documents",filenameBase:"outstanding_mandatory",rows:outstanding,columns:[
+              {label:"Order",get:r=>r.entity_id},{label:"Customer",get:r=>r.customer},
+              {label:"Category",get:r=>r.category},{label:"Source",get:r=>r.source||""},
+              {label:"Go-ahead",get:r=>r.go_ahead||""},{label:"Requested",get:r=>(r.requested_at||"").slice(0,10)}]})
+      )
+    ),
+    f.view==="documents" ? h(React.Fragment,null,
+      h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end",marginBottom:12,padding:"10px 12px",background:"#faf9f4",borderRadius:8}},
+        h("div",null,
+          h("label",{style:{display:"block",fontSize:10,color:colors.mutedLight,marginBottom:2}},"Search"),
+          h("input",{value:f.search,onChange:e=>setF(x=>({...x,search:e.target.value})),placeholder:"number, name, order…",style:{...inputStyle,padding:"4px 6px",fontSize:11.5,width:180}})),
+        h("div",null,
+          h("label",{style:{display:"block",fontSize:10,color:colors.mutedLight,marginBottom:2}},"On"),
+          h("select",{value:f.entity,onChange:e=>setF(x=>({...x,entity:e.target.value})),style:{...inputStyle,padding:"4px 6px",fontSize:11.5}},
+            h("option",{value:"all"},"Quotes and orders"),h("option",{value:"quote"},"Quotes only"),h("option",{value:"contract"},"Orders only"))),
+        sel("Customer","customer",uniq(rows.map(r=>r.customer))),
+        sel("Category","category",uniq(rows.map(r=>r.category))),
+        sel("Status","status",uniq(rows.map(r=>r.status))),
+        sel("Direction","direction",uniq(rows.map(r=>r.direction))),
+        sel("Added by","by",uniq(rows.map(r=>r.changed_by))),
+        h("div",null,
+          h("label",{style:{display:"block",fontSize:10,color:colors.mutedLight,marginBottom:2}},"Moved from"),
+          h("input",{type:"date",value:f.from,onChange:e=>setF(x=>({...x,from:e.target.value})),style:{...inputStyle,padding:"4px 6px",fontSize:11.5}})),
+        h("div",null,
+          h("label",{style:{display:"block",fontSize:10,color:colors.mutedLight,marginBottom:2}},"to"),
+          h("input",{type:"date",value:f.to,onChange:e=>setF(x=>({...x,to:e.target.value})),style:{...inputStyle,padding:"4px 6px",fontSize:11.5}})),
+        h("button",{onClick:()=>setF({view:"documents",search:"",customer:"",category:"",status:"",direction:"",entity:"all",from:"",to:"",by:""}),style:{...btnSecondary,fontSize:11.5}},"Clear")
+      ),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:6}},filtered.length+" of "+rows.length+" documents"),
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse"}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          ["Document","Quote/Order","Customer","Category","Rev","Direction","Status","Last moved","By"].map(cLbl=>
+            h("th",{key:cLbl,style:{padding:"6px 8px",fontSize:10.5}},cLbl))
+        )),
+        h("tbody",null, filtered.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #f0eee6",opacity:r.is_archived?0.5:1}},
+          h("td",{style:{padding:"6px 8px",fontWeight:600}},r.doc_number+(r.doc_name?" — "+r.doc_name:"")),
+          h("td",{style:{padding:"6px 8px"}},r.entity_id),
+          h("td",{style:{padding:"6px 8px",color:colors.muted}},r.customer||"—"),
+          h("td",{style:{padding:"6px 8px",color:colors.muted}},r.category),
+          h("td",{style:{padding:"6px 8px"}},r.rev_number+(r.revs>1?(" of "+r.revs):"")),
+          h("td",{style:{padding:"6px 8px"}},r.direction||"—"),
+          h("td",{style:{padding:"6px 8px"}},r.status?h("span",{style:{fontSize:9.5,padding:"1px 6px",borderRadius:9,...statusColor(r.status)}},r.status):"—"),
+          h("td",{style:{padding:"6px 8px",color:colors.mutedLight}},r.changed_at||"—"),
+          h("td",{style:{padding:"6px 8px",color:colors.mutedLight}},r.changed_by||"—")
+        )))
+      )
+    ) : h(React.Fragment,null,
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:6}},
+        outstanding.length+" mandatory document"+(outstanding.length===1?"":"s")+" outstanding across all orders"),
+      outstanding.length===0
+        ? h("div",{style:{padding:16,color:colors.muted,fontSize:12}},"Nothing outstanding. Every mandatory document on every order has been attached.")
+        : h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse"}},
+            h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+              ["Order","Customer","Document","Blocks","Source","Go-ahead","Since"].map(cLbl=>
+                h("th",{key:cLbl,style:{padding:"6px 8px",fontSize:10.5}},cLbl))
+            )),
+            h("tbody",null, outstanding.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #f0eee6"}},
+              h("td",{style:{padding:"6px 8px",fontWeight:600}},r.entity_id),
+              h("td",{style:{padding:"6px 8px",color:colors.muted}},r.customer||"—"),
+              h("td",{style:{padding:"6px 8px"}},r.category),
+              h("td",{style:{padding:"6px 8px",fontSize:11}},
+                isPoDocRequirement(r)
+                  ? h("span",{style:{color:"#a3312a"}},"Order Acceptance PDF")
+                  : h("span",{style:{color:"#854f0b"}},"Contract approval")),
+              h("td",{style:{padding:"6px 8px",color:colors.mutedLight,fontSize:11}},r.source||"—"),
+              h("td",{style:{padding:"6px 8px",fontSize:11}},r.go_ahead||"—"),
+              h("td",{style:{padding:"6px 8px",color:colors.mutedLight}},(r.requested_at||"").slice(0,10))
+            )))
+          )
+    )
+  );
+}
 function GrnStatusReport(){
   const [grns,setGrns] = useState([]);
   const [itemsMap,setItemsMap] = useState({});
