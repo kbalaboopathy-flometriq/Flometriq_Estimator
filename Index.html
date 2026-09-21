@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-20T15:45:00Z";
+  var APP_BUILD_VERSION = "2026-09-20T17:20:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -11620,7 +11620,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         const { error:err } = await sb.storage.from("quote-documents").upload(path,d.file);
         if(err) throw err;
         const { data:parentRow, error:parentErr } = await sb.from("universal_documents_tbl").insert({
-          doc_number:d.docNumber.trim(), doc_name:d.title.trim(), category:d.category, entity_type:"quote", entity_id:quoteExportRef,
+          // 20 Sep — was hardcoded "quote", so every document on a
+          // Sale Order was filed as a quote document. Harmless while
+          // quotes were the only user of this table; wrong the moment
+          // PO or GRN documents share it. See the backfill in
+          // document_entity_type_fix_20260920_v1.sql.
+          doc_number:d.docNumber.trim(), doc_name:d.title.trim(), category:d.category,
+          entity_type: mode==="contract" ? "contract" : "quote", entity_id:quoteExportRef,
           is_mandatory:false, is_archived:false, created_by:user?.username||"unknown"
         }).select().single();
         if(parentErr) throw parentErr;
@@ -11638,7 +11644,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       await loadDocumentRequests(quoteExportRef);
       setDocUploadStep("list");
       alert("Uploaded "+docDrafts.length+" document(s).");
-    } catch(e){ alert("Upload failed: "+(e.message||e)); }
+    } catch(e){ alert(documentSaveErrorText(e, (docDrafts.find(d=>d.docNumber)||{}).docNumber)); }
     finally { setDocUploading(false); }
   };
   // "Continuing an existing document" (25 Aug) — the doc-number typo
@@ -11711,7 +11717,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       await loadDocumentRequests(quoteExportRef);
       setDocUploadStep("list");
       setContinueDocPick(null); setContinueFile(null); setContinueLink(""); setContinueStatus(""); setContinueWhatChanged(""); setContinueNotes(""); setContinueOverrideUnlocked(false); setContinueFulfillsRequestId("");
-    } catch(e){ alert("Failed: "+(e.message||e)); }
+    } catch(e){ alert(documentSaveErrorText(e, continueDocPick && continueDocPick.doc_number)); }
     finally { setDocUploading(false); }
   };
   const [docHistoryFor,setDocHistoryFor]=useState(null); // document row being viewed/versioned
@@ -17680,7 +17686,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
             !r.fulfilled_document_id && h("button",{onClick:()=>deleteDocumentRequest(r),style:{background:"none",border:"none",cursor:"pointer",color:colors.mutedLight,fontSize:11}},"✕")
           ))),
           h("div",{style:{display:"flex",gap:6,alignItems:"center"}},
-            h(MasterSelect,{value:newRequestCategory,onChange:setNewRequestCategory,options:docCategoryOptions,table:"doc_category_tbl",valueCol:"value",fieldLabel:"Document Category",placeholder:"Select category to request…",style:{flex:1}}),
+            h(MasterSelect,{value:newRequestCategory,onChange:setNewRequestCategory,options:docCategoryOptions,table:"doc_category_tbl",valueCol:"value",fieldLabel:"Document Category",placeholder:"Select category to request…",style:{flex:1},refreshOptions:loadDocCategories}),   // 20 Sep: a category added from here now appears without a reload
             mode==="contract" && h("label",{style:{display:"flex",alignItems:"center",gap:4,fontSize:11,color:colors.muted,whiteSpace:"nowrap"}},
               h("input",{type:"checkbox",checked:newRequestMandatory,onChange:e=>setNewRequestMandatory(e.target.checked)}),"Mandatory"),
             h("button",{onClick:addDocumentRequest,style:{...btnSmall,fontSize:11}},"+ Add"),
@@ -17758,10 +17764,16 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
 
         docUploadStep==="continue" && h(React.Fragment,null,
           h("div",{style:{fontSize:13,fontWeight:600,marginBottom:10}},"Which document?"),
-          h("select",{value:continueDocPick?.id||"",onChange:e=>pickContinueDoc(e.target.value),style:{...inputStyle,width:"100%",marginBottom:12}},
-            h("option",{value:""},"Select a document…"),
-            quoteDocuments.filter(d=>!d.is_archived).map(d=>h("option",{key:d.id,value:d.id},d.doc_number+(d.title?" — "+d.title:"")))
-          ),
+          // 20 Sep — an empty combo used to appear here when there was
+          // nothing to continue, which reads as a loading failure. Say
+          // so instead, and offer the way out.
+          quoteDocuments.filter(d=>!d.is_archived).length===0
+            ? h("div",{style:{background:"#faf9f4",borderRadius:6,padding:"12px 14px",marginBottom:12,fontSize:12,color:colors.muted}},
+                "No documents on this ",(mode==="contract"?"order":"quote")," yet, so there is nothing to continue. Add the first revision as a new document.")
+            : h("select",{value:continueDocPick?.id||"",onChange:e=>pickContinueDoc(e.target.value),style:{...inputStyle,width:"100%",marginBottom:12}},
+                h("option",{value:""},"Select a document…"),
+                quoteDocuments.filter(d=>!d.is_archived).map(d=>h("option",{key:d.id,value:d.id},d.doc_number+(d.title?" — "+d.title:"")))
+              ),
           continueDocPick && (()=>{
             const expected = computeExpectedNext(continueDocHistory);
             const finalRev = continueOverrideUnlocked ? continueOverrideRev : expected.rev;
@@ -18731,6 +18743,17 @@ async function carryRequirementsToContract(quoteRef, contractNumber, username){
 // Every document on an entity with its full revision history, flattened
 // for the SO screen's panel and for the register report. One definition,
 // so the screen and the report can never disagree.
+// Postgres 23505 is a unique-constraint breach. On documents it means one
+// thing in practice: that document number already exists. The raw message
+// names the index, which tells the user nothing. (20 Sep)
+function documentSaveErrorText(e, docNumber){
+  const code = e && (e.code || e.details?.code);
+  const msg = String((e && (e.message||e.error_description)) || e || "");
+  if(code==="23505" || msg.indexOf("duplicate key")!==-1 || msg.indexOf("23505")!==-1){
+    return "Document number "+(docNumber||"").trim()+" already exists. To add a revision to it, go back and use \u201cContinue an existing document\u201d instead of adding it as new.";
+  }
+  return "Upload failed: "+msg;
+}
 async function fetchDocumentHistory(entityIds){
   const ids = (Array.isArray(entityIds)?entityIds:[entityIds]).filter(Boolean);
   if(!ids.length) return [];
@@ -23088,6 +23111,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"20 Sep 2026 (71)", summary:"Three Documents fixes. ENTITY TYPE: universal_documents_tbl.entity_type was hardcoded \\\"quote\\\" in the upload path, so every document on a Sale Order was filed as a quote document \u2014 now written from mode (contract/quote). Existing rows are corrected by document_entity_type_fix_20260920_v1.sql, which matches contract numbers against sale_order_tbl rather than guessing from the reference format. CONTINUING DROPDOWN: an empty combo appeared when the quote or order had no documents, which reads as a load failure; it now says there is nothing to continue and points at adding a new document. REFRESH: the requirements category combo lacked refreshOptions, so a category added from there did not appear until a reload. DUPLICATE KEY: new documentSaveErrorText turns a 23505 into \\\"Document number X already exists \u2014 use Continue an existing document instead\\\", used by both the new-document and continue paths; every other error is unchanged. PHASE 53: the unused table is dropped in the same SQL file, after a read-only check that it holds nothing \u2014 the requirements model is document_requests_tbl." },
   { date:"20 Sep 2026 (70)", summary:"Documents: the quote-stage checklist, carry-forward into the Sale Order, the SO-screen panel and the register report. CHECKLIST: a Checklist button on the Documents panel ticks several categories from doc_category_tbl in one pass, creating requirement rows (source Quote checklist) \u2014 requirements, never documents, and nothing mandatory or blocking at quote stage. Categories already on the list are shown ticked and disabled. CARRY-FORWARD: carryRequirementsToContract runs on contract creation (both the new-contract path and the reopen-existing path), copying the quote's requirements with source Carried from quote and carried_from set, skipping any category already on the order; a fulfilled requirement carries its fulfilled_document_id so a document already sent is not chased twice. is_mandatory deliberately NOT carried \u2014 mandatory is a decision taken on the order. SO PANEL: new ContractDocumentsPanel on the Sale Order screen (not a modal) \u2014 requirement list with Sent/Pending and Mandatory badges, outstanding banner naming which gate each blocks, and every document with its latest revision; a document with more than one revision expands to its full Out/In history. Reads fetchDocumentHistory, the same function the register uses. REGISTER: Reports \u2192 Document Register. View 1, all documents across quotes and orders with filters (search, quotes/orders, customer, category, status, direction, added by, date range) and Excel/PDF export. View 2, Outstanding mandatory across all orders with what each blocks, the order's go-ahead state, and its own export. No SQL \u2014 this build uses the columns added by document_requirements_and_snapshot_20260920_v1.sql." },
   { date:"20 Sep 2026 (69)", summary:"Production go-ahead and work orders \u2014 the last missing piece of the Sale Order itself. GO-AHEAD: four states on sale_order_tbl (Hold / Start Engineering / Start Production Code 2 / Start Production Code 1), moved in either direction, every move written to go_ahead_history_tbl with is_backward and a mandatory reason on a backward move. Auto-PROPOSE, not auto-release: an order whose Full Hold documents have all cleared (v_full_hold_outstanding) shows Ready for go-ahead, and only the Sales Head (post_holder_tbl sales_head) or a super_admin can move it \u2014 deliberately not automatic, because documents clearing is one precondition and the advance, the PO price and approval are others. Releasing early is allowed with a warning naming what is short. A fall back to Code 3 does not revoke, matching the delivery-clock rule. WORK ORDERS: work_order_tbl (contract_number, wo_number CONTRACT/WOn, seq), work_order_sl_no_tbl (one Sl No to one work order, whole quantity, uniqueness enforced in SQL and checked before insert), work_order_ack_tbl (a flag per post, each cleared individually). One is raised automatically on the first release into production covering all unissued Sl Nos; the contract header shows how many Sl Nos are on no work order and offers a picker for them. PROMPTS: GoAheadPendingPrompt (Sales Head + super admins, once a day) lists orders ready but unreleased; WorkOrderFlagPrompt shows each person the work orders flagged to their posts until they close them \u2014 no daily dedup, since the acknowledgement row is the real dismiss state. NEEDS SQL: crm_phase54_go_ahead_work_orders.sql. NOT BUILT: a printable work order sheet, and the phase 2 board the go-ahead is meant to trigger." },
   { date:"20 Sep 2026 (68)", summary:"The three decisions of 20 Sep, built. MANDATORY DOCUMENTS: document_requests_tbl gains is_mandatory, source and carried_from \u2014 one table now serves the customer-requested list, the Sale Order's mandatory list and (later) the quote checklist, so the phase 53 structure is not needed. fetchDocumentRequirements / outstandingMandatory / isPoDocRequirement / ensurePoDocumentRequirement are global. The PO requirement (category \\\"Purchase Order\\\") is raised automatically when a Sale Order is created, and back-filled the first time an older contract is opened from its quote. GATE 1 \u2014 the PO document blocks the Order Acceptance PDF, checked in attemptGenerateQuotePdf before the template chooser. GATE 2 \u2014 every OTHER mandatory document blocks contract approval, joining otherMissing in the approval card (the PO is excluded there so it is not counted twice). The DC is deliberately never blocked, and adding a document is never blocked anywhere. PERMISSION: marking mandatory, clearing it, and deleting a mandatory row all run through AuthCodeGate (requiredType edit); Admins/Super Admins pass straight through per the app's existing convention, and every change is audited. SNAPSHOT: quote_value_snapshot_tbl now stores total_value (rupees, what the CRM Dashboards cards add up) AND total_value_in_currency with currency, so a single quote can be shown as the customer sees it. PO-priced Sl Nos contribute their PO figure; everything else converts at the header rate. NEEDS SQL: document_requirements_and_snapshot_20260920_v1.sql. NOT IN THIS BUILD, still to come: the quote-stage checklist at quote creation, carry-forward of ticked requirements from quote to Sale Order, the Documents history view on the SO screen and the report with its filters, the entity_type \\\"quote\\\" hardcoding on contract documents, and the PO read." },
