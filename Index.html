@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-22T11:15:00Z";
+  var APP_BUILD_VERSION = "2026-09-22T17:05:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -130,7 +130,9 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
   // negative/stalled outcome," not something specific to Lost. Each
   // gets its own reason-option list and heading, same required-before-
   // save rule.
-  const needsReason = newStatus==="Lost" || newStatus==="Deferred" || newStatus==="Went Cold";
+  // 22 Sep — from the stage master, not a list of names, so a stage added
+  // later with "reason needed" ticked asks for one without a code change.
+  const needsReason = stageNeedsReason(newStatus);
   const REASON_OPTIONS = {
     Lost: ["Price","Delivery time","Technical fit","Relationship / competitor incumbent","Project cancelled","Other"],
     Deferred: ["Budget on hold","Awaiting internal approval","Project timeline pushed","Other"],
@@ -259,7 +261,7 @@ function WonLostOutcomeModal({ referenceNumber, newStatus, user, onDone, onCance
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:10}},"Why was "+referenceNumber+" marked "+newStatus+"?"),
         h("select",{value:draft.lost_reason,onChange:e=>setDraft(d=>({...d,lost_reason:e.target.value})),style:{...inputStyle,width:"100%",marginBottom:8}},
           h("option",{value:""},"Select a reason…"),
-          (REASON_OPTIONS[newStatus]||REASON_OPTIONS.Lost).map(r=>h("option",{key:r,value:r},r))
+          (REASON_OPTIONS[newStatus] || (stageKind(newStatus)==="parked" ? REASON_OPTIONS.Deferred : REASON_OPTIONS.Lost)).map(r=>h("option",{key:r,value:r},r))
         ),
         newStatus==="Lost" && h(React.Fragment,null,
           h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Competitor name (if known)"),
@@ -422,6 +424,57 @@ function drawPdfLetterhead(doc, W, company, opts){
 }
 function pdfFooterCompanyName(company){ return (company&&company.company_name)||COMPANY_NAME; }
 
+// ---- QUOTE STAGES (22 Sep) ---------------------------------------------
+// One field describes how far a quote has got: its STAGE. It is stored in
+// estimates.quote_status (the column keeps its name; only the screens say
+// Stage), and its values come from quote_status_tbl, now ordered for the
+// funnel and carrying what each stage MEANS rather than the app guessing
+// from names:
+//   kind          open | won | lost | parked
+//   needs_reason  a reason is captured when a quote moves into it
+//   win_pct       probability, for the weighted pipeline
+//   set_on_quote  offered by the Quote screen's own Stage dropdown
+// Nature (Unknown / Budgetary / Purchase Requirement) is folded into the
+// stages themselves and no longer shown anywhere.
+// A module-level cache, loaded once at start and again whenever the
+// master is edited; every lookup below falls back to sensible defaults by
+// name, so a screen that renders before the load still behaves.
+let QUOTE_STAGE_CACHE = [];
+let QUOTE_STAGE_LOADING = null;
+async function loadQuoteStages(force){
+  if(QUOTE_STAGE_LOADING && !force) return QUOTE_STAGE_LOADING;
+  QUOTE_STAGE_LOADING = (async()=>{
+    const { data, error } = await sb.from("quote_status_tbl").select("*");
+    if(error){ console.error("Quote stages could not be read", error); return QUOTE_STAGE_CACHE; }
+    QUOTE_STAGE_CACHE = (data||[]).slice().sort((a,b)=>{
+      const sa = a.sort_order==null ? 9999 : Number(a.sort_order), sb2 = b.sort_order==null ? 9999 : Number(b.sort_order);
+      return sa!==sb2 ? sa-sb2 : String(a.status||"").localeCompare(String(b.status||""));
+    });
+    return QUOTE_STAGE_CACHE;
+  })();
+  return QUOTE_STAGE_LOADING;
+}
+async function loadQuoteStageNames(){ return (await loadQuoteStages()).map(r=>r.status).filter(Boolean); }
+function stageInfo(name){
+  const n = String(name||"").trim();
+  const row = QUOTE_STAGE_CACHE.find(r=>String(r.status||"").trim()===n);
+  if(row && row.kind) return row;
+  // Defaults before the master carries the new columns, or for a stage
+  // that has since been removed but still sits on an old quote.
+  const kind = n==="Won" ? "won" : n==="Lost" ? "lost" : (n==="Deferred"||n==="Went Cold") ? "parked" : "open";
+  return { status:n, kind, needs_reason: kind==="lost"||kind==="parked", win_pct:null,
+           set_on_quote: ["Draft","Offer Sent","Won"].includes(n), ...(row||{}) , kind: (row&&row.kind)||kind };
+}
+function stageKind(name){ return stageInfo(name).kind||"open"; }
+// Closed = anything that ends the chase: won, lost or parked.
+function isClosedStage(name){ return ["won","lost","parked"].includes(stageKind(name)); }
+function stageNeedsReason(name){ const i = stageInfo(name); return !!(i.needs_reason ?? (i.kind==="lost"||i.kind==="parked")); }
+function stagesSettableOnQuote(){
+  const list = QUOTE_STAGE_CACHE.filter(r=>r.set_on_quote).map(r=>r.status);
+  return list.length ? list : ["Draft","Offer Sent","Won"];
+}
+loadQuoteStages();
+
 // ---- CLASSIC TEMPLATE (18 Sep) ----------------------------------------
 // The bordered letterhead Flometriq used before this app existed: a rule
 // around the whole page, the company block banded across the top with the
@@ -549,7 +602,7 @@ const MASTER_TABLES = [
   { key: "uom_tbl", label: "UOM", columns: ["uom"], addLabel:"New UOM", freeText:["uom"], editAllEnabled:true },
   { key: "material_rates", label: "Material rates", columns: ["material_shape","material_spec","material_grade","rate","uom","spec_grade"], addLabel:"New rate", cascade:[{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"material_grade",from:"grade_tbl",field:"material_grade"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"uom",from:"uom_tbl",field:"uom"}], freeText:["rate","spec_grade"] },
   { key: "bom", label: "BOM", columns: ["item","size","model","sub_assembly","component","material_shape","cutting_plan_layout_size","cutting_plan_qty","cutting_plan_uom","material_spec","qty_required","uom","rate","cost","sf","sales_price"], addLabel:"New BOM line", groupBy:["item","model"], cascade:[{col:"item",from:"item_tbl",field:"item"},{col:"size",from:"size_tbl",field:"size"},{col:"model",from:"model_tbl",field:"model"},{col:"component",from:"component_item_tbl",field:"component"},{col:"sub_assembly",from:"subassembly_tbl",field:"sub_assembly"},{col:"material_shape",from:"materials_shape",field:"shape"},{col:"material_spec",from:"material_spec",field:"material_spec"},{col:"uom",from:"uom_tbl",field:"uom"},{col:"cutting_plan_uom",from:"uom_tbl",field:"uom"}], freeText:["cutting_plan_layout_size","cutting_plan_qty","qty_required","rate","cost","sf","sales_price"] },
-  { key: "quote_status_tbl", label: "Quote Status", columns: ["status"], addLabel:"New status", freeText:["status"] },
+  { key: "quote_status_tbl", label: "Quote Stages", columns: ["status"], addLabel:"New stage", freeText:["status"] },   // 22 Sep: has its own screen, QuoteStagesMaster
   { key: "project_chase_outcome_tbl", label: "Project Chase Outcome", columns: ["value"], addLabel:"New outcome", freeText:["value"] },
   { key: "payment_terms_tbl", label: "Payment Terms", columns: ["value"], addLabel:"New payment term", freeText:["value"] },
   { key: "delivery_terms_tbl", label: "Delivery Terms", columns: ["value"], addLabel:"New delivery term", freeText:["value"] },
@@ -3304,6 +3357,115 @@ function HrHomeScreen({ user, onOpenTab }){
   );
 }
 
+// Quote Stages master (22 Sep). The stages in funnel order, each with what
+// it MEANS — kind, whether a reason is captured, win probability, and
+// whether the Quote screen's own dropdown offers it. Reorder with the
+// arrows; add with + Add stage. Draft and Won can't be removed: the app
+// depends on both existing (every new quote starts in Draft; a Sale Order
+// can only be raised from Won).
+function QuoteStagesMaster({ user }){
+  const [rows,setRows] = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [busy,setBusy] = useState(false);
+  const [adding,setAdding] = useState(null);   // {status, kind, needs_reason, win_pct, set_on_quote}
+  const isAdmin = user && (user.role==="admin"||user.role==="super_admin");
+  const load = async()=>{ setLoading(true); setRows(await loadQuoteStages(true)); setLoading(false); };
+  useEffect(()=>{ load(); },[]);
+  const save = async(row, changes)=>{
+    setBusy(true);
+    const { error } = await sb.from("quote_status_tbl").update(changes).eq("status",row.status);
+    setBusy(false);
+    if(error){ alert(saveFailedText("The stage "+row.status, error)); return; }
+    await logAudit("UPDATE","quote_status_tbl",row.status,"Stage "+row.status+" changed: "+JSON.stringify(changes),user?.username||"unknown",null,null);
+    await load();
+  };
+  const move = async(idx, dir)=>{
+    const j = idx+dir; if(j<0 || j>=rows.length) return;
+    const a = rows[idx], b = rows[j];
+    setBusy(true);
+    // Renumber the whole list so gaps and duplicates from older data can't
+    // leave two stages fighting over one position.
+    const order = rows.slice(); order[idx]=b; order[j]=a;
+    for(let k=0;k<order.length;k++){
+      await sb.from("quote_status_tbl").update({sort_order:(k+1)*10}).eq("status",order[k].status);
+    }
+    setBusy(false);
+    await load();
+  };
+  const remove = async(row)=>{
+    if(["Draft","Won"].includes(row.status)){ alert(row.status+" can't be removed \u2014 the app depends on it."); return; }
+    const { count } = await sb.from("estimates").select("id",{count:"exact",head:true}).eq("quote_status",row.status);
+    if(!confirm("Remove the stage \u201c"+row.status+"\u201d?"+((count||0)>0 ? "\n\n"+count+" Sl No row(s) are in it. They keep showing it until someone changes them \u2014 it just won't be offered any more." : ""))) return;
+    setBusy(true);
+    const { error } = await sb.from("quote_status_tbl").delete().eq("status",row.status);
+    setBusy(false);
+    if(error){ alert(saveFailedText("Removing "+row.status, error)); return; }
+    await logAudit("DELETE","quote_status_tbl",row.status,"Stage removed: "+row.status,user?.username||"unknown",null,null);
+    await load();
+  };
+  const addStage = async()=>{
+    const name = (adding.status||"").trim();
+    if(!name){ alert("Give the stage a name."); return; }
+    if(rows.some(r=>String(r.status).trim().toLowerCase()===name.toLowerCase())){ alert("\u201c"+name+"\u201d already exists."); return; }
+    setBusy(true);
+    const maxSort = rows.reduce((m,r)=>Math.max(m, Number(r.sort_order)||0), 0);
+    const { error } = await sb.from("quote_status_tbl").insert({
+      status:name, kind:adding.kind, needs_reason:!!adding.needs_reason,
+      win_pct: adding.win_pct===""||adding.win_pct==null ? null : Number(adding.win_pct),
+      set_on_quote:!!adding.set_on_quote, sort_order:maxSort+10
+    });
+    setBusy(false);
+    if(error){ alert(saveFailedText("The new stage", error)); return; }
+    await logAudit("INSERT","quote_status_tbl",name,"Stage added: "+name,user?.username||"unknown",null,null);
+    setAdding(null); await load();
+  };
+  const KINDS = [["open","Open"],["won","Won"],["lost","Lost"],["parked","Parked"]];
+  const cell = {padding:"7px 8px",fontSize:12.5,borderBottom:"1px solid #efede6"};
+  if(loading) return h("div",{style:{padding:20,color:colors.muted}},"Loading stages\u2026");
+  return h("div",{style:{padding:"16px 20px",maxWidth:980}},
+    h("div",{style:{fontWeight:700,fontSize:16,marginBottom:2}},"Quote Stages"),
+    h("div",{style:{fontSize:12,color:colors.muted,marginBottom:14}},
+      "The funnel, top to bottom. Kind decides how the app treats a stage everywhere \u2014 open stages are chased, won/lost/parked ones are closed. Win % feeds the weighted pipeline on the dashboard."),
+    h("table",{style:{borderCollapse:"collapse",width:"100%"}},
+      h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+        ["","Stage","Kind","Reason needed","Win %","On Quote screen",""].map((c,i)=>h("th",{key:i,style:{...cell,fontSize:11,fontWeight:700}},c)))),
+      h("tbody",null, rows.map((r,idx)=>h("tr",{key:r.status},
+        h("td",{style:{...cell,whiteSpace:"nowrap",width:52}},
+          h("button",{disabled:busy||!isAdmin||idx===0,onClick:()=>move(idx,-1),title:"Move up",style:{border:"none",background:"transparent",cursor:"pointer",color:colors.muted}},"\u25b2"),
+          h("button",{disabled:busy||!isAdmin||idx===rows.length-1,onClick:()=>move(idx,1),title:"Move down",style:{border:"none",background:"transparent",cursor:"pointer",color:colors.muted}},"\u25bc")),
+        h("td",{style:{...cell,fontWeight:600}},r.status),
+        h("td",{style:cell},
+          h("select",{value:r.kind||stageKind(r.status),disabled:busy||!isAdmin||["Draft","Won"].includes(r.status),onChange:e=>save(r,{kind:e.target.value}),style:{...inputStyle,padding:"4px 6px",fontSize:12,width:110}},
+            KINDS.map(([v,l])=>h("option",{key:v,value:v},l)))),
+        h("td",{style:cell},
+          h("input",{type:"checkbox",checked:!!(r.needs_reason ?? stageNeedsReason(r.status)),disabled:busy||!isAdmin,onChange:e=>save(r,{needs_reason:e.target.checked})})),
+        h("td",{style:cell},
+          h("input",{defaultValue:r.win_pct==null?"":r.win_pct,disabled:busy||!isAdmin,style:{...inputStyle,padding:"4px 6px",fontSize:12,width:70},
+            onBlur:e=>{ const v=e.target.value.trim(); const n=v===""?null:Number(v);
+              if(v!=="" && (!(n>=0) || n>100)){ alert("Win % is a number from 0 to 100."); e.target.value=r.win_pct==null?"":r.win_pct; return; }
+              if(n!==(r.win_pct==null?null:Number(r.win_pct))) save(r,{win_pct:n}); }})),
+        h("td",{style:cell},
+          h("input",{type:"checkbox",checked:!!r.set_on_quote,disabled:busy||!isAdmin||r.status==="Draft",onChange:e=>save(r,{set_on_quote:e.target.checked})})),
+        h("td",{style:{...cell,textAlign:"right"}},
+          isAdmin && !["Draft","Won"].includes(r.status) && h("button",{onClick:()=>remove(r),disabled:busy,style:{border:"none",background:"transparent",color:colors.danger,cursor:"pointer",fontSize:12}},"Remove"))
+      )))
+    ),
+    isAdmin && !adding && h("button",{onClick:()=>setAdding({status:"",kind:"open",needs_reason:false,win_pct:"",set_on_quote:false}),style:{...btnSecondary,marginTop:12,color:"#0f6e56",borderColor:"#0f6e56"}},"+ Add stage"),
+    adding && h("div",{style:{marginTop:12,padding:"12px 14px",background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:8,display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap"}},
+      h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:3}},"Stage name"),
+        h("input",{value:adding.status,onChange:e=>setAdding(a=>({...a,status:e.target.value})),style:{...inputStyle,width:240}})),
+      h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:3}},"Kind"),
+        h("select",{value:adding.kind,onChange:e=>setAdding(a=>({...a,kind:e.target.value})),style:{...inputStyle,width:110}},KINDS.map(([v,l])=>h("option",{key:v,value:v},l)))),
+      h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:3}},"Win %"),
+        h("input",{value:adding.win_pct,onChange:e=>setAdding(a=>({...a,win_pct:e.target.value.replace(/[^0-9.]/g,"")})),style:{...inputStyle,width:70}})),
+      h("label",{style:{fontSize:12,display:"flex",gap:4,alignItems:"center"}},h("input",{type:"checkbox",checked:adding.needs_reason,onChange:e=>setAdding(a=>({...a,needs_reason:e.target.checked}))}),"Reason needed"),
+      h("label",{style:{fontSize:12,display:"flex",gap:4,alignItems:"center"}},h("input",{type:"checkbox",checked:adding.set_on_quote,onChange:e=>setAdding(a=>({...a,set_on_quote:e.target.checked}))}),"On Quote screen"),
+      h("button",{onClick:()=>setAdding(null),style:btnSecondary},"Cancel"),
+      h("button",{onClick:addStage,disabled:busy,style:btnPrimary},"Add")
+    ),
+    h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:10}},"New stages go to the bottom; move them into place with the arrows.")
+  );
+}
 function MasterEditor({ tableKey, user }) {
   const tableDef = MASTER_TABLES.find(t=>t.key===tableKey);
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
@@ -12955,7 +13117,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [fixingModel,setFixingModel]=useState(false);
   const [quoteStatuses,setQuoteStatuses]=useState([]);
   const [quoteNatureOptions,setQuoteNatureOptions]=useState([]);
-  useEffect(()=>{ sb.from("quote_nature_tbl").select("nature").then(({data})=>setQuoteNatureOptions((data||[]).map(r=>r.nature))); },[]);
   const CT_MASTER_TABLES = {
     payment_term:"payment_terms_tbl", delivery_term:"delivery_terms_tbl", packing_forwarding:"packing_forwarding_tbl",
     insurance:"insurance_terms_tbl", price_basis:"price_basis_tbl", guarantee:"guarantee_terms_tbl",
@@ -12972,7 +13133,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   },[]);
   useEffect(()=>{
     loadCtMasters();
-    fetchAll("quote_status_tbl","status").then(rows=>setQuoteStatuses(rows.map(r=>r.status).filter(Boolean)));
+    loadQuoteStages(true).then(rows=>setQuoteStatuses(rows.map(r=>r.status).filter(Boolean)));   // 22 Sep: funnel order
   },[loadCtMasters]);
 
   useEffect(()=>{
@@ -15793,7 +15954,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:1}},quoteHeaderRow.customer_name||"—")
             ),
             h("div",{style:{border:"2px solid "+(readiness.ready?"#1c8c56":"#e0b325"),borderRadius:10,padding:"6px 14px",background:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#eafaf1":"#eaf2fb"):"#fffbea",display:"flex",alignItems:"center",gap:8}},
-              h("span",{style:{fontSize:9.5,color:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c"):"#7a5000",fontWeight:600}},mode==="contract"?"SO STAGE":"QUOTE STATUS"),
+              h("span",{style:{fontSize:9.5,color:readiness.ready?(quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c"):"#7a5000",fontWeight:600}},mode==="contract"?"SO STAGE":"STAGE"),
               mode==="contract"
                 // The real Sale Order Stage lives on sale_order_tbl (see
                 // ContractStatusBanner, which owns changing it) — this
@@ -15813,7 +15974,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 // by Log Follow-ups' Outcome field and shows read-only
                 // here, so a quote can't drift through the middle of the
                 // funnel with no follow-up behind it.
-                : !["Draft","Offer Sent","Won"].includes(quoteHeaderRow.quote_status||"Draft")
+                : !stagesSettableOnQuote().includes(quoteHeaderRow.quote_status||"Draft")
                 ? h("span",{style:{fontSize:14,fontWeight:800,color:"#0c447c"}},"🔒 "+(quoteHeaderRow.quote_status||"Draft").toUpperCase())
                 : h("select",{
                     value:quoteHeaderRow.quote_status||"Draft",
@@ -15859,24 +16020,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                   // (see comment above) — fixed alongside, since the new
                   // gating logic would have nothing to actually test
                   // otherwise.
-                  },["Draft","Offer Sent","Won"].map(s=>h("option",{key:s,value:s},s)))
+                  },stagesSettableOnQuote().map(s=>h("option",{key:s,value:s},s)))
             ),
-            // Nature of Quote (29 Aug) — independent of Status Funnel;
-            // unlike Status, this one IS directly settable here, not
-            // just via Log Follow-ups.
-            h("div",{style:{border:"2px solid "+colors.border,borderRadius:10,padding:"6px 14px",background:"#faf9f4",display:"flex",alignItems:"center",gap:8}},
-              h("span",{style:{fontSize:9.5,color:colors.muted,fontWeight:600}},"NATURE"),
-              h("select",{
-                value:quoteHeaderRow.quote_nature||"Unknown",
-                onChange:async e=>{
-                  const v=e.target.value;
-                  await sb.from("estimates").update({quote_nature:v}).eq("reference_number",refFilter);
-                  setOpenRef(r=>({...r,quote_nature:v}));
-                  setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,quote_nature:v}:r));
-                },
-                style:{fontSize:13,fontWeight:800,color:colors.dark,background:"transparent",border:"none",fontFamily:"inherit"}
-              },(quoteNatureOptions.length?quoteNatureOptions:["Unknown","Budgetary","Purchase Requirement"]).map(n=>h("option",{key:n,value:n},n)))
-            ),
+            // Nature removed 22 Sep — folded into the single Stage.
             h("div",{style:{width:220}},
               renderReadinessBar(readiness.categories, {height:32, onClick: readiness.ready?undefined:()=>alert(readiness.missing.map(m=>m.section+": "+m.items.join(", ")).join("\n"))})
             )
@@ -23268,6 +23414,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"22 Sep 2026 (79)", summary:"Quotes Report: Follow-up Stage removed; LAST INTERACTION in its place \u2014 the latest logged activity on that quote with its date, mode, who logged it and who was contacted, and the outcome and notes (two lines, full text on hover); legacy quotes with only an imported note show that. The inline Follow-up Stage editor is gone from the table; + Next Follow-up stays. New VALUE column from the value snapshot \u2014 the quote's own currency, rupees underneath when different, blank until the quote has been opened once. New QUOTE VALUE range filter: INR or USD, more than / less than, applied with the other filters and shown as chips. INR compares every quote's rupee value; USD uses the USD figure for USD quotes and converts the rest at one USD rate so every quote can be compared, defaulting to the latest USD quote's own rate and editable beside the filter. Quotes with no value yet can't be placed in a range and are left out, with the count shown. No SQL." },
+  { date:"22 Sep 2026 (78)", summary:"One field, STAGE, replaces Status and Nature everywhere. Stored in estimates.quote_status (column keeps its name; the screens say Stage). quote_status_tbl gains sort_order, kind (open/won/lost/parked), needs_reason, win_pct and set_on_quote; seeded with Draft, Offer Sent, Cold Budgetary, Hot Budgetary, Purchase Requirement 50%, Purchase Requirement 80%, Won, Lost, Deferred, and every other stage removed. Existing quotes untouched \u2014 a quote in a removed stage keeps showing it until someone picks a current one. SHARED: loadQuoteStages (module-level cache, funnel order), stageInfo/stageKind/isClosedStage/stageNeedsReason/stagesSettableOnQuote with name-based fallbacks. The six hard-coded \\\"Won, Lost, Deferred, Went Cold\\\" lists (Log Follow-ups x3, Quotes Report, funnel board x2, Quote Status Review, dashboards) now ask the master; the reason pop-up asks needs_reason. Every read of the master uses funnel order \u2014 it was alphabetical everywhere. SCREENS: Quote screen label QUOTE STATUS -> STAGE, its dropdown offers the set_on_quote stages, NATURE dropdown removed. Log Follow-ups Nature column removed (Outcome already read the master). Quotes Report one Stage column and filter, the edit dialog is Stage + date, a removed stage shows as \\\"(no longer used)\\\". Funnel board Nature filter removed. New Sales -> Commercials Master -> Quote Stages screen: reorder, kind, reason, win %, on-Quote-screen, + Add stage; Draft and Won can't be removed. DASHBOARD: funnel in stage order; Pipeline value card (open full value and weighted by win %, naming stages with no % set); Win rate card (won vs lost closed in the period, by count and by value, wins per credited FSE; Deferred excluded). The dashboard's estimates read was .limit(3000), silently capped at 1,000 \u2014 now paged. NEEDS SQL: quote_stages_20260922_v1.sql." },
   { date:"22 Sep 2026 (77)", summary:"Quotes Report: Apply filters, Refresh, saves that report failure, and no quotes lost to the row cap. FILTERS: the list now follows an APPLIED copy of the filters, not the boxes \u2014 nothing below changes until Apply filters or Enter. Boxes changed since the last apply are outlined amber and counted on the button; Clear empties both. Chips show what is in force; \u00d7 on a chip removes that one filter and re-applies at once. initialFilters from a click-through applies immediately. REFRESH: reloads with the same filters and shows when the list was loaded; the table stays on screen while it reloads. SAVES: updateQuoteStatusForQuote, the legacy status path and applyOutcomeNature now check their update and return {error}; the report reports a refused Status, Stage, Follow-up Stage or Next Follow-up save in plain words (saveFailedText) instead of reloading silently over it, and a successful save updates its row on screen immediately (patchRow) before the confirming reload. Every other caller of those shared writers is unaffected \u2014 they ignore the new field. ROW CAP: estimates and legacy quotes are read through the new fetchPaged; activity lookups and customer lookups are chunked 150 references at a time and paged. The report reads one row per Sl No, newest first, so past 1,000 Sl Nos the oldest quotes used to drop off without a word. No SQL." },
   { date:"22 Sep 2026 (76)", summary:"Sale Orders now start from the customer's order document. PoLoiGateModal sits between choosing the Won quote and creating anything, in both create paths (SaleOrderContractPicker confirmCreate, and createSaleOrderFromQuote on the quote screen): PO or LOI, number, date, currency (limit-to-list), optional value, mandatory Drive link. Cancel creates nothing. recordOrderBasis then writes the order document (PO-<contract>-001 or LOI-<contract>-001, direction In, the first no-action status, no PDF), and for a PO fulfils the mandatory Purchase Order requirement and writes po_number/po_date to the header; for an LOI the PO requirement stays open, so the OA PDF stays blocked. sale_order_tbl gains order_basis, basis_number, basis_date, basis_value, basis_currency. LOI TRACKING: header chip \u201cOn LOI \u2014 PO awaited N days\u201d; new Pending Actions source po_awaited owed to sales_coordinator, ageing from the LOI date; LoiPoAwaitedPrompt once a day to the Sales Coordinator, Sales Head and super admins. All three clear themselves when the PO requirement is fulfilled. The Sale Order screen's Won-quote picker is now LimitToListCombo over Won quotes only (was a free predictive field over every quote). FIX: the Documents box loaded documents with entity_type quote only, so anything uploaded on a Sale Order since the 20 Sep entity_type change was saved and then never shown; it now loads by entity_id, as does deleting a reference. The same SQL repoints commercial approvals and the advance question in Pending Actions from accounts_admin (a login role) to the accounts post, and makes the PDF optional at the database. NEEDS SQL: order_basis_po_loi_20260922_v1.sql." },
   { date:"21 Sep 2026 (75)", summary:"The document Status box was empty, and adding a status failed with \\\"Could not find the 'status' column of 'doc_status_tbl'\\\". Every reader of the Document Status master asked for a column named status \u2014 ordering by it, mapping it, inserting it \u2014 and the live table has no such column, so the read failed and the list came back empty. New docStatusName / docStatusNameCol / loadDocStatuses read the name column off the rows themselves rather than assuming either name; the Admin \u2192 Document Status Master screen writes with the same answer, trying label then status on an empty table. Every reader is switched over: both Status boxes in the Documents modal, the continue box's option list, the bucket-colour lookups on the Sale Order panel and the Document Register, and the master screen's list, bucket change and delete. The Status box is now an Access-style LIMIT-TO-LIST combo (the app's existing LimitToListCombo): type and the list narrows, and only a status in the master is accepted \u2014 anything else is refused with a pointer to the master. The + Add beside it is gone: a status carries whose-move and clears-the-clock settings, and one added from the upload box would get neither, sit grey, and never count as cleared. Requirement rows that have nothing linked now read NOT YET SENT instead of \\\"Initial submission pending\\\", which read like a document status and made it look as though the status list should contain it. Also carries the 11:40 link-checking build, never deployed." },
@@ -25674,9 +25822,8 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
   };
 
   useEffect(()=>{
-    sb.from("quote_status_tbl").select("status").then(({data})=>setQuoteStatusOptions((data||[]).map(r=>r.status)));
+    loadQuoteStages(true).then(rows=>({data:rows})).then(({data})=>setQuoteStatusOptions((data||[]).map(r=>r.status)));
     sb.from("sale_order_status_tbl").select("status").order("sort_order").then(({data})=>setSoStatusOptions((data||[]).map(r=>r.status)));
-    sb.from("quote_nature_tbl").select("nature").then(({data})=>setNatureOptions((data||[]).map(r=>r.nature)));
     sb.from("project_chase_outcome_tbl").select("value").then(({data})=>setProjectOutcomeOptions((data||[]).map(r=>r.value)));
   },[]);
 
@@ -25700,7 +25847,9 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
   // left to follow up on. Same four outcomes that already require a
   // reason via WonLostOutcomeModal — deliberately the same set, not a
   // second judgment call.
-  const CLOSED_OUTCOMES = ["Won","Lost","Deferred","Went Cold","Not pursuing"];
+  // 22 Sep — closed = the stage master says won, lost or parked. "Not
+  // pursuing" is a Log Follow-ups outcome, not a stage, so it stays named.
+  const CLOSED_OUTCOMES = { includes: (o)=> o==="Not pursuing" || isClosedStage(o) };
   const nextFollowupRequired = (r)=> !CLOSED_OUTCOMES.includes(r.outcome);
   const rowHasMinimumFields = (r)=> r.companyName.trim() && r.discussedWhat.trim() && (r.notes||"").trim() && (r.nextFollowupDate || !nextFollowupRequired(r)) &&
     !((r.chaseWhat==="Offer"||r.chaseWhat==="Order"||r.chaseWhat==="Projects") && !r.chaseReference);
@@ -25760,7 +25909,7 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
   const refreshReferenceOptions = async(key,companyName,chaseWhat)=>{
     if(!companyName || chaseWhat==="Cold" || chaseWhat==="Payment"){ updateRow(key,{referenceOptions:[],chaseReference:""}); return; }
     if(chaseWhat==="Offer"){
-      const CLOSED = ["Won","Lost","Deferred","Went Cold"];
+      const CLOSED = { includes: isClosedStage };   // 22 Sep: from the stage master
       const { data } = await sb.from("estimates").select("reference_number,quote_status").eq("customer_name",companyName);
       const open = Array.from(new Map((data||[]).filter(r=>!CLOSED.includes(r.quote_status)).map(r=>[r.reference_number,r])).values());
       // Legacy quotes (30 Aug) — same customer, same open-status filter,
@@ -25872,7 +26021,7 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
         // auto-save only wrote the activity_log_tbl entry itself.
         if(r._dirty || !r._savedId) await saveOneRowSilently(r);
         if(r.chaseWhat==="Offer" && r.outcome && refNumber){
-          if(["Won","Lost","Deferred","Went Cold"].includes(r.outcome)) queue.push({referenceNumber:refNumber,newStatus:r.outcome});
+          if(isClosedStage(r.outcome)) queue.push({referenceNumber:refNumber,newStatus:r.outcome});
           else await applyOutcomeStatus(refNumber, r.outcome, user.username, "Follow-up log");
         } else if(r.chaseWhat==="Order" && r.outcome && refNumber){
           await sb.from("sale_order_tbl").update({status:r.outcome}).eq("contract_number",refNumber);
@@ -25914,7 +26063,7 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
   const boxStyle = (extra)=>({fontFamily:F,fontSize:14,padding:"2px 4px",border:"1px solid "+T.border,borderRadius:2,width:"100%",height:30,boxSizing:"border-box",...extra});
   // Column widths — the user's exact adjusted values (converted back
   // from the Excel character-width units they left them in).
-  const COLW = [280,100,90,150,130,320,90,180,120,55];
+  const COLW = [280,100,90,150,130,380,100,240,55];   // 22 Sep: Nature column removed; its width given to Discussed What and Outcome
   const activeRow = rows.find(r=>r._key===activeRowKey) || rows[0];
 
   if(historyView) return h(FollowupHistoryScreen,{scope:historyView.scope, value:historyView.value, user, onBack:()=>setHistoryView(null)});
@@ -25987,7 +26136,7 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
         h("colgroup",null, COLW.map((w,i)=>h("col",{key:i,style:{width:w}}))),
         h("thead",null,
           h("tr",{style:{background:"#eef6f3",height:43}},
-            ["Customer","Mode","Chase What","Reference","Contacted Whom","Discussed What","Next Follow up","Outcome","Nature",""].map(hdr=>
+            ["Customer","Mode","Chase What","Reference","Contacted Whom","Discussed What","Next Follow up","Outcome",""].map(hdr=>
               h("th",{key:hdr,style:{padding:"4px 6px",textAlign:"left",borderBottom:"1px solid "+T.border,borderRight:"1px solid #e2ede9"}},hdr))
           )
         ),
@@ -26036,12 +26185,7 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
                 r.chaseWhat==="Projects" && h("option",{value:"__add_new__"},"+ Add new…")
               )
             ),
-            h("td",{style:td}, r.chaseWhat!=="Offer" ? h("span",{style:{color:T.muted}},"—") :
-              h("select",{value:r.nature,onChange:e=>updateRow(r._key,{nature:e.target.value}),onFocus:onFocusRow,style:boxStyle({})},
-                h("option",{value:""},"— no change —"),
-                natureOptions.map(n=>h("option",{key:n,value:n},n))
-              )
-            ),
+            // Nature column removed 22 Sep — the Outcome's Stage carries it now.
             h("td",{style:{...td,textAlign:"center",display:"flex",gap:4,alignItems:"center",justifyContent:"center"}},
               h("span",{title:"History",style:{color:T.accent,cursor:"pointer",fontSize:11},onClick:()=>setHistoryPopupFor({companyName:r.companyName,chaseReference:r.chaseReference})},"🕐"),
               h("span",{title:"Remove row",style:{color:T.muted,cursor:"pointer"},onClick:()=>removeRow(r._key)},"✕")
@@ -26258,7 +26402,7 @@ function DraftOfferReminder({ user, onDone }){
     (async()=>{
       const [{data:draftRows},{data:statusRows}] = await Promise.all([
         sb.from("estimates").select("id,reference_number,item_sl_no,customer_name,quote_status").eq("quote_status","Draft").order("reference_number"),
-        sb.from("quote_status_tbl").select("status").order("status")
+        loadQuoteStages(true).then(rows=>({data:rows}))   /* 22 Sep: funnel order, not alphabetical */
       ]);
       // Status is now one value per Quote#, shared across every Sl No — so
       // this list shows one row per Quote#, not one per Sl No (which would
@@ -29110,7 +29254,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   const [stageNotes,setStageNotes] = useState("");
   const [stageNextDate,setStageNextDate] = useState("");
   const [stageBusy,setStageBusy] = useState(false);
-  const CLOSED_OUTCOMES_QR = ["Won","Lost","Deferred","Went Cold"];
+  const CLOSED_OUTCOMES_QR = { includes: isClosedStage };   // 22 Sep: from the stage master
   const canEditFreely = async(customerName)=>{
     if(user.role==="super_admin") return true;
     if(user.role==="admin"){
@@ -29240,6 +29384,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   const [filters,setFilters] = useState({
     dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"", countryLike:"",
     zone:"", status:"", nature:"", followUp:"", projectLike:"",
+    valueCcy:"INR", valueMin:"", valueMax:"", usdRate:"",
     ...(initialFilters||{})
   });
   const setF = (k,v)=> setFilters(f=>({...f,[k]:v}));
@@ -29248,7 +29393,8 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   // filters can be set up without the rows jumping at every keystroke.
   const [applied,setApplied] = useState(()=>({
     dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"", countryLike:"",
-    zone:"", status:"", nature:"", followUp:"", projectLike:"", ...(initialFilters||{})
+    zone:"", status:"", nature:"", followUp:"", projectLike:"",
+    valueCcy:"INR", valueMin:"", valueMax:"", usdRate:"", ...(initialFilters||{})
   }));
   const filtersRef = useRef(filters);
   useEffect(()=>{ filtersRef.current = filters; },[filters]);
@@ -29256,13 +29402,29 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   // the same Enter press is included.
   const applyFilters = ()=> setTimeout(()=>setApplied({...filtersRef.current}),0);
   const FILTER_LABELS = { dateFrom:"From", dateTo:"To", refLike:"Reference", customerLike:"Customer", projectLike:"Project",
-    countryLike:"Country", stateLike:"State", cityLike:"City", zone:"Region", status:"Status", nature:"Stage", followUp:"Follow-up" };
+    countryLike:"Country", stateLike:"State", cityLike:"City", zone:"Region", status:"Stage", followUp:"Follow-up", valueMin:"Value \u2265", valueMax:"Value \u2264", valueCcy:"Value in", usdRate:"USD rate" };
   const pendingKeys = Object.keys(FILTER_LABELS).filter(k=>(filters[k]||"")!==(applied[k]||""));
+  const valueRangeOn = applied.valueMin!=="" || applied.valueMax!=="";
+  const chipKeys = Object.keys(FILTER_LABELS).filter(k=>applied[k] && ((k!=="valueCcy" && k!=="usdRate") || valueRangeOn));
   const clearFilters = ()=>{
-    const blank = Object.fromEntries(Object.keys(FILTER_LABELS).map(k=>[k,""]));
+    const blank = { ...Object.fromEntries(Object.keys(FILTER_LABELS).map(k=>[k,""])), valueCcy:"INR" };
     setFilters(f=>({...f,...blank})); setApplied(a=>({...a,...blank}));
   };
-  const removeApplied = (k)=>{ setFilters(f=>({...f,[k]:""})); setApplied(a=>({...a,[k]:""})); };
+  const removeApplied = (k)=>{ const v = k==="valueCcy" ? "INR" : ""; setFilters(f=>({...f,[k]:v})); setApplied(a=>({...a,[k]:v})); };
+  // The value used for the range filter, in the chosen currency. INR uses
+  // each quote's rupee value; USD converts that at one USD rate for every
+  // quote, so an INR quote and a USD quote can be compared at all. The
+  // rate defaults to the most recent USD quote's own rate.
+  const defaultUsdRate = (()=>{ const r = rows.find(x=>x.currency==="USD" && x.fx_to_inr>1); return r ? r.fx_to_inr : null; })();
+  const usdRateInUse = Number(applied.usdRate) || defaultUsdRate || null;
+  const valueIn = (r, ccy)=>{
+    if(r.value_inr==null) return null;
+    if(ccy==="USD"){
+      if(r.currency==="USD" && r.value_ccy!=null) return r.value_ccy;
+      return usdRateInUse ? r.value_inr/usdRateInUse : null;
+    }
+    return r.value_inr;
+  };
   // Country->State->City (29 Aug fix) — pulls from the real master
   // tables (WORLD_COUNTRIES, state_zone_tbl, city_tbl), same as the
   // Customer form, not just whatever happens to already exist in this
@@ -29287,7 +29449,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     try{
       // 22 Sep — paged. One row per Sl No, capped at 1,000 per read, so
       // the oldest quotes used to fall off the report without a word.
-      const estRows = await fetchPaged(()=>sb.from("estimates").select("reference_number,customer_name,quote_date,created_at,quote_status,quote_nature,linked_project_id,status_changed_at,status_changed_by,quote_nature_changed_at,quote_nature_changed_by")
+      const estRows = await fetchPaged(()=>sb.from("estimates").select("reference_number,customer_name,quote_date,created_at,quote_status,quote_nature,linked_project_id,status_changed_at,status_changed_by,quote_nature_changed_at,quote_nature_changed_by,currency,conversion_rate")
         .order("created_at",{ascending:false}));
       const byRef = new Map();
       (estRows||[]).forEach(r=>{ if(!byRef.has(r.reference_number)) byRef.set(r.reference_number,r); });
@@ -29331,10 +29493,16 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       for(let k=0;k<allRefs.length;k+=150){
         const chunk = allRefs.slice(k,k+150);
         acts = acts.concat(await fetchPaged(()=>sb.from("activity_log_tbl")
-          .select("chase_reference,outcome,notes,next_followup_date,created_at")
+          .select("chase_reference,outcome,notes,next_followup_date,created_at,activity_date,activity_type,logged_by,contacted_whom,discussed_what")
           .in("chase_reference",chunk).order("created_at",{ascending:false})));
       }
       acts.sort((a,b)=>String(b.created_at).localeCompare(String(a.created_at)));
+      // Quote values (22 Sep) — from the value snapshot: rupees for every
+      // quote, plus the figure in the quote's own currency. A quote never
+      // opened since snapshots began has no value yet, and says so.
+      const snaps = await fetchPaged(()=>sb.from("quote_value_snapshot_tbl")
+        .select("reference_number,total_value,total_value_in_currency,currency").order("reference_number"));
+      const snapByRef = new Map(snaps.map(sn=>[sn.reference_number,sn]));
       const latestActByRef = new Map();
       (acts||[]).forEach(a=>{ if(a.chase_reference && !latestActByRef.has(a.chase_reference)) latestActByRef.set(a.chase_reference,a); });
       const stageText = (act)=>{
@@ -29372,6 +29540,12 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           nature: h.quote_nature||"Unknown",
           project_reference: h.linked_project_id ? (projById.get(h.linked_project_id)||"—") : "—",
           followup_stage: stageText(act)||"—",
+          last_interaction: act ? { date:(act.activity_date||act.created_at||"").slice(0,10), type:act.activity_type||"", by:act.logged_by||"",
+            whom:act.contacted_whom||"", text:[act.outcome, act.notes||act.discussed_what].filter(x=>x&&String(x).trim()).join(" \u2014 ") } : null,
+          value_inr: snapByRef.has(h.reference_number) ? Number(snapByRef.get(h.reference_number).total_value)||0 : null,
+          value_ccy: snapByRef.has(h.reference_number) ? Number(snapByRef.get(h.reference_number).total_value_in_currency ?? snapByRef.get(h.reference_number).total_value)||0 : null,
+          currency: (snapByRef.get(h.reference_number)||{}).currency || h.currency || "INR",
+          fx_to_inr: Number(h.conversion_rate)||null,
           next_followup: act?.next_followup_date||"—",
           last_updated: lastUpdated(h),
           is_legacy: false,
@@ -29394,6 +29568,10 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           // A real logged call takes over from the frozen import note
           // the moment one exists — see comment above.
           followup_stage: stageText(act)||l.followup_note||"—",
+          last_interaction: act ? { date:(act.activity_date||act.created_at||"").slice(0,10), type:act.activity_type||"", by:act.logged_by||"",
+            whom:act.contacted_whom||"", text:[act.outcome, act.notes||act.discussed_what].filter(x=>x&&String(x).trim()).join(" \u2014 ") }
+            : (l.followup_note ? { date:"", type:"Imported", by:"", whom:"", text:l.followup_note } : null),
+          value_inr: null, value_ccy: null, currency: "INR", fx_to_inr: null,
           next_followup: act?.next_followup_date||l.next_followup_date||"—",
           last_updated: lastUpdated(l),
           is_legacy: true,
@@ -29407,8 +29585,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   useEffect(()=>{ load(); },[load]);
   useEffect(()=>{
     sb.from("zone_tbl").select("value").then(({data})=>setZoneOptions((data||[]).map(r=>r.value)));
-    sb.from("quote_status_tbl").select("status").then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
-    sb.from("quote_nature_tbl").select("nature").then(({data})=>setReportNatureOptions((data||[]).map(r=>r.nature)));
+    loadQuoteStages(true).then(rows=>({data:rows})).then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
   },[]);
 
   // Follow-up Status is computed, not stored — Overdue/Due today/
@@ -29432,9 +29609,14 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     if(applied.countryLike && r.country!==applied.countryLike) return false;
     if(applied.zone && r.region!==applied.zone) return false;
     if(applied.status && r.status!==applied.status) return false;
-    if(applied.nature && r.nature!==applied.nature) return false;
     if(applied.followUp && followUpBucket(r)!==applied.followUp) return false;
     if(applied.projectLike && !(r.project_reference||"").toLowerCase().includes(applied.projectLike.toLowerCase())) return false;
+    if(applied.valueMin!=="" || applied.valueMax!==""){
+      const v = valueIn(r, applied.valueCcy||"INR");
+      if(v==null) return false;   // no value yet — can't be placed in a range
+      if(applied.valueMin!=="" && v < Number(applied.valueMin)) return false;
+      if(applied.valueMax!=="" && v > Number(applied.valueMax)) return false;
+    }
     return true;
   });
 
@@ -29461,7 +29643,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   h("div",{style:{padding:"20px 24px",fontSize:14}},
     h("div",{style:{background:"#fff",border:"1px solid #cfe3dd",borderLeft:"4px solid #0f7a5c",borderRadius:6,padding:"12px 16px",marginBottom:14}},
       h("div",{style:{fontWeight:700,fontSize:16,color:"#124c3d"}},"Quotes Report"),
-      h("div",{style:{fontSize:11.5,color:"#8a9d97",marginTop:2}},"Click Status, Stage, or Follow-up Stage to edit inline")
+      h("div",{style:{fontSize:11.5,color:"#8a9d97",marginTop:2}},"Click the Stage to change it; + beside Next Follow-up to set one")
     ),
     h("div",{onKeyDown:e=>{ if(e.key==="Enter") applyFilters(); },style:{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:16,background:"#faf9f4",padding:14,borderRadius:8}},
       fld("Reference Date >=", h("input",{type:"date",value:filters.dateFrom,onChange:e=>setF("dateFrom",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),"dateFrom"),
@@ -29478,18 +29660,33 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       fld("Region (Zone)", h("select",{value:filters.zone,onChange:e=>setF("zone",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), zoneOptions.map(z=>h("option",{key:z,value:z},z))
       ),"zone"),
-      fld("Status", h("select",{value:filters.status,onChange:e=>setF("status",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
+      fld("Stage", h("select",{value:filters.status,onChange:e=>setF("status",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), statusOptions.map(s=>h("option",{key:s,value:s},s))
       ),"status"),
-      // Relabeled "Stage" in the UI (31 Aug) — same underlying values
-      // (Unknown/Budgetary/Purchase Requirement), filters.nature key
-      // left unchanged internally.
-      fld("Stage", h("select",{value:filters.nature,onChange:e=>setF("nature",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
-        h("option",{value:""},"All"), reportNatureOptions.map(n=>h("option",{key:n,value:n},n))
-      ),"nature"),
+      // The old Nature filter (shown as "Stage") was removed 22 Sep — Stage
+      // is now the single funnel field, filtered by the box before this.
       fld("Follow-up Status", h("select",{value:filters.followUp,onChange:e=>setF("followUp",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"),["Overdue","Due today","Upcoming","None"].map(s=>h("option",{key:s,value:s},s))
-      ),"followUp")
+      ),"followUp"),
+      // Quote value range (22 Sep). INR compares every quote's rupee value;
+      // USD converts at one rate for all quotes so they can be compared —
+      // defaulting to the latest USD quote's rate, editable.
+      h("div",{style:{gridColumn:"span 2"}},
+        h("label",{style:{display:"block",fontSize:10.5,color:["valueCcy","valueMin","valueMax","usdRate"].some(k=>pendingKeys.includes(k))?"#854f0b":colors.muted,marginBottom:3}},"Quote value"),
+        h("div",{style:{display:"flex",gap:6,alignItems:"center",
+          outline:["valueCcy","valueMin","valueMax","usdRate"].some(k=>pendingKeys.includes(k))?"1.5px solid #ef9f27":"none",borderRadius:6}},
+          h("select",{value:filters.valueCcy||"INR",onChange:e=>setF("valueCcy",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12,width:70}},
+            h("option",{value:"INR"},"INR"),h("option",{value:"USD"},"USD")),
+          h("input",{value:filters.valueMin,onChange:e=>setF("valueMin",e.target.value.replace(/[^0-9.]/g,"")),placeholder:"more than",style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+          h("span",{style:{fontSize:11,color:colors.mutedLight}},"to"),
+          h("input",{value:filters.valueMax,onChange:e=>setF("valueMax",e.target.value.replace(/[^0-9.]/g,"")),placeholder:"less than",style:{...inputStyle,padding:"6px 8px",fontSize:12}})
+        ),
+        (filters.valueCcy==="USD") && h("div",{style:{display:"flex",gap:6,alignItems:"center",marginTop:4}},
+          h("span",{style:{fontSize:10.5,color:colors.muted}},"1 USD ="),
+          h("input",{value:filters.usdRate,onChange:e=>setF("usdRate",e.target.value.replace(/[^0-9.]/g,"")),placeholder:defaultUsdRate?String(defaultUsdRate):"rate",style:{...inputStyle,padding:"4px 6px",fontSize:11.5,width:80}}),
+          h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"INR"+(defaultUsdRate&&!filters.usdRate?" (latest USD quote)":""))
+        )
+      )
     ),
     // Apply bar (22 Sep). The list below only changes when Apply filters
     // or Enter is pressed; boxes changed since then are outlined amber.
@@ -29505,8 +29702,10 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     // What is actually in force, with Refresh and how old the list is.
     h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:10}},
       h("span",{style:{fontSize:13,fontWeight:700}},filtered.length+" quote"+(filtered.length===1?"":"s")),
-      Object.keys(FILTER_LABELS).filter(k=>applied[k]).length>0 && h("span",{style:{fontSize:11.5,color:colors.muted}},"filtered by"),
-      Object.keys(FILTER_LABELS).filter(k=>applied[k]).map(k=>h("span",{key:k,
+      valueRangeOn && h("span",{style:{fontSize:11,color:"#854f0b"},title:"Quotes that have never been opened since values began being recorded have no value yet, so they can't be placed in a range."},
+        "\u00b7 "+rows.filter(r=>r.value_inr==null).length+" without a value left out"),
+      chipKeys.length>0 && h("span",{style:{fontSize:11.5,color:colors.muted}},"filtered by"),
+      chipKeys.map(k=>h("span",{key:k,
         style:{fontSize:11,padding:"3px 4px 3px 10px",borderRadius:12,background:"#e6f1fb",color:"#0c447c",display:"inline-flex",alignItems:"center",gap:4}},
         FILTER_LABELS[k]+": "+applied[k],
         h("button",{onClick:()=>removeApplied(k),title:"Remove this filter",
@@ -29519,7 +29718,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     h("div",{style:{overflowX:"auto",background:"#fff",border:"1px solid #cfe3dd",borderRadius:6}},
       h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:14}},
         h("thead",null,h("tr",{style:{background:"#eef6f3",textAlign:"left"}},
-          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Status","Stage","Project Reference","Follow-up Stage","Next Follow-up",""].map(c=>
+          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Stage","Value","Project Reference","Last interaction","Next Follow-up",""].map(c=>
             h("th",{key:c,style:{padding:"9px 10px",borderBottom:"2px solid #0f7a5c",whiteSpace:"nowrap",fontSize:11.5,color:"#4c6a61"}},c))
         )),
         h("tbody",null, filtered.map((r,i)=>h("tr",{key:r.reference_number,style:{borderBottom:"1px solid #e2ede9"}},
@@ -29538,15 +29737,26 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           h("td",{style:{padding:"10px"}},r.city),
           h("td",{style:{padding:"10px"}},r.state),
           h("td",{style:{padding:"10px"}},
-            h("span",{onClick:()=>openEditor(r),title:"Click to edit Status/Stage",style:{cursor:"pointer",fontSize:12,padding:"3px 10px",borderRadius:10,background:"#eaf9f4",color:"#085041",fontWeight:600}},r.status+" ✎"),
+            h("span",{onClick:()=>openEditor(r),title:"Click to change the Stage",style:{cursor:"pointer",fontSize:12,padding:"3px 10px",borderRadius:10,background:"#eaf9f4",color:"#085041",fontWeight:600}},r.status+" ✎"),
             r.last_updated && h("div",{style:{fontSize:9,color:colors.mutedLight,marginTop:3}},"Updated "+new Date(r.last_updated.at).toLocaleDateString()+(r.last_updated.by?" by "+r.last_updated.by:""))
           ),
-          h("td",{style:{padding:"10px"}},
-            h("span",{onClick:()=>openEditor(r),title:"Click to edit Status/Stage",style:{cursor:"pointer",fontSize:12,padding:"3px 10px",borderRadius:10,background:"#faf3e6",color:"#8a5a0c",fontWeight:600}},r.nature+" ✎")
-          ),
+          // Value (22 Sep): the quote's own currency, rupees underneath
+          // when different. Blank until the quote has been opened once.
+          h("td",{style:{padding:"10px",whiteSpace:"nowrap",textAlign:"right"}},
+            r.value_inr==null ? h("span",{style:{color:colors.mutedLight}},"\u2014")
+              : h(React.Fragment,null,
+                  h("div",{style:{fontWeight:600}},(r.currency||"INR")+" "+Math.round(r.value_ccy).toLocaleString("en-IN")),
+                  r.currency && r.currency!=="INR" && h("div",{style:{fontSize:10.5,color:colors.mutedLight}},"INR "+Math.round(r.value_inr).toLocaleString("en-IN")))),
           h("td",{style:{padding:"10px"}},r.project_reference),
-          h("td",{style:{padding:"10px"}},
-            h("span",{onClick:()=>openStageEditor(r),title:"Click to log an update",style:{cursor:"pointer",color:"#0f7a5c",textDecoration:"underline dotted"}},r.followup_stage+" ✎")
+          // Last interaction (22 Sep) replaces Follow-up Stage: what was
+          // actually last done on this quote, when, how and by whom.
+          h("td",{style:{padding:"10px",maxWidth:300}},
+            !r.last_interaction ? h("span",{style:{color:colors.mutedLight}},"No interaction logged")
+              : h("div",{title:r.last_interaction.text||""},
+                  h("div",{style:{fontSize:11,color:colors.muted}},
+                    [r.last_interaction.date, r.last_interaction.type, r.last_interaction.by, r.last_interaction.whom ? "with "+r.last_interaction.whom : ""].filter(Boolean).join(" \u00b7 ")),
+                  h("div",{style:{fontSize:12.5,overflow:"hidden",textOverflow:"ellipsis",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}},
+                    r.last_interaction.text||"\u2014"))
           ),
           h("td",{style:{padding:"10px"}},
             r.next_followup, " ",
@@ -29584,13 +29794,12 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   editFor && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center"}},
     h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"90%"}},
       h("div",{style:{fontWeight:700,fontSize:14,marginBottom:14}},"Edit — "+editFor.reference_number),
-      h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Status"),
-      h("select",{value:editStatusValue,onChange:e=>setEditStatusValue(e.target.value),style:{...inputStyle,marginBottom:12}},
-        statusOptions.map(s=>h("option",{key:s,value:s},s))
-      ),
       h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Stage"),
-      h("select",{value:editNatureValue,onChange:e=>setEditNatureValue(e.target.value),style:{...inputStyle,marginBottom:12}},
-        reportNatureOptions.map(n=>h("option",{key:n,value:n},n))
+      h("select",{value:editStatusValue,onChange:e=>setEditStatusValue(e.target.value),style:{...inputStyle,marginBottom:12}},
+        // A quote still in a stage that's since been removed shows it, marked,
+        // so the box reads true until someone picks a current one.
+        (statusOptions.includes(editStatusValue)||!editStatusValue ? [] : [h("option",{key:"__old",value:editStatusValue},editStatusValue+" (no longer used)")]),
+        statusOptions.map(s=>h("option",{key:s,value:s},s))
       ),
       h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Date this actually changed"),
       h("input",{type:"date",value:editDate,onChange:e=>setEditDate(e.target.value),style:{...inputStyle,marginBottom:16}}),
@@ -29747,9 +29956,12 @@ function CrmDashboardsScreen({ user, onDrillToQuotesReport, onOpenQuote, onGoToT
   const load = useCallback(async()=>{
     setLoading(true);
     try{
-      const { data: estRows } = await sb.from("estimates")
+      // 22 Sep — paged; .limit(3000) was silently capped at 1,000 rows by
+      // the database, so older quotes were missing from every card.
+      const estRows = await fetchPaged(()=>sb.from("estimates")
         .select("reference_number,customer_name,quote_status,quote_date,created_at,status_changed_by,status_changed_at,status_reason")
-        .order("created_at",{ascending:false}).limit(3000);
+        .order("created_at",{ascending:false}));
+      await loadQuoteStages(true);
       const byRef = new Map();
       (estRows||[]).forEach(r=>{ if(!byRef.has(r.reference_number)) byRef.set(r.reference_number,r); });
       const quotes = Array.from(byRef.values());
@@ -29824,7 +30036,7 @@ function CrmDashboardsScreen({ user, onDrillToQuotesReport, onOpenQuote, onGoToT
     h("p",{style:{fontSize:11,color:"#8a9d97",marginTop:-8,marginBottom:16}},"Showing "+from+" to "+to),
     loading || !data ? h("div",{style:{color:"#8a9d97"}},"Loading…") : (()=>{
       const { quotes, activities, outcomes, coByName, legacyRows, valueByRef } = data;
-      const CLOSED = ["Won","Lost","Deferred","Went Cold"];
+      const CLOSED = { includes: isClosedStage };   // 22 Sep: from the stage master
       const isOpen = q=>!CLOSED.includes(q.quote_status);
       const changedInPeriod = q=>q.status_changed_at && q.status_changed_at.slice(0,10)>=from && q.status_changed_at.slice(0,10)<=to;
       const outcomeByRef = new Map(outcomes.map(o=>[o.reference_number,o]));
@@ -29836,6 +30048,38 @@ function CrmDashboardsScreen({ user, onDrillToQuotesReport, onOpenQuote, onGoToT
       // 1. Funnel with drop-off — count + real ₹ value, clickable stage
       const funnelCounts = {}, funnelValue = {};
       quotes.forEach(q=>{ funnelCounts[q.quote_status]=(funnelCounts[q.quote_status]||0)+1; funnelValue[q.quote_status]=(funnelValue[q.quote_status]||0)+(valueByRef.get(q.reference_number)||0); });
+
+      // Funnel order from the stage master (22 Sep), not the order quotes
+      // happened to be read in; stages no longer in the master go last.
+      const stageOrder = (st)=>{ const i = QUOTE_STAGE_CACHE.findIndex(r=>r.status===st); return i<0 ? 999 : i; };
+      const funnelEntries = Object.entries(funnelCounts).sort((a,b)=>stageOrder(a[0])-stageOrder(b[0]));
+
+      // 1b. Weighted pipeline (22 Sep) — each open quote counted at its
+      // stage's win % from the master. A stage with no % set is left out
+      // of the weighted figure and says so, rather than guessing.
+      let rawOpen = 0, weighted = 0, unweightedValue = 0;
+      const unweightedStages = new Set();
+      quotes.filter(isOpen).forEach(q=>{
+        const v = valueByRef.get(q.reference_number)||0;
+        rawOpen += v;
+        const pct = stageInfo(q.quote_status).win_pct;
+        if(pct==null || pct===""){ if(v>0){ unweightedValue += v; unweightedStages.add(q.quote_status); } }
+        else weighted += v*Number(pct)/100;
+      });
+
+      // 1c. Win rate (22 Sep) — of the quotes that CLOSED in the period, how
+      // many were won. Parked stages (Deferred) haven't closed and aren't
+      // counted either way. By count and by value, overall and per FSE
+      // credited with the win (Lost has no FSE, so per-FSE is wins only).
+      const closedInPeriod = quotes.filter(q=>changedInPeriod(q) && ["won","lost"].includes(stageKind(q.quote_status)));
+      const wonQ = closedInPeriod.filter(q=>stageKind(q.quote_status)==="won");
+      const lostQ = closedInPeriod.filter(q=>stageKind(q.quote_status)==="lost");
+      const winRateCount = closedInPeriod.length ? Math.round(100*wonQ.length/closedInPeriod.length) : null;
+      const valOf = (list)=> list.reduce((a,q)=>a+(valueByRef.get(q.reference_number)||0),0);
+      const wonVal = valOf(wonQ), lostVal = valOf(lostQ);
+      const winRateValue = (wonVal+lostVal)>0 ? Math.round(100*wonVal/(wonVal+lostVal)) : null;
+      const winsByFse = {};
+      wonQ.forEach(q=>{ const f = outcomeByRef.get(q.reference_number)?.credited_fse || "(no FSE credited)"; winsByFse[f]=(winsByFse[f]||0)+1; });
 
       // 2. Stalled deals
       const staleCutoff = new Date(Date.now()-21*86400000);
@@ -29915,11 +30159,29 @@ function CrmDashboardsScreen({ user, onDrillToQuotesReport, onOpenQuote, onGoToT
 
       return h(React.Fragment,null,
         category("Pipeline Health",[
-          card("Funnel with drop-off", h(React.Fragment,null,
-              barChart(Object.entries(funnelCounts), (v)=>v, drillStatus),
-              Object.entries(funnelCounts).map(([s,c])=>line(s+" — "+c+" ("+fmtCr(funnelValue[s]||0)+")",false,()=>drillStatus(s)))
+          card("Funnel by stage", h(React.Fragment,null,
+              barChart(funnelEntries, (v)=>v, drillStatus),
+              funnelEntries.map(([s,c])=>line(s+" — "+c+" ("+fmtCr(funnelValue[s]||0)+")",false,()=>drillStatus(s)))
             )
           ),
+          card("Pipeline value", h(React.Fragment,null,
+              h("div",{style:{display:"flex",gap:16,marginBottom:6}},
+                h("div",null,h("div",{style:{fontSize:10.5,color:"#6b8e83"}},"Open, full value"),h("div",{style:{fontSize:17,fontWeight:700}},fmtCr(rawOpen))),
+                h("div",null,h("div",{style:{fontSize:10.5,color:"#6b8e83"}},"Weighted by stage"),h("div",{style:{fontSize:17,fontWeight:700,color:"#0f7a5c"}},fmtCr(weighted)))),
+              line("Each open quote counted at its stage's win % \u2014 set in Quote Stages."),
+              unweightedStages.size>0 && line(fmtCr(unweightedValue)+" not weighted \u2014 no win % set for: "+Array.from(unweightedStages).join(", "), true)
+            )
+          ),
+          card("Win rate", h(React.Fragment,null,
+              winRateCount==null ? line("No quotes won or lost in this period.") : h(React.Fragment,null,
+                h("div",{style:{display:"flex",gap:16,marginBottom:6}},
+                  h("div",null,h("div",{style:{fontSize:10.5,color:"#6b8e83"}},"By count"),h("div",{style:{fontSize:17,fontWeight:700}},winRateCount+"%")),
+                  h("div",null,h("div",{style:{fontSize:10.5,color:"#6b8e83"}},"By value"),h("div",{style:{fontSize:17,fontWeight:700}},winRateValue==null?"\u2014":winRateValue+"%"))),
+                line(wonQ.length+" won ("+fmtCr(wonVal)+") \u00b7 "+lostQ.length+" lost ("+fmtCr(lostVal)+")"),
+                line("Deferred quotes haven't closed and aren't counted."),
+                expandedCard==="winsbyfse" && detailList(Object.entries(winsByFse).sort((a,b)=>b[1]-a[1]), ([f,n])=>f+" \u2014 "+n+" won")
+              )
+            ), Object.keys(winsByFse).length>0 ? "winsbyfse" : null),
           card("Stalled deals (21+ days untouched)", h(React.Fragment,null,
             stalled.length===0?line("None."):line(stalled.length+" quote(s) open with no recent activity",true),
             expandedCard==="stalled" && detailList(stalled, q=>q.reference_number+" — "+q.customer_name)
@@ -29999,13 +30261,12 @@ function CrmFunnelKanban({ user }){
   useEffect(()=>{
     sb.from("employee_tbl").select("employee_name").eq("department","Sales").order("employee_name").then(({data})=>setOwnerOptions((data||[]).map(r=>r.employee_name).filter(Boolean)));
     sb.from("zone_tbl").select("value").order("value").then(({data})=>setZoneOptions((data||[]).map(r=>r.value)));
-    sb.from("quote_nature_tbl").select("nature").then(({data})=>setNatureOptions((data||[]).map(r=>r.nature)));
   },[]);
 
   const load = useCallback(async()=>{
     setLoading(true);
     const [{data:statusRows},{data:estimatesRows},{data:legacyRows}] = await Promise.all([
-      sb.from("quote_status_tbl").select("status").order("status"),
+      loadQuoteStages(true).then(rows=>({data:rows}))   /* 22 Sep: funnel order, not alphabetical */,
       sb.from("estimates").select("id,reference_number,item_sl_no,customer_name,description,quote_status,quote_nature,order_qty,status_changed_by,status_changed_at"),
       // Legacy quotes (31 Aug) — previously missing from this board
       // entirely. No BOM/Sl No/line items behind a legacy row, so no
@@ -30074,7 +30335,7 @@ function CrmFunnelKanban({ user }){
     moveCardChecked(card,newStatus);
   };
   const moveCardChecked = (card, newStatus)=>{
-    if(newStatus==="Won"||newStatus==="Lost"||newStatus==="Deferred"||newStatus==="Went Cold"){ setOutcomeTarget({card,newStatus}); return; }
+    if(isClosedStage(newStatus)){ setOutcomeTarget({card,newStatus}); return; }
     doMoveCard(card,newStatus);
   };
 
@@ -30098,7 +30359,7 @@ function CrmFunnelKanban({ user }){
   // "perspective" split: funnel progress on top, terminal results below.
   // Any status this app doesn't recognize as closed falls into the open
   // row as a safety net, rather than silently vanishing off the board.
-  const CLOSED_STATUSES = ["Won","Lost","Deferred","Went Cold"];
+  const CLOSED_STATUSES = { includes: isClosedStage };   // 22 Sep: from the stage master
   const openRow = statuses.filter(s=>!CLOSED_STATUSES.includes(s));
   const closedRow = statuses.filter(s=>CLOSED_STATUSES.includes(s));
 
@@ -30161,9 +30422,7 @@ function CrmFunnelKanban({ user }){
       h("select",{value:filters.zone,onChange:e=>setF("zone",e.target.value),style:{...inputStyle,width:"auto",padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"Zone: All"), zoneOptions.map(z=>h("option",{key:z,value:z},z))
       ),
-      h("select",{value:filters.nature,onChange:e=>setF("nature",e.target.value),style:{...inputStyle,width:"auto",padding:"6px 8px",fontSize:12}},
-        h("option",{value:""},"Nature: All"), natureOptions.map(n=>h("option",{key:n,value:n},n))
-      ),
+      // Nature filter removed 22 Sep — Stage is the one funnel field.
       h("label",{style:{fontSize:11.5,color:colors.muted,display:"flex",alignItems:"center",gap:4}},
         h("input",{type:"checkbox",checked:filters.includeLegacy,onChange:e=>setF("includeLegacy",e.target.checked)}),"Include Legacy"
       ),
@@ -30219,7 +30478,7 @@ function QuoteStatusReport(){
 
   useEffect(()=>{
     (async()=>{
-      const { data } = await sb.from("quote_status_tbl").select("status").order("status");
+      const { data } = await loadQuoteStages(true).then(rows=>({data:rows}))   /* 22 Sep: funnel order, not alphabetical */;
       setStatuses((data||[]).map(r=>r.status).filter(Boolean));
     })();
   },[]);
@@ -30332,7 +30591,7 @@ function QuoteStatusReview({ user }){
   const load = useCallback(async()=>{
     setLoading(true);
     const [{data:statusRows},{data:empRows},{data:estRows},{data:coRows}] = await Promise.all([
-      sb.from("quote_status_tbl").select("status").order("status"),
+      loadQuoteStages(true).then(rows=>({data:rows}))   /* 22 Sep: funnel order, not alphabetical */,
       sb.from("employee_tbl").select("employee_name").eq("status","Active").order("employee_name"),
       sb.from("estimates").select("id,reference_number,item_sl_no,customer_name,description,quote_status,order_qty,company_id,status_changed_by,status_changed_at"),
       sb.from("companies").select("id,company_name,zone,billing_state,billing_city,owner_employee_name")
@@ -30389,7 +30648,7 @@ function QuoteStatusReview({ user }){
     changeStatusChecked(row,newStatus);
   };
   const changeStatusChecked = (row,newStatus)=>{
-    if(newStatus==="Won"||newStatus==="Lost"||newStatus==="Deferred"||newStatus==="Went Cold"){ setOutcomeTarget({referenceNumber:row.reference_number,newStatus}); return; }
+    if(isClosedStage(newStatus)){ setOutcomeTarget({referenceNumber:row.reference_number,newStatus}); return; }
     doChangeStatus(row,newStatus);
   };
 
@@ -31012,7 +31271,7 @@ function WonByOwnerReport(){
   const load = useCallback(async(statusesToUse)=>{
     setLoading(true);
     const [{data:allStatusRows},{data:estRows},{data:coRows}] = await Promise.all([
-      sb.from("quote_status_tbl").select("status").order("status"),
+      loadQuoteStages(true).then(rows=>({data:rows}))   /* 22 Sep: funnel order, not alphabetical */,
       sb.from("estimates").select("id,reference_number,item_sl_no,quote_status,order_qty,company_id"),
       sb.from("companies").select("id,owner_employee_name")
     ]);
@@ -36080,6 +36339,7 @@ function App() {
         : h("div",{style:{fontSize:12,color:colors.mutedLight,marginBottom:14}},"Authored by K.Bala Boopathy"),
       h("div",{style:{fontSize:11,color:colors.mutedLight}},"Pick Quotes from Sales, or Engineering Calc above, to get started.")
     ):
+    tab==="quote_status_tbl"?h(QuoteStagesMaster,{user}):
     (tab!=="estimator" && tab!=="home"?h(MasterEditor,{tableKey:tab,key:tab,user}):null)
   );
 }
