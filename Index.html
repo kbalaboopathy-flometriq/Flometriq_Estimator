@@ -30,6 +30,8 @@ td:hover > .hoverPeekPop { display:block; }
 }
 @keyframes hourglass-flip { 0%,100% { transform: rotate(0deg); } 50% { transform: rotate(180deg); } }
 .hourglass-spin { display: inline-block; animation: hourglass-flip 1.4s ease-in-out infinite; }
+/* Quotes Report (22 Sep): the table uses separate borders so its header and first two columns can stay frozen; row lines therefore sit on the cells. */
+.qr-table td{border-bottom:1px solid #e2ede9}
 </style>
 </head>
 <body>
@@ -44,7 +46,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-22T19:10:00Z";
+  var APP_BUILD_VERSION = "2026-09-22T20:45:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -23434,6 +23436,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"22 Sep 2026 (81)", summary:"Quotes Report: freeze panes, full screen and grouping by currency. FREEZE: the table now scrolls inside its own area sized to the window, with the header row and the first two columns (S.No, Reference No) sticky; the table uses separate borders so sticky cells stay put, with row lines moved onto the cells (.qr-table td). FULL SCREEN: a real browser full screen of the whole report, dialogs included (the boundary wraps the edit and outcome pop-ups too, or they would open invisibly); the button follows the browser's own state so Esc and the button agree. OPTIONS: No grouping or By currency, remembered on the computer. Grouped view: INR, then USD, then any other currency as its own group, legacy quotes in a Currency unknown group until their currency is settled; each group has a header with count, no-value count and total, and a subtotal row; one line above the table gives all groups together in rupees. Numbering runs continuously across groups. No SQL." },
   { date:"22 Sep 2026 (80)", summary:"Quote values are kept up to date on demand. DATABASE: quote_value_snapshot_tbl gains is_stale and stale_since; mark_quote_value_stale() and six AFTER triggers raise the flag whenever anything a value is built from changes \u2014 estimate_lines, the value-bearing columns of estimates (order_qty, currency, conversion_rate, the PO price columns), quote_sl_extra_price_tbl, quote_sl_testing_tbl, quote_global_testing_tbl, quote_testing_mode_tbl \u2014 from any screen or SQL. A stage change or follow-up does not. APP: saveQuoteValueSnapshot clears the flag after each recompute, as a separate update so a database without the columns still saves the value. New refreshQuoteValues recomputes a list four at a time with progress. Quotes Report Apply filters: the other filters narrow the list, every quote left whose value is missing or stale is recalculated with the app's own formula (\\\"Updating quote values n of N\\\"), the refreshed values are read back into the rows, then the value filter runs. Legacy quotes have no BOM and are skipped. A stale value is marked * in the Value column. CRM Dashboards reads values paged and says how many open quotes have a stale or missing value. NEEDS SQL: quote_value_stale_triggers_20260922_v1.sql." },
   { date:"22 Sep 2026 (79)", summary:"Quotes Report: Follow-up Stage removed; LAST INTERACTION in its place \u2014 the latest logged activity on that quote with its date, mode, who logged it and who was contacted, and the outcome and notes (two lines, full text on hover); legacy quotes with only an imported note show that. The inline Follow-up Stage editor is gone from the table; + Next Follow-up stays. New VALUE column from the value snapshot \u2014 the quote's own currency, rupees underneath when different, blank until the quote has been opened once. New QUOTE VALUE range filter: INR or USD, more than / less than, applied with the other filters and shown as chips. INR compares every quote's rupee value; USD uses the USD figure for USD quotes and converts the rest at one USD rate so every quote can be compared, defaulting to the latest USD quote's own rate and editable beside the filter. Quotes with no value yet can't be placed in a range and are left out, with the count shown. No SQL." },
   { date:"22 Sep 2026 (78)", summary:"One field, STAGE, replaces Status and Nature everywhere. Stored in estimates.quote_status (column keeps its name; the screens say Stage). quote_status_tbl gains sort_order, kind (open/won/lost/parked), needs_reason, win_pct and set_on_quote; seeded with Draft, Offer Sent, Cold Budgetary, Hot Budgetary, Purchase Requirement 50%, Purchase Requirement 80%, Won, Lost, Deferred, and every other stage removed. Existing quotes untouched \u2014 a quote in a removed stage keeps showing it until someone picks a current one. SHARED: loadQuoteStages (module-level cache, funnel order), stageInfo/stageKind/isClosedStage/stageNeedsReason/stagesSettableOnQuote with name-based fallbacks. The six hard-coded \\\"Won, Lost, Deferred, Went Cold\\\" lists (Log Follow-ups x3, Quotes Report, funnel board x2, Quote Status Review, dashboards) now ask the master; the reason pop-up asks needs_reason. Every read of the master uses funnel order \u2014 it was alphabetical everywhere. SCREENS: Quote screen label QUOTE STATUS -> STAGE, its dropdown offers the set_on_quote stages, NATURE dropdown removed. Log Follow-ups Nature column removed (Outcome already read the master). Quotes Report one Stage column and filter, the edit dialog is Stage + date, a removed stage shows as \\\"(no longer used)\\\". Funnel board Nature filter removed. New Sales -> Commercials Master -> Quote Stages screen: reorder, kind, reason, win %, on-Quote-screen, + Add stage; Draft and Won can't be removed. DASHBOARD: funnel in stage order; Pipeline value card (open full value and weighted by win %, naming stages with no % set); Win rate card (won vs lost closed in the period, by count and by value, wins per credited FSE; Deferred excluded). The dashboard's estimates read was .limit(3000), silently capped at 1,000 \u2014 now paged. NEEDS SQL: quote_stages_20260922_v1.sql." },
@@ -29426,6 +29429,27 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   // since it was last worked out, is recalculated first with the app's
   // own formula; then the value filter runs on correct figures.
   const [valueJob,setValueJob] = useState(null);   // {done,total}
+  // Options (22 Sep): group rows by currency or not. Remembered on this
+  // computer, so the report opens the way it was last left.
+  const [grouping,setGroupingState] = useState(()=>{ try{ return localStorage.getItem("flometriq_qr_grouping")||"none"; }catch(e){ return "none"; } });
+  const setGrouping = (g)=>{ setGroupingState(g); try{ localStorage.setItem("flometriq_qr_grouping",g); }catch(e){} };
+  const [optionsOpen,setOptionsOpen] = useState(false);
+  // Full screen (22 Sep): the report itself fills the monitor — menus and
+  // banners hidden — and Esc brings it back. Tracks the browser's own
+  // state, so Esc and the button can never disagree.
+  const reportRef = useRef(null);
+  const [isFull,setIsFull] = useState(false);
+  useEffect(()=>{
+    const onChange = ()=> setIsFull(document.fullscreenElement===reportRef.current);
+    document.addEventListener("fullscreenchange", onChange);
+    return ()=> document.removeEventListener("fullscreenchange", onChange);
+  },[]);
+  const toggleFull = ()=>{
+    try{
+      if(document.fullscreenElement) document.exitFullscreen();
+      else if(reportRef.current && reportRef.current.requestFullscreen) reportRef.current.requestFullscreen();
+    }catch(e){ console.error("Full screen not available", e); }
+  };
   const applyFilters = ()=> setTimeout(async()=>{
     const next = {...filtersRef.current};
     const keep = rows.filter(r=>passesNonValueFilters(r, next));
@@ -29672,6 +29696,50 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     return true;
   });
 
+  // Grouped view (22 Sep). INR first, then USD, then any other currency as
+  // its own group — never folded into USD, since adding euros to dollars
+  // gives a wrong total. Legacy quotes have no currency on record yet and
+  // sit in their own group rather than being guessed.
+  const CCY_ORDER = ["INR","USD"];
+  const ccyOf = (r)=> r.is_legacy ? "Currency unknown" : (r.currency||"INR");
+  const displayRows = (()=>{
+    if(grouping!=="ccy") return filtered.map((r,i)=>({ ...r, __n:i+1 }));
+    const by = new Map();
+    filtered.forEach(r=>{ const c=ccyOf(r); if(!by.has(c)) by.set(c,[]); by.get(c).push(r); });
+    const keys = Array.from(by.keys()).sort((a,b)=>{
+      const ia = a==="Currency unknown" ? 99 : (CCY_ORDER.indexOf(a)<0 ? 50 : CCY_ORDER.indexOf(a));
+      const ib = b==="Currency unknown" ? 99 : (CCY_ORDER.indexOf(b)<0 ? 50 : CCY_ORDER.indexOf(b));
+      return ia!==ib ? ia-ib : a.localeCompare(b);
+    });
+    const out = []; let n = 0;
+    keys.forEach(c=>{
+      const rs = by.get(c);
+      const withVal = rs.filter(r=>r.value_ccy!=null);
+      const total = withVal.reduce((a,r)=>a+r.value_ccy,0);
+      const noValue = rs.length - withVal.length;
+      out.push({ __grp:"head", ccy:c, count:rs.length, total, noValue });
+      rs.forEach(r=>{ n++; out.push({ ...r, __n:n }); });
+      out.push({ __grp:"sub", ccy:c, count:rs.length, total, noValue });
+    });
+    return out;
+  })();
+  const allInr = filtered.reduce((a,r)=>a+(r.value_inr||0),0);
+  const fmtMoney = (c,v)=> (c==="Currency unknown" ? "" : c+" ")+Math.round(v).toLocaleString(c==="INR"?"en-IN":"en-US");
+  // Sticky cells (freeze panes): opaque backgrounds so scrolled content
+  // doesn't show through underneath.
+  const STICKY0 = { position:"sticky", left:0, zIndex:2, background:"#fff", width:52, minWidth:52 };
+  const STICKY1 = { position:"sticky", left:52, zIndex:2, background:"#fff", minWidth:170, borderRight:"1px solid #cfe3dd" };
+  const groupRowEl = (g)=> h("tr",{key:g.__grp+"-"+g.ccy},
+    h("td",{style:{...STICKY0,background:g.__grp==="head"?"#e6f1fb":"#faf9f4"}}),
+    h("td",{style:{...STICKY1,padding:"8px 10px",fontWeight:700,background:g.__grp==="head"?"#e6f1fb":"#faf9f4",color:g.__grp==="head"?"#0c447c":colors.text}},
+      g.__grp==="head" ? g.ccy : "Total "+g.ccy),
+    h("td",{colSpan:6,style:{padding:"8px 10px",fontSize:12,background:g.__grp==="head"?"#e6f1fb":"#faf9f4",color:g.__grp==="head"?"#0c447c":colors.muted}},
+      g.__grp==="head" ? (g.count+" quote"+(g.count===1?"":"s")+(g.noValue?" \u00b7 "+g.noValue+" with no value yet":"")) : ""),
+    h("td",{style:{padding:"8px 10px",textAlign:"right",fontWeight:700,whiteSpace:"nowrap",background:g.__grp==="head"?"#e6f1fb":"#faf9f4",color:g.__grp==="head"?"#0c447c":colors.text}},
+      g.ccy==="Currency unknown" ? "\u2014" : fmtMoney(g.ccy,g.total)),
+    h("td",{colSpan:4,style:{background:g.__grp==="head"?"#e6f1fb":"#faf9f4"}})
+  );
+
   // Limit-to-list options (29 Aug) — derived from the unfiltered dataset
   // itself, not a separate master fetch, so the dropdowns only ever
   // offer values that genuinely exist in this report — except Country/
@@ -29691,7 +29759,10 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
 
   if(historyView) return h(FollowupHistoryScreen,{scope:historyView.scope, value:historyView.value, user, onBack:()=>setHistoryView(null)});
 
-  return h(React.Fragment,null,
+  // The full-screen boundary wraps EVERYTHING this screen draws, including
+  // its edit and outcome dialogs — anything outside it is hidden while the
+  // report is full screen, so a dialog outside would open invisibly.
+  return h("div",{ref:reportRef,style:{background:"#fff",overflow:isFull?"auto":undefined,height:isFull?"100vh":undefined}},
   h("div",{style:{padding:"20px 24px",fontSize:14}},
     h("div",{style:{background:"#fff",border:"1px solid #cfe3dd",borderLeft:"4px solid #0f7a5c",borderRadius:6,padding:"12px 16px",marginBottom:14}},
       h("div",{style:{fontWeight:700,fontSize:16,color:"#124c3d"}},"Quotes Report"),
@@ -29765,18 +29836,32 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           style:{border:"none",background:"transparent",color:"#0c447c",cursor:"pointer",fontSize:12,padding:"0 4px"}},"\u00d7"))),
       h("span",{style:{marginLeft:"auto",fontSize:11,color:colors.mutedLight}},
         loadedAt ? "Loaded "+loadedAt.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}) : ""),
-      h("button",{onClick:()=>load(),disabled:loading,style:{...btnSecondary,fontSize:12,padding:"6px 12px"}},loading?"Loading\u2026":"\u21bb Refresh")
+      h("button",{onClick:()=>load(),disabled:loading,style:{...btnSecondary,fontSize:12,padding:"6px 12px"}},loading?"Loading\u2026":"\u21bb Refresh"),
+      h("div",{style:{position:"relative"}},
+        h("button",{onClick:()=>setOptionsOpen(o=>!o),style:{...btnSecondary,fontSize:12,padding:"6px 12px"}},"Options \u25be"),
+        optionsOpen && h("div",{style:{position:"absolute",right:0,top:"calc(100% + 4px)",zIndex:20,background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"10px 14px",width:230,boxShadow:"0 6px 18px rgba(0,0,0,0.12)"}},
+          h("div",{style:{fontSize:11,color:colors.muted,marginBottom:6}},"Group rows"),
+          [["none","No grouping"],["ccy","By currency (INR, USD\u2026)"]].map(([v,l])=>h("label",{key:v,style:{display:"flex",gap:8,alignItems:"center",fontSize:12.5,padding:"4px 0",cursor:"pointer"}},
+            h("input",{type:"radio",name:"qr-grouping",checked:grouping===v,onChange:()=>{ setGrouping(v); setOptionsOpen(false); }}), l))
+        )
+      ),
+      h("button",{onClick:toggleFull,style:{...btnSecondary,fontSize:12,padding:"6px 12px"}},isFull?"Exit full screen":"\u26f6 Full screen")
     ),
+    grouping==="ccy" && filtered.length>0 && h("div",{style:{fontSize:11.5,color:colors.muted,margin:"-4px 0 8px"}},
+      "Grouped by currency \u00b7 all groups together: INR "+Math.round(allInr).toLocaleString("en-IN")+" in rupees"),
     (loading && !rows.length) ? h("div",{style:{color:colors.mutedLight}},"Loading…") :
-    h("div",{style:{overflowX:"auto",background:"#fff",border:"1px solid #cfe3dd",borderRadius:6}},
-      h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:14}},
+    h("div",{style:{overflow:"auto",background:"#fff",border:"1px solid #cfe3dd",borderRadius:6,
+      maxHeight: isFull ? "calc(100vh - 150px)" : "calc(100vh - 260px)", minHeight:240}},
+      h("table",{className:"qr-table",style:{borderCollapse:"separate",borderSpacing:0,width:"100%",fontSize:14}},
         h("thead",null,h("tr",{style:{background:"#eef6f3",textAlign:"left"}},
-          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Stage","Value","Project Reference","Last interaction","Next Follow-up",""].map(c=>
-            h("th",{key:c,style:{padding:"9px 10px",borderBottom:"2px solid #0f7a5c",whiteSpace:"nowrap",fontSize:11.5,color:"#4c6a61"}},c))
+          ["S.No","Reference No","Reference Date","Customer Name","Region","City","State","Stage","Value","Project Reference","Last interaction","Next Follow-up",""].map((c,ci)=>
+            h("th",{key:c,style:{padding:"9px 10px",borderBottom:"2px solid #0f7a5c",whiteSpace:"nowrap",fontSize:11.5,color:"#4c6a61",
+              position:"sticky",top:0,zIndex:ci<2?4:3,background:"#eef6f3",
+              ...(ci===0?{left:0,width:52,minWidth:52}:ci===1?{left:52,minWidth:170,borderRight:"1px solid #cfe3dd"}:{})}},c))
         )),
-        h("tbody",null, filtered.map((r,i)=>h("tr",{key:r.reference_number,style:{borderBottom:"1px solid #e2ede9"}},
-          h("td",{style:{padding:"10px"}},i+1),
-          h("td",{style:{padding:"10px",fontWeight:600}},
+        h("tbody",null, displayRows.map((r,i)=> r.__grp ? groupRowEl(r) : h("tr",{key:r.reference_number,style:{borderBottom:"1px solid #e2ede9"}},
+          h("td",{style:{...STICKY0,padding:"10px",borderBottom:"1px solid #e2ede9"}},r.__n),
+          h("td",{style:{...STICKY1,padding:"10px",fontWeight:600,borderBottom:"1px solid #e2ede9"}},
             // Legacy rows have no real quote/BOM behind them — clicking
             // through would land on a broken, empty screen. Shown as
             // plain text with a badge instead of a link for those.
