@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-21T09:10:00Z";
+  var APP_BUILD_VERSION = "2026-09-21T13:25:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -11543,10 +11543,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [docUploading,setDocUploading]=useState(false);
   const [docStatusOptions,setDocStatusOptions]=useState([]);
   useEffect(()=>{
-    sb.from("doc_status_tbl").select("*").order("status").then(({data})=>setDocStatusOptions(data||[]));
+    loadDocStatuses().then(setDocStatusOptions);
   },[]);
   const docStatusColor = (statusLabel)=>{
-    const row = docStatusOptions.find(s=>s.status===statusLabel);
+    const row = docStatusOptions.find(s=>docStatusName(s)===statusLabel);
     const bucket = row?.action_type;
     if(bucket==="our_action") return {background:"#fdecea",color:"#a3312a"};
     if(bucket==="third_party_action") return {background:"#fff4d6",color:"#854f0b"};
@@ -11597,7 +11597,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     for(const d of docDrafts){
       if(!d.file){ alert("Choose a PDF file for every document before uploading."); return; }
       if(!d.docNumber.trim()){ alert("Every document needs a doc number."); return; }
-      if(!d.link.trim()){ alert("Every document needs its permanent link (e.g. OneDrive) before uploading — the file in Supabase is only temporary and gets removed once this quote leaves Draft; the link is what stays."); return; }
+      if(!confirmDocumentLink(d.link, "Document "+(d.docNumber||"").trim())) return;
       if(d.file.type!=="application/pdf"){ alert("\""+d.file.name+"\" isn't a PDF. Only PDF files are accepted here."); return; }
       if(!d.status){ alert("Pick a status for every document before uploading."); return; }
     }
@@ -11677,7 +11677,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(!continueDocPick) return;
     if(!continueFile){ alert("Choose the PDF file."); return; }
     if(continueFile.type!=="application/pdf"){ alert("Only PDF files are accepted here."); return; }
-    if(!continueLink.trim()){ alert("The link is required."); return; }
+    if(!confirmDocumentLink(continueLink, continueDocPick ? ("Document "+continueDocPick.doc_number) : "")) return;
     if(!continueStatus){ alert("Pick a status."); return; }
     if(!continueWhatChanged.trim()){ alert("Say what changed in this version."); return; }
     if(!continueNotes.trim()){ alert("Notes is required for this version too."); return; }
@@ -11760,7 +11760,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(docNewVersionFile.type!=="application/pdf"){ alert("Only PDF files can be uploaded here."); return; }
     if(!docNewVersionNote.trim()){ alert("Say what changed in this version."); return; }
     if(!docNewVersionExtraNotes.trim()){ alert("Notes is required for this version too."); return; }
-    if(!docNewVersionLink.trim()){ alert("The link is required for this version too."); return; }
+    if(!confirmDocumentLink(docNewVersionLink, "New version")) return;
     setDocUploading(true);
     try{
       const oldPath = docHistoryFor.file_path;
@@ -17627,7 +17627,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{fontWeight:700,fontSize:15}},"Documents — "+quoteExportRef),
           h("button",{onClick:()=>setShowDocumentsPanel(false),style:{background:"none",border:"none",fontSize:16,cursor:"pointer",color:colors.mutedLight}},"✕")
         ),
-        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:16}},"Drawings, procedures, ITP — PDF only, with a required link (e.g. OneDrive). The uploaded file here is temporary and is removed once this quote leaves Draft; the link is what stays."),
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginBottom:16}},(mode==="contract"
+          ? "Drawings, procedures, ITP \u2014 PDF only, each with its Google Drive link. The link is the permanent record; keep the file itself in Drive."
+          : "Drawings, procedures, ITP \u2014 PDF only, each with its Google Drive link. The uploaded file here is temporary and is removed once this quote leaves Draft; the link is what stays.")),
 
         // Documents Requested by Customer (25 Aug) — purely informational,
         // shown regardless of docUploadStep so it's always visible
@@ -17649,7 +17651,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("div",{style:{marginBottom:8}}, documentRequests.map(r=>h("div",{key:r.id,style:{display:"flex",alignItems:"center",gap:8,padding:"5px 0",borderBottom:"1px solid #eceae0"}},
             r.fulfilled_document_id
               ? h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:9,background:"#eaf9f4",color:"#085041"}},"Sent")
-              : h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:9,background:"#fdecea",color:"#a3312a"}},"Initial submission pending"),
+              : h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:9,background:"#fdecea",color:"#a3312a"},title:"Nothing has been linked to this requirement yet. This is not a document status."},"Not yet sent"),
             r.is_mandatory && h("span",{style:{fontSize:10,padding:"1px 7px",borderRadius:9,background:"#fff4d6",color:"#854f0b",fontWeight:700}},"Mandatory"),
             h("span",{style:{fontSize:12,flex:1}},r.category,
               r.source ? h("span",{style:{fontSize:10,color:colors.mutedLight,marginLeft:6}},r.source) : null),
@@ -17764,7 +17766,15 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 h("button",{onClick:()=>setContinueOverrideDirection("Out"),style:{flex:1,padding:"6px",border:"1px solid "+(continueOverrideDirection==="Out"?"#185FA5":colors.border),borderRadius:6,background:"#fff",cursor:"pointer",fontSize:11.5}},"Out"),
                 h("button",{onClick:()=>setContinueOverrideDirection("In"),style:{flex:1,padding:"6px",border:"1px solid "+(continueOverrideDirection==="In"?"#185FA5":colors.border),borderRadius:6,background:"#fff",cursor:"pointer",fontSize:11.5}},"In")
               ),
-              h(MasterSelect,{value:continueStatus,onChange:setContinueStatus,options:docStatusOptions.map(s=>s.status),table:"doc_status_tbl",valueCol:"status",fieldLabel:"Document Status",placeholder:"Select status…",style:{marginBottom:8}}),
+              // Access-style limit-to-list (21 Sep): type and the list narrows as
+              // you go; only a status that exists in the master is accepted.
+              // New statuses are added at Admin \u2192 Document Status Master,
+              // where whose-move and clears-the-clock are set with them.
+              h(LimitToListCombo,{value:continueStatus,onChange:setContinueStatus,
+                options:docStatusOptions.map(docStatusName).filter(Boolean),
+                placeholder:"Type to find a status\u2026",
+                invalidMessage:v=>"\u201c"+v+"\u201d is not in the Document Status master. Pick one from the list, or add it at Admin \u2192 Document Status Master.",
+                style:{...inputStyle,width:"100%",marginBottom:8}}),
               documentRequests.filter(r=>!r.fulfilled_document_id).length>0 && h(React.Fragment,null,
                 h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Does this fulfill a customer's requested document?"),
                 h("select",{value:continueFulfillsRequestId,onChange:e=>setContinueFulfillsRequestId(e.target.value),style:{...inputStyle,width:"100%",marginBottom:8}},
@@ -17773,7 +17783,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 )
               ),
               h("input",{type:"file",accept:"application/pdf",onChange:e=>setContinueFile(e.target.files[0]||null),style:{width:"100%",marginBottom:8}}),
-              h("input",{value:continueLink,onChange:e=>setContinueLink(e.target.value),placeholder:"Link (OneDrive etc.)",style:{...inputStyle,width:"100%",marginBottom:8}}),
+              h("input",{value:continueLink,onChange:e=>setContinueLink(e.target.value),placeholder:"Google Drive link \u2014 https://drive.google.com/\u2026",style:{...inputStyle,width:"100%",marginBottom:8}}),
               h("input",{value:continueWhatChanged,onChange:e=>setContinueWhatChanged(e.target.value),placeholder:"What changed? e.g. Updated nozzle orientation",style:{...inputStyle,width:"100%",marginBottom:8}}),
               h("input",{value:continueNotes,onChange:e=>setContinueNotes(e.target.value),placeholder:"Notes (required)",style:{...inputStyle,width:"100%",marginBottom:10}}),
               !continueOverrideUnlocked && user.role==="super_admin" && h("button",{onClick:requestSequenceOverride,style:{...btnSmall,fontSize:10.5,marginBottom:10}},"Override sequence (requires code)"),
@@ -17813,7 +17823,11 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h("button",{type:"button",onClick:()=>updateDocDraft(idx,{direction:"In"}),style:{flex:1,padding:"6px",border:"1px solid "+(d.direction==="In"?"#185FA5":colors.border),borderRadius:6,background:"#fff",cursor:"pointer",fontSize:11.5}},"In — came back to us")
             ),
             h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Status"),
-            h(MasterSelect,{value:d.status,onChange:v=>updateDocDraft(idx,{status:v}),options:docStatusOptions.map(s=>s.status),table:"doc_status_tbl",valueCol:"status",fieldLabel:"Document Status",placeholder:"Select status…",style:{marginBottom:8}}),
+            h(LimitToListCombo,{value:d.status,onChange:v=>updateDocDraft(idx,{status:v}),
+              options:docStatusOptions.map(docStatusName).filter(Boolean),
+              placeholder:"Type to find a status\u2026",
+              invalidMessage:v=>"\u201c"+v+"\u201d is not in the Document Status master. Pick one from the list, or add it at Admin \u2192 Document Status Master.",
+              style:{...inputStyle,width:"100%",marginBottom:8}}),
             documentRequests.filter(r=>!r.fulfilled_document_id).length>0 && h(React.Fragment,null,
               h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Does this fulfill a customer's requested document?"),
               h("select",{value:d.fulfillsRequestId,onChange:e=>updateDocDraft(idx,{fulfillsRequestId:e.target.value}),style:{...inputStyle,width:"100%",marginBottom:8}},
@@ -17821,9 +17835,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 documentRequests.filter(r=>!r.fulfilled_document_id).map(r=>h("option",{key:r.id,value:r.id},r.category))
               )
             ),
-            h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Link (OneDrive etc.) ",h("span",{style:{color:colors.danger}},"*required")),
-            h("input",{value:d.link,onChange:e=>updateDocDraft(idx,{link:e.target.value}),placeholder:"https://…",style:{...inputStyle,width:"100%",marginBottom:4}}),
-            h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginBottom:8}},"The uploaded PDF here is temporary — it's removed once this quote leaves Draft. This link is what stays."),
+            h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"Google Drive link ",h("span",{style:{color:colors.danger}},"*required")),
+            h("input",{value:d.link,onChange:e=>updateDocDraft(idx,{link:e.target.value}),placeholder:"https://drive.google.com/…",style:{...inputStyle,width:"100%",marginBottom:4}}),
+            d.link && !checkDocumentLink(d.link).ok && h("div",{style:{fontSize:9.5,color:checkDocumentLink(d.link).block?colors.danger:"#854f0b",marginBottom:4}},
+              checkDocumentLink(d.link).block ? checkDocumentLink(d.link).message
+                : (/onedrive|1drv|sharepoint/i.test(d.link) ? "OneDrive link \u2014 stops opening after the move to Google Drive." : "Not a Google Drive link \u2014 you'll be asked to confirm.")),
+            h("div",{style:{fontSize:9.5,color:colors.mutedLight,marginBottom:8}},(mode==="contract" ? "The link is the permanent record of this document." : "The uploaded PDF here is temporary — it's removed once this quote leaves Draft. This link is what stays.")),
             h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},"PDF file"),
             h("input",{type:"file",accept:"application/pdf",onChange:e=>updateDocDraft(idx,{file:e.target.files[0]||null}),style:{width:"100%"}})
           )),
@@ -17847,7 +17864,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
               h2.direction && h("span",{style:{fontSize:9.5,padding:"1px 6px",borderRadius:9,background:h2.direction==="Out"?"#fff4d6":"#e6f1fb",color:h2.direction==="Out"?"#854f0b":"#0c447c"}},h2.direction),
               h("select",{value:h2.status||"",onChange:e=>changeHistoryStatus(h2,e.target.value),style:{...docStatusColor(h2.status),fontSize:9.5,padding:"1px 4px",borderRadius:9,border:"none"}},
                 h("option",{value:""},"— status —"),
-                docStatusOptions.map(s=>h("option",{key:s.status,value:s.status},s.status))
+                docStatusOptions.map(s=>h("option",{key:docStatusName(s),value:docStatusName(s)},docStatusName(s)))
               )
             ),
             h("span",{style:{color:colors.muted}},(h2.changed_at||"").slice(0,10)+" — "+(h2.changed_by||"—")+": "),
@@ -18734,6 +18751,52 @@ async function carryRequirementsToContract(quoteRef, contractNumber, username){
 // Postgres 23505 is a unique-constraint breach. On documents it means one
 // thing in practice: that document number already exists. The raw message
 // names the index, which tells the user nothing. (20 Sep)
+// Document links (21 Sep). Only the link is permanent, so it has to be
+// one that will still open next year. Google Drive is where the company's
+// files now live; OneDrive links are flagged because they stop resolving
+// once the migration completes; anything else is flagged because nobody
+// else in the company can be assumed to reach it. None of this BLOCKS a
+// well-formed link — a link that looks wrong may still be right — it
+// asks the person to confirm, once, with the reason in front of them.
+// ---- Document Status master: which column holds the name (21 Sep) ----
+// The app was written against doc_status_tbl.status; the live table has no
+// such column (the database said so: "Could not find the 'status' column
+// of 'doc_status_tbl'"), so every read ordered by it failed and the Status
+// box came up empty. Rather than trade one assumed name for another, the
+// name column is read off the rows themselves. Writes use the same
+// answer; on an empty table they try "label" and fall back to "status".
+function docStatusName(row){
+  if(!row) return "";
+  return row.label ?? row.status ?? row.value ?? "";
+}
+function docStatusNameCol(rows){
+  const r = (rows||[])[0];
+  if(r){ if("label" in r) return "label"; if("status" in r) return "status"; if("value" in r) return "value"; }
+  return null;
+}
+async function loadDocStatuses(){
+  const { data, error } = await sb.from("doc_status_tbl").select("*");
+  if(error){ console.error("Document Status master could not be read", error); return []; }
+  return (data||[]).slice().sort((a,b)=>String(docStatusName(a)).localeCompare(String(docStatusName(b))));
+}
+function checkDocumentLink(raw){
+  const url = String(raw||"").trim();
+  if(!url) return { ok:false, block:true, message:"The link is required." };
+  if(!/^https:\/\//i.test(url)) return { ok:false, block:true, message:"The link must be a full web address starting https://" };
+  let host = "";
+  try{ host = new URL(url).hostname.toLowerCase(); }catch(e){ return { ok:false, block:true, message:"That doesn't read as a web address. Paste the share link exactly as Drive gives it." }; }
+  if(/(^|\.)drive\.google\.com$|(^|\.)docs\.google\.com$/.test(host)) return { ok:true };
+  if(/onedrive\.live\.com$|(^|\.)1drv\.ms$|sharepoint\.com$/.test(host)){
+    return { ok:false, block:false, message:"This is a OneDrive link. The company is moving to Google Drive, and OneDrive links stop opening once that move is complete \u2014 the record would keep pointing at nothing. Put the file in Drive and use that link instead?\n\nOK to save this OneDrive link anyway, Cancel to go back and change it." };
+  }
+  return { ok:false, block:false, message:"This link isn't Google Drive ("+host+"). If it lives somewhere the rest of the company can't open, the record is only useful to you.\n\nOK to save it anyway, Cancel to go back and change it." };
+}
+function confirmDocumentLink(raw, label){
+  const r = checkDocumentLink(raw);
+  if(r.ok) return true;
+  if(r.block){ alert((label?label+": ":"")+r.message); return false; }
+  return confirm((label?label+"\n\n":"")+r.message);
+}
 function documentSaveErrorText(e, docNumber){
   const code = e && (e.code || e.details?.code);
   const msg = String((e && (e.message||e.error_description)) || e || "");
@@ -23090,6 +23153,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"21 Sep 2026 (75)", summary:"The document Status box was empty, and adding a status failed with \\\"Could not find the 'status' column of 'doc_status_tbl'\\\". Every reader of the Document Status master asked for a column named status \u2014 ordering by it, mapping it, inserting it \u2014 and the live table has no such column, so the read failed and the list came back empty. New docStatusName / docStatusNameCol / loadDocStatuses read the name column off the rows themselves rather than assuming either name; the Admin \u2192 Document Status Master screen writes with the same answer, trying label then status on an empty table. Every reader is switched over: both Status boxes in the Documents modal, the continue box's option list, the bucket-colour lookups on the Sale Order panel and the Document Register, and the master screen's list, bucket change and delete. The Status box is now an Access-style LIMIT-TO-LIST combo (the app's existing LimitToListCombo): type and the list narrows, and only a status in the master is accepted \u2014 anything else is refused with a pointer to the master. The + Add beside it is gone: a status carries whose-move and clears-the-clock settings, and one added from the upload box would get neither, sit grey, and never count as cleared. Requirement rows that have nothing linked now read NOT YET SENT instead of \\\"Initial submission pending\\\", which read like a document status and made it look as though the status list should contain it. Also carries the 11:40 link-checking build, never deployed." },
+  { date:"21 Sep 2026 (74)", summary:"Document links are checked. New checkDocumentLink / confirmDocumentLink, used by all three places a link is entered (new document, continue an existing document, new version). A missing link, one not starting https://, or one that doesn't parse BLOCKS with the reason. A Google Drive or Google Docs link passes silently. A OneDrive or SharePoint link ASKS once \u2014 those stop resolving after the move to Google Drive \u2014 and anything else asks once too, since the rest of the company may not be able to open it. The new-document box also says what is wrong with the link as it is typed. Wording: every OneDrive reference in the Documents box now says Google Drive, and on a Sale Order the box no longer claims the file is removed when the quote leaves Draft \u2014 it says the link is the permanent record." },
   { date:"21 Sep 2026 (73)", summary:"The PO requirement is now guaranteed however a Sale Order is opened. It used to be raised only from the Create Sale Order button on the quote, so contracts opened from the Sale Order screen \u2014 which is how everyone opens them \u2014 never got one; every contract made before 20 Sep was missing it until the 21 Sep backfill. ensurePoDocumentRequirement now also runs when the Sale Order screen's Documents panel loads and when the Documents box loads in contract mode. Both can fire in the same instant on opening a contract, so calls for the same contract share one in-flight promise rather than both seeing no requirement and both inserting. No SQL." },
   { date:"21 Sep 2026 (72)", summary:"The template chooser is gone: every Generate PDF goes straight to the Classic bordered template, quotes and Sale Orders alike. askPdfTemplate, its modal and its state are removed; generateQuotePdf defaults to classic and both resume paths (summary near-miss review, no-documents confirm) pass classic explicitly. The App-layout branches inside the builder are left in place but are no longer reachable from any button \u2014 removing them outright is a larger edit across every page's drawing code, and nothing is gained by it until the builder is next restructured." },
   { date:"20 Sep 2026 (71)", summary:"Three Documents fixes. ENTITY TYPE: universal_documents_tbl.entity_type was hardcoded \\\"quote\\\" in the upload path, so every document on a Sale Order was filed as a quote document \u2014 now written from mode (contract/quote). Existing rows are corrected by document_entity_type_fix_20260920_v1.sql, which matches contract numbers against sale_order_tbl rather than guessing from the reference format. CONTINUING DROPDOWN: an empty combo appeared when the quote or order had no documents, which reads as a load failure; it now says there is nothing to continue and points at adding a new document. REFRESH: the requirements category combo lacked refreshOptions, so a category added from there did not appear until a reload. DUPLICATE KEY: new documentSaveErrorText turns a 23505 into \\\"Document number X already exists \u2014 use Continue an existing document instead\\\", used by both the new-document and continue paths; every other error is unchanged. PHASE 53: the unused table is dropped in the same SQL file, after a read-only check that it holds nothing \u2014 the requirements model is document_requests_tbl." },
@@ -23469,24 +23534,30 @@ function DocStatusEditor({ user }){
   const bucketMeta = (b)=> BUCKETS.find(x=>x.value===b) || BUCKETS[2];
   const load = useCallback(async()=>{
     setLoading(true);
-    const { data } = await sb.from("doc_status_tbl").select("*").order("status");
-    setRows(data||[]);
+    setRows(await loadDocStatuses());   // 21 Sep: no longer orders by a column that does not exist
     setLoading(false);
   },[]);
   useEffect(()=>{ load(); },[load]);
   const addStatus = async()=>{
     if(!newLabel.trim()){ alert("Status label is required."); return; }
-    const { error } = await sb.from("doc_status_tbl").insert({status:newLabel.trim(), action_type:newBucket});
+    // The name column is read off the existing rows; on an empty master,
+    // "label" is tried first and "status" only if the database refuses it.
+    const col = docStatusNameCol(rows) || "label";
+    let { error } = await sb.from("doc_status_tbl").insert({[col]:newLabel.trim(), action_type:newBucket});
+    if(error && !docStatusNameCol(rows)){
+      ({ error } = await sb.from("doc_status_tbl").insert({status:newLabel.trim(), action_type:newBucket}));
+    }
     if(error){ alert("Failed: "+error.message); return; }
     setNewLabel(""); setNewBucket("our_action"); load();
   };
   const changeBucket = async(row,bucket)=>{
-    setRows(rs=>rs.map(r=>r.status===row.status?{...r,action_type:bucket}:r));
-    await sb.from("doc_status_tbl").update({action_type:bucket}).eq("status",row.status);
+    const col = docStatusNameCol([row]);
+    setRows(rs=>rs.map(r=>docStatusName(r)===docStatusName(row)?{...r,action_type:bucket}:r));
+    await sb.from("doc_status_tbl").update({action_type:bucket}).eq(col,docStatusName(row));
   };
   const deleteStatus = async(row)=>{
-    if(!confirm("Delete status \""+row.status+"\"? Documents already using it keep the label, just lose the color mapping.")) return;
-    await sb.from("doc_status_tbl").delete().eq("status",row.status);
+    if(!confirm("Delete status \""+docStatusName(row)+"\"? Documents already using it keep the label, just lose the color mapping.")) return;
+    await sb.from("doc_status_tbl").delete().eq(docStatusNameCol([row]),docStatusName(row));
     load();
   };
   return h("div",{style:{padding:"20px 24px",maxWidth:640}},
@@ -23496,9 +23567,9 @@ function DocStatusEditor({ user }){
     ),
     loading ? h("div",{style:{fontSize:12,color:colors.mutedLight}},"Loading…") :
     h("div",{style:{display:"flex",flexDirection:"column",gap:6,marginBottom:16}},
-      rows.map(r=>h("div",{key:r.status,style:{display:"flex",alignItems:"center",gap:10,background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"9px 12px"}},
+      rows.map(r=>h("div",{key:docStatusName(r),style:{display:"flex",alignItems:"center",gap:10,background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"9px 12px"}},
         h("span",{style:{fontSize:11,padding:"2px 9px",borderRadius:10,...bucketMeta(r.action_type).swatch,whiteSpace:"nowrap"}},r.action_type?bucketMeta(r.action_type).label.split(" — ")[0]:"Unset"),
-        h("span",{style:{flex:1,fontSize:12.5}},r.status),
+        h("span",{style:{flex:1,fontSize:12.5}},docStatusName(r)),
         h("select",{value:r.action_type||"",onChange:e=>changeBucket(r,e.target.value),style:{...inputStyle,padding:"4px 8px",fontSize:11.5}},
           h("option",{value:""},"— pick bucket —"),
           BUCKETS.map(b=>h("option",{key:b.value,value:b.value},b.label))
@@ -24851,7 +24922,7 @@ function ContractDocumentsPanel({ contractNumber, refreshKey, user }){
   const [statusRows,setStatusRows] = useState([]);
   useEffect(()=>{ sb.from("doc_status_tbl").select("*").then(({data})=>setStatusRows(data||[])); },[]);
   const statusColor = (label)=>{
-    const bucket = (statusRows.find(r=>r.status===label)||{}).action_type;
+    const bucket = (statusRows.find(r=>docStatusName(r)===label)||{}).action_type;
     if(bucket==="our_action") return {background:"#fdecea",color:"#a3312a"};
     if(bucket==="third_party_action") return {background:"#fff4d6",color:"#854f0b"};
     return {background:"#eaf9f4",color:"#085041"};
@@ -37010,7 +37081,7 @@ function DocumentRegisterReport(){
 
   const uniq = (arr)=>[...new Set(arr.filter(Boolean))].sort();
   const statusColor = (label)=>{
-    const bucket = (statusRows.find(r=>r.status===label)||{}).action_type;
+    const bucket = (statusRows.find(r=>docStatusName(r)===label)||{}).action_type;
     if(bucket==="our_action") return {background:"#fdecea",color:"#a3312a"};
     if(bucket==="third_party_action") return {background:"#fff4d6",color:"#854f0b"};
     return {background:"#eaf9f4",color:"#085041"};
