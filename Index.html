@@ -46,7 +46,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-22T22:00:00Z";
+  var APP_BUILD_VERSION = "2026-09-22T22:40:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -23444,6 +23444,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"22 Sep 2026 (83)", summary:"Log Follow-ups brought in line with the single Stage. Outcome colours now follow the stage's kind from the master (won green, lost red, parked amber) instead of a list of names, so an added stage colours correctly; Not pursuing and Stalled, which are other chase types' outcomes, stay named. The \\\"Next Followup Date required unless...\\\" message names the closing stages from the master instead of the old Won/Lost/Deferred/Went Cold. Draft is no longer offered as an Outcome for an Offer, in the entry grid or the Review tab \u2014 a call doesn't send a quote back to Draft; the Quote screen still can. A stage change that the database refuses when a follow-up is saved is now reported (the follow-up itself is saved either way), instead of vanishing. The Nature column was already removed on 22 Sep and its Outcome list already read the stage master in funnel order. No SQL." },
   { date:"22 Sep 2026 (82)", summary:"Stage wording carried through the rest of the app, after a sweep for every visible Status/Nature label and every comparison against an old stage name. Menus: Quotes by Status -> Quotes by Stage, Quote Status Review -> Quote Stage Review (also the source name recorded in the audit trail), Status Change History -> Stage Change History. Column headers on the Draft reminder, the funnel board's list view and Quote Stage Review (Status -> Stage, Days in status -> Days in stage). Quotes by Stage report title, PDF heading and empty message; Stage Change History title, subtitle, sheet and file name \u2014 its audit filter still matches 'Status changed from', which is what the audit rows say, so history is unaffected. The owner alert heading and message, the Extra Price prompt, and the Tour card. The User Manual's two passages describing the old Status and Nature fields now open with a note saying what replaced them. No code compares against a removed stage name any more except the fallbacks used before the stage master has loaded. No SQL." },
   { date:"22 Sep 2026 (81)", summary:"Quotes Report: freeze panes, full screen and grouping by currency. FREEZE: the table now scrolls inside its own area sized to the window, with the header row and the first two columns (S.No, Reference No) sticky; the table uses separate borders so sticky cells stay put, with row lines moved onto the cells (.qr-table td). FULL SCREEN: a real browser full screen of the whole report, dialogs included (the boundary wraps the edit and outcome pop-ups too, or they would open invisibly); the button follows the browser's own state so Esc and the button agree. OPTIONS: No grouping or By currency, remembered on the computer. Grouped view: INR, then USD, then any other currency as its own group, legacy quotes in a Currency unknown group until their currency is settled; each group has a header with count, no-value count and total, and a subtotal row; one line above the table gives all groups together in rupees. Numbering runs continuously across groups. No SQL." },
   { date:"22 Sep 2026 (80)", summary:"Quote values are kept up to date on demand. DATABASE: quote_value_snapshot_tbl gains is_stale and stale_since; mark_quote_value_stale() and six AFTER triggers raise the flag whenever anything a value is built from changes \u2014 estimate_lines, the value-bearing columns of estimates (order_qty, currency, conversion_rate, the PO price columns), quote_sl_extra_price_tbl, quote_sl_testing_tbl, quote_global_testing_tbl, quote_testing_mode_tbl \u2014 from any screen or SQL. A stage change or follow-up does not. APP: saveQuoteValueSnapshot clears the flag after each recompute, as a separate update so a database without the columns still saves the value. New refreshQuoteValues recomputes a list four at a time with progress. Quotes Report Apply filters: the other filters narrow the list, every quote left whose value is missing or stale is recalculated with the app's own formula (\\\"Updating quote values n of N\\\"), the refreshed values are read back into the rows, then the value filter runs. Legacy quotes have no BOM and are skipped. A stale value is marked * in the Value column. CRM Dashboards reads values paged and says how many open quotes have a stale or missing value. NEEDS SQL: quote_value_stale_triggers_20260922_v1.sql." },
@@ -26042,7 +26043,7 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
       if((r.chaseWhat==="Offer"||r.chaseWhat==="Order"||r.chaseWhat==="Projects") && !r.chaseReference){ alert("Pick a Reference for every Offer/Order/Projects row."); return; }
       if(!r.discussedWhat.trim()){ alert("Say what was discussed on every row."); return; }
       if(!(r.notes||"").trim()){ alert("Every row needs a Note (footer panel — click into the row, then fill in Notes below)."); return; }
-      if(!r.nextFollowupDate && nextFollowupRequired(r)){ alert("Every row needs a Next Followup Date, unless the Outcome is Won, Lost, Deferred, or Went Cold."); return; }
+      if(!r.nextFollowupDate && nextFollowupRequired(r)){ alert("Every row needs a Next Followup Date, unless the Outcome closes the quote ("+(QUOTE_STAGE_CACHE.filter(r=>isClosedStage(r.status)).map(r=>r.status).join(", ")||"Won, Lost, Deferred")+")."); return; }
     }
     setSaving(true);
     try{
@@ -26055,7 +26056,12 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
         if(r._dirty || !r._savedId) await saveOneRowSilently(r);
         if(r.chaseWhat==="Offer" && r.outcome && refNumber){
           if(isClosedStage(r.outcome)) queue.push({referenceNumber:refNumber,newStatus:r.outcome});
-          else await applyOutcomeStatus(refNumber, r.outcome, user.username, "Follow-up log");
+          else {
+            const res = await applyOutcomeStatus(refNumber, r.outcome, user.username, "Follow-up log");
+            // 22 Sep — the follow-up itself is saved either way; only the
+            // quote's stage change is at stake, so say so plainly.
+            if(res && res.error) alert("The follow-up for "+refNumber+" was saved, but its stage could not be changed to "+r.outcome+":\n\n"+(res.error.message||res.error));
+          }
         } else if(r.chaseWhat==="Order" && r.outcome && refNumber){
           await sb.from("sale_order_tbl").update({status:r.outcome}).eq("contract_number",refNumber);
         }
@@ -26084,10 +26090,16 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
   const T = {
     ink:"#124c3d", sub:"#4c6a61", muted:"#8a9d97", accent:"#0f7a5c",
     border:"#cfe3dd", card:"#fff", bg:"#f7f9f8",
+    // 22 Sep — colours follow the stage's kind from the master, so a stage
+    // added later is coloured correctly. "Not pursuing" and "Stalled" are
+    // outcomes of other chase types, not stages, and stay named.
     outcome:(o)=>{
-      if(o==="Won") return {bg:"#eaf9f4",fg:"#085041"};
-      if(o==="Lost"||o==="Not pursuing") return {bg:"#fdecea",fg:"#a3312a"};
-      if(o==="Deferred"||o==="Stalled") return {bg:"#fff4d6",fg:"#854f0b"};
+      if(o==="Not pursuing") return {bg:"#fdecea",fg:"#a3312a"};
+      if(o==="Stalled") return {bg:"#fff4d6",fg:"#854f0b"};
+      const k = o ? stageKind(o) : "open";
+      if(k==="won") return {bg:"#eaf9f4",fg:"#085041"};
+      if(k==="lost") return {bg:"#fdecea",fg:"#a3312a"};
+      if(k==="parked") return {bg:"#fff4d6",fg:"#854f0b"};
       return {bg:"#e6f1fb",fg:"#0c447c"};
     }
   };
@@ -26214,7 +26226,7 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
               ) :
               h("select",{value:r.outcome,onChange:e=>{ if(e.target.value==="__add_new__"){ setAddingOutcomeKey(r._key); setNewOutcomeText(""); setNewOutcomeCode(""); setNewOutcomeMsg(""); } else updateRow(r._key,{outcome:e.target.value}); },onFocus:onFocusRow,style:boxStyle({background:oc.bg,color:oc.fg})},
                 h("option",{value:""},"— no change —"),
-                (r.chaseWhat==="Offer"?quoteStatusOptions:r.chaseWhat==="Order"?soStatusOptions:r.chaseWhat==="Projects"?projectOutcomeOptions:[]).map(s=>h("option",{key:s,value:s},s)),
+                (r.chaseWhat==="Offer"?quoteStatusOptions.filter(st=>st!=="Draft"):r.chaseWhat==="Order"?soStatusOptions:r.chaseWhat==="Projects"?projectOutcomeOptions:[]).map(s=>h("option",{key:s,value:s},s)),
                 r.chaseWhat==="Projects" && h("option",{value:"__add_new__"},"+ Add new…")
               )
             ),
@@ -26334,7 +26346,7 @@ function ContinuousFollowupEntry({ user, sessionCompany, prefill, onBackToOverdu
                     h("td",{style:{...td,background:oc.bg,color:oc.fg}}, reviewIsReadOnly ? (e.outcome||"—") :
                       h("select",{value:e.outcome||"",onFocus:onFocusReview,onChange:ev=>updateReviewField(e.id,"outcome",ev.target.value),style:boxStyle({background:oc.bg,color:oc.fg})},
                         h("option",{value:""},"— no change —"),
-                        (e.chase_what==="Offer"?quoteStatusOptions:e.chase_what==="Order"?soStatusOptions:e.chase_what==="Projects"?projectOutcomeOptions:[]).map(s=>h("option",{key:s,value:s},s))
+                        (e.chase_what==="Offer"?quoteStatusOptions.filter(st=>st!=="Draft"):e.chase_what==="Order"?soStatusOptions:e.chase_what==="Projects"?projectOutcomeOptions:[]).map(s=>h("option",{key:s,value:s},s))
                       )
                     ),
                     h("td",{style:{...td,textAlign:"center"}},
