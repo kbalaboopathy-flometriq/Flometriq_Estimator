@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-20T17:20:00Z";
+  var APP_BUILD_VERSION = "2026-09-21T09:10:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -10130,21 +10130,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // that call real functions directly has no such length ceiling.
   const [draftConfirm,setDraftConfirm]=useState(null); // {missing, incompleteBomDetails}
   const draftConfirmResolveRef = useRef(null);
-  // Template chooser (18 Sep) — asked once, at the start of every Generate
-  // PDF, before any other gate runs, so the choice is made while the user
-  // is still thinking about this document. "app" is the layout the app has
-  // always produced; "classic" is the bordered printed template.
-  const [pdfTemplateAsk,setPdfTemplateAsk]=useState(false);
-  const [pdfTemplate,setPdfTemplate]=useState("app");   // last choice, so a gate that bounces and resumes keeps it
-  const pdfTemplateResolveRef = useRef(null);
-  const askPdfTemplate = ()=> new Promise(resolve=>{
-    pdfTemplateResolveRef.current = resolve;
-    setPdfTemplateAsk(true);
-  });
-  const answerPdfTemplate = (choice)=>{
-    setPdfTemplateAsk(false);
-    if(pdfTemplateResolveRef.current){ pdfTemplateResolveRef.current(choice); pdfTemplateResolveRef.current=null; }
-  };
+  // Template chooser removed 21 Sep — Classic is the only layout.
   const askDraftConfirm = (missing, incompleteBomDetails)=> new Promise(resolve=>{
     draftConfirmResolveRef.current = resolve;
     setDraftConfirm({missing, incompleteBomDetails: incompleteBomDetails||[]});
@@ -11443,8 +11429,13 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const [mandatoryGate,setMandatoryGate]=useState(null);   // {run}
   const loadDocumentRequests = useCallback(async(ref)=>{
     if(!ref) return;
+    // 21 Sep — a Sale Order always has its PO requirement, however it was
+    // opened. It used to be raised only from the Create Sale Order button,
+    // so contracts opened from the Sale Order screen never got one. Safe
+    // to call every time: it does nothing if the requirement exists.
+    if(mode==="contract") await ensurePoDocumentRequirement(ref, user?.username);
     setDocumentRequests(await fetchDocumentRequirements(ref));
-  },[]);
+  },[mode, user?.username]);
   useEffect(()=>{ if(quoteExportRef) loadDocumentRequests(quoteExportRef); },[quoteExportRef,loadDocumentRequests]);
   // Runs now for an Admin/Super Admin, otherwise behind the code.
   const withMandatoryAuth = (run)=>{ if(isAdminOrAbove) return run(); setMandatoryGate({run}); };
@@ -14138,7 +14129,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     const { testingMode, watermark, template } = pendingAfterReview;
     setSummaryNearMisses(null); setPendingAfterReview(null);
     if(quoteDocuments.filter(d=>!d.is_archived).length===0){ setPendingTestingMode(testingMode); setPendingWatermark(watermark); setShowNoDocsGenerateConfirm(true); return; }
-    generateQuotePdf(testingMode, watermark, summaryMode, template||pdfTemplate);
+    generateQuotePdf(testingMode, watermark, summaryMode, "classic");
   };
   // Draft watermark, role-based (25 Aug) — applies only to a Contract
   // whose status is still "Draft". User always gets the watermark, no
@@ -14186,9 +14177,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         return;
       }
     }
-    const template = await askPdfTemplate();
-    if(!template) return;   // closed the chooser — nothing generated
-    setPdfTemplate(template);
+    // 21 Sep — the Classic bordered template is the only layout now. The
+    // chooser that used to open here is gone; every Generate PDF goes
+    // straight to the frame.
+    const template = "classic";
     try {
       // Contract approval gate (24 Aug) — a Contract can't generate its
       // PDF until all three sections are approved. Nothing else about
@@ -14256,7 +14248,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       alert("Could not start PDF generation: "+e.message);
     }
   };
-  const generateQuotePdf = async(testingMode="separate", watermark=false, summarised=false, template="app")=>{
+  const generateQuotePdf = async(testingMode="separate", watermark=false, summarised=false, template="classic")=>{
     if(!quoteExportRef) return;
     setGeneratingQuotePdf(true);
     try {
@@ -15730,7 +15722,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       // requirement rows so the panel reloads when something is added or
       // marked mandatory in the modal, without polling.
       mode==="contract" && contractInfo && h(ContractDocumentsPanel,{
-        contractNumber: contractInfo.contract_number,
+        contractNumber: contractInfo.contract_number, user,
         refreshKey: documentRequests.length+"|"+quoteDocuments.length
       }),
       mode==="contract" && showEditContractDetails && h(SaleOrderHeaderModal,{
@@ -17484,22 +17476,6 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       )
     ),
     mandatoryGate && h(AuthCodeGate,{requiredType:"edit",user,onClose:()=>setMandatoryGate(null),onAuthorized:async()=>{ const run=mandatoryGate.run; setMandatoryGate(null); await run(); }}),
-    pdfTemplateAsk && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}},
-      h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:430,maxWidth:"100%"}},
-        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:6}},"Which template?"),
-        h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:14}},"Only the look changes \u2014 the content, prices and annexures are identical either way."),
-        h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
-          h("button",{onClick:()=>answerPdfTemplate("app"),style:{...btnSecondary,textAlign:"left",padding:"10px 12px"}},
-            h("div",{style:{fontWeight:700,fontSize:12.5}},"App layout"),
-            h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},"Open page, logo and address across the top, no border.")),
-          h("button",{onClick:()=>answerPdfTemplate("classic"),style:{...btnSecondary,textAlign:"left",padding:"10px 12px"}},
-            h("div",{style:{fontWeight:700,fontSize:12.5}},"Classic template"),
-            h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:2}},"Bordered page, banded letterhead, boxed customer and quote number, footer bar."))
-        ),
-        h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:14}},
-          h("button",{onClick:()=>answerPdfTemplate(null),style:btnSecondary},"Cancel"))
-      )
-    ),
     showBomRefreshConfirm && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
         h("div",{style:{fontWeight:700,fontSize:14,marginBottom:8}},"Refresh this Sl No's BOM from the master?"),
@@ -17601,7 +17577,7 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
         h("div",{style:{fontSize:12.5,color:colors.mutedLight,marginBottom:16}},"Do you want to attach documents before generating this quote?"),
         h("div",{style:{display:"flex",gap:8}},
           h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); openDocumentsPanel(); },style:{...btnPrimary,flex:1}},"Yes"),
-          h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); generateQuotePdf(pendingTestingMode, pendingWatermark, summaryMode, pdfTemplate); },style:{...btnSecondary,flex:1}},"No, generate anyway")
+          h("button",{onClick:()=>{ setShowNoDocsGenerateConfirm(false); generateQuotePdf(pendingTestingMode, pendingWatermark, summaryMode, "classic"); },style:{...btnSecondary,flex:1}},"No, generate anyway")
         )
       )
     ),
@@ -18699,8 +18675,20 @@ function isPoDocRequirement(r){
 }
 // Raised automatically the moment a Sale Order is created. There is no such
 // thing as an order without a PO, so nobody has to remember to add it.
+// The Sale Order screen's panel and the Documents box both call this, and
+// they can fire in the same instant when a contract opens. Without this
+// both would see "no PO requirement yet" and both would insert one. Calls
+// for the same contract share a single in-flight promise instead.
+const _poRequirementInFlight = new Map();
 async function ensurePoDocumentRequirement(contractNumber, username){
   if(!contractNumber) return;
+  if(_poRequirementInFlight.has(contractNumber)) return _poRequirementInFlight.get(contractNumber);
+  const p = _ensurePoDocumentRequirement(contractNumber, username)
+    .finally(()=>_poRequirementInFlight.delete(contractNumber));
+  _poRequirementInFlight.set(contractNumber, p);
+  return p;
+}
+async function _ensurePoDocumentRequirement(contractNumber, username){
   try{
     const { data: existing } = await sb.from("document_requests_tbl").select("id,category").eq("entity_id",contractNumber);
     if((existing||[]).some(isPoDocRequirement)) return;
@@ -21152,16 +21140,7 @@ const MANUAL_SECTIONS = [
           },
           {
             "type": "p",
-            "text": "Choosing a template (from 18 September 2026). The first thing Generate PDF now asks is which template to print: the App layout the app has always produced, or the Classic template \u2014 the bordered page the company used before this app existed, with the letterhead banded across the top, the customer and quote number in boxes side by side, and a footer bar. Only the look changes. Prices, terms, annexures, datasheets and every gate behind the button are identical either way, and the choice is not saved against the quote \u2014 it is made fresh each time you generate."
-          },
-          {
-            "type": "bullets",
-            "items": [
-              "The chooser comes first, before the approval, readiness, Extra Price and document gates, so you are never asked to pick a template for a PDF that then gets stopped.",
-              "Cancel on the chooser generates nothing at all.",
-              "On the Classic template the revision number sits inside the quote-number box on the cover. The Index page's revision table is unchanged.",
-              "Every box on the Classic cover grows to fit what is in it, so a long customer name or a five-line address makes its own row taller instead of running over the line below."
-            ]
+            "text": "Layout (from 21 September 2026). Every Generate PDF uses the Classic template \u2014 the bordered page with the letterhead banded across the top, the customer and quote number boxed side by side, and a footer bar. The template chooser introduced on 18 September has been removed, along with the old open App layout. Every box on the cover grows to fit what is in it, so a long customer name or a five-line address makes its own row taller instead of running over the line below. The revision sits inside the quote-number box; the Index page's revision table is unchanged."
           },
           {
             "type": "tip",
@@ -23111,6 +23090,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"21 Sep 2026 (73)", summary:"The PO requirement is now guaranteed however a Sale Order is opened. It used to be raised only from the Create Sale Order button on the quote, so contracts opened from the Sale Order screen \u2014 which is how everyone opens them \u2014 never got one; every contract made before 20 Sep was missing it until the 21 Sep backfill. ensurePoDocumentRequirement now also runs when the Sale Order screen's Documents panel loads and when the Documents box loads in contract mode. Both can fire in the same instant on opening a contract, so calls for the same contract share one in-flight promise rather than both seeing no requirement and both inserting. No SQL." },
+  { date:"21 Sep 2026 (72)", summary:"The template chooser is gone: every Generate PDF goes straight to the Classic bordered template, quotes and Sale Orders alike. askPdfTemplate, its modal and its state are removed; generateQuotePdf defaults to classic and both resume paths (summary near-miss review, no-documents confirm) pass classic explicitly. The App-layout branches inside the builder are left in place but are no longer reachable from any button \u2014 removing them outright is a larger edit across every page's drawing code, and nothing is gained by it until the builder is next restructured." },
   { date:"20 Sep 2026 (71)", summary:"Three Documents fixes. ENTITY TYPE: universal_documents_tbl.entity_type was hardcoded \\\"quote\\\" in the upload path, so every document on a Sale Order was filed as a quote document \u2014 now written from mode (contract/quote). Existing rows are corrected by document_entity_type_fix_20260920_v1.sql, which matches contract numbers against sale_order_tbl rather than guessing from the reference format. CONTINUING DROPDOWN: an empty combo appeared when the quote or order had no documents, which reads as a load failure; it now says there is nothing to continue and points at adding a new document. REFRESH: the requirements category combo lacked refreshOptions, so a category added from there did not appear until a reload. DUPLICATE KEY: new documentSaveErrorText turns a 23505 into \\\"Document number X already exists \u2014 use Continue an existing document instead\\\", used by both the new-document and continue paths; every other error is unchanged. PHASE 53: the unused table is dropped in the same SQL file, after a read-only check that it holds nothing \u2014 the requirements model is document_requests_tbl." },
   { date:"20 Sep 2026 (70)", summary:"Documents: the quote-stage checklist, carry-forward into the Sale Order, the SO-screen panel and the register report. CHECKLIST: a Checklist button on the Documents panel ticks several categories from doc_category_tbl in one pass, creating requirement rows (source Quote checklist) \u2014 requirements, never documents, and nothing mandatory or blocking at quote stage. Categories already on the list are shown ticked and disabled. CARRY-FORWARD: carryRequirementsToContract runs on contract creation (both the new-contract path and the reopen-existing path), copying the quote's requirements with source Carried from quote and carried_from set, skipping any category already on the order; a fulfilled requirement carries its fulfilled_document_id so a document already sent is not chased twice. is_mandatory deliberately NOT carried \u2014 mandatory is a decision taken on the order. SO PANEL: new ContractDocumentsPanel on the Sale Order screen (not a modal) \u2014 requirement list with Sent/Pending and Mandatory badges, outstanding banner naming which gate each blocks, and every document with its latest revision; a document with more than one revision expands to its full Out/In history. Reads fetchDocumentHistory, the same function the register uses. REGISTER: Reports \u2192 Document Register. View 1, all documents across quotes and orders with filters (search, quotes/orders, customer, category, status, direction, added by, date range) and Excel/PDF export. View 2, Outstanding mandatory across all orders with what each blocks, the order's go-ahead state, and its own export. No SQL \u2014 this build uses the columns added by document_requirements_and_snapshot_20260920_v1.sql." },
   { date:"20 Sep 2026 (69)", summary:"Production go-ahead and work orders \u2014 the last missing piece of the Sale Order itself. GO-AHEAD: four states on sale_order_tbl (Hold / Start Engineering / Start Production Code 2 / Start Production Code 1), moved in either direction, every move written to go_ahead_history_tbl with is_backward and a mandatory reason on a backward move. Auto-PROPOSE, not auto-release: an order whose Full Hold documents have all cleared (v_full_hold_outstanding) shows Ready for go-ahead, and only the Sales Head (post_holder_tbl sales_head) or a super_admin can move it \u2014 deliberately not automatic, because documents clearing is one precondition and the advance, the PO price and approval are others. Releasing early is allowed with a warning naming what is short. A fall back to Code 3 does not revoke, matching the delivery-clock rule. WORK ORDERS: work_order_tbl (contract_number, wo_number CONTRACT/WOn, seq), work_order_sl_no_tbl (one Sl No to one work order, whole quantity, uniqueness enforced in SQL and checked before insert), work_order_ack_tbl (a flag per post, each cleared individually). One is raised automatically on the first release into production covering all unissued Sl Nos; the contract header shows how many Sl Nos are on no work order and offers a picker for them. PROMPTS: GoAheadPendingPrompt (Sales Head + super admins, once a day) lists orders ready but unreleased; WorkOrderFlagPrompt shows each person the work orders flagged to their posts until they close them \u2014 no daily dedup, since the acknowledgement row is the real dismiss state. NEEDS SQL: crm_phase54_go_ahead_work_orders.sql. NOT BUILT: a printable work order sheet, and the phase 2 board the go-ahead is meant to trigger." },
@@ -24862,7 +24843,7 @@ function WorkOrderFlagPrompt({ user, onDone }){
 // Documents on the Sale Order screen itself (20 Sep). The modal is for
 // adding; this is for seeing — what is required, what is outstanding,
 // and every document with its revisions, without opening anything.
-function ContractDocumentsPanel({ contractNumber, refreshKey }){
+function ContractDocumentsPanel({ contractNumber, refreshKey, user }){
   const [reqs,setReqs] = useState([]);
   const [docs,setDocs] = useState([]);
   // Same three buckets the modal uses, read from the same master, so a
@@ -24880,6 +24861,9 @@ function ContractDocumentsPanel({ contractNumber, refreshKey }){
   useEffect(()=>{
     let cancelled=false;
     (async()=>{
+      // Same guarantee as the Documents box: opening the Sale Order screen
+      // is enough for the PO requirement to exist. (21 Sep)
+      await ensurePoDocumentRequirement(contractNumber, user?.username);
       const [r,d] = await Promise.all([
         fetchDocumentRequirements(contractNumber),
         fetchDocumentHistory(contractNumber)
