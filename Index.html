@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-22T17:05:00Z";
+  var APP_BUILD_VERSION = "2026-09-22T19:10:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -935,6 +935,22 @@ async function computeSlNoPricing(referenceNumber, itemSlNo, orderQty){
 // alongside for later "what sells most, who sold what" analysis, even
 // though nothing reads them yet — best-effort: a failure here never
 // blocks navigation, it just means that visit's snapshot didn't update.
+// Recalculates the stored value for a list of quotes (22 Sep), a few at a
+// time, reporting progress. Used by the Quotes Report's Apply filters for
+// quotes whose value is missing or marked stale by the database triggers.
+async function refreshQuoteValues(refs, user, onProgress){
+  let done = 0;
+  const queue = refs.slice();
+  const worker = async()=>{
+    while(queue.length){
+      const ref = queue.shift();
+      try{ await saveQuoteValueSnapshot(ref, CONTRACT_NUMBER_RE.test(ref) ? "sale_order" : "quote", user); }
+      catch(e){ console.error("Value refresh failed for "+ref, e); }
+      done++; onProgress && onProgress(done, refs.length);
+    }
+  };
+  await Promise.all([worker(),worker(),worker(),worker()]);
+}
 async function saveQuoteValueSnapshot(referenceNumber, entityType, user){
   if(!referenceNumber) return;
   try{
@@ -963,6 +979,10 @@ async function saveQuoteValueSnapshot(referenceNumber, entityType, user){
     if(existing){ await sb.from("quote_value_snapshot_tbl").update(headerPayload).eq("id",existing.id); snapshotId = existing.id; }
     else { const { data: inserted } = await sb.from("quote_value_snapshot_tbl").insert(headerPayload).select("id").single(); snapshotId = inserted?.id; }
     if(!snapshotId) return;
+    // 22 Sep — the value is fresh again. Written on its own so a database
+    // without the stale columns yet still saves the value itself.
+    const { error: staleErr } = await sb.from("quote_value_snapshot_tbl").update({ is_stale:false, stale_since:null }).eq("id",snapshotId);
+    if(staleErr && !/is_stale|stale_since/.test(String(staleErr.message||""))) console.error("Could not clear the stale flag for "+referenceNumber, staleErr);
 
     // 17 Sep FIX -- the column on estimate_lines is `grade` (confirmed from
     // information_schema, 16 Sep). This select asked for material_grade,
@@ -23414,6 +23434,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"22 Sep 2026 (80)", summary:"Quote values are kept up to date on demand. DATABASE: quote_value_snapshot_tbl gains is_stale and stale_since; mark_quote_value_stale() and six AFTER triggers raise the flag whenever anything a value is built from changes \u2014 estimate_lines, the value-bearing columns of estimates (order_qty, currency, conversion_rate, the PO price columns), quote_sl_extra_price_tbl, quote_sl_testing_tbl, quote_global_testing_tbl, quote_testing_mode_tbl \u2014 from any screen or SQL. A stage change or follow-up does not. APP: saveQuoteValueSnapshot clears the flag after each recompute, as a separate update so a database without the columns still saves the value. New refreshQuoteValues recomputes a list four at a time with progress. Quotes Report Apply filters: the other filters narrow the list, every quote left whose value is missing or stale is recalculated with the app's own formula (\\\"Updating quote values n of N\\\"), the refreshed values are read back into the rows, then the value filter runs. Legacy quotes have no BOM and are skipped. A stale value is marked * in the Value column. CRM Dashboards reads values paged and says how many open quotes have a stale or missing value. NEEDS SQL: quote_value_stale_triggers_20260922_v1.sql." },
   { date:"22 Sep 2026 (79)", summary:"Quotes Report: Follow-up Stage removed; LAST INTERACTION in its place \u2014 the latest logged activity on that quote with its date, mode, who logged it and who was contacted, and the outcome and notes (two lines, full text on hover); legacy quotes with only an imported note show that. The inline Follow-up Stage editor is gone from the table; + Next Follow-up stays. New VALUE column from the value snapshot \u2014 the quote's own currency, rupees underneath when different, blank until the quote has been opened once. New QUOTE VALUE range filter: INR or USD, more than / less than, applied with the other filters and shown as chips. INR compares every quote's rupee value; USD uses the USD figure for USD quotes and converts the rest at one USD rate so every quote can be compared, defaulting to the latest USD quote's own rate and editable beside the filter. Quotes with no value yet can't be placed in a range and are left out, with the count shown. No SQL." },
   { date:"22 Sep 2026 (78)", summary:"One field, STAGE, replaces Status and Nature everywhere. Stored in estimates.quote_status (column keeps its name; the screens say Stage). quote_status_tbl gains sort_order, kind (open/won/lost/parked), needs_reason, win_pct and set_on_quote; seeded with Draft, Offer Sent, Cold Budgetary, Hot Budgetary, Purchase Requirement 50%, Purchase Requirement 80%, Won, Lost, Deferred, and every other stage removed. Existing quotes untouched \u2014 a quote in a removed stage keeps showing it until someone picks a current one. SHARED: loadQuoteStages (module-level cache, funnel order), stageInfo/stageKind/isClosedStage/stageNeedsReason/stagesSettableOnQuote with name-based fallbacks. The six hard-coded \\\"Won, Lost, Deferred, Went Cold\\\" lists (Log Follow-ups x3, Quotes Report, funnel board x2, Quote Status Review, dashboards) now ask the master; the reason pop-up asks needs_reason. Every read of the master uses funnel order \u2014 it was alphabetical everywhere. SCREENS: Quote screen label QUOTE STATUS -> STAGE, its dropdown offers the set_on_quote stages, NATURE dropdown removed. Log Follow-ups Nature column removed (Outcome already read the master). Quotes Report one Stage column and filter, the edit dialog is Stage + date, a removed stage shows as \\\"(no longer used)\\\". Funnel board Nature filter removed. New Sales -> Commercials Master -> Quote Stages screen: reorder, kind, reason, win %, on-Quote-screen, + Add stage; Draft and Won can't be removed. DASHBOARD: funnel in stage order; Pipeline value card (open full value and weighted by win %, naming stages with no % set); Win rate card (won vs lost closed in the period, by count and by value, wins per credited FSE; Deferred excluded). The dashboard's estimates read was .limit(3000), silently capped at 1,000 \u2014 now paged. NEEDS SQL: quote_stages_20260922_v1.sql." },
   { date:"22 Sep 2026 (77)", summary:"Quotes Report: Apply filters, Refresh, saves that report failure, and no quotes lost to the row cap. FILTERS: the list now follows an APPLIED copy of the filters, not the boxes \u2014 nothing below changes until Apply filters or Enter. Boxes changed since the last apply are outlined amber and counted on the button; Clear empties both. Chips show what is in force; \u00d7 on a chip removes that one filter and re-applies at once. initialFilters from a click-through applies immediately. REFRESH: reloads with the same filters and shows when the list was loaded; the table stays on screen while it reloads. SAVES: updateQuoteStatusForQuote, the legacy status path and applyOutcomeNature now check their update and return {error}; the report reports a refused Status, Stage, Follow-up Stage or Next Follow-up save in plain words (saveFailedText) instead of reloading silently over it, and a successful save updates its row on screen immediately (patchRow) before the confirming reload. Every other caller of those shared writers is unaffected \u2014 they ignore the new field. ROW CAP: estimates and legacy quotes are read through the new fetchPaged; activity lookups and customer lookups are chunked 150 references at a time and paged. The report reads one row per Sl No, newest first, so past 1,000 Sl Nos the oldest quotes used to drop off without a word. No SQL." },
@@ -29400,7 +29421,32 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   useEffect(()=>{ filtersRef.current = filters; },[filters]);
   // Read through the ref after a tick, so a combo that sets its value on
   // the same Enter press is included.
-  const applyFilters = ()=> setTimeout(()=>setApplied({...filtersRef.current}),0);
+  // 22 Sep — Apply also brings values up to date: every quote the OTHER
+  // filters keep whose value is missing, or marked stale by the database
+  // since it was last worked out, is recalculated first with the app's
+  // own formula; then the value filter runs on correct figures.
+  const [valueJob,setValueJob] = useState(null);   // {done,total}
+  const applyFilters = ()=> setTimeout(async()=>{
+    const next = {...filtersRef.current};
+    const keep = rows.filter(r=>passesNonValueFilters(r, next));
+    const needs = keep.filter(r=>!r.is_legacy && (r.value_inr==null || r.value_stale)).map(r=>r.reference_number);
+    if(needs.length){
+      setValueJob({done:0,total:needs.length});
+      await refreshQuoteValues(needs, user, (done,total)=>setValueJob({done,total}));
+      // Read back just the refreshed values and patch those rows.
+      let fresh = [];
+      for(let k=0;k<needs.length;k+=150){
+        const { data } = await sb.from("quote_value_snapshot_tbl").select("*").in("reference_number",needs.slice(k,k+150));
+        fresh = fresh.concat(data||[]);
+      }
+      const fBy = new Map(fresh.map(f=>[f.reference_number,f]));
+      setRows(rs=>rs.map(r=>{ const f=fBy.get(r.reference_number); if(!f) return r;
+        return {...r, value_inr:Number(f.total_value)||0, value_ccy:Number(f.total_value_in_currency ?? f.total_value)||0,
+          currency:f.currency||r.currency, value_stale:!!f.is_stale}; }));
+      setValueJob(null);
+    }
+    setApplied(next);
+  },0);
   const FILTER_LABELS = { dateFrom:"From", dateTo:"To", refLike:"Reference", customerLike:"Customer", projectLike:"Project",
     countryLike:"Country", stateLike:"State", cityLike:"City", zone:"Region", status:"Stage", followUp:"Follow-up", valueMin:"Value \u2265", valueMax:"Value \u2264", valueCcy:"Value in", usdRate:"USD rate" };
   const pendingKeys = Object.keys(FILTER_LABELS).filter(k=>(filters[k]||"")!==(applied[k]||""));
@@ -29501,7 +29547,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       // quote, plus the figure in the quote's own currency. A quote never
       // opened since snapshots began has no value yet, and says so.
       const snaps = await fetchPaged(()=>sb.from("quote_value_snapshot_tbl")
-        .select("reference_number,total_value,total_value_in_currency,currency").order("reference_number"));
+        .select("*").order("reference_number"));   // * so a database without is_stale yet still loads
       const snapByRef = new Map(snaps.map(sn=>[sn.reference_number,sn]));
       const latestActByRef = new Map();
       (acts||[]).forEach(a=>{ if(a.chase_reference && !latestActByRef.has(a.chase_reference)) latestActByRef.set(a.chase_reference,a); });
@@ -29546,6 +29592,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           value_ccy: snapByRef.has(h.reference_number) ? Number(snapByRef.get(h.reference_number).total_value_in_currency ?? snapByRef.get(h.reference_number).total_value)||0 : null,
           currency: (snapByRef.get(h.reference_number)||{}).currency || h.currency || "INR",
           fx_to_inr: Number(h.conversion_rate)||null,
+          value_stale: !!(snapByRef.get(h.reference_number)||{}).is_stale,
           next_followup: act?.next_followup_date||"—",
           last_updated: lastUpdated(h),
           is_legacy: false,
@@ -29599,7 +29646,8 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     return "Upcoming";
   };
 
-  const filtered = rows.filter(r=>{
+  // Every filter except the value range, against a given filter set.
+  function passesNonValueFilters(r, applied){
     if(applied.dateFrom && r.reference_date < applied.dateFrom) return false;
     if(applied.dateTo && r.reference_date > applied.dateTo) return false;
     if(applied.refLike && !r.reference_number.toLowerCase().includes(applied.refLike.toLowerCase())) return false;
@@ -29611,6 +29659,10 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     if(applied.status && r.status!==applied.status) return false;
     if(applied.followUp && followUpBucket(r)!==applied.followUp) return false;
     if(applied.projectLike && !(r.project_reference||"").toLowerCase().includes(applied.projectLike.toLowerCase())) return false;
+    return true;
+  }
+  const filtered = rows.filter(r=>{
+    if(!passesNonValueFilters(r, applied)) return false;
     if(applied.valueMin!=="" || applied.valueMax!==""){
       const v = valueIn(r, applied.valueCcy||"INR");
       if(v==null) return false;   // no value yet — can't be placed in a range
@@ -29691,12 +29743,13 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     // Apply bar (22 Sep). The list below only changes when Apply filters
     // or Enter is pressed; boxes changed since then are outlined amber.
     h("div",{style:{display:"flex",alignItems:"center",gap:10,margin:"-6px 0 14px"}},
-      pendingKeys.length>0
+      valueJob ? h("span",{style:{fontSize:11.5,color:"#0c447c"}},"Updating quote values "+valueJob.done+" of "+valueJob.total+"\u2026")
+      : pendingKeys.length>0
         ? h("span",{style:{fontSize:11.5,color:"#854f0b"}},pendingKeys.length+" filter"+(pendingKeys.length>1?"s":"")+" changed \u2014 press Apply filters (or Enter) to update the list")
         : h("span",{style:{fontSize:11.5,color:colors.mutedLight}},"The list below matches these filters."),
       h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
         h("button",{onClick:clearFilters,style:{...btnSecondary,fontSize:12}},"Clear"),
-        h("button",{onClick:applyFilters,style:{...btnPrimary,fontSize:12,padding:"8px 16px"}},
+        h("button",{onClick:applyFilters,disabled:!!valueJob,style:{...btnPrimary,fontSize:12,padding:"8px 16px",opacity:valueJob?0.6:1}},
           pendingKeys.length ? "Apply filters ("+pendingKeys.length+")" : "Apply filters"))
     ),
     // What is actually in force, with Refresh and how old the list is.
@@ -29745,7 +29798,8 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           h("td",{style:{padding:"10px",whiteSpace:"nowrap",textAlign:"right"}},
             r.value_inr==null ? h("span",{style:{color:colors.mutedLight}},"\u2014")
               : h(React.Fragment,null,
-                  h("div",{style:{fontWeight:600}},(r.currency||"INR")+" "+Math.round(r.value_ccy).toLocaleString("en-IN")),
+                  h("div",{style:{fontWeight:600},title:r.value_stale?"Changed since this value was worked out \u2014 Apply filters updates it":""},
+                    (r.currency||"INR")+" "+Math.round(r.value_ccy).toLocaleString("en-IN")+(r.value_stale?" *":"")),
                   r.currency && r.currency!=="INR" && h("div",{style:{fontSize:10.5,color:colors.mutedLight}},"INR "+Math.round(r.value_inr).toLocaleString("en-IN")))),
           h("td",{style:{padding:"10px"}},r.project_reference),
           // Last interaction (22 Sep) replaces Follow-up Stage: what was
@@ -29984,10 +30038,14 @@ function CrmDashboardsScreen({ user, onDrillToQuotesReport, onOpenQuote, onGoToT
       // earlier this session. A quote with no snapshot yet (never
       // opened since that feature shipped) just shows no value rather
       // than a wrong/guessed one.
-      const { data: snaps } = await sb.from("quote_value_snapshot_tbl").select("reference_number,total_value");
+      const snaps = await fetchPaged(()=>sb.from("quote_value_snapshot_tbl").select("*").order("reference_number"));
       const valueByRef = new Map((snaps||[]).map(s=>[s.reference_number,Number(s.total_value)||0]));
+      // 22 Sep — values the database has marked out of date since they were
+      // worked out, and quotes with no value at all, so the cards can say
+      // how far to trust their totals.
+      const staleRefs = new Set((snaps||[]).filter(s=>s.is_stale).map(s=>s.reference_number));
 
-      setData({ quotes, activities, outcomes: outcomes||[], coByName, legacyRows: legacyRows||[], valueByRef });
+      setData({ quotes, activities, outcomes: outcomes||[], coByName, legacyRows: legacyRows||[], valueByRef, staleRefs });
     } finally { setLoading(false); }
   },[from,to]);
   useEffect(()=>{ load(); },[load]);
@@ -30035,7 +30093,7 @@ function CrmDashboardsScreen({ user, onDrillToQuotesReport, onOpenQuote, onGoToT
     ),
     h("p",{style:{fontSize:11,color:"#8a9d97",marginTop:-8,marginBottom:16}},"Showing "+from+" to "+to),
     loading || !data ? h("div",{style:{color:"#8a9d97"}},"Loading…") : (()=>{
-      const { quotes, activities, outcomes, coByName, legacyRows, valueByRef } = data;
+      const { quotes, activities, outcomes, coByName, legacyRows, valueByRef, staleRefs } = data;
       const CLOSED = { includes: isClosedStage };   // 22 Sep: from the stage master
       const isOpen = q=>!CLOSED.includes(q.quote_status);
       const changedInPeriod = q=>q.status_changed_at && q.status_changed_at.slice(0,10)>=from && q.status_changed_at.slice(0,10)<=to;
@@ -30169,7 +30227,11 @@ function CrmDashboardsScreen({ user, onDrillToQuotesReport, onOpenQuote, onGoToT
                 h("div",null,h("div",{style:{fontSize:10.5,color:"#6b8e83"}},"Open, full value"),h("div",{style:{fontSize:17,fontWeight:700}},fmtCr(rawOpen))),
                 h("div",null,h("div",{style:{fontSize:10.5,color:"#6b8e83"}},"Weighted by stage"),h("div",{style:{fontSize:17,fontWeight:700,color:"#0f7a5c"}},fmtCr(weighted)))),
               line("Each open quote counted at its stage's win % \u2014 set in Quote Stages."),
-              unweightedStages.size>0 && line(fmtCr(unweightedValue)+" not weighted \u2014 no win % set for: "+Array.from(unweightedStages).join(", "), true)
+              unweightedStages.size>0 && line(fmtCr(unweightedValue)+" not weighted \u2014 no win % set for: "+Array.from(unweightedStages).join(", "), true),
+              (()=>{ const open = quotes.filter(isOpen);
+                const stale = open.filter(q=>staleRefs && staleRefs.has(q.reference_number)).length;
+                const missing = open.filter(q=>!valueByRef.has(q.reference_number)).length;
+                return (stale||missing) ? line((stale?stale+" value(s) out of date":"")+(stale&&missing?", ":"")+(missing?missing+" quote(s) with no value yet":"")+" \u2014 Apply filters in the Quotes Report updates them.", true) : null; })()
             )
           ),
           card("Win rate", h(React.Fragment,null,
