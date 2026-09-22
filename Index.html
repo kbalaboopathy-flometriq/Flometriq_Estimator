@@ -46,7 +46,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-22T22:40:00Z";
+  var APP_BUILD_VERSION = "2026-09-23T01:20:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -468,6 +468,34 @@ function stageInfo(name){
            set_on_quote: ["Draft","Offer Sent","Won"].includes(n), ...(row||{}) , kind: (row&&row.kind)||kind };
 }
 function stageKind(name){ return stageInfo(name).kind||"open"; }
+// Every stage move carries a note, wherever it is made (22 Sep): the note
+// is written as a Log Follow-ups entry, so it becomes the quote's Last
+// interaction and sits in its history like any logged call. "where" names
+// the screen, so the trail can say where a move came from.
+async function logStageMoveFollowup({ referenceNumber, customerName, stage, date, note, nextFollowup, username, where }){
+  const { error } = await sb.from("activity_log_tbl").insert({
+    company_name: customerName||"",
+    activity_date: date || new Date().toISOString().slice(0,10),
+    activity_type: "Others",
+    chase_what: "Offer",
+    chase_reference: referenceNumber,
+    contacted_whom: "",
+    discussed_what: "Stage moved on "+where,
+    outcome: stage,
+    next_followup_date: nextFollowup || null,
+    notes: note,
+    logged_by: username||"unknown",
+  });
+  if(error) console.error("Stage-move follow-up not saved for "+referenceNumber, error);
+  return { error: error||null };
+}
+// Where a logged Outcome came from, for the stage trail.
+function followupSourceLabel(act){
+  const d = String(act && act.discussed_what || "");
+  if(/^Stage moved on /.test(d)) return d.replace(/^Stage moved on /,"");
+  if(/from Quotes Report$/.test(d)) return "Quotes Report";
+  return "Log Follow-ups";
+}
 // Closed = anything that ends the chase: won, lost or parked.
 function isClosedStage(name){ return ["won","lost","parked"].includes(stageKind(name)); }
 function stageNeedsReason(name){ const i = stageInfo(name); return !!(i.needs_reason ?? (i.kind==="lost"||i.kind==="parked")); }
@@ -3385,6 +3413,149 @@ function HrHomeScreen({ user, onOpenTab }){
 // arrows; add with + Add stage. Draft and Won can't be removed: the app
 // depends on both existing (every new quote starts in Draft; a Sale Order
 // can only be raised from Won).
+// Stage track on the Quote screen (22 Sep). Every stage can be set here;
+// a move asks for the date it changed, a note, and (for an open stage) the
+// next follow-up, and writes a follow-up with the note. Won, Lost and
+// Deferred continue to the shared outcome box for the PO/FSE credit or the
+// reason. The track re-checks the stage whenever the screen or the browser
+// tab comes back into view, and every minute while open, so a move made in
+// Log Follow-ups or the Quotes Report shows here without reopening.
+function QuoteStageTrack({ referenceNumber, customerName, current, changedAt, changedBy, ready, user, onRequestAuth, onMoved, onOpenOutcome }){
+  const [stages,setStages] = useState(QUOTE_STAGE_CACHE);
+  const [target,setTarget] = useState(null);
+  const [f,setF] = useState({ date:"", note:"", next:"" });
+  const [errs,setErrs] = useState({});
+  const [busy,setBusy] = useState(false);
+  const [trail,setTrail] = useState([]);
+  const [checkedAt,setCheckedAt] = useState(null);
+  const [notice,setNotice] = useState(null);
+  const currentRef = useRef(current);
+  useEffect(()=>{ currentRef.current = current; },[current]);
+  useEffect(()=>{ loadQuoteStages().then(r=>setStages(r.slice())); },[]);
+  const loadTrail = useCallback(async()=>{
+    const { data } = await sb.from("activity_log_tbl").select("activity_date,created_at,outcome,notes,discussed_what,logged_by")
+      .eq("chase_reference",referenceNumber).not("outcome","is",null).order("created_at",{ascending:false}).limit(20);
+    // Every logged outcome against this quote, including ones in stages
+    // that have since been removed — the trail is history.
+    const rows = (data||[]).filter(a=>a.outcome && String(a.outcome).trim());
+    rows.sort((a,b)=> String(b.activity_date||"").localeCompare(String(a.activity_date||"")) || String(b.created_at||"").localeCompare(String(a.created_at||"")));
+    setTrail(rows.slice(0,4));
+  },[referenceNumber]);
+  // Re-check the stage against the database.
+  const recheck = useCallback(async()=>{
+    const { data } = await sb.from("estimates").select("quote_status,status_changed_at,status_changed_by").eq("reference_number",referenceNumber).limit(1).maybeSingle();
+    setCheckedAt(new Date());
+    if(data && (data.quote_status||"Draft")!==(currentRef.current||"Draft")){
+      setNotice("Moved to "+data.quote_status+(data.status_changed_by?" by "+data.status_changed_by:"")+(data.status_changed_at?", "+new Date(data.status_changed_at).toLocaleString():"")+" \u2014 updated here.");
+      onMoved && onMoved(data.quote_status, { at:data.status_changed_at, by:data.status_changed_by });
+      loadTrail();
+    }
+  },[referenceNumber, loadTrail, onMoved]);
+  useEffect(()=>{
+    loadTrail(); recheck();
+    const t = setInterval(recheck, 60000);
+    const onFocus = ()=>recheck();
+    const onVis = ()=>{ if(document.visibilityState==="visible") recheck(); };
+    window.addEventListener("focus", onFocus); document.addEventListener("visibilitychange", onVis);
+    return ()=>{ clearInterval(t); window.removeEventListener("focus", onFocus); document.removeEventListener("visibilitychange", onVis); };
+  },[referenceNumber]);
+
+  const ladder = stages.filter(r=>r.kind==="open"||r.kind==="won");
+  const exits = stages.filter(r=>r.kind==="lost"||r.kind==="parked");
+  const ci = ladder.findIndex(r=>r.status===(current||"Draft"));
+  const open = (st)=>{
+    if(st===(current||"Draft")) return;
+    if(!ready){ alert("The stage can be moved once the quote is complete \u2014 see the readiness bar."); return; }
+    setTarget(st); setErrs({}); setF({ date:new Date().toISOString().slice(0,10), note:"", next:"" });
+  };
+  const closing = target && isClosedStage(target);
+  const save = ()=>{
+    const e = {};
+    if(!f.note.trim()) e.note = "A note is required \u2014 what happened?";
+    if(!closing && !f.next) e.next = "Set the next follow-up.";
+    if(!f.date) e.date = "Pick the date it changed.";
+    setErrs(e); if(Object.keys(e).length) return;
+    const st = target;
+    const action = async()=>{
+      setBusy(true);
+      try{
+        if((current||"")==="Won" && st!=="Won"){
+          const { data: so } = await sb.from("sale_order_tbl").select("contract_number").eq("quote_reference_number",referenceNumber).maybeSingle();
+          if(so){ alert("Can't move "+referenceNumber+" out of Won \u2014 Sale Order "+so.contract_number+" was raised from it. Cancel the Sale Order first."); return; }
+          if(!confirm("Move "+referenceNumber+" from Won back to "+st+"?\n\nThe PO details and the FSE credit already captured stay on record.")) return;
+        }
+        const changedAtIso = new Date(f.date+"T12:00:00").toISOString();
+        if(isClosedStage(st)){
+          // The outcome box applies the stage (PO / FSE credit / reason);
+          // the note is written when it completes.
+          setTarget(null);
+          onOpenOutcome && onOpenOutcome(st, { date:f.date, note:f.note.trim(), changedAt:changedAtIso });
+          return;
+        }
+        const res = await updateQuoteStatusForQuote(referenceNumber, st, user.username, "Quote form", null, changedAtIso);
+        if(res && res.blocked) return;
+        if(res && res.error){ alert(saveFailedText("The stage", res.error)); return; }
+        await logStageMoveFollowup({ referenceNumber, customerName, stage:st, date:f.date, note:f.note.trim(), nextFollowup:f.next, username:user.username, where:"Quote screen" });
+        setTarget(null); setNotice(null);
+        onMoved && onMoved(st, { at:changedAtIso, by:user.username });
+        loadTrail();
+      } finally { setBusy(false); }
+    };
+    // Same rule as before: a plain user needs a code for any stage change
+    // made on this screen; admins pass straight through.
+    if(!(user.role==="admin"||user.role==="super_admin")) onRequestAuth(action); else action();
+  };
+  const box = {padding:"7px 4px",border:"1px solid "+colors.border,borderRadius:6,textAlign:"center",fontSize:11,cursor:ready?"pointer":"default",lineHeight:1.25,background:"#fff",color:colors.muted,flex:1,minWidth:0};
+  return h("div",{style:{background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:8,padding:"10px 12px",marginBottom:12}},
+    h("div",{style:{display:"flex",alignItems:"baseline",gap:10,flexWrap:"wrap"}},
+      h("span",{style:{fontSize:12.5,fontWeight:700}},"Stage"),
+      h("span",{style:{fontSize:11.5,color:colors.muted}},
+        (current||"Draft")+(changedAt?" \u00b7 since "+new Date(changedAt).toLocaleDateString():"")+(changedBy?" \u00b7 by "+changedBy:"")),
+      !ready && h("span",{style:{fontSize:11,color:"#7a5000"}},"Complete the quote to move its stage"),
+      h("span",{style:{marginLeft:"auto",fontSize:10.5,color:colors.mutedLight}},checkedAt?"checked for changes "+checkedAt.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}):"")
+    ),
+    notice && h("div",{style:{marginTop:6,fontSize:11.5,color:"#0c447c",background:"#e6f1fb",borderRadius:6,padding:"5px 9px"}},notice),
+    h("div",{style:{display:"flex",gap:4,marginTop:8}},
+      ladder.map((r,i)=>h("div",{key:r.status,onClick:()=>open(r.status),title:r.status+(r.win_pct!=null?" \u00b7 "+r.win_pct+"%":""),
+        style:{...box,
+          ...(i===ci ? {background:r.kind==="won"?"#0f6e56":"#1c1f1a",color:"#fff",borderColor:r.kind==="won"?"#0f6e56":"#1c1f1a",fontWeight:700}
+             : (ci>=0 && i<ci) ? {background:"#eaf9f4",color:"#085041",borderColor:"#9fe1cb"} : {})}},r.status))
+    ),
+    h("div",{style:{display:"flex",gap:6,alignItems:"center",marginTop:6}},
+      h("span",{style:{fontSize:11,color:colors.muted}},"Or close it:"),
+      exits.map(r=>h("button",{key:r.status,onClick:()=>open(r.status),
+        style:{...btnSecondary,fontSize:11,padding:"4px 10px",
+          ...((current||"")===r.status?{background:r.kind==="lost"?"#fdecea":"#fff4d6",color:r.kind==="lost"?"#a3312a":"#854f0b",fontWeight:700}:{})}},r.status))
+    ),
+    target && h("div",{style:{marginTop:10,background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"10px 12px"}},
+      h("div",{style:{fontWeight:700,fontSize:13,marginBottom:8}},"Move from "+(current||"Draft")+" to "+target),
+      h("div",{style:{display:"grid",gridTemplateColumns:"minmax(0,1fr) minmax(0,1fr)",gap:10}},
+        h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:3}},"Date it changed"),
+          h("input",{type:"date",value:f.date,max:new Date().toISOString().slice(0,10),onChange:e=>{ setF(x=>({...x,date:e.target.value})); setErrs(x=>({...x,date:""})); },style:{...inputStyle,padding:"6px 8px"}}),
+          errs.date && h("div",{style:{fontSize:10.5,color:colors.danger,marginTop:3}},errs.date)),
+        !closing && h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:3}},"Next follow-up"),
+          h("input",{type:"date",value:f.next,onChange:e=>{ setF(x=>({...x,next:e.target.value})); setErrs(x=>({...x,next:""})); },style:{...inputStyle,padding:"6px 8px"}}),
+          errs.next && h("div",{style:{fontSize:10.5,color:colors.danger,marginTop:3}},errs.next))
+      ),
+      h("div",{style:{marginTop:8}},h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:3}},"Note \u2014 what happened"),
+        h("textarea",{rows:2,value:f.note,onChange:e=>{ setF(x=>({...x,note:e.target.value})); setErrs(x=>({...x,note:""})); },style:{...inputStyle,padding:"6px 8px",resize:"vertical"}}),
+        errs.note && h("div",{style:{fontSize:10.5,color:colors.danger,marginTop:3}},errs.note)),
+      h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:6}},"Saved as a follow-up too \u2014 it becomes this quote's Last interaction."),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:8}},
+        h("button",{onClick:()=>setTarget(null),disabled:busy,style:btnSecondary},"Cancel"),
+        h("button",{onClick:save,disabled:busy,style:{...btnPrimary,opacity:busy?0.6:1}},
+          busy?"Saving\u2026": target==="Won" ? "Next: PO and FSE credit" : closing ? "Next: reason" : "Move stage"))
+    ),
+    trail.length>0 && h("div",{style:{marginTop:10}},
+      h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:3}},"Stage trail"),
+      trail.map((a,i)=>h("div",{key:i,style:{fontSize:11.5,lineHeight:1.7}},
+        h("span",{style:{color:colors.muted}},(a.activity_date||String(a.created_at||"").slice(0,10))+"  "),
+        h("b",null,a.outcome),
+        h("span",{style:{color:colors.mutedLight}},"  "+(a.logged_by||"")+" \u00b7 "+followupSourceLabel(a)),
+        a.notes ? " \u2014 "+a.notes : ""))
+    )
+  );
+}
 function QuoteStagesMaster({ user }){
   const [rows,setRows] = useState([]);
   const [loading,setLoading] = useState(true);
@@ -3434,7 +3605,7 @@ function QuoteStagesMaster({ user }){
     const { error } = await sb.from("quote_status_tbl").insert({
       status:name, kind:adding.kind, needs_reason:!!adding.needs_reason,
       win_pct: adding.win_pct===""||adding.win_pct==null ? null : Number(adding.win_pct),
-      set_on_quote:!!adding.set_on_quote, sort_order:maxSort+10
+      set_on_quote:true, sort_order:maxSort+10   /* 22 Sep: every stage can be set on the Quote screen */
     });
     setBusy(false);
     if(error){ alert(saveFailedText("The new stage", error)); return; }
@@ -3450,7 +3621,7 @@ function QuoteStagesMaster({ user }){
       "The funnel, top to bottom. Kind decides how the app treats a stage everywhere \u2014 open stages are chased, won/lost/parked ones are closed. Win % feeds the weighted pipeline on the dashboard."),
     h("table",{style:{borderCollapse:"collapse",width:"100%"}},
       h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
-        ["","Stage","Kind","Reason needed","Win %","On Quote screen",""].map((c,i)=>h("th",{key:i,style:{...cell,fontSize:11,fontWeight:700}},c)))),
+        ["","Stage","Kind","Reason needed","Win %",""].map((c,i)=>h("th",{key:i,style:{...cell,fontSize:11,fontWeight:700}},c)))),
       h("tbody",null, rows.map((r,idx)=>h("tr",{key:r.status},
         h("td",{style:{...cell,whiteSpace:"nowrap",width:52}},
           h("button",{disabled:busy||!isAdmin||idx===0,onClick:()=>move(idx,-1),title:"Move up",style:{border:"none",background:"transparent",cursor:"pointer",color:colors.muted}},"\u25b2"),
@@ -3466,8 +3637,6 @@ function QuoteStagesMaster({ user }){
             onBlur:e=>{ const v=e.target.value.trim(); const n=v===""?null:Number(v);
               if(v!=="" && (!(n>=0) || n>100)){ alert("Win % is a number from 0 to 100."); e.target.value=r.win_pct==null?"":r.win_pct; return; }
               if(n!==(r.win_pct==null?null:Number(r.win_pct))) save(r,{win_pct:n}); }})),
-        h("td",{style:cell},
-          h("input",{type:"checkbox",checked:!!r.set_on_quote,disabled:busy||!isAdmin||r.status==="Draft",onChange:e=>save(r,{set_on_quote:e.target.checked})})),
         h("td",{style:{...cell,textAlign:"right"}},
           isAdmin && !["Draft","Won"].includes(r.status) && h("button",{onClick:()=>remove(r),disabled:busy,style:{border:"none",background:"transparent",color:colors.danger,cursor:"pointer",fontSize:12}},"Remove"))
       )))
@@ -3481,7 +3650,6 @@ function QuoteStagesMaster({ user }){
       h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:3}},"Win %"),
         h("input",{value:adding.win_pct,onChange:e=>setAdding(a=>({...a,win_pct:e.target.value.replace(/[^0-9.]/g,"")})),style:{...inputStyle,width:70}})),
       h("label",{style:{fontSize:12,display:"flex",gap:4,alignItems:"center"}},h("input",{type:"checkbox",checked:adding.needs_reason,onChange:e=>setAdding(a=>({...a,needs_reason:e.target.checked}))}),"Reason needed"),
-      h("label",{style:{fontSize:12,display:"flex",gap:4,alignItems:"center"}},h("input",{type:"checkbox",checked:adding.set_on_quote,onChange:e=>setAdding(a=>({...a,set_on_quote:e.target.checked}))}),"On Quote screen"),
       h("button",{onClick:()=>setAdding(null),style:btnSecondary},"Cancel"),
       h("button",{onClick:addStage,disabled:busy,style:btnPrimary},"Add")
     ),
@@ -11752,6 +11920,9 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // Won/Lost outcome capture — see shared WonLostOutcomeModal. Fires from
   // the status dropdown above the moment status moves to Won or Lost.
   const [outcomeTarget,setOutcomeTarget]=useState(null); // {referenceNumber, newStatus} | null
+  // The note typed in the stage track for a Won/Lost/Deferred move, held
+  // until the outcome box completes, then written as the follow-up.
+  const pendingStageNoteRef = useRef(null);
   const [quoteHasTerms,setQuoteHasTerms]=useState(false);
   useEffect(()=>{
     if(!quoteExportRef){ setQuoteHasTerms(false); return; }
@@ -15985,70 +16156,30 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
                 ? h("span",{style:{fontSize:14,fontWeight:800,color:(contractInfo?.status==="Draft")?"#0f6e3f":"#0c447c"}},(contractInfo?.status||"Draft").toUpperCase())
               : !readiness.ready
                 ? h("span",{style:{fontSize:14,fontWeight:800,color:"#7a5000"}},"🔒 "+(quoteHeaderRow.quote_status||"Draft").toUpperCase())
-                // Settable here: Draft, Offer Sent and — since 19 Sep —
-                // Won, because an order often lands before anyone gets to
-                // log the call, and the OA cannot be raised until the
-                // quote is Won. Won still goes through the same
-                // WonLostOutcomeModal as everywhere else, so the PO
-                // capture and the FSE credit happen either way. The rest
-                // of the funnel (Under Tech Evaluation, Commercial
-                // Discussion, Deferred, Went Cold, Lost) is still driven
-                // by Log Follow-ups' Outcome field and shows read-only
-                // here, so a quote can't drift through the middle of the
-                // funnel with no follow-up behind it.
-                : !stagesSettableOnQuote().includes(quoteHeaderRow.quote_status||"Draft")
-                ? h("span",{style:{fontSize:14,fontWeight:800,color:"#0c447c"}},"🔒 "+(quoteHeaderRow.quote_status||"Draft").toUpperCase())
-                : h("select",{
-                    value:quoteHeaderRow.quote_status||"Draft",
-                    onChange:e=>{
-                      const newStatus=e.target.value;
-                      const doChange=async()=>{
-                        // Won hands off to the shared outcome modal — it
-                        // captures the PO and the FSE credit and applies
-                        // the status itself, so it must not be applied
-                        // here as well.
-                        if(newStatus==="Won"){ setOutcomeTarget({referenceNumber:refFilter,newStatus:"Won"}); return; }
-                        // Moving a Won quote back is now possible from
-                        // this dropdown, so it is guarded: a quote that
-                        // already has a Sale Order against it cannot be
-                        // un-won, or the contract would be orphaned.
-                        if((quoteHeaderRow.quote_status||"")==="Won"){
-                          const { data: so } = await sb.from("sale_order_tbl").select("contract_number").eq("quote_reference_number",refFilter).maybeSingle();
-                          if(so){ alert("Can't move "+refFilter+" out of Won \u2014 Sale Order "+so.contract_number+" was raised from it. Cancel the Sale Order first."); return; }
-                          if(!confirm("Move "+refFilter+" from Won back to "+newStatus+"?\n\nThe PO details and the FSE credit already captured stay on record.")) return;
-                        }
-                        const result = await updateQuoteStatusForQuote(refFilter,newStatus,user.username,"Quote form");
-                        if(result && result.blocked) return;
-                        setOpenRef(r=>({...r,quote_status:newStatus}));
-                        setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,quote_status:newStatus}:r));
-                      };
-                      // 31 Aug — tightened beyond the shared isQuoteLocked
-                      // rule (which only locks once status is ALREADY
-                      // non-Draft): from THIS screen specifically, a
-                      // plain user needs a code for any change made here,
-                      // including the very first Draft -> Offer Sent
-                      // move, not just changes made once it's already
-                      // Offer Sent. Admin/Super Admin unchanged — still
-                      // free, no code. isQuoteLocked itself is left
-                      // untouched since Kanban/Quote Status Review still
-                      // rely on its original (less strict) behavior.
-                      if(!(user.role==="admin"||user.role==="super_admin")){ setAuthGate({requiredType:"edit",action:doChange}); return; }
-                      doChange();
-                    },
-                    style:{fontSize:13,fontWeight:800,color:quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c",background:"transparent",border:"none",fontFamily:"inherit"}
-                  // Real bug found while making the change above: this
-                  // only ever offered "Draft" as an option, even though
-                  // the screen is meant to allow Draft AND Offer Sent
-                  // (see comment above) — fixed alongside, since the new
-                  // gating logic would have nothing to actually test
-                  // otherwise.
-                  },stagesSettableOnQuote().map(s=>h("option",{key:s,value:s},s)))
+                // 22 Sep — read-only here; every stage is moved from the
+                // stage track below the header, which asks for a note.
+                : h("span",{style:{fontSize:14,fontWeight:800,color:quoteHeaderRow.quote_status==="Draft"?"#0f6e3f":"#0c447c"}},(quoteHeaderRow.quote_status||"Draft").toUpperCase())
             ),
             // Nature removed 22 Sep — folded into the single Stage.
             h("div",{style:{width:220}},
               renderReadinessBar(readiness.categories, {height:32, onClick: readiness.ready?undefined:()=>alert(readiness.missing.map(m=>m.section+": "+m.items.join(", ")).join("\n"))})
             )
           ),
+          mode!=="contract" && quoteHeaderRow && h(QuoteStageTrack,{
+            key:refFilter,
+            referenceNumber:refFilter, customerName:quoteHeaderRow.customer_name,
+            current:quoteHeaderRow.quote_status||"Draft",
+            changedAt:quoteHeaderRow.status_changed_at, changedBy:quoteHeaderRow.status_changed_by,
+            ready:readiness.ready, user,
+            onRequestAuth:(action)=>setAuthGate({requiredType:"edit",action}),
+            onMoved:(st,meta)=>{
+              const patch = { quote_status:st, ...(meta&&meta.at?{status_changed_at:meta.at}:{}), ...(meta&&meta.by?{status_changed_by:meta.by}:{}) };
+              setOpenRef(r=>({...r,...patch}));
+              setRefs(rs=>rs.map(r=>r.reference_number===refFilter?{...r,...patch}:r));
+            },
+            onOpenOutcome:(st,pending)=>{ pendingStageNoteRef.current = { ...pending, stage:st, ref:refFilter, customer:quoteHeaderRow.customer_name };
+              setOutcomeTarget({referenceNumber:refFilter,newStatus:st,changedAt:pending.changedAt}); }
+          }),
           readiness.categories.bomComplete!=="all" && readiness.incompleteBomDetails && readiness.incompleteBomDetails.length>0 && h("div",{style:{background:"#fdecea",border:"1px solid #f0997b",borderRadius:6,padding:"8px 12px",marginTop:8,marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}},
             h("div",{style:{fontSize:12,color:"#a3312a"}},
               h("strong",null,"Incomplete BOM"),": this item's master template is missing a required component — "+readiness.incompleteBomDetails.map(d=>"Sl No "+d.slNo+" (\""+d.itemName+"\"): "+d.missingParams.map(p=>p.label||mocParamValues(p).join(" or ")).join(", ")).join("; ")
@@ -17793,13 +17924,17 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
       )
     ),
     outcomeTarget && h(WonLostOutcomeModal,{
-      referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user, source:"Quote form",
-      onDone:(newStatus)=>{
-        setOpenRef(r=>({...r,quote_status:newStatus}));
+      referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user, source:"Quote form", changedAt:outcomeTarget.changedAt,
+      onDone:async(newStatus)=>{
+        const p = pendingStageNoteRef.current; pendingStageNoteRef.current = null;
+        if(p && p.ref===outcomeTarget.referenceNumber){
+          await logStageMoveFollowup({ referenceNumber:p.ref, customerName:p.customer, stage:newStatus, date:p.date, note:p.note, nextFollowup:null, username:user.username, where:"Quote screen" });
+        }
+        setOpenRef(r=>({...r,quote_status:newStatus,status_changed_by:user.username,status_changed_at:outcomeTarget.changedAt||new Date().toISOString()}));
         setRefs(rs=>rs.map(r=>r.reference_number===outcomeTarget.referenceNumber?{...r,quote_status:newStatus}:r));
         setOutcomeTarget(null);
       },
-      onCancel:()=>setOutcomeTarget(null)
+      onCancel:()=>{ pendingStageNoteRef.current = null; setOutcomeTarget(null); }
     }),
     showQuoteActivityPanel && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:12,width:"100%",maxWidth:480,maxHeight:"85vh",overflow:"auto",padding:"20px 24px"}},
@@ -22638,6 +22773,10 @@ const MANUAL_SECTIONS = [
             "text": "Changed 22 September 2026 \u2014 this replaces what follows. A quote now has ONE field, its Stage, in this funnel order: Draft, Offer Sent, Cold Budgetary, Hot Budgetary, Purchase Requirement 50%, Purchase Requirement 80%, Won \u2014 with Lost and Deferred as exits from any open stage. Nature (Unknown / Budgetary / Purchase Requirement) no longer exists as a separate field; it is part of the stage name. Every screen says Stage: the Quote screen, Log Follow-ups' Outcome, the Quotes Report, the funnel board, Quotes by Stage, Quote Stage Review and Stage Change History. Stages, their order, whether each needs a reason and its win % are set at Sales \u2192 Commercials Master \u2192 Quote Stages."
           },
           {
+            "type": "warn",
+            "text": "Changed 23 September 2026. Every stage can now be moved from the Quote screen too \u2014 on the stage track under the header, or Lost / Deferred beside it \u2014 as well as from Log Follow-ups and the Quotes Report. Wherever it is moved, the move asks for the date it changed, a note, and the next follow-up for an open stage, and the note is saved as a follow-up, so it becomes the quote's Last interaction. The Quote screen picks up a move made on another screen when you come back to it, switch back to the tab, or within a minute while it is open."
+          },
+          {
             "type": "p",
             "text": "Two separate fields on every Quote, tracking two different things. Status Funnel is progress: Draft \u2192 Offer Sent \u2192 Under Tech Evaluation \u2192 Commercial Discussion \u2192 Finalised \u2192 Won/Lost/Deferred/Went Cold. Nature of Quote is a classification: Unknown, Budgetary, or Purchase Requirement \u2014 it can move in either direction, unlike Status."
           },
@@ -23444,6 +23583,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"23 Sep 2026 (85)", summary:"Stage moves from every screen, each with a note. QUOTE SCREEN: the three-stage dropdown is replaced by QuoteStageTrack under the header \u2014 the funnel's open and won stages in master order (passed ones green, current dark), Lost and Deferred as exits, a move box asking for the date it changed, a note and (for open stages) the next follow-up; Won/Lost/Deferred hand on to the outcome box with the note held until it completes. Every move writes a follow-up via logStageMoveFollowup (discussed_what \\\"Stage moved on Quote screen\\\"), so it becomes Last interaction; a stage trail shows the last four moves with who, where and the note. The track re-checks the stage on returning to the screen, on window focus/visibility and every 60 s, and shows who moved it elsewhere. Readiness gate, the plain-user authorization code and the un-Won guard are kept. QUOTES REPORT: the stage box asks for a note and next follow-up and writes the same follow-up (\\\"Stage moved on Quotes Report\\\"). LAST INTERACTION: ordered by the date the interaction happened, then time entered; shows the notes only. QUOTE STAGES: On Quote screen column removed \u2014 every stage is settable. SOP FMQ-SOP-CRM-001 Rev 1. Headless test 50 of 50. No SQL." },
+  { date:"22 Sep 2026 (84)", summary:"The Quotes Report keeps its place. Leaving it \u2014 to open a quote or for any other screen \u2014 and coming back restores the filter boxes, the applied filters and their chips, the rows already worked out (values included), the grouping, and the scroll position in both the table and the page, then refreshes quietly behind the rows shown. Kept in QUOTES_REPORT_SAVED for the session; a fresh drill-down from the dashboard (new initialFilters) starts clean. Previously the existing Back to Quotes Report button on the Quote screen returned to a report rebuilt from nothing. App-wide: leaving the Quotes Report for any screen now shows a \\\"Back to Quotes Report\\\" pill bottom-left on every screen until it is used, the report is reopened another way, or it is dismissed. Headless test: 39 of 39, including leave-and-return restoring list, boxes and chips, and a dashboard drill-down starting clean. No SQL." },
   { date:"22 Sep 2026 (83)", summary:"Log Follow-ups brought in line with the single Stage. Outcome colours now follow the stage's kind from the master (won green, lost red, parked amber) instead of a list of names, so an added stage colours correctly; Not pursuing and Stalled, which are other chase types' outcomes, stay named. The \\\"Next Followup Date required unless...\\\" message names the closing stages from the master instead of the old Won/Lost/Deferred/Went Cold. Draft is no longer offered as an Outcome for an Offer, in the entry grid or the Review tab \u2014 a call doesn't send a quote back to Draft; the Quote screen still can. A stage change that the database refuses when a follow-up is saved is now reported (the follow-up itself is saved either way), instead of vanishing. The Nature column was already removed on 22 Sep and its Outcome list already read the stage master in funnel order. No SQL." },
   { date:"22 Sep 2026 (82)", summary:"Stage wording carried through the rest of the app, after a sweep for every visible Status/Nature label and every comparison against an old stage name. Menus: Quotes by Status -> Quotes by Stage, Quote Status Review -> Quote Stage Review (also the source name recorded in the audit trail), Status Change History -> Stage Change History. Column headers on the Draft reminder, the funnel board's list view and Quote Stage Review (Status -> Stage, Days in status -> Days in stage). Quotes by Stage report title, PDF heading and empty message; Stage Change History title, subtitle, sheet and file name \u2014 its audit filter still matches 'Status changed from', which is what the audit rows say, so history is unaffected. The owner alert heading and message, the Extra Price prompt, and the Tour card. The User Manual's two passages describing the old Status and Nature fields now open with a note saying what replaced them. No code compares against a removed stage name any more except the fallbacks used before the stage master has loaded. No SQL." },
   { date:"22 Sep 2026 (81)", summary:"Quotes Report: freeze panes, full screen and grouping by currency. FREEZE: the table now scrolls inside its own area sized to the window, with the header row and the first two columns (S.No, Reference No) sticky; the table uses separate borders so sticky cells stay put, with row lines moved onto the cells (.qr-table td). FULL SCREEN: a real browser full screen of the whole report, dialogs included (the boundary wraps the edit and outcome pop-ups too, or they would open invisibly); the button follows the browser's own state so Esc and the button agree. OPTIONS: No grouping or By currency, remembered on the computer. Grouped view: INR, then USD, then any other currency as its own group, legacy quotes in a Currency unknown group until their currency is settled; each group has a header with count, no-value count and total, and a subtotal row; one line above the table gives all groups together in rupees. Numbering runs continuously across groups. No SQL." },
@@ -29244,11 +29385,20 @@ function MajorProjectsBulkImport({ user }){
 // (never had a real equivalent in this app). Reference No and Quote No
 // collapse into one field here — Flometriq has no separate concept for
 // the two, unlike the source screen.
+// The Quotes Report's last state, kept for the rest of the session so the
+// report reopens exactly as it was left. Cleared on reload.
+let QUOTES_REPORT_SAVED = null;
 function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
-  const [rows,setRows] = useState([]);
-  const [loading,setLoading] = useState(true);
+  // 22 Sep — the report keeps its place. Leaving it (to open a quote, or
+  // for any other screen) and coming back restores the filters, grouping,
+  // the rows already worked out and the scroll position, instead of
+  // starting again from nothing. A fresh drill-down from the dashboard
+  // (new initialFilters) starts clean, as it should.
+  const saved = (QUOTES_REPORT_SAVED && QUOTES_REPORT_SAVED.initialFilters===initialFilters) ? QUOTES_REPORT_SAVED : null;
+  const [rows,setRows] = useState(saved ? saved.rows : []);
+  const [loading,setLoading] = useState(!saved);
   // 22 Sep — when the list was last read, shown beside Refresh.
-  const [loadedAt,setLoadedAt] = useState(null);
+  const [loadedAt,setLoadedAt] = useState(saved ? saved.loadedAt : null);
   // Update one row on screen immediately after a successful save; the
   // reload that follows then confirms it from the database.
   const patchRow = (ref, changes)=> setRows(rs=>rs.map(r=>r.reference_number===ref ? {...r, ...changes} : r));
@@ -29277,6 +29427,11 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   const [editStatusValue,setEditStatusValue] = useState("");
   const [editNatureValue,setEditNatureValue] = useState("");
   const [editDate,setEditDate] = useState("");
+  // 22 Sep — a stage move from here carries a note and a next follow-up,
+  // written as a follow-up like a move anywhere else.
+  const [editNote,setEditNote] = useState("");
+  const [editNext,setEditNext] = useState("");
+  const pendingReportNoteRef = useRef(null);
   const [outcomeTarget,setOutcomeTarget] = useState(null); // {referenceNumber,newStatus,changedAt}
   // "+ Next Follow-up" (31 Aug) — writes a REAL Log Follow-ups entry
   // (activity_log_tbl), not a field living only on the quote — so it
@@ -29317,6 +29472,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     setEditStatusValue(row.status);
     setEditNatureValue(row.nature);
     setEditDate(new Date().toISOString().slice(0,10));
+    setEditNote(""); setEditNext("");
   };
   const confirmEdit = async()=>{
     const row = editFor;
@@ -29328,6 +29484,10 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     // whichever of the two actually changed uses this same date, so
     // editing both together never produces two different dates.
     const changedAtIso = new Date(editDate+"T12:00:00").toISOString();
+    if(newStatus!==row.status){
+      if(!editNote.trim()){ alert("A note is required \u2014 what happened?"); return; }
+      if(!isClosedStage(newStatus) && !editNext){ alert("Set the next follow-up date."); return; }
+    }
     const proceed = async()=>{
       setEditFor(null);
       // 22 Sep — each save's result is checked, and a successful one
@@ -29339,6 +29499,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       }
       if(newStatus!==row.status){
         if(CLOSED_OUTCOMES_QR.includes(newStatus)){
+          pendingReportNoteRef.current = { ref:row.reference_number, customer:row.customer_name, date:editDate, note:editNote.trim() };
           setOutcomeTarget({ referenceNumber: row.reference_number, newStatus, changedAt: changedAtIso });
           return;
         }
@@ -29346,7 +29507,8 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
         if(r && r.error){ alert(saveFailedText("Status for "+row.reference_number, r.error)); load(); return; }
         if(r && r.blocked){ load(); return; }   // the user chose to add Extra Price first — nothing changed, knowingly
         if(r && r.notFound){ alert(row.reference_number+" wasn't found \u2014 it may have been deleted. The list will reload."); load(); return; }
-        patchRow(row.reference_number, { status:newStatus });
+        await logStageMoveFollowup({ referenceNumber:row.reference_number, customerName:row.customer_name, stage:newStatus, date:editDate, note:editNote.trim(), nextFollowup:editNext, username:user.username, where:"Quotes Report" });
+        patchRow(row.reference_number, { status:newStatus, next_followup:editNext, last_interaction:{ date:editDate, type:"Others", by:user.username, whom:"", text:editNote.trim() } });
       }
       load();
     };
@@ -29426,7 +29588,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     if(!allowed){ setAuthGate({ requiredType:"edit", action: doSave }); return; }
     await doSave();
   };
-  const [filters,setFilters] = useState({
+  const [filters,setFilters] = useState(saved ? saved.filters : {
     dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"", countryLike:"",
     zone:"", status:"", nature:"", followUp:"", projectLike:"",
     valueCcy:"INR", valueMin:"", valueMax:"", usdRate:"",
@@ -29436,7 +29598,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   // 22 Sep — the list follows APPLIED filters, not the boxes. Typing in a
   // box changes nothing below until Apply filters or Enter, so several
   // filters can be set up without the rows jumping at every keystroke.
-  const [applied,setApplied] = useState(()=>({
+  const [applied,setApplied] = useState(()=> saved ? saved.applied : ({
     dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"", countryLike:"",
     zone:"", status:"", nature:"", followUp:"", projectLike:"",
     valueCcy:"INR", valueMin:"", valueMax:"", usdRate:"", ...(initialFilters||{})
@@ -29459,6 +29621,24 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   // banners hidden — and Esc brings it back. Tracks the browser's own
   // state, so Esc and the button can never disagree.
   const reportRef = useRef(null);
+  const tableScrollRef = useRef(null);
+  const latest = useRef({});
+  latest.current = { rows, loadedAt, filters, applied };
+  useEffect(()=>{
+    // Put the reader back where they were once the rows are on screen.
+    if(saved){
+      requestAnimationFrame(()=>{
+        if(tableScrollRef.current){ tableScrollRef.current.scrollTop = saved.tableScroll||0; tableScrollRef.current.scrollLeft = saved.tableScrollLeft||0; }
+        window.scrollTo(0, saved.pageScroll||0);
+      });
+    }
+    return ()=>{
+      QUOTES_REPORT_SAVED = { initialFilters, ...latest.current,
+        tableScroll: tableScrollRef.current ? tableScrollRef.current.scrollTop : 0,
+        tableScrollLeft: tableScrollRef.current ? tableScrollRef.current.scrollLeft : 0,
+        pageScroll: window.scrollY||0 };
+    };
+  },[]);
   const [isFull,setIsFull] = useState(false);
   useEffect(()=>{
     const onChange = ()=> setIsFull(document.fullscreenElement===reportRef.current);
@@ -29587,7 +29767,12 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           .select("chase_reference,outcome,notes,next_followup_date,created_at,activity_date,activity_type,logged_by,contacted_whom,discussed_what")
           .in("chase_reference",chunk).order("created_at",{ascending:false})));
       }
-      acts.sort((a,b)=>String(b.created_at).localeCompare(String(a.created_at)));
+      // 22 Sep — "latest" means the interaction that HAPPENED last, not the
+      // one typed in last: interaction date first, time entered only to
+      // break a tie on the same day. Logging yesterday's call this
+      // afternoon no longer pushes today's aside.
+      acts.sort((a,b)=> String(b.activity_date||String(b.created_at||"").slice(0,10)).localeCompare(String(a.activity_date||String(a.created_at||"").slice(0,10)))
+                        || String(b.created_at).localeCompare(String(a.created_at)));
       // Quote values (22 Sep) — from the value snapshot: rupees for every
       // quote, plus the figure in the quote's own currency. A quote never
       // opened since snapshots began has no value yet, and says so.
@@ -29632,7 +29817,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           project_reference: h.linked_project_id ? (projById.get(h.linked_project_id)||"—") : "—",
           followup_stage: stageText(act)||"—",
           last_interaction: act ? { date:(act.activity_date||act.created_at||"").slice(0,10), type:act.activity_type||"", by:act.logged_by||"",
-            whom:act.contacted_whom||"", text:[act.outcome, act.notes||act.discussed_what].filter(x=>x&&String(x).trim()).join(" \u2014 ") } : null,
+            whom:act.contacted_whom||"", text:(act.notes&&String(act.notes).trim()) ? act.notes : (act.discussed_what||"") }   /* 22 Sep: the notes — what was said; the stage has its own column */ : null,
           value_inr: snapByRef.has(h.reference_number) ? Number(snapByRef.get(h.reference_number).total_value)||0 : null,
           value_ccy: snapByRef.has(h.reference_number) ? Number(snapByRef.get(h.reference_number).total_value_in_currency ?? snapByRef.get(h.reference_number).total_value)||0 : null,
           currency: (snapByRef.get(h.reference_number)||{}).currency || h.currency || "INR",
@@ -29661,7 +29846,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           // the moment one exists — see comment above.
           followup_stage: stageText(act)||l.followup_note||"—",
           last_interaction: act ? { date:(act.activity_date||act.created_at||"").slice(0,10), type:act.activity_type||"", by:act.logged_by||"",
-            whom:act.contacted_whom||"", text:[act.outcome, act.notes||act.discussed_what].filter(x=>x&&String(x).trim()).join(" \u2014 ") }
+            whom:act.contacted_whom||"", text:(act.notes&&String(act.notes).trim()) ? act.notes : (act.discussed_what||"") }   /* 22 Sep: the notes — what was said; the stage has its own column */
             : (l.followup_note ? { date:"", type:"Imported", by:"", whom:"", text:l.followup_note } : null),
           value_inr: null, value_ccy: null, currency: "INR", fx_to_inr: null,
           next_followup: act?.next_followup_date||l.next_followup_date||"—",
@@ -29674,7 +29859,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       setLoadedAt(new Date());
     } finally { setLoading(false); }
   },[]);
-  useEffect(()=>{ load(); },[load]);
+  useEffect(()=>{ load(); },[load]);   // on a restored report this refreshes quietly behind the rows already shown
   useEffect(()=>{
     sb.from("zone_tbl").select("value").then(({data})=>setZoneOptions((data||[]).map(r=>r.value)));
     loadQuoteStages(true).then(rows=>({data:rows})).then(({data})=>setStatusOptions((data||[]).map(r=>r.status)));
@@ -29871,7 +30056,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     grouping==="ccy" && filtered.length>0 && h("div",{style:{fontSize:11.5,color:colors.muted,margin:"-4px 0 8px"}},
       "Grouped by currency \u00b7 all groups together: INR "+Math.round(allInr).toLocaleString("en-IN")+" in rupees"),
     (loading && !rows.length) ? h("div",{style:{color:colors.mutedLight}},"Loading…") :
-    h("div",{style:{overflow:"auto",background:"#fff",border:"1px solid #cfe3dd",borderRadius:6,
+    h("div",{ref:tableScrollRef,style:{overflow:"auto",background:"#fff",border:"1px solid #cfe3dd",borderRadius:6,
       maxHeight: isFull ? "calc(100vh - 150px)" : "calc(100vh - 260px)", minHeight:240}},
       h("table",{className:"qr-table",style:{borderCollapse:"separate",borderSpacing:0,width:"100%",fontSize:14}},
         h("thead",null,h("tr",{style:{background:"#eef6f3",textAlign:"left"}},
@@ -29962,7 +30147,14 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
         statusOptions.map(s=>h("option",{key:s,value:s},s))
       ),
       h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Date this actually changed"),
-      h("input",{type:"date",value:editDate,onChange:e=>setEditDate(e.target.value),style:{...inputStyle,marginBottom:16}}),
+      h("input",{type:"date",value:editDate,onChange:e=>setEditDate(e.target.value),style:{...inputStyle,marginBottom:12}}),
+      editStatusValue!==editFor.status && !isClosedStage(editStatusValue) && h(React.Fragment,null,
+        h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Next follow-up"),
+        h("input",{type:"date",value:editNext,onChange:e=>setEditNext(e.target.value),style:{...inputStyle,marginBottom:12}})),
+      editStatusValue!==editFor.status && h(React.Fragment,null,
+        h("label",{style:{display:"block",fontSize:11,color:colors.muted,marginBottom:3}},"Note \u2014 what happened"),
+        h("textarea",{rows:2,value:editNote,onChange:e=>setEditNote(e.target.value),style:{...inputStyle,marginBottom:6,resize:"vertical"}}),
+        h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginBottom:12}},"Saved as a follow-up too \u2014 it becomes the quote's Last interaction.")),
       h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
         h("button",{onClick:()=>setEditFor(null),style:btnSecondary},"Cancel"),
         h("button",{onClick:confirmEdit,style:btnPrimary},"Save")
@@ -30013,8 +30205,14 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   outcomeTarget && h(WonLostOutcomeModal,{
     referenceNumber:outcomeTarget.referenceNumber, newStatus:outcomeTarget.newStatus, user,
     source:"Quotes Report", changedAt:outcomeTarget.changedAt,
-    onDone:()=>{ setOutcomeTarget(null); load(); },
-    onCancel:()=>setOutcomeTarget(null)
+    onDone:async(newStatus)=>{
+      const p = pendingReportNoteRef.current; pendingReportNoteRef.current = null;
+      if(p && p.ref===outcomeTarget.referenceNumber){
+        await logStageMoveFollowup({ referenceNumber:p.ref, customerName:p.customer, stage:newStatus||outcomeTarget.newStatus, date:p.date, note:p.note, nextFollowup:null, username:user.username, where:"Quotes Report" });
+      }
+      setOutcomeTarget(null); load();
+    },
+    onCancel:()=>{ pendingReportNoteRef.current = null; setOutcomeTarget(null); }
   })
   );
 }
@@ -36094,6 +36292,17 @@ function App() {
   // "Back to Quotes Report" button instead of always landing with no
   // way back except the main nav.
   const [cameFromQuotesReport,setCameFromQuotesReport]=useState(false);
+  // 22 Sep — leaving the Quotes Report for ANY screen leaves a way back:
+  // a "Back to Quotes Report" pill that stays on every screen until it's
+  // used, the report is reopened another way, or it's dismissed. The
+  // report itself reopens exactly as it was left (QUOTES_REPORT_SAVED).
+  const [returnToReport,setReturnToReport]=useState(false);
+  const prevTabRef = useRef(tab);
+  useEffect(()=>{
+    if(prevTabRef.current==="quotes_report" && tab!=="quotes_report") setReturnToReport(true);
+    if(tab==="quotes_report") setReturnToReport(false);
+    prevTabRef.current = tab;
+  },[tab]);
   // Dashboard drill-through (30 Aug) — clicking a Funnel stage or Zone
   // line seeds Quotes Report's filters before navigating there.
   const [dashboardDrillFilters,setDashboardDrillFilters]=useState(null);
@@ -36356,6 +36565,13 @@ function App() {
     }),
     (user.role==="admin"||user.role==="super_admin") && showBillingOverrideReminder && h(IncompleteSaleOrderReminder,{user,onDone:dismissBillingOverrideReminder,onOpenContract:openContract}),
     showQuoteOwnerAlerts && h(QuoteStatusOwnerAlerts,{user,onDone:()=>setShowQuoteOwnerAlerts(false)}),
+    returnToReport && tab!=="quotes_report" && h("div",{style:{position:"fixed",left:16,bottom:16,zIndex:1100,display:"flex",alignItems:"center",gap:2,
+        background:"#0f6e56",borderRadius:22,boxShadow:"0 4px 14px rgba(0,0,0,0.18)"}},
+      h("button",{onClick:()=>{ setCameFromQuotesReport(false); setTab("quotes_report"); },title:"Back to the Quotes Report, as you left it",
+        style:{background:"transparent",border:"none",color:"#fff",fontWeight:700,fontSize:12.5,padding:"9px 6px 9px 16px",cursor:"pointer"}},"\u2190 Back to Quotes Report"),
+      h("button",{onClick:()=>setReturnToReport(false),title:"Dismiss",
+        style:{background:"transparent",border:"none",color:"#cfeee3",fontSize:15,padding:"6px 12px 6px 6px",cursor:"pointer"}},"\u00d7")
+    ),
     (isSalesHeadUser||user.role==="super_admin") && showGoAheadPrompt && h(GoAheadPendingPrompt,{user,onDone:dismissGoAheadPrompt,onOpenContract:openContract}),
     showWorkOrderFlags && h(WorkOrderFlagPrompt,{user,onDone:()=>setShowWorkOrderFlags(false)}),
     (isSalesCoordinatorUser||isSalesHeadUser||user.role==="super_admin") && showLoiPrompt && h(LoiPoAwaitedPrompt,{onDone:dismissLoiPrompt,onOpenContract:openContract}),
