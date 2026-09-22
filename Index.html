@@ -44,7 +44,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-21T13:25:00Z";
+  var APP_BUILD_VERSION = "2026-09-22T11:15:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -9345,6 +9345,10 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
   const [contractSlNos,setContractSlNos] = useState([]);
   const [woPick,setWoPick] = useState([]);          // Sl Nos ticked for a new work order
   const [woOpen,setWoOpen] = useState(false);
+  // Order basis (22 Sep): an order started on an LOI shows it, with the
+  // days the PO has been awaited, until the PO is attached.
+  const [basis,setBasis] = useState(null);           // {order_basis, basis_number, basis_date}
+  const [poAwaited,setPoAwaited] = useState(false);
   useEffect(()=>{
     if(!user?.id){ setIsSalesHead(false); return; }
     (async()=>{
@@ -9365,6 +9369,14 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
       sb.from("estimates").select("item_sl_no,item,order_qty").eq("reference_number",contractInfo.contract_number).order("item_sl_no")
     ]);
     setGoState((so&&so.go_ahead_state)||"Hold");
+    try{
+      const [{ data: b }, reqs] = await Promise.all([
+        sb.from("sale_order_tbl").select("order_basis,basis_number,basis_date").eq("contract_number",contractInfo.contract_number).maybeSingle(),
+        fetchDocumentRequirements(contractInfo.contract_number)
+      ]);
+      setBasis(b||null);
+      setPoAwaited(outstandingMandatory(reqs).some(isPoDocRequirement));
+    }catch(e){ setBasis(null); }
     setWorkOrders(wos||[]); setWoSlNos(slRows||[]); setContractSlNos(ests||[]);
   },[contractInfo?.contract_number]);
   useEffect(()=>{ loadGoAhead(); },[loadGoAhead]);
@@ -9915,6 +9927,15 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
         background: goState==="Hold" ? "#f1efe8" : goState==="Start Engineering" ? "#e6f1fb" : "#e6f4f1",
         color: goState==="Hold" ? colors.muted : goState==="Start Engineering" ? "#0c447c" : "#0f6e56"}},
         goState==="Hold" ? "Production on hold" : goState),
+      // Running on an LOI — stays visible until the PO is attached, with
+      // the days it has been waiting, so nobody forgets the order has no
+      // PO behind it.
+      basis && basis.order_basis==="LOI" && poAwaited && h("span",{
+        title:"LOI "+(basis.basis_number||"")+" dated "+(basis.basis_date||"")+". The Order Acceptance PDF is blocked until the PO is attached.",
+        style:{fontSize:10.5,padding:"2px 8px",borderRadius:9,background:"#fff4d6",color:"#854f0b",fontWeight:700}},
+        "On LOI \u2014 PO awaited "+(basis.basis_date ? Math.max(0,Math.floor((Date.now()-new Date(basis.basis_date).getTime())/86400000))+" days" : "")),
+      basis && basis.order_basis==="LOI" && !poAwaited && h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:9,background:"#eaf9f4",color:"#085041"}},
+        "Started on LOI \u2014 PO now received"),
       // Ready, but nobody has released it. Shown to everyone; only the
       // Sales Head or a Super Admin can act on it.
       goState==="Hold" && readyForGoAhead && h("span",{style:{fontSize:10.5,padding:"2px 8px",borderRadius:9,background:"#fff4d6",color:"#854f0b",fontWeight:600}},
@@ -10548,6 +10569,22 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   // is a one-time, one-to-one action — see the guard in startAmendment
   // just below, which blocks further amendment on this Quote# once a
   // Contract exists for it, so a Quote and its Contract can't drift apart.
+  // PO/LOI gate on the Quote screen's Create Sale Order (22 Sep) — same
+  // gate and same rule as the Sale Order screen: nothing is created until
+  // the customer's PO or LOI is entered.
+  const [quoteBasisGate,setQuoteBasisGate] = useState(null);   // {contractNumber}
+  const completeSaleOrderFromQuote = async(contractNumber, basis)=>{
+    try{
+      const newContract = await cloneQuoteIntoContract(refFilter, contractNumber, quoteHeaderRow.customer_name, user?.username);
+      await advanceContractNumberSuggestion(contractNumber, user?.username);
+      await carryRequirementsToContract(refFilter, contractNumber, user?.username);
+      await ensurePoDocumentRequirement(contractNumber, user?.username);
+      try{ await recordOrderBasis(contractNumber, basis, user?.username); }
+      catch(e){ alert("The sale order was created, but the "+basis.kind+" could not be recorded: "+(e.message||e)+"\n\nAdd it from the Documents box on the order."); }
+      setQuoteBasisGate(null);
+      if(onOpenContract) onOpenContract(newContract);
+    } catch(e){ alert("Couldn't create the Sale Order: "+e.message); }
+  };
   const createSaleOrderFromQuote = async()=>{
     if(!refFilter || !quoteHeaderRow) return;
     if(quoteHeaderRow.quote_status!=="Won"){
@@ -10573,15 +10610,10 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
     if(typed===null) return;
     const contractNumber = typed.trim();
     if(!CONTRACT_NUMBER_RE.test(contractNumber)){ alert("Contract Number must be exactly 6 digits (YY + 4-digit sequence)."); return; }
-    try{
-      const newContract = await cloneQuoteIntoContract(refFilter, contractNumber, quoteHeaderRow.customer_name, user?.username);
-      await advanceContractNumberSuggestion(contractNumber, user?.username);
-      // The order inherits what the customer asked for at quote stage,
-      // and the PO becomes a mandatory requirement on it straight away.
-      await carryRequirementsToContract(refFilter, contractNumber, user?.username);
-      await ensurePoDocumentRequirement(contractNumber, user?.username);
-      if(onOpenContract) onOpenContract(newContract);
-    } catch(e){ alert("Couldn't create the Sale Order: "+e.message); }
+    const { data: dupSo } = await sb.from("sale_order_tbl").select("contract_number,customer_name").eq("contract_number",contractNumber).maybeSingle();
+    if(dupSo){ alert("Contract "+contractNumber+" already exists ("+(dupSo.customer_name||"\u2014")+"). Pick another number."); return; }
+    // Create happens from the gate's confirm — see completeSaleOrderFromQuote.
+    setQuoteBasisGate({ contractNumber });
   };
 
   const startAmendment = async()=>{
@@ -11476,7 +11508,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
   const outstandingMandatoryDocs = outstandingMandatory(documentRequests);
   const loadQuoteDocuments = useCallback(async(ref)=>{
     if(!ref) return;
-    const { data: parents } = await sb.from("universal_documents_tbl").select("*").eq("entity_type","quote").eq("entity_id",ref);
+    // 22 Sep FIX — this filtered on entity_type "quote". Since the 20 Sep
+    // build, documents uploaded on a Sale Order are written as
+    // "contract", so they were saved but never shown again in this box.
+    // entity_id alone is exact: a contract number and a quote reference
+    // cannot collide.
+    const { data: parents } = await sb.from("universal_documents_tbl").select("*").eq("entity_id",ref);
     if(!parents?.length){ setQuoteDocuments([]); return; }
     const ids = parents.map(p=>p.id);
     const { data: history } = await sb.from("universal_document_history_tbl").select("*").in("document_id",ids).order("rev_number",{ascending:false});
@@ -17475,6 +17512,12 @@ function SavedEstimates({ user, sessionCompany, openTarget, onConsumedTarget, on
           h("button",{onClick:()=>setFreshBom(null),style:btnSecondary},"Close"))
       )
     ),
+    quoteBasisGate && h(PoLoiGateModal,{
+      contractNumber: quoteBasisGate.contractNumber, customerName: quoteHeaderRow && quoteHeaderRow.customer_name,
+      defaultCurrency: (quoteHeaderRow && quoteHeaderRow.currency) || "INR",
+      onCancel: ()=>setQuoteBasisGate(null),
+      onConfirm: (basis)=>completeSaleOrderFromQuote(quoteBasisGate.contractNumber, basis)
+    }),
     mandatoryGate && h(AuthCodeGate,{requiredType:"edit",user,onClose:()=>setMandatoryGate(null),onAuthorized:async()=>{ const run=mandatoryGate.run; setMandatoryGate(null); await run(); }}),
     showBomRefreshConfirm && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px"}},
       h("div",{style:{background:"#fff",borderRadius:8,padding:"20px 24px",width:380,maxWidth:"100%"}},
@@ -18389,7 +18432,7 @@ async function deleteQuoteReferenceEverywhere(referenceNumber, performedBy){
   const [{data:slRows},{data:linesData},{data:docParentsToDelete}] = await Promise.all([
     sb.from("estimates").select("*").eq("reference_number",referenceNumber),
     sb.from("estimate_lines").select("*").eq("reference_number",referenceNumber),
-    sb.from("universal_documents_tbl").select("id").eq("entity_type","quote").eq("entity_id",referenceNumber)
+    sb.from("universal_documents_tbl").select("id").eq("entity_id",referenceNumber)   // 22 Sep: deleting a reference removes its documents whatever they were filed as
   ]);
   const docIdsToDelete = (docParentsToDelete||[]).map(p=>p.id);
   await Promise.all([
@@ -18499,7 +18542,11 @@ async function updateQuoteStatusForQuote(referenceNumber, newStatus, changedBy, 
   const now = changedAt || new Date().toISOString();
   const { data: allRows } = await sb.from("estimates").select("id,item_sl_no,quote_status").eq("reference_number",referenceNumber);
   const oldStatus = allRows && allRows[0] ? allRows[0].quote_status : null;
-  await sb.from("estimates").update({quote_status:newStatus,status_changed_by:changedBy,status_changed_at:now,status_reason:reason||null}).eq("reference_number",referenceNumber);
+  // 22 Sep — the result is checked. A refused update used to vanish, and
+  // every screen then reloaded and showed the old status as though
+  // nothing had been attempted.
+  const { error: stErr } = await sb.from("estimates").update({quote_status:newStatus,status_changed_by:changedBy,status_changed_at:now,status_reason:reason||null}).eq("reference_number",referenceNumber);
+  if(stErr) return { error: stErr, oldStatus };
   await logAudit("UPDATE","estimates",referenceNumber,"Status changed from "+(oldStatus||"Draft")+" to "+newStatus+" via "+source+" (applies to all "+(allRows?allRows.length:0)+" Sl No(s) on this quote)",changedBy,{quote_status:oldStatus},{quote_status:newStatus});
   if(newStatus!=="Draft"){
     // Clear the abandoned-incomplete flag too, if set — leaving Draft
@@ -18562,7 +18609,8 @@ async function applyOutcomeStatus(referenceNumber, newStatus, changedBy, source,
   const { data: legacyRow } = await sb.from("legacy_quotes_tbl").select("id,quote_status").eq("reference_number",referenceNumber).maybeSingle();
   if(legacyRow){
     const now = changedAt || new Date().toISOString();
-    await sb.from("legacy_quotes_tbl").update({quote_status:newStatus, status_reason:reason||null, status_changed_at:now, status_changed_by:changedBy}).eq("id",legacyRow.id);
+    const { error: lgErr } = await sb.from("legacy_quotes_tbl").update({quote_status:newStatus, status_reason:reason||null, status_changed_at:now, status_changed_by:changedBy}).eq("id",legacyRow.id);
+    if(lgErr) return { error: lgErr, oldStatus: legacyRow.quote_status };
     await logAudit("UPDATE","legacy_quotes_tbl",referenceNumber,"Status changed from "+(legacyRow.quote_status||"Draft")+" to "+newStatus+" via "+source,changedBy,{quote_status:legacyRow.quote_status},{quote_status:newStatus});
     return { oldStatus: legacyRow.quote_status };
   }
@@ -18859,8 +18907,34 @@ async function fetchFseNames(){
 async function applyOutcomeNature(referenceNumber, nature, changedBy, changedAt){
   const now = changedAt || new Date().toISOString();
   const { data: liveRow } = await sb.from("estimates").select("id").eq("reference_number",referenceNumber).limit(1).maybeSingle();
-  if(liveRow){ await sb.from("estimates").update({quote_nature:nature,quote_nature_changed_at:now,quote_nature_changed_by:changedBy||null}).eq("reference_number",referenceNumber); return; }
-  await sb.from("legacy_quotes_tbl").update({quote_nature:nature,quote_nature_changed_at:now,quote_nature_changed_by:changedBy||null}).eq("reference_number",referenceNumber);
+  // 22 Sep — returns {error} so a refused save can be reported.
+  if(liveRow){
+    const { error } = await sb.from("estimates").update({quote_nature:nature,quote_nature_changed_at:now,quote_nature_changed_by:changedBy||null}).eq("reference_number",referenceNumber);
+    return { error: error||null };
+  }
+  const { error } = await sb.from("legacy_quotes_tbl").update({quote_nature:nature,quote_nature_changed_at:now,quote_nature_changed_by:changedBy||null}).eq("reference_number",referenceNumber);
+  return { error: error||null };
+}
+// Paged read (22 Sep). A single read is capped at 1,000 rows by the
+// database; a screen that reads more than that in one go silently loses
+// the rest. build() returns a fresh query each call so .range() can be
+// applied per page.
+async function fetchPaged(build, pageSize){
+  const size = pageSize||1000;
+  let all = [], from = 0;
+  while(true){
+    const { data, error } = await build().range(from, from+size-1);
+    if(error){ console.error("Paged read failed", error); break; }
+    all = all.concat(data||[]);
+    if(!data || data.length < size) break;
+    from += size;
+  }
+  return all;
+}
+// Plain words for a refused save, whatever shape the error came in.
+function saveFailedText(what, err){
+  const m = String((err && (err.message||err.details||err.hint)) || err || "unknown reason");
+  return what+" was not saved \u2014 the database refused it:\n\n"+m;
 }
 
 // Documents live in Supabase only while the quote is being actively worked
@@ -19321,7 +19395,7 @@ function SaleOrderContractPicker({ user, onOpenContract }){
   const loadQuoteOptions = async()=>{
     setQuoteOptionsLoading(true);
     const [{data:estRows},{data:contractsAll}] = await Promise.all([
-      sb.from("estimates").select("reference_number,customer_name,quote_status,item_sl_no").order("reference_number"),
+      sb.from("estimates").select("reference_number,customer_name,quote_status,item_sl_no,currency").order("reference_number"),
       sb.from("sale_order_tbl").select("contract_number"),
     ]);
     const contractNumbers = new Set((contractsAll||[]).map(c=>c.contract_number));
@@ -19332,7 +19406,7 @@ function SaleOrderContractPicker({ user, onOpenContract }){
       const revNum = (r.reference_number.match(/-Rev-(\d+)$/)||[])[1];
       const existing = byBase.get(base);
       if(!existing || (revNum && Number(revNum)>(existing.revNum||0))){
-        byBase.set(base,{rn:base, latestRef:r.reference_number, revNum:revNum?Number(revNum):0, customer_name:r.customer_name, quote_status:r.quote_status});
+        byBase.set(base,{rn:base, latestRef:r.reference_number, revNum:revNum?Number(revNum):0, customer_name:r.customer_name, quote_status:r.quote_status, currency:r.currency});
       }
     });
     setQuoteOptions(Array.from(byBase.values()).sort((a,b)=>a.rn.localeCompare(b.rn)));
@@ -19363,6 +19437,11 @@ function SaleOrderContractPicker({ user, onOpenContract }){
     setDupError(data||null);
   };
 
+  // PO/LOI gate (22 Sep): the customer's order document is asked for
+  // BEFORE anything is created. basisRef carries the answer through the
+  // optional document-carry-forward step to finishCreate.
+  const [basisGate,setBasisGate] = useState(null);   // {num, quoteHit}
+  const basisRef = useRef(null);
   const confirmCreate = async()=>{
     const num = addNumber.trim();
     if(!CONTRACT_NUMBER_RE.test(num)){ alert("Contract Number must be exactly 6 digits (YY + 4-digit sequence)."); return; }
@@ -19377,6 +19456,9 @@ function SaleOrderContractPicker({ user, onOpenContract }){
       // backstop against a same-moment race, not this one.
       const { data: existingDup } = await sb.from("sale_order_tbl").select("*").eq("contract_number",num).maybeSingle();
       if(existingDup){ setDupError(existingDup); return; }
+      // Ask for the PO or LOI now. Everything below runs from the gate's
+      // confirm, so Cancel there creates nothing.
+      if(!basisRef.current){ setBasisGate({ num, quoteHit }); return; }
       // Document carry-forward prompt (31 Aug) — only bother asking if
       // the source Quote actually has any. entity_type stays "quote"
       // even though this is headed for a Contract — see the comment on
@@ -19398,6 +19480,8 @@ function SaleOrderContractPicker({ user, onOpenContract }){
   };
 
   const finishCreate = async(num, quoteHit, selectedDocIds)=>{
+    const basis = basisRef.current;
+    if(!basis){ alert("The PO or LOI hasn't been entered \u2014 start again from Create Contract."); return; }
     const newContract = await cloneQuoteIntoContract(quoteHit.latestRef, num, quoteHit.customer_name, user?.username);
     if(selectedDocIds && selectedDocIds.length){
       // Documents panel everywhere in this app queries entity_type="quote"
@@ -19408,6 +19492,10 @@ function SaleOrderContractPicker({ user, onOpenContract }){
       await carryForwardDocuments("quote", quoteHit.latestRef, "quote", num, user?.username, selectedDocIds);
     }
     await advanceContractNumberSuggestion(num, user?.username);
+    await carryRequirementsToContract(quoteHit.latestRef, num, user?.username);
+    try{ await recordOrderBasis(num, basis, user?.username); }
+    catch(e){ alert("The sale order was created, but the "+basis.kind+" could not be recorded: "+(e.message||e)+"\n\nAdd it from the Documents box on the order."); }
+    basisRef.current = null;
     onOpenContract(newContract);
   };
   const confirmDocPick = async()=>{
@@ -19487,11 +19575,14 @@ function SaleOrderContractPicker({ user, onOpenContract }){
             h("span",{onClick:()=>openExisting(dupError),style:{textDecoration:"underline",cursor:"pointer",fontWeight:600}},"Open it instead →")
           ),
           h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:4}},"Which Quote is this Contract for?"),
-          h(PredictiveTextField,{
+          // 22 Sep — limit-to-list, and only Won quotes are offered: a
+          // quote that isn't Won can't become an order, so listing it only
+          // invites a refusal after the user has picked it.
+          h(LimitToListCombo,{
             value:addQuoteSearch, onChange:setAddQuoteSearch,
-            options:quoteOptions.map(o=>o.rn+" — "+(o.customer_name||"—")),
-            placeholder:quoteOptionsLoading?"Loading Won quotes…":"Offer number or customer name… (must be Won)",
-            onPick:setAddQuoteSearch,
+            options:quoteOptions.filter(o=>o.quote_status==="Won").map(o=>o.rn+" \u2014 "+(o.customer_name||"\u2014")),
+            placeholder:quoteOptionsLoading?"Loading Won quotes\u2026":"Type the offer number or customer\u2026",
+            invalidMessage:"Pick a Won quote from the list.",
             style:{...inputStyle,padding:"7px 9px",width:"100%",boxSizing:"border-box",marginBottom:14}
           }),
           h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
@@ -19525,6 +19616,15 @@ function SaleOrderContractPicker({ user, onOpenContract }){
       )
     )
   ),
+  // PO/LOI gate (22 Sep). Confirm stores the answer and re-runs
+  // confirmCreate, which now carries on past the gate to the document
+  // carry-forward step and the create itself.
+  basisGate && h(PoLoiGateModal,{
+    contractNumber: basisGate.num, customerName: basisGate.quoteHit.customer_name,
+    defaultCurrency: basisGate.quoteHit.currency || "INR",
+    onCancel: ()=>{ setBasisGate(null); basisRef.current = null; },
+    onConfirm: async(basis)=>{ basisRef.current = basis; setBasisGate(null); await confirmCreate(); }
+  }),
   // Document carry-forward picker (31 Aug) — select-all by default,
   // matching the existing amendment "Documents" area-picker precedent.
   showDocPick && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:1200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
@@ -19543,7 +19643,7 @@ function SaleOrderContractPicker({ user, onOpenContract }){
         docPickList.length===0 && h("div",{style:{padding:12,fontSize:11.5,color:colors.mutedLight}},"No documents on this Quote.")
       ),
       h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8}},
-        h("button",{onClick:()=>{ setShowDocPick(false); setPendingCreate(null); },disabled:busy,style:btnSecondary},"Cancel"),
+        h("button",{onClick:()=>{ setShowDocPick(false); setPendingCreate(null); basisRef.current = null; },disabled:busy,style:btnSecondary},"Cancel"),
         h("button",{onClick:skipDocPick,disabled:busy,style:btnSecondary},"Skip — start empty"),
         h("button",{onClick:confirmDocPick,disabled:busy,style:{...btnPrimary,opacity:busy?0.6:1}},busy?"Creating…":"Carry forward selected ("+docPickSelected.size+")")
       )
@@ -22805,6 +22905,21 @@ const MANUAL_SECTIONS = [
           },
           {
             "type": "p",
+            "text": "Starting a Sale Order (from 22 September 2026). Nothing is created until the customer's order document is in. After the Won quote and the contract number, a box asks what the customer has sent \u2014 the purchase order, or a Letter of Intent \u2014 with its number, date, currency, value if known, and the Google Drive link. Cancel there and no contract exists. This applies to both ways of starting an order: + Add new contract on the Sale Order screen, and Create Sale Order on a Won quote."
+          },
+          {
+            "type": "bullets",
+            "items": [
+              "The Won quote box on the Sale Order screen lists Won quotes only, and is limit-to-list: type any part of the offer number or customer, and only a quote in the list is accepted.",
+              "PO: the PO is recorded as the order's Purchase Order document, the mandatory requirement is marked sent, and the PO number and date go onto the order's header \u2014 the approval stops asking for them.",
+              "LOI: the LOI is recorded as its own document. The Purchase Order stays a mandatory document with nothing against it, so the Order Acceptance PDF stays blocked until the PO arrives.",
+              "An order on an LOI shows \u201cOn LOI \u2014 PO awaited N days\u201d on its header, appears in Pending Actions for the Sales Coordinator, and is listed once a day at login to the Sales Coordinator, the Sales Head and Super Admins, longest-waiting first.",
+              "When the PO arrives, add it from the order's Documents box against the Purchase Order requirement. Every reminder stops on its own, and the header reads \u201cStarted on LOI \u2014 PO now received\u201d.",
+              "A PDF is optional throughout; the Drive link is the record."
+            ]
+          },
+          {
+            "type": "p",
             "text": "Document checklist, carry-forward and the register (20 September 2026). The Documents panel has a Checklist button: tick several categories from the master in one pass instead of adding them one at a time. Ticking creates a requirement, never a document. At quote stage nothing is mandatory and nothing blocks \u2014 it is a record of what the customer asked for."
           },
           {
@@ -23153,6 +23268,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"22 Sep 2026 (77)", summary:"Quotes Report: Apply filters, Refresh, saves that report failure, and no quotes lost to the row cap. FILTERS: the list now follows an APPLIED copy of the filters, not the boxes \u2014 nothing below changes until Apply filters or Enter. Boxes changed since the last apply are outlined amber and counted on the button; Clear empties both. Chips show what is in force; \u00d7 on a chip removes that one filter and re-applies at once. initialFilters from a click-through applies immediately. REFRESH: reloads with the same filters and shows when the list was loaded; the table stays on screen while it reloads. SAVES: updateQuoteStatusForQuote, the legacy status path and applyOutcomeNature now check their update and return {error}; the report reports a refused Status, Stage, Follow-up Stage or Next Follow-up save in plain words (saveFailedText) instead of reloading silently over it, and a successful save updates its row on screen immediately (patchRow) before the confirming reload. Every other caller of those shared writers is unaffected \u2014 they ignore the new field. ROW CAP: estimates and legacy quotes are read through the new fetchPaged; activity lookups and customer lookups are chunked 150 references at a time and paged. The report reads one row per Sl No, newest first, so past 1,000 Sl Nos the oldest quotes used to drop off without a word. No SQL." },
+  { date:"22 Sep 2026 (76)", summary:"Sale Orders now start from the customer's order document. PoLoiGateModal sits between choosing the Won quote and creating anything, in both create paths (SaleOrderContractPicker confirmCreate, and createSaleOrderFromQuote on the quote screen): PO or LOI, number, date, currency (limit-to-list), optional value, mandatory Drive link. Cancel creates nothing. recordOrderBasis then writes the order document (PO-<contract>-001 or LOI-<contract>-001, direction In, the first no-action status, no PDF), and for a PO fulfils the mandatory Purchase Order requirement and writes po_number/po_date to the header; for an LOI the PO requirement stays open, so the OA PDF stays blocked. sale_order_tbl gains order_basis, basis_number, basis_date, basis_value, basis_currency. LOI TRACKING: header chip \u201cOn LOI \u2014 PO awaited N days\u201d; new Pending Actions source po_awaited owed to sales_coordinator, ageing from the LOI date; LoiPoAwaitedPrompt once a day to the Sales Coordinator, Sales Head and super admins. All three clear themselves when the PO requirement is fulfilled. The Sale Order screen's Won-quote picker is now LimitToListCombo over Won quotes only (was a free predictive field over every quote). FIX: the Documents box loaded documents with entity_type quote only, so anything uploaded on a Sale Order since the 20 Sep entity_type change was saved and then never shown; it now loads by entity_id, as does deleting a reference. The same SQL repoints commercial approvals and the advance question in Pending Actions from accounts_admin (a login role) to the accounts post, and makes the PDF optional at the database. NEEDS SQL: order_basis_po_loi_20260922_v1.sql." },
   { date:"21 Sep 2026 (75)", summary:"The document Status box was empty, and adding a status failed with \\\"Could not find the 'status' column of 'doc_status_tbl'\\\". Every reader of the Document Status master asked for a column named status \u2014 ordering by it, mapping it, inserting it \u2014 and the live table has no such column, so the read failed and the list came back empty. New docStatusName / docStatusNameCol / loadDocStatuses read the name column off the rows themselves rather than assuming either name; the Admin \u2192 Document Status Master screen writes with the same answer, trying label then status on an empty table. Every reader is switched over: both Status boxes in the Documents modal, the continue box's option list, the bucket-colour lookups on the Sale Order panel and the Document Register, and the master screen's list, bucket change and delete. The Status box is now an Access-style LIMIT-TO-LIST combo (the app's existing LimitToListCombo): type and the list narrows, and only a status in the master is accepted \u2014 anything else is refused with a pointer to the master. The + Add beside it is gone: a status carries whose-move and clears-the-clock settings, and one added from the upload box would get neither, sit grey, and never count as cleared. Requirement rows that have nothing linked now read NOT YET SENT instead of \\\"Initial submission pending\\\", which read like a document status and made it look as though the status list should contain it. Also carries the 11:40 link-checking build, never deployed." },
   { date:"21 Sep 2026 (74)", summary:"Document links are checked. New checkDocumentLink / confirmDocumentLink, used by all three places a link is entered (new document, continue an existing document, new version). A missing link, one not starting https://, or one that doesn't parse BLOCKS with the reason. A Google Drive or Google Docs link passes silently. A OneDrive or SharePoint link ASKS once \u2014 those stop resolving after the move to Google Drive \u2014 and anything else asks once too, since the rest of the company may not be able to open it. The new-document box also says what is wrong with the link as it is typed. Wording: every OneDrive reference in the Documents box now says Google Drive, and on a Sale Order the box no longer claims the file is removed when the quote leaves Draft \u2014 it says the link is the permanent record." },
   { date:"21 Sep 2026 (73)", summary:"The PO requirement is now guaranteed however a Sale Order is opened. It used to be raised only from the Create Sale Order button on the quote, so contracts opened from the Sale Order screen \u2014 which is how everyone opens them \u2014 never got one; every contract made before 20 Sep was missing it until the 21 Sep backfill. ensurePoDocumentRequirement now also runs when the Sale Order screen's Documents panel loads and when the Documents box loads in contract mode. Both can fire in the same instant on opening a contract, so calls for the same contract share one in-flight promise rather than both seeing no requirement and both inserting. No SQL." },
@@ -24857,6 +24974,47 @@ function GoAheadPendingPrompt({ user, onDone, onOpenContract }){
     )
   );
 }
+// Orders running on an LOI with the PO still not attached (22 Sep). Once a
+// day, to the Sales Coordinator, the Sales Head and Super Admins. It stops
+// appearing for an order the moment its PO is attached — the PO
+// requirement being fulfilled IS the dismissal.
+function LoiPoAwaitedPrompt({ onDone, onOpenContract }){
+  const [rows,setRows] = useState(null);
+  useEffect(()=>{
+    (async()=>{
+      try{
+        const { data: sos } = await sb.from("sale_order_tbl").select("id,contract_number,customer_name,basis_number,basis_date").eq("order_basis","LOI");
+        if(!sos || !sos.length){ setRows([]); return; }
+        const { data: reqs } = await sb.from("document_requests_tbl").select("entity_id,category,is_mandatory,fulfilled_document_id").in("entity_id",sos.map(s=>s.contract_number));
+        const waiting = new Set(outstandingMandatory(reqs||[]).filter(isPoDocRequirement).map(r=>r.entity_id));
+        setRows(sos.filter(so=>waiting.has(so.contract_number))
+          .map(so=>({...so, days: so.basis_date ? Math.max(0,Math.floor((Date.now()-new Date(so.basis_date).getTime())/86400000)) : null}))
+          .sort((a,b)=>(b.days||0)-(a.days||0)));
+      }catch(e){ console.error("LOI prompt failed", e); setRows([]); }
+    })();
+  },[]);
+  if(rows===null) return null;
+  if(!rows.length){ onDone(); return null; }
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.4)",zIndex:1350,display:"flex",alignItems:"center",justifyContent:"center",padding:16}},
+    h("div",{style:{background:"#fff",borderRadius:12,padding:"22px 26px",width:600,maxWidth:"94vw",maxHeight:"80vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:4}},rows.length+" order"+(rows.length>1?"s":"")+" running on an LOI \u2014 PO not yet received"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},"The Order Acceptance can't be issued on any of these until the PO is attached. Chase the customer, then add the PO from the order's Documents box."),
+      h("table",{style:{width:"100%",fontSize:12,borderCollapse:"collapse",marginBottom:14}},
+        h("thead",null,h("tr",{style:{background:"#faf9f4",textAlign:"left"}},
+          ["Contract","Customer","LOI","Waiting",""].map(c=>h("th",{key:c,style:{padding:"6px 8px",fontSize:10.5}},c)))),
+        h("tbody",null, rows.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #f0eee6"}},
+          h("td",{style:{padding:"6px 8px",fontWeight:600}},r.contract_number),
+          h("td",{style:{padding:"6px 8px",color:colors.muted}},r.customer_name||"\u2014"),
+          h("td",{style:{padding:"6px 8px",color:colors.muted,fontSize:11}},(r.basis_number||"\u2014")+(r.basis_date?" \u00b7 "+r.basis_date:"")),
+          h("td",{style:{padding:"6px 8px",fontWeight:600,color:(r.days||0)>=14?"#a3312a":(r.days||0)>=7?"#854f0b":colors.text}},r.days==null?"\u2014":r.days+" days"),
+          h("td",{style:{padding:"6px 8px",textAlign:"right"}},
+            h("button",{onClick:()=>{ onDone(); onOpenContract && onOpenContract(r); },style:{...btnSmall,fontSize:10.5}},"Open"))
+        )))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end"}},h("button",{onClick:onDone,style:btnSecondary},"Later"))
+    )
+  );
+}
 // Every post gets flagged when a work order is raised and clears its own
 // flag, so it is visible who has picked the job up. Shown to whoever
 // holds a post with an open flag. (20 Sep)
@@ -25012,6 +25170,128 @@ function ContractDocumentsPanel({ contractNumber, refreshKey, user }){
               );
             }))
           )
+    )
+  );
+}
+// ---- ORDER BASIS: PO or LOI (22 Sep) ----------------------------------
+// A Sale Order is not created until the customer's order document is in:
+// either the PO, or a Letter of Intent when the PO is still to come. The
+// gate sits between choosing the quote and creating anything, so Cancel
+// leaves nothing half-made — the way orders without a PO came to exist.
+//   PO  — the PO document is recorded and linked to the mandatory
+//         Purchase Order requirement; PO number and date go on the header.
+//   LOI — the LOI is recorded as its own document; the Purchase Order
+//         requirement stays open and mandatory, so the OA PDF stays blocked
+//         and Pending Actions chases the PO until it arrives.
+const LOI_DOC_CATEGORY = "Letter of Intent";
+// A document needs a status from the master. An incoming PO or LOI needs
+// nothing from us, so the first no-action (green) status is used.
+async function receivedDocStatus(){
+  const rows = await loadDocStatuses();
+  const green = rows.find(r=>r.action_type==="no_action");
+  return docStatusName(green || rows[0] || null) || null;
+}
+async function recordOrderBasis(contractNumber, basis, username){
+  const isPo = basis.kind==="PO";
+  const category = isPo ? PO_DOC_CATEGORY : LOI_DOC_CATEGORY;
+  const docNumber = (isPo?"PO-":"LOI-")+contractNumber+"-001";
+  const status = await receivedDocStatus();
+  const { data: parent, error: pErr } = await sb.from("universal_documents_tbl").insert({
+    doc_number:docNumber,
+    doc_name:(isPo?"Customer PO ":"Letter of Intent ")+basis.number.trim()+" dated "+basis.date,
+    category, entity_type:"contract", entity_id:contractNumber,
+    is_mandatory:isPo, is_archived:false, created_by:username||"unknown"
+  }).select().single();
+  if(pErr) throw pErr;
+  const { error: hErr } = await sb.from("universal_document_history_tbl").insert({
+    document_id:parent.id, doc_number:docNumber, rev_number:0, direction:"In", status,
+    link:basis.link.trim(), file_path:null, lives_in_supabase:false,
+    reason:(isPo?"Customer PO":"Letter of Intent")+" received with the order", changed_by:username||"unknown"
+  });
+  if(hErr) throw hErr;
+  // The PO requirement exists from the moment the contract does; a PO
+  // fulfils it, an LOI deliberately does not.
+  await ensurePoDocumentRequirement(contractNumber, username);
+  if(isPo){
+    const { data: reqs } = await sb.from("document_requests_tbl").select("id,category").eq("entity_id",contractNumber);
+    const poReq = (reqs||[]).find(isPoDocRequirement);
+    if(poReq) await sb.from("document_requests_tbl").update({fulfilled_document_id:parent.id}).eq("id",poReq.id);
+    await sb.from("estimates").update({po_number:basis.number.trim(), po_date:basis.date}).eq("reference_number",contractNumber);
+  }
+  const { error: soErr } = await sb.from("sale_order_tbl").update({
+    order_basis:basis.kind, basis_number:basis.number.trim(), basis_date:basis.date,
+    basis_value: basis.value===""||basis.value==null ? null : Number(basis.value),
+    basis_currency: basis.currency||null
+  }).eq("contract_number",contractNumber);
+  if(soErr) console.error("Order basis columns not saved for "+contractNumber+" — run order_basis_po_loi_20260922_v1.sql", soErr);
+  await logAudit("INSERT","universal_documents_tbl",contractNumber,
+    (isPo?"Customer PO ":"LOI ")+basis.number.trim()+" recorded with the order", username||"unknown",null,null);
+}
+// The gate itself. Nothing is written here — onConfirm hands the answers
+// back, and the caller creates the contract and then records them.
+function PoLoiGateModal({ contractNumber, customerName, defaultCurrency, onCancel, onConfirm }){
+  const [kind,setKind] = useState("");
+  const [f,setF] = useState({ number:"", date:"", currency:defaultCurrency||"INR", value:"", link:"" });
+  const [errs,setErrs] = useState({});
+  const [busy,setBusy] = useState(false);
+  const set = (k,v)=>{ setF(x=>({...x,[k]:v})); setErrs(e=>({...e,[k]:""})); };
+  const go = async()=>{
+    const e = {};
+    if(!kind) e.kind = "Say whether this is the PO or a Letter of Intent.";
+    if(!f.number.trim()) e.number = "Enter the "+(kind==="LOI"?"LOI":"PO")+" number.";
+    if(!f.date) e.date = "Enter the date on it.";
+    if(!["INR","USD","EUR","AED"].includes(f.currency)) e.currency = "Pick a currency from the list.";
+    const lk = checkDocumentLink(f.link);
+    if(lk.block) e.link = lk.message;
+    setErrs(e);
+    if(Object.keys(e).length) return;
+    if(!lk.ok && !confirm(lk.message)) return;
+    setBusy(true);
+    try{ await onConfirm({ kind, ...f }); } finally { setBusy(false); }
+  };
+  const field = (label, key, input)=> h("div",null,
+    h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},label),
+    input,
+    errs[key] && h("div",{style:{fontSize:10.5,color:colors.danger,marginTop:3}},errs[key]));
+  const kindBtn = (k,title,sub)=> h("button",{onClick:()=>{ setKind(k); setErrs(e=>({...e,kind:""})); },
+    style:{...btnSecondary,flex:1,textAlign:"left",padding:"10px 12px",
+      border:"1px solid "+(kind===k?"#0f6e56":colors.border), background:kind===k?"#e1f5ee":"#fff"}},
+    h("div",{style:{fontWeight:700,fontSize:12.5,color:kind===k?"#085041":colors.text}},title),
+    h("div",{style:{fontSize:11,color:kind===k?"#0f6e56":colors.muted,marginTop:2}},sub));
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:1500,display:"flex",alignItems:"center",justifyContent:"center",padding:16}},
+    h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 24px",width:560,maxWidth:"96vw",maxHeight:"92vh",overflowY:"auto"}},
+      h("div",{style:{fontWeight:700,fontSize:15,marginBottom:2}},"What has the customer sent?"),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},
+        "Contract "+contractNumber+(customerName?" for "+customerName:"")+". Nothing is created until this is saved."),
+      h("div",{style:{display:"flex",gap:8,marginBottom:4}},
+        kindBtn("PO","The purchase order","The order proceeds normally"),
+        kindBtn("LOI","A Letter of Intent","PO still to come \u2014 tracked and chased")),
+      errs.kind && h("div",{style:{fontSize:10.5,color:colors.danger,marginBottom:6}},errs.kind),
+      kind && h(React.Fragment,null,
+        kind==="LOI" && h("div",{style:{background:"#fff4d6",border:"1px solid #efb95f",borderRadius:6,padding:"8px 10px",fontSize:11,color:"#854f0b",margin:"10px 0"}},
+          "The order starts on the LOI. The Purchase Order stays a mandatory document: the Order Acceptance PDF stays blocked, and Pending Actions chases it every day until the PO is attached."),
+        h("div",{style:{display:"grid",gridTemplateColumns:"minmax(0,1fr) minmax(0,1fr)",gap:10,marginTop:10}},
+          field((kind==="LOI"?"LOI":"PO")+" number","number",
+            h("input",{value:f.number,onChange:e=>set("number",e.target.value),placeholder:kind==="LOI"?"LSPL/PUR/LOI/2026-27/0142":"PO-26-00412",style:{...inputStyle,width:"100%"}})),
+          field("Date","date",
+            h("input",{type:"date",value:f.date,onChange:e=>set("date",e.target.value),style:{...inputStyle,width:"100%"}})),
+          field("Currency","currency",
+            h(LimitToListCombo,{value:f.currency,onChange:v=>set("currency",v),options:["INR","USD","EUR","AED"],
+              invalidMessage:"Pick INR, USD, EUR or AED.",style:{...inputStyle,width:"100%"}})),
+          field("Value (optional)","value",
+            h("input",{value:f.value,onChange:e=>set("value",e.target.value.replace(/[^0-9.]/g,"")),placeholder:"14900",style:{...inputStyle,width:"100%"}}))
+        ),
+        h("div",{style:{marginTop:10}},
+          field("Google Drive link to the "+(kind==="LOI"?"LOI":"PO"),"link",
+            h("input",{value:f.link,onChange:e=>set("link",e.target.value),placeholder:"https://drive.google.com/file/d/\u2026",style:{...inputStyle,width:"100%"}})),
+          f.link && !errs.link && !checkDocumentLink(f.link).ok && !checkDocumentLink(f.link).block &&
+            h("div",{style:{fontSize:10.5,color:"#854f0b",marginTop:3}},"Not a Google Drive link \u2014 you'll be asked to confirm.")),
+        h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:8}},"A PDF can be attached later from the Documents box; the link is the record.")
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16}},
+        h("button",{onClick:onCancel,disabled:busy,style:btnSecondary},"Cancel"),
+        h("button",{onClick:go,disabled:busy,style:{...btnPrimary,opacity:busy?0.6:1}},
+          busy?"Creating\u2026":(kind==="LOI"?"Save LOI and create sale order":"Save PO and create sale order")))
     )
   );
 }
@@ -28778,6 +29058,11 @@ function MajorProjectsBulkImport({ user }){
 function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   const [rows,setRows] = useState([]);
   const [loading,setLoading] = useState(true);
+  // 22 Sep — when the list was last read, shown beside Refresh.
+  const [loadedAt,setLoadedAt] = useState(null);
+  // Update one row on screen immediately after a successful save; the
+  // reload that follows then confirms it from the database.
+  const patchRow = (ref, changes)=> setRows(rs=>rs.map(r=>r.reference_number===ref ? {...r, ...changes} : r));
   const [zoneOptions,setZoneOptions] = useState([]);
   const [statusOptions,setStatusOptions] = useState([]);
   const [reportNatureOptions,setReportNatureOptions] = useState([]);
@@ -28856,15 +29141,23 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     const changedAtIso = new Date(editDate+"T12:00:00").toISOString();
     const proceed = async()=>{
       setEditFor(null);
+      // 22 Sep — each save's result is checked, and a successful one
+      // updates its row on screen straight away, before the reload.
       if(newNature!==row.nature){
-        await applyOutcomeNature(row.reference_number, newNature, user.username, changedAtIso);
+        const r = await applyOutcomeNature(row.reference_number, newNature, user.username, changedAtIso);
+        if(r && r.error){ alert(saveFailedText("Stage for "+row.reference_number, r.error)); load(); return; }
+        patchRow(row.reference_number, { nature:newNature });
       }
       if(newStatus!==row.status){
         if(CLOSED_OUTCOMES_QR.includes(newStatus)){
           setOutcomeTarget({ referenceNumber: row.reference_number, newStatus, changedAt: changedAtIso });
           return;
         }
-        await applyOutcomeStatus(row.reference_number, newStatus, user.username, "Quotes Report", null, changedAtIso);
+        const r = await applyOutcomeStatus(row.reference_number, newStatus, user.username, "Quotes Report", null, changedAtIso);
+        if(r && r.error){ alert(saveFailedText("Status for "+row.reference_number, r.error)); load(); return; }
+        if(r && r.blocked){ load(); return; }   // the user chose to add Extra Price first — nothing changed, knowingly
+        if(r && r.notFound){ alert(row.reference_number+" wasn't found \u2014 it may have been deleted. The list will reload."); load(); return; }
+        patchRow(row.reference_number, { status:newStatus });
       }
       load();
     };
@@ -28901,9 +29194,14 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           next_followup_date: stageNextDate||null,
           notes: stageNotes,
           logged_by: user.username,
-        });
+        }).then(res=>{ if(res.error) throw res.error; });
         setStageEditFor(null);
+        patchRow(row.reference_number, {
+          followup_stage: [stageOutcome, stageNotes].filter(x=>x&&x.trim()).join(" - ") || row.followup_stage,
+          ...(stageNextDate ? { next_followup: stageNextDate } : {})
+        });
         load();
+      } catch(e){ alert(saveFailedText("The follow-up for "+row.reference_number, e));
       } finally { setStageBusy(false); }
     };
     const allowed = await canEditFreely(row.customer_name);
@@ -28928,9 +29226,11 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
           next_followup_date: nfDate,
           notes: nfNotes,
           logged_by: user.username,
-        });
+        }).then(res=>{ if(res.error) throw res.error; });
         setNextFollowupFor(null);
+        patchRow(row.reference_number, { next_followup: nfDate });
         load();
+      } catch(e){ alert(saveFailedText("The next follow-up for "+row.reference_number, e));
       } finally { setNfBusy(false); }
     };
     const allowed = await canEditFreely(row.customer_name);
@@ -28943,6 +29243,26 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
     ...(initialFilters||{})
   });
   const setF = (k,v)=> setFilters(f=>({...f,[k]:v}));
+  // 22 Sep — the list follows APPLIED filters, not the boxes. Typing in a
+  // box changes nothing below until Apply filters or Enter, so several
+  // filters can be set up without the rows jumping at every keystroke.
+  const [applied,setApplied] = useState(()=>({
+    dateFrom:"", dateTo:"", refLike:"", customerLike:"", cityLike:"", stateLike:"", countryLike:"",
+    zone:"", status:"", nature:"", followUp:"", projectLike:"", ...(initialFilters||{})
+  }));
+  const filtersRef = useRef(filters);
+  useEffect(()=>{ filtersRef.current = filters; },[filters]);
+  // Read through the ref after a tick, so a combo that sets its value on
+  // the same Enter press is included.
+  const applyFilters = ()=> setTimeout(()=>setApplied({...filtersRef.current}),0);
+  const FILTER_LABELS = { dateFrom:"From", dateTo:"To", refLike:"Reference", customerLike:"Customer", projectLike:"Project",
+    countryLike:"Country", stateLike:"State", cityLike:"City", zone:"Region", status:"Status", nature:"Stage", followUp:"Follow-up" };
+  const pendingKeys = Object.keys(FILTER_LABELS).filter(k=>(filters[k]||"")!==(applied[k]||""));
+  const clearFilters = ()=>{
+    const blank = Object.fromEntries(Object.keys(FILTER_LABELS).map(k=>[k,""]));
+    setFilters(f=>({...f,...blank})); setApplied(a=>({...a,...blank}));
+  };
+  const removeApplied = (k)=>{ setFilters(f=>({...f,[k]:""})); setApplied(a=>({...a,[k]:""})); };
   // Country->State->City (29 Aug fix) — pulls from the real master
   // tables (WORLD_COUNTRIES, state_zone_tbl, city_tbl), same as the
   // Customer form, not just whatever happens to already exist in this
@@ -28965,17 +29285,20 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   const load = useCallback(async()=>{
     setLoading(true);
     try{
-      const { data: estRows } = await sb.from("estimates")
-        .select("reference_number,customer_name,quote_date,created_at,quote_status,quote_nature,linked_project_id,status_changed_at,status_changed_by,quote_nature_changed_at,quote_nature_changed_by")
-        .order("created_at",{ascending:false});
+      // 22 Sep — paged. One row per Sl No, capped at 1,000 per read, so
+      // the oldest quotes used to fall off the report without a word.
+      const estRows = await fetchPaged(()=>sb.from("estimates").select("reference_number,customer_name,quote_date,created_at,quote_status,quote_nature,linked_project_id,status_changed_at,status_changed_by,quote_nature_changed_at,quote_nature_changed_by")
+        .order("created_at",{ascending:false}));
       const byRef = new Map();
       (estRows||[]).forEach(r=>{ if(!byRef.has(r.reference_number)) byRef.set(r.reference_number,r); });
       const headers = Array.from(byRef.values());
 
       const customerNames = Array.from(new Set(headers.map(h=>h.customer_name).filter(Boolean)));
-      const { data: cos } = customerNames.length
-        ? await sb.from("companies").select("company_name,zone,billing_city,billing_state,billing_country").in("company_name",customerNames)
-        : { data: [] };
+      let cos = [];
+      for(let k=0;k<customerNames.length;k+=150){
+        const { data } = await sb.from("companies").select("company_name,zone,billing_city,billing_state,billing_country").in("company_name",customerNames.slice(k,k+150));
+        cos = cos.concat(data||[]);
+      }
       const coByName = new Map((cos||[]).map(c=>[c.company_name,c]));
 
       const projectIds = Array.from(new Set(headers.map(h=>h.linked_project_id).filter(Boolean)));
@@ -28987,7 +29310,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       // Blend in Legacy Quotes (29 Aug) — the whole point of aligning
       // the status/nature vocabulary was so this could be one combined
       // list, not a separate screen requiring translation.
-      const { data: legacyRows } = await sb.from("legacy_quotes_tbl").select("*");
+      const legacyRows = await fetchPaged(()=>sb.from("legacy_quotes_tbl").select("*").order("reference_number"));
 
       // Follow-up Stage/Next Follow-up (31 Aug) — rescoped from
       // "customer's latest call about anything" to "THIS reference's own
@@ -29002,9 +29325,16 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       const allRefs = Array.from(new Set(
         headers.map(h=>h.reference_number).concat((legacyRows||[]).map(l=>l.reference_number)).filter(Boolean)
       ));
-      const { data: acts } = allRefs.length
-        ? await sb.from("activity_log_tbl").select("chase_reference,outcome,notes,next_followup_date,created_at").in("chase_reference",allRefs).order("created_at",{ascending:false})
-        : { data: [] };
+      // Chunked and paged (22 Sep): hundreds of references in one filter
+      // make the request too long, and the answer is capped at 1,000 rows.
+      let acts = [];
+      for(let k=0;k<allRefs.length;k+=150){
+        const chunk = allRefs.slice(k,k+150);
+        acts = acts.concat(await fetchPaged(()=>sb.from("activity_log_tbl")
+          .select("chase_reference,outcome,notes,next_followup_date,created_at")
+          .in("chase_reference",chunk).order("created_at",{ascending:false})));
+      }
+      acts.sort((a,b)=>String(b.created_at).localeCompare(String(a.created_at)));
       const latestActByRef = new Map();
       (acts||[]).forEach(a=>{ if(a.chase_reference && !latestActByRef.has(a.chase_reference)) latestActByRef.set(a.chase_reference,a); });
       const stageText = (act)=>{
@@ -29071,6 +29401,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       });
 
       setRows(merged.concat(legacyMerged));
+      setLoadedAt(new Date());
     } finally { setLoading(false); }
   },[]);
   useEffect(()=>{ load(); },[load]);
@@ -29092,18 +29423,18 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   };
 
   const filtered = rows.filter(r=>{
-    if(filters.dateFrom && r.reference_date < filters.dateFrom) return false;
-    if(filters.dateTo && r.reference_date > filters.dateTo) return false;
-    if(filters.refLike && !r.reference_number.toLowerCase().includes(filters.refLike.toLowerCase())) return false;
-    if(filters.customerLike && !r.customer_name.toLowerCase().includes(filters.customerLike.toLowerCase())) return false;
-    if(filters.cityLike && !r.city.toLowerCase().includes(filters.cityLike.toLowerCase())) return false;
-    if(filters.stateLike && r.state!==filters.stateLike) return false;
-    if(filters.countryLike && r.country!==filters.countryLike) return false;
-    if(filters.zone && r.region!==filters.zone) return false;
-    if(filters.status && r.status!==filters.status) return false;
-    if(filters.nature && r.nature!==filters.nature) return false;
-    if(filters.followUp && followUpBucket(r)!==filters.followUp) return false;
-    if(filters.projectLike && !(r.project_reference||"").toLowerCase().includes(filters.projectLike.toLowerCase())) return false;
+    if(applied.dateFrom && r.reference_date < applied.dateFrom) return false;
+    if(applied.dateTo && r.reference_date > applied.dateTo) return false;
+    if(applied.refLike && !r.reference_number.toLowerCase().includes(applied.refLike.toLowerCase())) return false;
+    if(applied.customerLike && !r.customer_name.toLowerCase().includes(applied.customerLike.toLowerCase())) return false;
+    if(applied.cityLike && !r.city.toLowerCase().includes(applied.cityLike.toLowerCase())) return false;
+    if(applied.stateLike && r.state!==applied.stateLike) return false;
+    if(applied.countryLike && r.country!==applied.countryLike) return false;
+    if(applied.zone && r.region!==applied.zone) return false;
+    if(applied.status && r.status!==applied.status) return false;
+    if(applied.nature && r.nature!==applied.nature) return false;
+    if(applied.followUp && followUpBucket(r)!==applied.followUp) return false;
+    if(applied.projectLike && !(r.project_reference||"").toLowerCase().includes(applied.projectLike.toLowerCase())) return false;
     return true;
   });
 
@@ -29119,7 +29450,9 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
   const projectOptions = distinct(rows.map(r=>r.project_reference));
   const stateOptions = filters.countryLike==="India" ? indiaStateOptions : [];
 
-  const fld = (label, child)=> h("div",null, h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},label), child);
+  const fld = (label, child, key)=> h("div",null,
+    h("label",{style:{display:"block",fontSize:10.5,color:(key&&pendingKeys.includes(key))?"#854f0b":colors.muted,marginBottom:3}},label),
+    (key && pendingKeys.includes(key)) ? h("div",{style:{outline:"1.5px solid #ef9f27",borderRadius:6}},child) : child);
   const combo = (key,options,opts)=> h(LimitToListCombo,{value:filters[key],onChange:v=>{ setF(key,v); if(key==="countryLike"){ setF("stateLike",""); setF("cityLike",""); } if(key==="stateLike"){ setF("cityLike",""); } },options,placeholder:"All",style:{...inputStyle,padding:"6px 8px",fontSize:12},...opts});
 
   if(historyView) return h(FollowupHistoryScreen,{scope:historyView.scope, value:historyView.value, user, onBack:()=>setHistoryView(null)});
@@ -29130,35 +29463,59 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters }){
       h("div",{style:{fontWeight:700,fontSize:16,color:"#124c3d"}},"Quotes Report"),
       h("div",{style:{fontSize:11.5,color:"#8a9d97",marginTop:2}},"Click Status, Stage, or Follow-up Stage to edit inline")
     ),
-    h("div",{style:{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:16,background:"#faf9f4",padding:14,borderRadius:8}},
-      fld("Reference Date >=", h("input",{type:"date",value:filters.dateFrom,onChange:e=>setF("dateFrom",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
-      fld("Reference Date <=", h("input",{type:"date",value:filters.dateTo,onChange:e=>setF("dateTo",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
-      fld("Reference No / Quote No", combo("refLike",refOptions,{limitToList:false})),
-      fld("Customer Name", combo("customerLike",customerOptions,{limitToList:false})),
-      fld("Project Reference", combo("projectLike",projectOptions,{limitToList:false})),
-      fld("Country", combo("countryLike",WORLD_COUNTRIES)),
-      fld("State", combo("stateLike",stateOptions,{disabled:filters.countryLike!=="India"})),
+    h("div",{onKeyDown:e=>{ if(e.key==="Enter") applyFilters(); },style:{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:16,background:"#faf9f4",padding:14,borderRadius:8}},
+      fld("Reference Date >=", h("input",{type:"date",value:filters.dateFrom,onChange:e=>setF("dateFrom",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),"dateFrom"),
+      fld("Reference Date <=", h("input",{type:"date",value:filters.dateTo,onChange:e=>setF("dateTo",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}}),"dateTo"),
+      fld("Reference No / Quote No", combo("refLike",refOptions,{limitToList:false}),"refLike"),
+      fld("Customer Name", combo("customerLike",customerOptions,{limitToList:false}),"customerLike"),
+      fld("Project Reference", combo("projectLike",projectOptions,{limitToList:false}),"projectLike"),
+      fld("Country", combo("countryLike",WORLD_COUNTRIES),"countryLike"),
+      fld("State", combo("stateLike",stateOptions,{disabled:filters.countryLike!=="India"}),"stateLike"),
       // City: real master list, but NOT limit-to-list — a genuine city
       // can be missing from the seeded master, and this shouldn't block
       // filtering by it.
-      fld("City", combo("cityLike",cityOptionsLive,{limitToList:false,disabled:!filters.countryLike})),
+      fld("City", combo("cityLike",cityOptionsLive,{limitToList:false,disabled:!filters.countryLike}),"cityLike"),
       fld("Region (Zone)", h("select",{value:filters.zone,onChange:e=>setF("zone",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), zoneOptions.map(z=>h("option",{key:z,value:z},z))
-      )),
+      ),"zone"),
       fld("Status", h("select",{value:filters.status,onChange:e=>setF("status",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), statusOptions.map(s=>h("option",{key:s,value:s},s))
-      )),
+      ),"status"),
       // Relabeled "Stage" in the UI (31 Aug) — same underlying values
       // (Unknown/Budgetary/Purchase Requirement), filters.nature key
       // left unchanged internally.
       fld("Stage", h("select",{value:filters.nature,onChange:e=>setF("nature",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"), reportNatureOptions.map(n=>h("option",{key:n,value:n},n))
-      )),
+      ),"nature"),
       fld("Follow-up Status", h("select",{value:filters.followUp,onChange:e=>setF("followUp",e.target.value),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"All"),["Overdue","Due today","Upcoming","None"].map(s=>h("option",{key:s,value:s},s))
-      ))
+      ),"followUp")
     ),
-    loading ? h("div",{style:{color:colors.mutedLight}},"Loading…") :
+    // Apply bar (22 Sep). The list below only changes when Apply filters
+    // or Enter is pressed; boxes changed since then are outlined amber.
+    h("div",{style:{display:"flex",alignItems:"center",gap:10,margin:"-6px 0 14px"}},
+      pendingKeys.length>0
+        ? h("span",{style:{fontSize:11.5,color:"#854f0b"}},pendingKeys.length+" filter"+(pendingKeys.length>1?"s":"")+" changed \u2014 press Apply filters (or Enter) to update the list")
+        : h("span",{style:{fontSize:11.5,color:colors.mutedLight}},"The list below matches these filters."),
+      h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
+        h("button",{onClick:clearFilters,style:{...btnSecondary,fontSize:12}},"Clear"),
+        h("button",{onClick:applyFilters,style:{...btnPrimary,fontSize:12,padding:"8px 16px"}},
+          pendingKeys.length ? "Apply filters ("+pendingKeys.length+")" : "Apply filters"))
+    ),
+    // What is actually in force, with Refresh and how old the list is.
+    h("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:10}},
+      h("span",{style:{fontSize:13,fontWeight:700}},filtered.length+" quote"+(filtered.length===1?"":"s")),
+      Object.keys(FILTER_LABELS).filter(k=>applied[k]).length>0 && h("span",{style:{fontSize:11.5,color:colors.muted}},"filtered by"),
+      Object.keys(FILTER_LABELS).filter(k=>applied[k]).map(k=>h("span",{key:k,
+        style:{fontSize:11,padding:"3px 4px 3px 10px",borderRadius:12,background:"#e6f1fb",color:"#0c447c",display:"inline-flex",alignItems:"center",gap:4}},
+        FILTER_LABELS[k]+": "+applied[k],
+        h("button",{onClick:()=>removeApplied(k),title:"Remove this filter",
+          style:{border:"none",background:"transparent",color:"#0c447c",cursor:"pointer",fontSize:12,padding:"0 4px"}},"\u00d7"))),
+      h("span",{style:{marginLeft:"auto",fontSize:11,color:colors.mutedLight}},
+        loadedAt ? "Loaded "+loadedAt.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}) : ""),
+      h("button",{onClick:()=>load(),disabled:loading,style:{...btnSecondary,fontSize:12,padding:"6px 12px"}},loading?"Loading\u2026":"\u21bb Refresh")
+    ),
+    (loading && !rows.length) ? h("div",{style:{color:colors.mutedLight}},"Loading…") :
     h("div",{style:{overflowX:"auto",background:"#fff",border:"1px solid #cfe3dd",borderRadius:6}},
       h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:14}},
         h("thead",null,h("tr",{style:{background:"#eef6f3",textAlign:"left"}},
@@ -35501,6 +35858,14 @@ function App() {
   // is the acknowledgement row itself, and the component self-closes once
   // nothing is left open for this person's posts.
   const [showWorkOrderFlags,setShowWorkOrderFlags]=useState(true);
+  const [showLoiPrompt,setShowLoiPrompt]=useState(()=>{
+    try{ return sessionStorage.getItem("flometriq_loi_prompt_date")!==new Date().toISOString().slice(0,10); }catch(e){ return true; }
+  });
+  const dismissLoiPrompt = ()=>{
+    setShowLoiPrompt(false);
+    try{ sessionStorage.setItem("flometriq_loi_prompt_date",new Date().toISOString().slice(0,10)); }catch(e){}
+  };
+  const [isSalesCoordinatorUser,setIsSalesCoordinatorUser]=useState(false);
   const [isSalesHeadUser,setIsSalesHeadUser]=useState(false);
   useEffect(()=>{
     if(!user?.id){ setIsSalesHeadUser(false); return; }
@@ -35511,6 +35876,8 @@ function App() {
       ]);
       const me = emp && emp.employee_name;
       setIsSalesHeadUser(!!me && (holders||[]).some(hh=>hh.employee_name===me));
+      const { data: sc } = await sb.from("post_holder_tbl").select("employee_name").eq("post_key","sales_coordinator");
+      setIsSalesCoordinatorUser(!!me && (sc||[]).some(hh=>hh.employee_name===me));
     })();
   },[user?.id]);
   const [showDocSequenceReminder,setShowDocSequenceReminder]=useState(()=>{
@@ -35564,6 +35931,7 @@ function App() {
     showQuoteOwnerAlerts && h(QuoteStatusOwnerAlerts,{user,onDone:()=>setShowQuoteOwnerAlerts(false)}),
     (isSalesHeadUser||user.role==="super_admin") && showGoAheadPrompt && h(GoAheadPendingPrompt,{user,onDone:dismissGoAheadPrompt,onOpenContract:openContract}),
     showWorkOrderFlags && h(WorkOrderFlagPrompt,{user,onDone:()=>setShowWorkOrderFlags(false)}),
+    (isSalesCoordinatorUser||isSalesHeadUser||user.role==="super_admin") && showLoiPrompt && h(LoiPoAwaitedPrompt,{onDone:dismissLoiPrompt,onOpenContract:openContract}),
     (user.role==="admin"||user.role==="super_admin") && showDocSequenceReminder && h(DocumentSequenceReminder,{onDone:dismissDocSequenceReminder}),
     showDraftPanel && h(DraftOfferReminder,{user,onDone:()=>{ setShowDraftPanel(false); refreshDraftCount(); }}),
     showSignatoryNoticesPopup && h(SignatoryOverrideNoticesPopup,{notices:signatoryNotices,onAcknowledgeOne:acknowledgeSignatoryNotice,onAcknowledgeAll:acknowledgeAllSignatoryNotices,onClose:()=>setShowSignatoryNoticesPopup(false)}),
