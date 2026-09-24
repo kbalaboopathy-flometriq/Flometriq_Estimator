@@ -46,7 +46,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-23T01:20:00Z";
+  var APP_BUILD_VERSION = "2026-09-23T06:40:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -334,6 +334,21 @@ window.__unsavedGuard = { dirty:false, message:"", saveFn:null };
 function setUnsavedGuard(dirty, message, saveFn){
   window.__unsavedGuard = { dirty:!!dirty, message: message||"You have unsaved changes. Leave anyway?", saveFn: saveFn||null };
 }
+// ---- UNFINISHED QUOTE, kept on this computer (23 Sep) -----------------
+// Nothing exists in the database until the first Sl No is saved, so a
+// header captured in the new-quote box and a part-built BOM used to vanish
+// the moment the user left the screen. The work in hand is written to this
+// browser as it goes and offered back on return. It is per computer, not
+// per person's account — a quote started here is resumed here.
+const QUOTE_DRAFT_KEY = "flometriq_quote_in_progress";
+function saveQuoteDraft(draft){
+  try{ localStorage.setItem(QUOTE_DRAFT_KEY, JSON.stringify({ ...draft, savedAt:new Date().toISOString() })); }
+  catch(e){ console.error("Couldn't keep the unfinished quote", e); }   // full or private mode — never block the user
+}
+function readQuoteDraft(){
+  try{ const raw = localStorage.getItem(QUOTE_DRAFT_KEY); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
+}
+function clearQuoteDraft(){ try{ localStorage.removeItem(QUOTE_DRAFT_KEY); }catch(e){} }
 function confirmLeaveIfDirty(){
   if(!window.__unsavedGuard.dirty) return true;
   return confirm(window.__unsavedGuard.message);
@@ -441,6 +456,47 @@ function pdfFooterCompanyName(company){ return (company&&company.company_name)||
 // A module-level cache, loaded once at start and again whenever the
 // master is edited; every lookup below falls back to sensible defaults by
 // name, so a screen that renders before the load still behaves.
+// ---- WHO HOLDS A POST (23 Sep) ----------------------------------------
+// Messages name the PERSON, never the post: "Veenai Vimal (Technical Head)
+// has been asked to add the template". When nobody holds the post there is
+// nobody to chase, so the message says so and names who to go to instead.
+const POST_VACANT_CONTACT = "Bala Boopathy";   // whom to contact when a post is empty
+let POST_PEOPLE_CACHE = { posts:[], holders:[] };
+let POST_PEOPLE_LOADING = null;
+async function loadPostPeople(force){
+  if(POST_PEOPLE_LOADING && !force) return POST_PEOPLE_LOADING;
+  POST_PEOPLE_LOADING = (async()=>{
+    const [{ data: posts }, { data: holders }] = await Promise.all([
+      sb.from("post_tbl").select("post_key,label").order("sort_order"),
+      sb.from("post_holder_tbl").select("post_key,employee_name")
+    ]);
+    POST_PEOPLE_CACHE = { posts: posts||[], holders: holders||[] };
+    return POST_PEOPLE_CACHE;
+  })();
+  return POST_PEOPLE_LOADING;
+}
+function postLabel(postKey){
+  const p = POST_PEOPLE_CACHE.posts.find(r=>r.post_key===postKey);
+  if(p && p.label) return p.label;
+  return String(postKey||"").replace(/_/g," ").replace(/\b\w/g,c=>c.toUpperCase());
+}
+function postHolders(postKey){
+  return POST_PEOPLE_CACHE.holders.filter(r=>r.post_key===postKey).map(r=>r.employee_name).filter(Boolean);
+}
+// "Veenai Vimal (Technical Head)" — or, vacant:
+// "the Technical Head post is empty — contact Bala Boopathy".
+function postPersonText(postKey){
+  const people = postHolders(postKey), label = postLabel(postKey);
+  if(!people.length) return "the "+label+" post is empty \u2014 contact "+POST_VACANT_CONTACT;
+  return people.join(" / ")+" ("+label+")";
+}
+// Just the name(s), for a table cell.
+function postPersonShort(postKey){
+  const people = postHolders(postKey);
+  return people.length ? people.join(" / ") : postLabel(postKey)+" \u2014 vacant, contact "+POST_VACANT_CONTACT;
+}
+loadPostPeople();
+
 let QUOTE_STAGE_CACHE = [];
 let QUOTE_STAGE_LOADING = null;
 async function loadQuoteStages(force){
@@ -5313,9 +5369,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   // The cart is this screen's "unsaved work" — feed it into the app-wide
   // guard so both browser-level navigation and the Close/New buttons below
   // know there's something to lose.
-  useEffect(()=>{
-    setUnsavedGuard(cart.length>0, "You have "+cart.length+" unsaved line(s) in the cart. Leave anyway?");
-  },[cart.length]);
+
   const [closeAction,setCloseAction]=useState(null); // "close" | "new" | null — set when Close/New is clicked with unsaved cart
   const [closeActionBusy,setCloseActionBusy]=useState(false);
   const [showAddGateway,setShowAddGateway]=useState(false);
@@ -6306,6 +6360,101 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setCustomerCountry(await fetchCustomerCountry(head.customer_name));
   };
   const [holdingNewSlNo,setHoldingNewSlNo]=useState(null); // {reference_number,item_sl_no,isNewQuote} banner shown while building this line
+  // 23 Sep — the guard now covers a captured header and a part-built BOM,
+  // not just the cart: on a brand-new quote nothing is in the database yet,
+  // so leaving used to lose the lot silently.
+  const [resumeOffer,setResumeOffer] = useState(null);   // a kept draft waiting to be resumed
+  // Add an item / size / model without leaving the quote (23 Sep). Anyone
+  // may, with the authorization code; the new model is marked as needing a
+  // BOM template and the Technical Head is asked for it, so a quote can't
+  // quietly be built on an item with nothing behind it.
+  const [addItemOpen,setAddItemOpen] = useState(false);
+  const [addItemF,setAddItemF] = useState({ item:"", size:"", model:"" });
+  const [addItemBusy,setAddItemBusy] = useState(false);
+  const [addItemGate,setAddItemGate] = useState(null);
+  const saveNewCatalogItem = async()=>{
+    const item=(addItemF.item||"").trim(), size=(addItemF.size||"").trim(), model=(addItemF.model||"").trim();
+    if(!item || !size || !model){ alert("Item, size and model are all needed."); return; }
+    const exists = modelCatalog.some(r=>String(r.item).trim().toLowerCase()===item.toLowerCase()
+      && String(r.size).trim().toLowerCase()===size.toLowerCase() && String(r.model).trim().toLowerCase()===model.toLowerCase());
+    if(exists){ alert("That item, size and model is already in the catalog."); return; }
+    setAddItemBusy(true);
+    try{
+      const { error: mErr } = await sb.from("model_tbl").insert({ item, size, model, is_custom:false, needs_template:true, created_by:user?.username||"unknown" });
+      if(mErr){
+        // A database without the new columns still gets the row.
+        const { error: retry } = await sb.from("model_tbl").insert({ item, size, model, is_custom:false });
+        if(retry){ alert(saveFailedText("The new item", retry)); return; }
+        alert("Added \u2014 but the \u201cneeds a template\u201d flag could not be saved. Run item_needs_template_20260923_v1.sql.");
+      }
+      if(!itemOptions.some(i=>String(i).trim().toLowerCase()===item.toLowerCase())){
+        await sb.from("item_tbl").insert({ item });
+      }
+      await logAudit("INSERT","model_tbl",item+" / "+size+" / "+model,"Item added from the Estimator; BOM template still needed",user?.username||"unknown",null,null);
+      await loadPostPeople(true);
+      // Straight back into the list, with the new one picked.
+      if(onRefresh) await onRefresh();
+      handleItemSelectEst(item); setSizeFilterEst(size); setModelFilter(model);
+      setAddItemOpen(false); setAddItemF({ item:"", size:"", model:"" });
+      alert("Added "+item+" / "+size+" / "+model+".\n\nIt has no BOM template yet, so its BOM will come up empty. "+postPersonText("technical_head")+" has been asked to add the template.");
+    } finally { setAddItemBusy(false); }
+  };
+  const newQuoteInHand = !!(holdingNewSlNo && holdingNewSlNo.isNewQuote);
+  useEffect(()=>{
+    const partBuilt = !!selectedModel || lines.length>0;
+    const dirty = cart.length>0 || (newQuoteInHand && (partBuilt || !!customerName || !!enquiryNumber));
+    setUnsavedGuard(dirty,
+      cart.length>0
+        ? ("You have "+cart.length+" unsaved line(s) in the cart."+(newQuoteInHand?" Your work is kept on this computer and offered back when you return.":" Leave anyway?"))
+        : "This quote isn't saved yet. Your work is kept on this computer and offered back when you return. Leave now?");
+  },[cart.length, selectedModel, lines.length, newQuoteInHand, customerName, enquiryNumber]);
+  // Write the work in hand to this browser as it changes.
+  useEffect(()=>{
+    if(!newQuoteInHand) return;
+    const t = setTimeout(()=>{
+      saveQuoteDraft({
+        ref: holdingNewSlNo.reference_number, slNo: holdingNewSlNo.item_sl_no,
+        username: user?.username,
+        header: { enquiryNumber, enquiryDate, quoteDate, currency, conversionRate, customerName, customerAddress,
+                  contactName, contactDesignation, signatoryName, signatoryDesignation, linkedProjectId, linkedProjectName, refDesc },
+        selectedModel, lines, overrides, cart
+      });
+    }, 800);   // a breath after typing stops, not on every keystroke
+    return ()=>clearTimeout(t);
+  },[newQuoteInHand, holdingNewSlNo, enquiryNumber, enquiryDate, quoteDate, currency, conversionRate, customerName, customerAddress,
+     contactName, contactDesignation, signatoryName, signatoryDesignation, linkedProjectId, linkedProjectName, refDesc,
+     selectedModel, lines, overrides, cart]);
+  // Offer it back on arrival — unless that quote number has since been saved
+  // properly, in which case the kept copy is stale and goes quietly.
+  useEffect(()=>{
+    (async()=>{
+      const d = readQuoteDraft();
+      if(!d || !d.ref) return;
+      if(d.username && user?.username && d.username!==user.username){ return; }   // someone else's work on a shared machine
+      const { data } = await sb.from("estimates").select("id").eq("reference_number",d.ref).limit(1);
+      if(data && data.length){ clearQuoteDraft(); return; }
+      setResumeOffer(d);
+    })();
+  },[user?.username]);
+  const resumeDraft = ()=>{
+    const d = resumeOffer; if(!d) return;
+    const hd = d.header||{};
+    setEnquiryNumber(hd.enquiryNumber||""); setEnquiryDate(hd.enquiryDate||""); setQuoteDate(hd.quoteDate||"");
+    setCurrency(hd.currency||"INR"); setConversionRate(String(hd.conversionRate||1));
+    setCustomerName(hd.customerName||""); setCustomerAddress(hd.customerAddress||"");
+    setContactName(hd.contactName||""); setContactDesignation(hd.contactDesignation||"");
+    setSignatoryName(hd.signatoryName||""); setSignatoryDesignation(hd.signatoryDesignation||"");
+    setLinkedProjectId(hd.linkedProjectId||null); setLinkedProjectName(hd.linkedProjectName||"");
+    setRefDesc(hd.refDesc||"");
+    setSelectedModel(d.selectedModel||null); setLines(d.lines||[]); setOverrides(d.overrides||{}); setCart(d.cart||[]);
+    setRefNumber(d.ref); setItemSlNo(String(d.slNo||1)); setGatewayConfirmedNewSlNo(true);
+    setHoldingNewSlNo({ reference_number:d.ref, item_sl_no:d.slNo||1, isNewQuote:true });
+    setResumeOffer(null);
+  };
+  const discardDraft = ()=>{
+    if(!confirm("Throw away the unfinished quote "+(resumeOffer&&resumeOffer.ref)+"?\n\nIt can't be brought back.")) return;
+    clearQuoteDraft(); setResumeOffer(null);
+  };
   useEffect(()=>{
     if(!pendingNewSlNo) return;
     (async()=>{
@@ -6395,6 +6544,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   const afterNewSlNoSave = async()=>{
     if(!holdingNewSlNo) return;
     const { reference_number, item_sl_no } = holdingNewSlNo;
+    clearQuoteDraft();   // 23 Sep — it is in the database now
     setHoldingNewSlNo(null);
     // Already answered permanently at the Order Qty gate (Custom/Direct
     // Price line, "No — skip it") — don't ask again here.
@@ -6642,6 +6792,36 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
   };
 
   return h(React.Fragment, null,
+    // An unfinished quote kept on this computer (23 Sep).
+    resumeOffer && !holdingNewSlNo && h("div",{style:{background:"#fff4d6",border:"1px solid #efb95f",borderRadius:6,padding:"10px 14px",margin:"0 0 12px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}},
+      h("div",{style:{fontSize:13,color:"#854f0b",fontWeight:600}},
+        "Unfinished quote "+resumeOffer.ref+(resumeOffer.header&&resumeOffer.header.customerName?" for "+resumeOffer.header.customerName:"")),
+      h("div",{style:{fontSize:11.5,color:"#854f0b"}},
+        "started "+(resumeOffer.savedAt?new Date(resumeOffer.savedAt).toLocaleString():"earlier")+
+        ((resumeOffer.cart&&resumeOffer.cart.length)?" \u00b7 "+resumeOffer.cart.length+" line(s) in the cart":" \u00b7 nothing in the cart yet")),
+      h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
+        h("button",{onClick:discardDraft,style:{...btnSecondary,fontSize:12}},"Discard"),
+        h("button",{onClick:resumeDraft,style:{...btnPrimary,fontSize:12,padding:"7px 14px"}},"Resume"))
+    ),
+    addItemGate && h(AuthCodeGate,{requiredType:addItemGate.requiredType,user,
+      onClose:()=>setAddItemGate(null),
+      onAuthorized:()=>{ const a=addItemGate.action; setAddItemGate(null); a(); }}),
+    addItemOpen && h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:1400,display:"flex",alignItems:"center",justifyContent:"center",padding:16}},
+      h("div",{style:{background:"#fff",borderRadius:10,padding:"20px 24px",width:460,maxWidth:"94vw"}},
+        h("div",{style:{fontWeight:700,fontSize:14,marginBottom:2}},"Add an item to the catalog"),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:14}},
+          "It appears in the pickers straight away. Its BOM will be empty until a template is built, and "+postPersonText("technical_head")+" is asked for one."),
+        ["item","size","model"].map(k=>h("div",{key:k,style:{marginBottom:10}},
+          h("label",{style:{display:"block",fontSize:10.5,color:colors.muted,marginBottom:3}},k.charAt(0).toUpperCase()+k.slice(1)),
+          h("input",{value:addItemF[k],onChange:e=>setAddItemF(f=>({...f,[k]:e.target.value})),
+            list: k==="item" ? "est-item-list" : undefined,
+            placeholder: k==="size" ? "e.g. 200NB" : "",
+            style:{...inputStyle}}))),
+        h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:6}},
+          h("button",{onClick:()=>setAddItemOpen(false),disabled:addItemBusy,style:btnSecondary},"Cancel"),
+          h("button",{onClick:saveNewCatalogItem,disabled:addItemBusy,style:{...btnPrimary,opacity:addItemBusy?0.6:1}},addItemBusy?"Adding\u2026":"Add"))
+      )
+    ),
     holdingNewSlNo && h("div",{style:{background:"#eaf2fb",border:"1px solid #85b7eb",borderRadius:6,padding:"9px 14px",margin:"0 0 12px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
       h("span",{style:{fontSize:13,color:"#0c447c",fontWeight:600}},
         holdingNewSlNo.isNewQuote
@@ -6857,6 +7037,12 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         h("div",{style:{fontSize:11,letterSpacing:"0.08em",color:colors.mutedLight,marginBottom:8,opacity:itemFilterEst?1:0.5}},"SIZE"),
         h("input",{list:"est-size-list",disabled:!itemFilterEst,value:sizeFilterEst,onChange:e=>handleSizeSelectEst(e.target.value),placeholder:itemFilterEst?"Type or pick a size…":"Select item first",style:{...inputStyle,fontSize:13,marginBottom:8,background:itemFilterEst?"#fff":colors.bg,opacity:itemFilterEst?1:0.5}}),
         h("datalist",{id:"est-size-list"},sizeOptionsForItemEst.map(m=>h("option",{key:m,value:m}))),
+        // 23 Sep — add what's missing without leaving the quote.
+        h("button",{onClick:()=>{ setAddItemF({ item:itemFilterEst||"", size:sizeFilterEst||"", model:modelFilter||"" });
+            if(user.role==="admin"||user.role==="super_admin") setAddItemOpen(true);
+            else setAddItemGate({ requiredType:"edit", action:()=>setAddItemOpen(true) }); },
+          style:{...btnSecondary,width:"100%",fontSize:11.5,padding:"6px 8px",marginBottom:12,color:"#0f6e56",borderColor:"#0f6e56"}},
+          "+ Add item / size / model"),
         h("div",{style:{fontSize:11,letterSpacing:"0.08em",color:colors.mutedLight,marginBottom:8,opacity:sizeFilterEst?1:0.5}},"MODEL ("+(modelsForItemSizeEst===null?0:modelsForItemSizeEst.length)+")"),
         h("input",{disabled:!sizeFilterEst,value:modelFilter,onChange:e=>setModelFilter(e.target.value),
           onFocus:()=>setModelFieldFocused(true), onBlur:()=>setModelFieldFocused(false),
@@ -23583,6 +23769,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"23 Sep 2026 (86)", summary:"Three things on the new-offer flow, plus a naming rule. UNFINISHED QUOTES: nothing exists in the database until the first Sl No is saved, and the unsaved-work guard only watched the cart \u2014 a captured header and a part-built BOM were lost silently. The work in hand (header, selected model, BOM lines, overrides, cart) is now written to the browser as it goes, under that quote number; the guard covers it; and the Estimator offers \\\"Unfinished quote X, started HH:MM \u2014 Resume / Discard\\\" on return. Cleared when the quote saves, when discarded, or when that number turns out to exist already; per computer and per username. ADD ITEM MID-QUOTE: new \\\"+ Add item / size / model\\\" under the Estimator's pickers \u2014 anyone may, with the authorization code (admins pass through), audited, the catalog reloads immediately and the new item/size/model is selected, so the page never has to be reloaded (which is what lost the header). The new row is marked needs_template. FLAG: new Pending Actions source item_template owed to the Technical Head \u2014 models marked needs_template with no BOM rows, ageing from when they were added; it clears itself once a template exists. NAMING: messages name the PERSON, not the post \u2014 postPersonText/postPersonShort over a post cache; when a post is vacant they read \\\"the Technical Head post is empty \u2014 contact Bala Boopathy\\\". Used in the add-item messages, the work-order flag list and Pending Actions' Waiting on column. NEEDS SQL: item_needs_template_20260923_v1.sql. Headless test 54 of 54." },
   { date:"23 Sep 2026 (85)", summary:"Stage moves from every screen, each with a note. QUOTE SCREEN: the three-stage dropdown is replaced by QuoteStageTrack under the header \u2014 the funnel's open and won stages in master order (passed ones green, current dark), Lost and Deferred as exits, a move box asking for the date it changed, a note and (for open stages) the next follow-up; Won/Lost/Deferred hand on to the outcome box with the note held until it completes. Every move writes a follow-up via logStageMoveFollowup (discussed_what \\\"Stage moved on Quote screen\\\"), so it becomes Last interaction; a stage trail shows the last four moves with who, where and the note. The track re-checks the stage on returning to the screen, on window focus/visibility and every 60 s, and shows who moved it elsewhere. Readiness gate, the plain-user authorization code and the un-Won guard are kept. QUOTES REPORT: the stage box asks for a note and next follow-up and writes the same follow-up (\\\"Stage moved on Quotes Report\\\"). LAST INTERACTION: ordered by the date the interaction happened, then time entered; shows the notes only. QUOTE STAGES: On Quote screen column removed \u2014 every stage is settable. SOP FMQ-SOP-CRM-001 Rev 1. Headless test 50 of 50. No SQL." },
   { date:"22 Sep 2026 (84)", summary:"The Quotes Report keeps its place. Leaving it \u2014 to open a quote or for any other screen \u2014 and coming back restores the filter boxes, the applied filters and their chips, the rows already worked out (values included), the grouping, and the scroll position in both the table and the page, then refreshes quietly behind the rows shown. Kept in QUOTES_REPORT_SAVED for the session; a fresh drill-down from the dashboard (new initialFilters) starts clean. Previously the existing Back to Quotes Report button on the Quote screen returned to a report rebuilt from nothing. App-wide: leaving the Quotes Report for any screen now shows a \\\"Back to Quotes Report\\\" pill bottom-left on every screen until it is used, the report is reopened another way, or it is dismissed. Headless test: 39 of 39, including leave-and-return restoring list, boxes and chips, and a dashboard drill-down starting clean. No SQL." },
   { date:"22 Sep 2026 (83)", summary:"Log Follow-ups brought in line with the single Stage. Outcome colours now follow the stage's kind from the master (won green, lost red, parked amber) instead of a list of names, so an added stage colours correctly; Not pursuing and Stalled, which are other chase types' outcomes, stay named. The \\\"Next Followup Date required unless...\\\" message names the closing stages from the master instead of the old Won/Lost/Deferred/Went Cold. Draft is no longer offered as an Outcome for an Offer, in the entry grid or the Review tab \u2014 a call doesn't send a quote back to Draft; the Quote screen still can. A stage change that the database refuses when a follow-up is saved is now reported (the follow-up itself is saved either way), instead of vanishing. The Nature column was already removed on 22 Sep and its Outcome list already read the stage master in funnel order. No SQL." },
@@ -25382,7 +25569,7 @@ function WorkOrderFlagPrompt({ user, onDone }){
         h("tbody",null, rows.map(r=>h("tr",{key:r.id,style:{borderTop:"1px solid #f0eee6"}},
           h("td",{style:{padding:"6px 8px",fontWeight:600}},r.wo.wo_number),
           h("td",{style:{padding:"6px 8px",color:colors.muted}},r.wo.contract_number),
-          h("td",{style:{padding:"6px 8px",color:colors.mutedLight,fontSize:11}},r.post_key),
+          h("td",{style:{padding:"6px 8px",color:colors.mutedLight,fontSize:11}},postPersonShort(r.post_key)),
           h("td",{style:{padding:"6px 8px",textAlign:"right"}},
             h("button",{onClick:()=>close(r),disabled:busy,style:{...btnSmall,fontSize:10.5}},"Close"))
         )))
@@ -38001,7 +38188,11 @@ function PendingActionsScreen({ user }){
             h("td",{style:{padding:"8px 6px"}},r.what,
               r.on_hold?h("div",{style:{fontSize:10.5,color:colors.muted}},"On hold: "+(r.hold_reason||"")):null),
             h("td",{style:{padding:"8px 6px"}},r.entity_key),
-            h("td",{style:{padding:"8px 6px"}},r.owed_by_person||r.owed_by_role||"\u2014"),
+            // 23 Sep — the person, not the post; and when nobody holds it,
+            // say so and name who to go to instead.
+            h("td",{style:{padding:"8px 6px"}},
+              r.owed_by_person ? r.owed_by_person
+                : h("span",{style:{color:"#a3312a"}}, postLabel(r.owed_by_role)+" \u2014 vacant, contact "+POST_VACANT_CONTACT)),
             h("td",{style:{padding:"8px 6px",textAlign:"right"}},
               r.days_waiting==null?h("span",{style:{color:colors.mutedLight},title:"Nothing to measure from \u2014 this predates the timestamps"},"\u2014"):r.days_waiting),
             h("td",{style:{padding:"8px 6px",textAlign:"right"}},
