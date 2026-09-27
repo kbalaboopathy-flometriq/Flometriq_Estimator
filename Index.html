@@ -11,10 +11,11 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
-<!-- settings.js — OPTIONAL, and per site. Levaflow's copy sits beside this
-     file and points the app at Levaflow's database and branding. Flometriq's
-     site has no settings.js at all and falls back to its own values below,
-     so the SAME Index.html is safe to deploy to either. -->
+<!-- settings.js — REQUIRED, and per site (since build 90, 27 Sep 2026).
+     Each company's copy sits beside this file and points the app at that
+     company's database and branding. There is no built-in database: without
+     a readable settings.js the app shows an error screen and stops. The SAME
+     Index.html is deployed to both sites; settings.js is never copied across. -->
 <script src="settings.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tabler-icons/3.44.0/tabler-icons.min.css" />
 <style>
@@ -51,7 +52,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-09-25T05:05:00Z";
+  var APP_BUILD_VERSION = "2026-09-27T01:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -420,8 +421,13 @@ function formatReadinessGaps(missing){
 //   companyName / companyAddress / companyWebsite / companyEmail
 //   quoteNumberSuggestion      — suggest the next Quote#; OFF unless set
 const APP_SETTINGS = (typeof window!=="undefined" && window.APP_SETTINGS && typeof window.APP_SETTINGS==="object") ? window.APP_SETTINGS : {};
-const SUPABASE_URL = APP_SETTINGS.supabaseUrl || "https://afqioawxgcgssktdzyql.supabase.co";
-const SUPABASE_KEY = APP_SETTINGS.supabaseKey || "sb_publishable_3vYQANajyTU0wBhGjmfmgQ_eMReC9pl";
+// 27 Sep (90): settings.js is REQUIRED on every site. There is no built-in
+// database any more — a site whose settings.js is missing, renamed or broken
+// shows SettingsMissingScreen and stops, instead of silently opening
+// Flometriq's database under another company's name.
+const SETTINGS_OK = !!(APP_SETTINGS.supabaseUrl && APP_SETTINGS.supabaseKey);
+const SUPABASE_URL = SETTINGS_OK ? String(APP_SETTINGS.supabaseUrl) : "https://settings-missing.invalid";
+const SUPABASE_KEY = SETTINGS_OK ? String(APP_SETTINGS.supabaseKey) : "settings-missing";
 const QUOTE_NUMBER_SUGGESTION = APP_SETTINGS.quoteNumberSuggestion === true;
 const APP_INSTANCE_LABEL = APP_SETTINGS.instanceLabel || "";
 if(APP_SETTINGS.appTitle){ try{ document.title = String(APP_SETTINGS.appTitle); }catch(e){} }
@@ -23941,6 +23947,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"27 Sep 2026 (90)", summary:"settings.js is now REQUIRED on every site. Until now a missing settings.js made the app fall back to a database address built into Index.html (Flometriq\u2019s), so a Levaflow site that lost its settings.js would open Flometriq\u2019s database under Levaflow\u2019s name \u2014 and anyone with a login on both (the MD) could save Levaflow work into Flometriq without noticing. The built-in address and key are removed. If settings.js is missing, renamed, unreadable, or lacks supabaseUrl/supabaseKey, the app does not mount at all: SettingsMissingScreen says what is wrong, that nothing was read or saved, and how to fix it (put settings.js back beside Index.html, wait for the site to update, click Try again). The Supabase client is created against a dummy .invalid address in that case so nothing can reach a real database. Flometriq\u2019s site therefore MUST also have its own settings.js with its own supabaseUrl/supabaseKey. Deploy is unchanged: upload Index.html and version.txt only; settings.js stays in each repo untouched." },
   { date:"25 Sep 2026 (89)", summary:"The 8 Sep no-id fix, finished. estimate_lines has no id column \u2014 build 58 corrected the ten database writes that filtered on it, but two screens were still keying their own React state on line.id, which is undefined on every row. Every line therefore shared the single key \"undefined\". CONSEQUENCES, both real: on the Pending validation card (Pricing & Description), a Sl No with two or more Direct Price lines showed the LAST line's item, description, qty, cost and sales price in every line's boxes, and saving one line wrote those values over the other; on the Pending Validation screen, marking one line Validated ran rs.filter(r=>r.id!==row.id), and since undefined !== undefined is false for every row, the whole list disappeared from the screen instead of that one line (the other lines were not actually validated \u2014 they came back on reload, which is how it stayed hidden). A Sl No with a single Direct Price line, which is the common case, was never affected. FIX: one shared lineKey(line) beside byLine, returning reference_number|item_sl_no|sl_no \u2014 the same key byLine already filters the database on, so screen state and database writes now agree on what \"this line\" means. Applied to all 38 places across the two components; no other line list in the file was keyed this way. Nothing else changed: no pricing, no layout, no wording." },
   { date:"25 Sep 2026 (88)", summary:"Direct Price lines are priced PER ITEM. A Direct Price line (a hand-priced, bought-in item with no BOM costing) is now stored as one per item \u2014 qty_required = 1 \u2014 and the number of items lives only on the Sl No's order qty. Before this, users typed the ordered quantity into the line's Qty box AND into the Order Quantity popup, and the app multiplied the two: a 15NB globe valve at 1,800 with Qty 70 and order qty 70 showed a unit cost of 1,26,000 and a total of 88,20,000 instead of 1,800 and 1,26,000. SECOND BUG FIXED, found while tracing the first: changing an Sl No's order qty ran every line through rate \u00d7 sf to recompute cost and sales_price. A Direct Price line has no rate and no sf, so its typed cost and sales price were overwritten with 0 every time the order qty was nudged \u2014 the same wipe happened when such a line was edited through the BOM table's line editor. Both now skip Direct Price lines entirely: nothing recomputes a hand-typed price, not an order-qty change, not a line edit, not a price refresh. FOUR SHARED HELPERS added beside roundedUnitTotal \u2014 lineUnitCost, lineUnitSale, isDirectPriceOnly, slNoIsDirectPriceOnly \u2014 so every summary asks \"the price of one of this line\" in one place instead of reading rate/sf and silently getting 0. EXACT PRICING: an Sl No made only of Direct Price lines is now printed to the rupee rather than rounded to the nearest 5, the same rule a PO price already had, because the figure was typed by a person. Applied to the cost card, the internal BOM totals, Annexure II, the grand total, the cover letter's Total Basic Price and the Datasheet Price Data, so no two of them can disagree. WHERE DIRECT PRICE LINES NOW APPEAR PROPERLY: both material summaries give each one its own row (\"Direct price: <item>\") at its typed cost and sales price instead of burying it under \"(no spec)\" at rate 0; both cutting plans drop them, since nothing is cut for a bought-in item, instead of printing an empty \"(no spec)\" row; the internal BOM PDF/Excel shows the item name, its cost price in the Rate column and \"\u2014\" for Sf. LABELS AND GUARDS: the Custom (no BOM) form's Qty is labelled \"Qty (order qty)\" with a line saying the prices are per item, and it pre-fills the Order Quantity popup so the figure is confirmed rather than typed twice; the Add Line popup and the Pending validation card label theirs \"Qty per item\" and warn before saving when that equals the Sl No's order qty, which is almost always the old double-counting habit; on a Sl No made only of Direct Price lines the validation card's Qty box IS the order qty and saving it changes the order qty. The Pending Validation list reads \"INR x each\". A ONE-TIME DATA CORRECTION (preview + fix SQL, quantities only, never prices) repairs quotes saved the old way; anything ambiguous is listed for the MD rather than guessed. BOM Sl Nos, and BOM Sl Nos that merely carry a Direct Price line (2 gaskets per strainer), are unchanged in every respect." },
   { date:"24 Sep 2026 (87)", summary:"One Index.html, safe for both companies. The file now reads an optional settings.js beside it (loaded before the app's own script): supabaseUrl / supabaseKey decide which database, appTitle the browser tab, instanceLabel the line under BOM Estimator on the sign-in screen, companyName/Address/Website/Email the PDF letterhead fallbacks, quoteNumberSuggestion the Quote# suggestion. Falls back to Flometriq's own values when no settings.js is present, and a key present but empty wins over the fallback, so a company with no website shows none. Written to match the settings.js already deployed on Levaflow, so that file needs no change. This closes the hole that sent Levaflow's site at Flometriq's database this morning: without settings support, every Index.html handed over was a Flometriq file. No SQL." },
@@ -38900,7 +38907,29 @@ function TestTypesScreen(){
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(h(App));
+function SettingsMissingScreen(){
+  const loaded = (typeof window!=="undefined" && window.APP_SETTINGS && typeof window.APP_SETTINGS==="object");
+  const why = loaded
+    ? "settings.js was found, but it does not give a database address (supabaseUrl) and key (supabaseKey)."
+    : "settings.js did not load. It is missing, renamed (for example \"settings (1).js\"), or has a typo that stops the browser reading it.";
+  const box={maxWidth:560,margin:"80px auto",padding:"28px 32px",border:"2px solid #c0392b",borderRadius:8,background:"#fff",fontFamily:"system-ui, sans-serif",color:"#222",lineHeight:1.5};
+  return h("div",{style:{minHeight:"100vh",background:"#f6f5f0",padding:"0 16px"}},
+    h("div",{style:box},
+      h("div",{style:{fontSize:20,fontWeight:700,color:"#c0392b",marginBottom:8}},"Settings file missing — the app has stopped"),
+      h("p",{style:{margin:"0 0 12px"}},why),
+      h("p",{style:{margin:"0 0 12px"}},"Nothing has been read or saved. The app will not open without it, so that no one works in the wrong company's database."),
+      h("div",{style:{fontWeight:600,margin:"16px 0 6px"}},"To fix"),
+      h("ol",{style:{margin:"0 0 16px",paddingLeft:20}},
+        h("li",null,"Put this company's settings.js back in the root of its GitHub repo, beside Index.html (exact name: settings.js)."),
+        h("li",null,"Wait a minute for the site to update."),
+        h("li",null,"Click Try again.")
+      ),
+      h("p",{style:{margin:"0 0 16px",fontSize:13,color:"#666"}},"Site: "+(location.host||"(local file)")+" · Build "+(window.APP_BUILD_VERSION||"")+" · Contact Bala Boopathy if unsure."),
+      h("button",{onClick:()=>location.reload(),style:{padding:"8px 18px",background:"#c0392b",color:"#fff",border:"none",borderRadius:4,fontSize:14,cursor:"pointer"}},"Try again")
+    )
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(SETTINGS_OK ? h(App) : h(SettingsMissingScreen));
 </script>
 </body>
 </html>
