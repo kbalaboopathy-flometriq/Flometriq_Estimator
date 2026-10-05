@@ -52,7 +52,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-10-05T18:30:00Z";
+  var APP_BUILD_VERSION = "2026-10-05T20:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -22458,6 +22458,17 @@ function docStatusName(row){
   if(!row) return "";
   return row.label ?? row.status ?? row.value ?? "";
 }
+// 130: the colour bucket may be stored as "our_action" or as words ("Our Action", "Third Party Action",
+// "No Action") — Flometriq's master has the words. Everything reads it through this.
+function docBucketNorm(v){
+  const k = String(v||"").toLowerCase().replace(/[^a-z]/g,"");
+  if(!k) return v||null;
+  if(k.startsWith("our")) return "our_action";
+  if(k.startsWith("third") || k.startsWith("client") || k.startsWith("party")) return "third_party_action";
+  if(k.startsWith("no") || k.startsWith("none") || k.startsWith("green")) return "no_action";
+  return v;
+}
+const docStatusRowsNorm = (rows)=> (rows||[]).map(r=>({ ...r, action_type: docBucketNorm(r.action_type) }));
 function docStatusNameCol(rows){
   const r = (rows||[])[0];
   if(r){ if("label" in r) return "label"; if("status" in r) return "status"; if("value" in r) return "value"; }
@@ -22466,7 +22477,7 @@ function docStatusNameCol(rows){
 async function loadDocStatuses(){
   const { data, error } = await sb.from("doc_status_tbl").select("*");
   if(error){ console.error("Document Status master could not be read", error); return []; }
-  return (data||[]).slice().sort((a,b)=>String(docStatusName(a)).localeCompare(String(docStatusName(b))));
+  return docStatusRowsNorm(data).slice().sort((a,b)=>String(docStatusName(a)).localeCompare(String(docStatusName(b))));
 }
 function checkDocumentLink(raw){
   const url = String(raw||"").trim();
@@ -27229,6 +27240,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"5 Oct 2026 (130)", summary:"Every board feeds one board per person. FIX: document statuses stored as words (Our Action / Third Party Action / No Action) were not understood \u2014 the Document Control board put approved documents (Code 1, All Cleared, For Info) under Not submitted, and the contract Documents panel and Document Register showed every status green. Both spellings are now read everywhere; a status with no colour set is read from its words. Purchase Order, Order Acceptance / OA and Letter of Intent are not on the Document Control board (commercial papers, not for client approval); their task cards are closed by the app. Handing out a document creates or updates its task card at once (assigned, due by the task type). The Task board brings document cards up to date every time it opens (chase letters once a day). A document gets an initial-submission card until the client has returned it; resubmission after that. TASK BOARD: every card carries a tag for where it came from (Enquiry, Document, Chase letter, Own task) and From buttons filter by source (with counts on a person's board); each person's board shows their open work from all boards split by source with overdue; the Task Assignment Board shows the same split under each person. No SQL." },
   { date:"5 Oct 2026 (129)", summary:"Document Control board, and a new top-level ORDER STATUS group. Order Status \u2192 Document Control: the board (Document Control Board), Report by Contract, Chase Letters and Document Register (moved from Reports); Setup (Admin): Document Status Master and Document Categories (moved from Admin \u2192 Company). Sales now holds Enquiry (moved from its own tab), Quotes with Datasheet Master (Admin, moved from Engineering master), Sale Order and Commercials. QC / Technical Head / Accounts approval logins see Order Status too. BOARD: one card per contract document or requested document, four lists (Not submitted \u2014 our action / Submitted \u2014 client action pending / Code 2 \u2014 proceed, resubmission outstanding / All approved); doc_status_tbl.board_list sets the list, else the red/yellow/green bucket. All contracts or one contract; By stage or By person (Unassigned pile + Document Controller + Document Control and Design & Estimation people + current owners); filters hold level, owner, department (category's department), search; sort. Drag to another list = log the next revision (status, Rev and Out/In by the sequence, date, link, what changed); a request card logs Rev 0 and creates the document. Drag onto a person, the Owner box under \u25be more, or tick rows in a table to hand out \u2014 the Document Controller, Admins and the card's owner may. \ud83d\udd17 on the card opens the latest file; \ud83d\udd58 opens the whole revision history with each file. \u229e on every list and Table \u2014 whole board: summary (stage counts, total, overdue, Full Hold open) with Group by stage / contract / owner / hold / category / department, bulk assign, Excel and PDF on the letterhead. TASK CARDS: every round of our work (a request, or a Code 3 / Code 2 return) is a Task Manager card in the Document Control pile (types Document \u2013 initial submission / resubmission, due by the type's days); it completes by itself when the document is sent. CHASE: a document with the client 7 days after we sent it (or after the last letter) is due a chase; the app drafts one letter per contract (First / Second / Final reminder, number DC/YY/NNNN) with a card for the Document Controller; edit the wording, Download PDF, Copy as email text, Mark as sent (records it on each document and moves the chase date). Report by contract: internal or client version, PDF and Excel. Full Hold: a fall-back from Code 2 tells Super Admins (the clock is not reset); the last Full Hold document reaching Code 2 reminds you to set the Code 2 date on the contract. SQL: structure_document_control_129 then data_document_control_129, both companies." },
   { date:"5 Oct 2026 (128c)", summary:"PDFs on the letterhead. The \u229e Table of any board list gets Download PDF (landscape: Sl No, Enquiry, Customer, Quote#, Subject / task, Type, Customer closes, Due with days over, Stage, With, Created on). That PDF and the Tasks Completed report print the company logo, name, address and contact (session company, else the first in Company Master), a divider line, and Company \u00b7 title \u00b7 page n of N at the foot of every page." },
   { date:"5 Oct 2026 (128b)", summary:"Enquiries: a card still in the Unassigned pile shows Waiting in pile (it showed Tasks Assigned) in the Card column and on the enquiry screen." },
@@ -29121,7 +29133,7 @@ function ContractDocumentsPanel({ contractNumber, refreshKey, user }){
   // Same three buckets the modal uses, read from the same master, so a
   // status looks identical wherever it is shown.
   const [statusRows,setStatusRows] = useState([]);
-  useEffect(()=>{ sb.from("doc_status_tbl").select("*").then(({data})=>setStatusRows(data||[])); },[]);
+  useEffect(()=>{ sb.from("doc_status_tbl").select("*").then(({data})=>setStatusRows(docStatusRowsNorm(data))); },[]);
   const statusColor = (label)=>{
     const bucket = (statusRows.find(r=>docStatusName(r)===label)||{}).action_type;
     if(bucket==="our_action") return {background:"#fdecea",color:"#a3312a"};
@@ -42674,9 +42686,21 @@ const DOC_LETTER_DELIVERY = "Please note that as per the contract, the delivery 
 function docStatusListKey(row, label){
   if(row && ["our","client","code2","done"].includes(row.board_list)) return row.board_list;
   if(/code\s*-?\s*2/i.test(label||"") && !/code\s*-?\s*3/i.test(label||"")) return "code2";
-  const b = (row||{}).action_type;
+  const b = docStatusBucketOf(row, label);
   return b==="third_party_action" ? "client" : b==="no_action" ? "done" : "our";
 }
+// 130: bucket from the master, else from the words of the status itself (never "our action" by default).
+function docStatusBucketOf(row, label){
+  const b = row ? docBucketNorm(row.action_type) : null;
+  if(b==="our_action" || b==="third_party_action" || b==="no_action") return b;
+  const t = String(label||"");
+  if(/our action|resubmission pending|code\s*-?\s*3/i.test(t)) return /resubmission done/i.test(t) ? "third_party_action" : "our_action";
+  if(/third party|resubmission done|client action|submitted/i.test(t)) return "third_party_action";
+  return "no_action";
+}
+// 130: commercial papers are not client-approval documents — never on the board.
+const DOC_BOARD_SKIP = /^(purchase order|order acceptance|oa|po|customer po|letter of intent|loi)$/i;
+const docOnBoard = (category)=> !DOC_BOARD_SKIP.test(String(category||"").trim());
 async function loadDocDept(){
   try{
     const { data } = await sb.from("department_tbl").select("department");
@@ -42715,7 +42739,7 @@ async function docBoardLoad(){
   const sentFor = {}; lettersArr.filter(l=>l.status==="sent").forEach(l=>{ (l.doc_ids||[]).forEach(id=>{ const k=String(id); (sentFor[k]=sentFor[k]||[]).push(l); }); });
   const taskArr = tasks.error ? [] : (tasks.data||[]).filter(t=>t.doc_id || t.doc_request_id || t.chase_letter_id);   // only document cards, whatever the filter returned
   const items = [];
-  const liveDocs = (docs||[]).filter(d=>d.entity_type==="contract" && !d.is_archived);
+  const liveDocs = (docs||[]).filter(d=>d.entity_type==="contract" && !d.is_archived && docOnBoard(d.category));
   const docIds = new Set(liveDocs.map(d=>String(d.id)));
   liveDocs.forEach(d=>{
     const revs = histBy[String(d.id)]||[];
@@ -42723,7 +42747,7 @@ async function docBoardLoad(){
     const status = last ? (last.status||"") : "";
     const st = stBy[status];
     const list = last ? docStatusListKey(st, status) : "our";
-    const bucket = st ? st.action_type : (last ? "our_action" : "our_action");
+    const bucket = last ? docStatusBucketOf(st, status) : "our_action";
     const lastOut = [...revs].reverse().find(r=>r.direction==="Out")||null;
     const ltrs = (sentFor["d"+d.id]||[]);
     const lastChase = ltrs.reduce((m,l)=> l.sent_at && l.sent_at>m ? l.sent_at : m, "");
@@ -42735,7 +42759,7 @@ async function docBoardLoad(){
       revs, last, status, bucket, list, needsUs: bucket==="our_action" || !last, waitingClient, chaseDate, chased:ltrs.length, lastChase,
       since: last ? last.changed_at : d.created_at, owner: d.owner||null, round: last ? "h"+last.id : "new" });
   });
-  (reqs||[]).filter(r=>r.entity_type==="contract" && (!r.fulfilled_document_id || !docIds.has(String(r.fulfilled_document_id)))).forEach(r=>{
+  (reqs||[]).filter(r=>r.entity_type==="contract" && docOnBoard(r.category) && (!r.fulfilled_document_id || !docIds.has(String(r.fulfilled_document_id)))).forEach(r=>{
     items.push({ key:"r"+r.id, kind:"req", doc:null, req:r, ct:String(r.entity_id||""), name:r.category+(r.item_sl_no!=null?" · Sl "+r.item_sl_no:""), no:"", cat:r.category||"", sl:r.item_sl_no,
       revs:[], last:null, status:"Requested — no document yet", bucket:"our_action", list:"our", needsUs:true, waitingClient:false, chaseDate:"", chased:0, lastChase:"",
       since:r.created_at||r.requested_at||null, owner:r.owner||null, round:"req" });
@@ -42773,7 +42797,7 @@ async function docTasksSync(data, by){
         if(it.needsUs){
           const have = it.tasks.some(t=>t.doc_round===it.round);
           if(have) continue;
-          const tyName = it.kind==="req" || !it.last ? DOC_TT_INITIAL : DOC_TT_RESUB;
+          const tyName = it.kind==="req" || !it.revs.some(r=>r.direction==="In") ? DOC_TT_INITIAL : DOC_TT_RESUB;   // 130: resubmission only once the client has returned it
           const ty = typeOf(tyName);
           const who = it.owner || null;
           const ownerE = who ? data.emps.find(e=>e.employee_name===who) : null;
@@ -42782,7 +42806,7 @@ async function docTasksSync(data, by){
           const row = { title: it.name+(tyName===DOC_TT_INITIAL?" — prepare & submit":" — resubmit"), ref:(it.no||it.cat)+" · "+it.ct, customer:it.customer||null,
             department:dept, assignee:who, due_date: who ? (taskTypeDue(ty,today)||addDaysISO(today,3)) : null, status:"open",
             ...(ty?{task_type:tyName}:{}), labels:["Document"], links:lastLink, checklists: ty && taskTypeChecklist(ty).length ? taskTypeChecklist(ty) : [],
-            notes: it.last ? ("Client returned Rev "+it.last.rev_number+": "+(it.last.status||"")+(it.last.notes?" — "+it.last.notes:"")) : "Requested on contract "+it.ct+(it.req&&it.req.is_mandatory?" (mandatory)":""),
+            notes: it.last && it.last.direction==="In" ? ("Client returned Rev "+it.last.rev_number+": "+(it.last.status||"")+(it.last.notes?" — "+it.last.notes:"")) : "Requested on contract "+it.ct+(it.req&&it.req.is_mandatory?" (mandatory)":""),
             created_by:"App", doc_id: it.doc ? String(it.doc.id) : null, doc_request_id: it.req ? String(it.req.id) : null, doc_round: it.round, doc_contract: it.ct };
           const { data:t, error } = await sb.from("task_tbl").insert(row).select().single();
           if(error){ console.error("Document card not made", error); continue; }
@@ -42807,9 +42831,9 @@ async function docTasksSync(data, by){
         if(t.status==="done" || t.chase_letter_id) continue;
         const ok = (t.doc_id && live.has("d"+t.doc_id)) || (t.doc_request_id && live.has("r"+t.doc_request_id));
         if(ok) continue;
-        await sb.from("task_tbl").update({ status:"done", approved_by:"App (document removed)", approved_at:now, moved_by:"App", moved_at:now, moved_what:"Document no longer on the contract" }).eq("id",t.id);
+        await sb.from("task_tbl").update({ status:"done", approved_by:"App (not on the Document Control board)", approved_at:now, moved_by:"App", moved_at:now, moved_what:"Not a document for client approval, or no longer on the contract" }).eq("id",t.id);
         t.status = "done"; closed++;
-        await taskLog(t.id, "App", "Document no longer on the contract: card closed by the app");
+        await taskLog(t.id, "App", "Closed by the app: not a document for client approval (Purchase Order / OA), or no longer on the contract");
       }
     }catch(e){ console.error("Document card sync failed", e); }
     return { made, closed };
@@ -42855,11 +42879,15 @@ async function docChaseSweep(data, by){
   }catch(e){ console.error("Chase letters not made", e); }
   return made;
 }
-// Run once a day per browser from the Task board too, so the Document Controller's cards appear without opening the board.
-async function docDailySweep(user){
-  const k = "doc_sweep_"+toISODate(new Date());
-  try{ if(localStorage.getItem(k)) return; localStorage.setItem(k,"1"); }catch(e){}
-  try{ const d = await docBoardLoad(); await docTasksSync(d,"App"); await docChaseSweep(d,"App"); }catch(e){ console.error("Document sweep failed", e); }
+// 130: from the Task board — document cards every time it opens; chase letters once a day per browser.
+async function docTaskBoardSync(){
+  try{
+    const d = await docBoardLoad();
+    await docTasksSync(d,"App");
+    const k = "doc_sweep_"+toISODate(new Date()); let due = true;
+    try{ if(localStorage.getItem(k)) due = false; else localStorage.setItem(k,"1"); }catch(e){}
+    if(due) await docChaseSweep(d,"App");
+  }catch(e){ console.error("Document card sync failed", e); }
 }
 
 // ---- PDFs ----
@@ -43029,7 +43057,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
         await logAudit("UPDATE", it.doc?"universal_documents_tbl":"document_requests_tbl", it.ct, (it.no||it.cat)+" handed to "+(who||"the Unassigned pile")+(it.owner?" (was "+it.owner+")":""), user?.username||"unknown", {owner:it.owner||null}, {owner:who||null});
       }
     }catch(e){ alert("Could not hand out:\n\n"+(e&&e.message||e)); }
-    await load(false); setBusy(false);
+    await load(true); setBusy(false);   // 130: sync at once, so the person's Task board has the card now
   };
 
   // ---- move = log the next revision ----
@@ -43489,6 +43517,10 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
     panel==="report" ? reportModal() : null);
 }
 
+// 130: where a task card came from — every board feeds the same person board.
+const TASK_SOURCES = [["enq","Enquiry","#e6f1fb","#2a6db0"],["doc","Document","#fbeee0","#8a4b14"],["chs","Chase letter","#fff4d6","#8a6100"],["own","Own task","#eef0ea","#4f5a4a"]];
+const taskSource = (t)=> t && t.enquiry_id ? "enq" : t && t.chase_letter_id ? "chs" : t && (t.doc_id || t.doc_request_id) ? "doc" : "own";
+const taskSourceMeta = (k)=> TASK_SOURCES.find(x=>x[0]===k) || TASK_SOURCES[3];
 function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackToEnquiry, company }){
   // 3 Oct (119) — three views:
   //   Task Assignment Board  a department's Unassigned pile + one list per employee
@@ -43522,6 +43554,7 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
   const [deletedLog,setDeletedLog] = useState(null); // 121: rows of deleted cards, or null when closed
   const [settings,setSettings] = useState([]);     // 122: task_dept_setting_tbl (load limits, stale, approval wait)
   const [chips,setChips] = useState([]);           // 122: quick filters (AND)
+  const [srcF,setSrcF] = useState([]);             // 130: show only these sources (empty = all)
   const [q,setQ] = useState("");                   // 122: search title / ref / customer
   const [tvPer,setTvPer] = useState("month");      // 122: Table view completed period
   const [tvSort,setTvSort] = useState("due");
@@ -43551,6 +43584,7 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
     const dcNames = (dcRows||[]).map(r=>r.employee_name).filter(Boolean); setDocCtl(dcNames);
     { const { data: sRows, error: sErr } = await sb.from("task_dept_setting_tbl").select("*"); setSettings(sErr ? [] : (sRows||[])); }   // 122 (missing table = defaults)
     { const { data: ttRows, error: ttErr } = await sb.from("task_type_tbl").select("*").order("sort_order"); setTaskTypes(ttErr ? [] : (ttRows||[])); }   // 128
+    if(first) await docTaskBoardSync();   // 130: document cards brought up to date every time the board opens (chase letters once a day)
     const [{data:e},{data:t,error:tErr},{data:l},{data:a},name] = await Promise.all([
       sb.from("employee_tbl").select("*").order("employee_name"),   // 123: * so second_department comes too
       sb.from("task_tbl").select("*").order("due_date",{ascending:true}).limit(20000),
@@ -43563,7 +43597,6 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
     let tl = t||[];
     // 123: enquiry cards — read their enquiries; any whose quote has left Draft is completed now
     // (safety net; normally done the moment the stage changes).
-    docDailySweep(user);   // 129: document cards + chase letters, once a day
     try{
       const readEnq = async(rows)=>{ const ids = Array.from(new Set(rows.map(x=>x.enquiry_id).filter(Boolean))); let out=[];
         for(let k=0;k<ids.length;k+=150){ const { data:er } = await sb.from("enquiry_tbl").select("*").in("id",ids.slice(k,k+150)); out=out.concat(er||[]); } return out; };
@@ -43693,8 +43726,8 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
     closepast:t=>t.status!=="done" && !!closeOf(t) && closeOf(t)<today };
   const labelOk = (t)=> !labelFilter || (t.labels||[]).includes(labelFilter);
   const searchOk = (t)=> !q.trim() || [t.title,t.ref,t.customer].filter(Boolean).join(" ").toLowerCase().includes(q.trim().toLowerCase());
-  const passes = (t)=> labelOk(t) && searchOk(t) && chips.every(c=>chipTest[c](t));
-  const filtering = chips.length>0 || !!labelFilter || !!q.trim();
+  const passes = (t)=> labelOk(t) && searchOk(t) && chips.every(c=>chipTest[c](t)) && (!srcF.length || srcF.includes(taskSource(t)));
+  const filtering = chips.length>0 || !!labelFilter || !!q.trim() || srcF.length>0;
   const parentOf = (t)=> t.parent_id ? tasks.find(p=>p.id===t.parent_id) : null;
   const kidsOf = (t)=> tasks.filter(x=>x.parent_id===t.id);
   const itemPasses = (t)=> passes(t) || kidsOf(t).some(passes);
@@ -43708,10 +43741,22 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
   const toggleChip = (c)=> setChips(cs=> cs.includes(c) ? cs.filter(x=>x!==c) : [...cs,c]);
   const dotC = (t)=> TASK_STAGES.find(s=>s.key===taskStage(t,today)).color;
   const hint = (txt)=> h("div",{style:{fontSize:10.5,color:colors.mutedLight,textAlign:"center",padding:"6px 2px"}},txt);
+  // 130: a person's open work from EVERY board, split by where it came from
+  const loadSplit = (name, wide)=>{
+    const open = tasks.filter(t=>t.assignee===name && t.status!=="done");
+    const od = open.filter(t=>taskOverdue(t,today)).length;
+    const parts = TASK_SOURCES.map(([k,l,bg,fg])=>[k,l,fg,open.filter(t=>taskSource(t)===k).length]).filter(x=>x[3]);
+    const plural = {enq:"enquiries",doc:"documents",chs:"chase letters",own:"own tasks"};
+    return h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:6,...(wide?{display:"inline-flex",gap:10,alignItems:"center",flexWrap:"wrap"}:{})}},
+      open.length ? h("div",{style:{display:"flex",height:7,borderRadius:4,overflow:"hidden",background:"#e9efec",margin:wide?"0":"0 0 3px",width:wide?160:"100%"}},
+        parts.map(([k,l,fg,n])=>h("span",{key:k,style:{width:(n/open.length*100)+"%",background:fg}}))) : null,
+      h("div",{style:{display:"flex",gap:7,flexWrap:"wrap"}},
+        parts.map(([k,l,fg,n])=>h("span",{key:k},h("span",{style:{display:"inline-block",width:7,height:7,borderRadius:2,background:fg,marginRight:3}}),n+" "+(n>1?plural[k]:l.toLowerCase()))),
+        od ? h("span",{style:{color:"#a3312a",fontWeight:700}},od+" overdue") : null)); };
   const loadBadge = (name)=>{ const L=loadOf(name);
-    if(L.lvl==="ok") return h("div",{style:{fontSize:11,color:colors.muted,background:"#fff",borderRadius:6,padding:"4px 7px",marginBottom:6}},L.n+" open");
-    return h("div",{style:{fontSize:11,fontWeight:700,borderRadius:6,padding:"4px 7px",marginBottom:6,background:L.lvl==="over"?"#fdecea":"#fff4d6",color:L.lvl==="over"?"#a3312a":"#854f0b"}},
-      "⚠ "+(L.lvl==="over"?"Overloaded: "+L.n+" open (limit "+L.s.red_open+")":"Busy: "+L.n+" open (amber from "+L.s.amber_open+")")); };
+    if(L.lvl==="ok") return h("div",null,h("div",{style:{fontSize:11,color:colors.muted,background:"#fff",borderRadius:6,padding:"4px 7px",marginBottom:4}},L.n+" open (all boards)"),loadSplit(name));
+    return h("div",null,h("div",{style:{fontSize:11,fontWeight:700,borderRadius:6,padding:"4px 7px",marginBottom:4,background:L.lvl==="over"?"#fdecea":"#fff4d6",color:L.lvl==="over"?"#a3312a":"#854f0b"}},
+      "⚠ "+(L.lvl==="over"?"Overloaded: "+L.n+" open (limit "+L.s.red_open+")":"Busy: "+L.n+" open (amber from "+L.s.amber_open+")")),loadSplit(name)); };
 
   // ---------- 128: sorting (one order for the whole board, any list may have its own; kept per person) ----------
   const SORTS = [["due","Due date — earliest first"],["due_d","Due date — latest first"],["close","Customer closing date"],["cust","Customer A–Z"],["enq","Enquiry date — oldest first"],["quote","Quote#"]];
@@ -43755,6 +43800,7 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
     const dueTxt = st==="done" ? "✓ completed "+(t.approved_at?fmtDMY(t.approved_at):"") : t.due_date ? "Due "+fmtDMY(t.due_date)+(od?" · "+over+" day"+(over===1?"":"s")+" over":"") : "No due date";
     return h("div",{key:t.id, draggable:true, onDragStart:ev=>ev.dataTransfer.setData("text/plain",String(t.id)), onClick:()=>setOpenId(t.id),
         style:{background:"#fff",border:"1px solid "+colors.border,borderLeft:edge,borderRadius:7,padding:"7px 9px",marginBottom:7,cursor:"grab",opacity:st==="done"?0.8:1}},
+      (()=>{ const sm = taskSourceMeta(taskSource(t)); return h("span",{title:"From: "+sm[1],style:{display:"inline-block",fontSize:9.5,fontWeight:700,borderRadius:8,padding:"0 6px",background:sm[2],color:sm[3],marginBottom:3,marginRight:4}},sm[1]); })(),   // 130
       prog ? h("span",{style:{display:"inline-block",fontSize:9.5,fontWeight:700,borderRadius:8,padding:"0 6px",background:"#fff6d5",color:"#7a5c00",marginBottom:3}},"In progress") : null,
       h("div",{style:{display:"flex",gap:6,alignItems:"baseline"}},...top),
       line2 ? h("div",{style:{fontSize:11,color:colors.muted,marginTop:1}},line2) : null,
@@ -43823,8 +43869,12 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
   const chipRow = h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center",marginBottom:10}},
     CHIPS.map(([k,l])=>{ const on = chips.includes(k);
       return h("button",{key:k,onClick:()=>toggleChip(k),title:CHIP_TIP[k]||"",style:{fontSize:12,padding:"5px 11px",borderRadius:14,cursor:"pointer",border:"1px solid "+(on?colors.dark:colors.border),background:on?colors.dark:"#fff",color:on?"#fff":colors.text}},l); }),
+    h("span",{style:{display:"inline-flex",gap:4,alignItems:"center",marginLeft:4}}, h("span",{style:{fontSize:11,color:colors.muted}},"From"),   // 130: by source
+      TASK_SOURCES.map(([k,l,bg,fg])=>{ const on = srcF.includes(k); const n = mode==="emp" ? tasks.filter(t=>t.assignee===who && t.status!=="done" && taskSource(t)===k).length : null;
+        return h("button",{key:k,onClick:()=>setSrcF(a=>a.includes(k)?a.filter(x=>x!==k):[...a,k]),title:"Show only cards from: "+l,
+          style:{fontSize:11.5,padding:"4px 9px",borderRadius:14,cursor:"pointer",border:"1px solid "+(on?fg:colors.border),background:on?fg:bg,color:on?"#fff":fg,fontWeight:700}},l+(n!=null?" · "+n:"")); })),
     h("input",{value:q,onChange:e=>setQ(e.target.value),placeholder:"Search title, reference, customer",style:{...inputStyle,width:240,padding:"6px 9px"}}),
-    filtering ? h("button",{onClick:()=>{ setChips([]); setQ(""); setLabelFilter(""); },style:btnSmall},"Clear filters") : null,
+    filtering ? h("button",{onClick:()=>{ setChips([]); setQ(""); setLabelFilter(""); setSrcF([]); },style:btnSmall},"Clear filters") : null,
     mode!=="dash" ? h("span",{style:{display:"inline-flex",gap:6,alignItems:"center",marginLeft:"auto",fontSize:11.5,color:colors.muted}},"Sort lists by",   // 128
       h("select",{value:sortPref.global||"due",onChange:e=>saveSort({global:e.target.value,lists:sortPref.lists||{}}),style:{...inputStyle,width:210,padding:"5px 8px"}},SORTS.map(([k,l])=>h("option",{key:k,value:k},l))),
       Object.keys(sortPref.lists||{}).length ? h("button",{onClick:()=>saveSort({global:sortPref.global||"due",lists:{}}),style:btnSmall},"Reset list orders") : null) : null);
@@ -44064,6 +44114,8 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
     const whoDept = deptOf(who); const ap = approvers.filter(a=>a.department===whoDept).map(a=>a.employee_name);
     const total = tasks.filter(t=>t.assignee===who).length;
     return h("div",null,
+      h("div",{style:{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"7px 10px",marginBottom:8}},   // 130: workload from every board
+        h("b",{style:{fontSize:12.5}},(who===me?"Your":who+"'s")+" open work, all boards: "+openCount(who)), loadSplit(who, true)),
       h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:10}},
         (who===me?"Your board":who+"'s board")+(whoDept?" · "+whoDept:"")+" · approver: "+(ap.length?ap.join(", "):"an Admin")+" · "+total+" cards in all"+
         ". Drag your card to In Progress when you start it, to Today's or Tasks Assigned to re-plan it, to Under Approval to send it; only an approver completes. Completed cards move down on their own: today \u2192 this week \u2192 this month \u2192 the quarter; earlier years are archived."),
@@ -44792,7 +44844,7 @@ function DocumentRegisterReport(){
       (history||[]).forEach(hh=>{ if(!byDoc.has(hh.document_id)) byDoc.set(hh.document_id,[]); byDoc.get(hh.document_id).push(hh); });
       const reqBy = new Map();
       (reqs||[]).forEach(r=>{ if(r.fulfilled_document_id) reqBy.set(r.fulfilled_document_id, r); });
-      setStatusRows(st||[]);
+      setStatusRows(docStatusRowsNorm(st));
       setRows((parents||[]).map(p=>{
         const revs = byDoc.get(p.id)||[];
         const L = revs[0]||{};
