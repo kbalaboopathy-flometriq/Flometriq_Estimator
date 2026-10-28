@@ -52,7 +52,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-10-28T05:00:00Z";
+  var APP_BUILD_VERSION = "2026-10-28T07:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -2351,6 +2351,8 @@ function MenuTabs({ user, active, onChange, onRefresh }) {
   const isTechHeadRole = user.role==="technical_head";   // 235
   const [calcAccess,setCalcAccess] = useState(user.role==="super_admin" || user.role==="technical_head");   // Engineering Calc: Super Admin, Technical Head, Design & Estimation
   useEffect(()=>{ let live=true; cwCanUse(user).then(v=>{ window.__cwAccess = v; if(live) setCalcAccess(v); }); return ()=>{ live=false; }; },[user?.id, user?.role]);
+  const [vendAccess,setVendAccess] = useState(user.role==="admin" || user.role==="super_admin");   // 2026-10-28T07:00:00Z: Purchase -> Vendors
+  useEffect(()=>{ let live=true; vendorRights(user).then(r=>{ if(live) setVendAccess(!!r.view); }); return ()=>{ live=false; }; },[user?.id, user?.role, user?.username]);
   const [openGroup,setOpenGroup] = useState(null);
   const rootRef = useRef(null);
 
@@ -2427,7 +2429,8 @@ function MenuTabs({ user, active, onChange, onRefresh }) {
   const purchaseGroup = { label:"Purchase", subgroups:[
       { label:"Procurement", tabs:[{key:"proc_list",label:"Procurement list"},{key:"proc_gantt",label:"Procurement Gantt"},{key:"proc_reports",label:"Procurement reports"}] },
       { label:"Registers", tabs:[{key:"po_register",label:"Purchase Register"},{key:"end_user_rules",label:"End User Rules"}] },   // 173: from Stores; 209: Purchase Register; 237: End User Rules
-      { label:"Price List", tabs:[ ...(canSeeValvePrice(user)?[{key:"valve_price_purchase",label:"Valves"}]:[]), ...(isAdmin?[{key:"price_list",label:"Price List"},{key:"vendors",label:"Vendors"}]:[]) ] },
+      { label:"Price List", tabs:[ ...(canSeeValvePrice(user)?[{key:"valve_price_purchase",label:"Valves"}]:[]), ...(isAdmin?[{key:"price_list",label:"Price List"}]:[]) ] },
+      ...(vendAccess ? [{ label:"Vendors", tabs:[{key:"vendors",label:"Vendors"}] }] : []),   // 2026-10-28T07:00:00Z: its own gateway
     ]};
   const crmGroup = { label:"CRM", subgroups:[
       { label:"Daily", tabs:[
@@ -6922,6 +6925,7 @@ function AddPricePanel({ user, existing, onSaved, onClose }){
   const items = useMemo(()=>Array.from(new Set(live.map(r=>r.item))).sort(),[live]);
   const [item,setItem]=useState(items[0]||""); const [v,setV]=useState({});
   const [sizes,setSizes]=useState([]); const [vendors,setVendors]=useState([]); const [newV,setNewV]=useState("");
+  const [vAdd,setVAdd]=useState(false); useEffect(()=>{ vendorRights(user).then(r=>setVAdd(!!r.add)); },[user && user.username]);   // only vendor-right holders may add a vendor here
   const [f,setF]=useState({vendor:"",vendor_ref:"",pricelist_no:"",wef:"",list_price:"",uplift_pct:"0",description:"",note:""});
   const [mats,setMats]=useState({}); const [busy,setBusy]=useState(false); const [msg,setMsg]=useState("");
   useEffect(()=>{
@@ -7003,7 +7007,7 @@ function AddPricePanel({ user, existing, onSaved, onClose }){
       h("label",{htmlFor:"ap-vendor",style:{fontSize:13}},"Vendor"),
       h("div",{style:{display:"flex",gap:6}},
         h("select",{id:"ap-vendor",value:f.vendor,onChange:e=>setF(x=>({...x,vendor:e.target.value})),style:{...inputStyle,padding:"7px 9px"}},
-          h("option",{value:""},"Pick…"), vendors.map(o=>h("option",{key:o.vendor_name,value:o.vendor_name},o.vendor_name+(o.approval_status&&o.approval_status!=="Approved"?" ("+o.approval_status+")":""))), h("option",{value:"__new"},"+ New vendor…")),
+          h("option",{value:""},"Pick…"), vendors.map(o=>h("option",{key:o.vendor_name,value:o.vendor_name},o.vendor_name+(o.approval_status&&o.approval_status!=="Approved"?" ("+o.approval_status+")":""))), vAdd ? h("option",{value:"__new"},"+ New vendor…") : null),
         f.vendor==="__new" && h("input",{value:newV,onChange:e=>setNewV(e.target.value),placeholder:"New vendor's name",style:{...inputStyle,padding:"7px 9px"}}))),
     inp("Vendor ref","vendor_ref",{placeholder:"Vendor's own item / catalogue no. (internal)"}),
     inp("Price list no","pricelist_no"), inp("W.e.f.","wef",{placeholder:"dd-mm-yyyy"}),
@@ -12096,6 +12100,17 @@ function docIsCleared(status){
   return /code ?1|code ?2|all cleared|for info|internal info|no action/i.test(s) && !/code ?3/i.test(s);
 }
 // The posts that may change a document's For-production flag and hand over.
+// 2026-10-28T07:00:00Z: who may open Purchase -> Vendors, add and edit. Admins always; others from Admin -> Permissions
+// (user_permissions, table vendor_tbl — vendor_rights_purchase_2026-10-28.sql) or the Purchase Manager post.
+async function vendorRights(user){
+  if(!user) return { view:false, add:false, edit:false };
+  if(user.role==="admin" || user.role==="super_admin") return { view:true, add:true, edit:true, admin:true };
+  let r = { view:false, add:false, edit:false };
+  try{ const { data } = await sb.from("user_permissions").select("can_view,can_add,can_edit").eq("username",user.username||"").eq("table_name","vendor_tbl").limit(1);
+    const p = (data||[])[0]; if(p) r = { view:!!(p.can_view||p.can_add||p.can_edit), add:!!p.can_add, edit:!!p.can_edit }; }catch(e){}
+  if(!r.add){ try{ const { keys } = await myPostKeys(user); if((keys||[]).includes("purchase_manager")) r = { view:true, add:true, edit:true }; }catch(e){} }
+  return r;
+}
 async function myPostKeys(user){
   try{
     const { data: emp } = await sb.from("employee_tbl").select("employee_name").eq("app_user_id",user?.id||"").limit(1).maybeSingle();
@@ -33706,6 +33721,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"28 Oct 2026 (270)", summary:"Built on 2026-10-28T07:00:00Z, on top of 2026-10-28T06:00:00Z. VENDORS: its own gateway, Purchase → Vendors (was hidden under Price List for Admins only). Open to Admins / Super Admins, the Purchase Manager post (Keerthi) and anyone given vendor rights in Admin → Permissions (Vendors row; vendor_rights_purchase_2026-10-28.sql gives view + add + edit to the Purchase Manager and every login in the Purchase department). View-only people see the vendors but no + New vendor / Save. The Valve Price List's \u201c+ New vendor\u201d now shows only to people with add rights. SQL: vendor_rights_purchase_2026-10-28.sql (data, each company)." },
+  { date:"28 Oct 2026 (269)", summary:"Built on 2026-10-28T06:00:00Z, on top of 2026-10-28T05:00:00Z. FACTORY MANAGER post (V. Babu): factory admin, machine maintenance, safety and health hazards, logistics and factory security; not Quality Control. The post carries Stores rights everywhere the Stores In Charge has them — DCs, gate passes (recording the exit and the signed scan), the Stores side of the Procurement Gantt, PO making — while the Stores notices and tasks still go to the Stores In Charge. On the task boards he sits on, and approves, the Factory / Maintenance / Safety / Security / Logistics boards (when those departments exist) and sits on Stores. SQL: post_factory_manager_vbabu_2026-10-28.sql (data, Flometriq only)." },
   { date:"28 Oct 2026 (268)", summary:"Built on 2026-10-28T05:00:00Z, on top of 2026-10-28T04:00:00Z. ORDER STATUS BOARD (SOP FMQ-SOP-DESP-001). The old Order Status menu is now DOCUMENT CONTROL (unchanged inside); a new ORDER STATUS menu opens the board: 1 Under production · 2 Ready – with QC · 3 QC cleared · 4 Clearance given · 5 Shipped – awaiting payment · 6 Payment received. LOTS: the Production Manager presses Items ready on a contract card and ticks the Sl Nos and quantities that are ready — that makes Lot 1, Lot 2 …; the contract card shows what is left. Each lot: QC Head links the QC documents and issues the QC clearance letter (PDF) or objects (back to production); Stores press Make the DC — the DC opens with the lot's Sl Nos and quantities — and finish it with Done – to Production Manager; the Production Manager requests the despatch clearance (the DC goes to Accounts); the Accounts Head gives it (Approve and number on the DC) or holds it with a reason; the Production Manager enters gate pass, LR / AWB and the payment due date (invoice date + credit days from the payment terms) and presses Shipped; the lot moves to Payment received by itself when the receipt is allocated against its invoice in the books, or by hand with a note. When every quantity is in lots and every lot is paid, the contract is Closed and the Production Manager, Accounts Head and Sales Head are told. Every step closes the last task card and opens the next one, with a bell Action needed notice that lights up the button to press. MINE filter shows only what waits on you. PLACE OLD CONTRACTS (Production Manager / Super Admin, 30 days from go-live): tick many contracts in one list, pick the column, one note — no tasks, no gates; placed contracts are moved on by hand; placing in Payment received closes them. SQL: structure_order_status_board_2026-10-28.sql (structural, both companies)." },
   { date:"28 Oct 2026 (267)", summary:"Built on 2026-10-28T04:00:00Z, on top of 2026-10-28T03:00:00Z. WON — SINGLE OR MULTIPLE POs: marking a quote Won now asks, compulsorily, how the client will order: Single PO (one Sale Order; a second is refused) or Multiple POs (rate contract / plant-wise / phase-wise: a Sale Order per PO, every Sl No each time, the team trims it; open until Close). Multiple tells the Sales Head in the bell; so does ticking Multiple POs on the ribbon. THE BELL: Unread / All, × deletes one, Clear read deletes the read ones, read ones older than 30 days go on their own, Load older (25 at a time), a ? Help. ACTION GATEWAY: each notification is Action needed (a red button takes you to the record and enlarges, pulses and explains the button to press), Open (goes to the record) or Info. When the job is done — by you or another approver of the same section — it shows Done ✓ for everyone. Wired: Sale Order approvals (new: Accounts Admin for Commercial Terms, FSE / Sales Head for Everything else, on Sale Order creation), Purchase Order approval and the owner's send-out, organisation chart HR / MD approval, requests to add a document, direct invoice quantities, Production BOM re-approval, tasks given, Multiple-POs notice. Old notifications stay Info. FIX: the Calculations picker and the Multiple-POs bar read the client PO from basis_number (sale_order_tbl has no po_number). SQL: bell_action_gateway_2026-10-28.sql (structural, both companies)." },
   { date:"28 Oct 2026 (266)", summary:"Built on 2026-10-28T03:00:00Z, on top of 2026-10-28T02:00:00Z. SQL (structural): quote_multiple_po_2026-10-28.sql (both companies) \u2014 removes the one-Sale-Order-per-quote rule from the database and adds quote_multi_po_tbl. ONE QUOTE, MANY SALE ORDERS: a Won quote has a \u201cMultiple POs\u201d tick in the ribbon (Next step). Ticked, Create Sale Order makes a new Sale Order (next contract number) for every PO; each gets every Sl No of the quote, and the user removes the Sl Nos that PO doesn\u2019t have and changes the quantities \u2014 no balance, no checks. Not ticked, it works as before (one Sale Order; Create Sale Order opens it). The quote shows a bar with its Sale Orders (click to open). The quote stays locked from the first Sale Order, as before. Close \u2014 no more POs (reason required, logged) stops new Sale Orders; the bar shows who closed it, when and why; Reopen POs is for the Super Admin, with a reason. On a Sale Order from a Multiple-POs quote, anyone editing it may Remove Sl Nos while it is before the OA (no Admin / delete code needed). The Sale Order screen\u2019s create path also refuses a second Sale Order for a quote that isn\u2019t ticked. Quotes Report: \u201cOpen rate contracts only\u201d box beside Clear." },
@@ -41224,7 +41241,7 @@ async function pgCanEdit(user){
 async function pgStoresCan(user){
   const emp = await pgEmp(user); if(!emp) return false;
   if(/store/i.test(emp.department||"") || (typeof empBoards==="function" && empBoards(emp).some(b=>/store/i.test(b)))) return true;
-  try{ const { data } = await sb.from("post_holder_tbl").select("post_key").eq("post_key","stores").eq("employee_name",emp.employee_name).limit(1); return !!(data && data.length); }catch(e){ return false; }
+  try{ const { data } = await sb.from("post_holder_tbl").select("post_key").in("post_key",["stores","factory_manager"]).eq("employee_name",emp.employee_name).limit(1); return !!(data && data.length); }catch(e){ return false; }
 }
 const pgStoresKey = (key, field)=> String(key).split("|")[0]==="fac" && (field==="as" || field==="ae");
 // 157: an actual date may not be in the future (a week counts from its Sunday)
@@ -48075,7 +48092,7 @@ function PermissionsEditor() {
   const [users,setUsers]=useState([]); const [selUser,setSelUser]=useState("");
   const [perms,setPerms]=useState({}); const [loading,setLoading]=useState(false);
   const [saving,setSaving]=useState(false); const [msg,setMsg]=useState("");
-  const tables=["bom","model_tbl","category_tbl","item_tbl","size_tbl","component_item_tbl","subassembly_tbl","materials_shape","material_spec","uom_tbl","material_rates"];
+  const tables=["bom","model_tbl","category_tbl","item_tbl","size_tbl","component_item_tbl","subassembly_tbl","materials_shape","material_spec","uom_tbl","material_rates","vendor_tbl"];   // vendor_tbl: Purchase -> Vendors (2026-10-28T07:00:00Z)
 
   useEffect(()=>{ sb.from("app_users").select("username,role").order("username").then(({data})=>setUsers(data||[])); },[]);
 
@@ -55139,7 +55156,7 @@ function App() {
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user}):
     tab==="customers"?h(CustomersScreen,{user}):
     tab==="end_user_rules"?h(EndUserRulesScreen,{user}):   // 237
-    tab==="vendors"?h(VendorsScreen,{user}):
+    tab==="vendors"?h(VendorsScreen,{user}):   // rights checked inside (2026-10-28T07:00:00Z)
     tab==="test_types"?h(TestTypesScreen,null):
     tab==="crm_helper_masters"?h(CrmHelperMastersScreen,{user}):
     tab==="issues"?h(IssueTracker,{user}):
@@ -55423,7 +55440,7 @@ async function purWho(user){
   let dept = ""; try{ const e = await pgEmp(user); dept = (e && e.department)||""; if(!me && e) me = e.employee_name||""; }catch(e){}
   const name = me || user?.employee_name || user?.username || "";
   const sa = user?.role==="super_admin", admin = sa || user?.role==="admin";
-  const pm = keys.includes("purchase_manager"), qc = keys.includes("qc"), th = keys.includes("technical_head"), stores = keys.includes("stores");
+  const pm = keys.includes("purchase_manager"), qc = keys.includes("qc"), th = keys.includes("technical_head"), stores = keys.includes("stores") || keys.includes("factory_manager");
   // 20 Oct (11:00): PO makers = the Purchase department, the Stores In Charge post (Ravikumar) and the named makers;
   // Purchase side = the Purchase Manager post (Keerthi) or a super admin (Bala Boopathy); QC side = the QC post
   // (Thangavignesh) or the Technical Head post (Veenai Vimal) or a super admin.
@@ -58298,6 +58315,8 @@ function PoRegisterReport(){
 }
 
 function VendorsScreen({ user }){
+  const [VR,setVR] = useState(null);   // 2026-10-28T07:00:00Z: { view, add, edit }
+  useEffect(()=>{ vendorRights(user).then(setVR); },[user && user.username]);
   const [vendors,setVendors] = useState([]);
   const [page,setPage] = useState(0);
   const PAGE_SIZE = 25;
@@ -58409,7 +58428,7 @@ function VendorsScreen({ user }){
   return h("div",{style:{padding:20}},
     h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
       h("div",{style:{fontWeight:700,fontSize:18}},"Vendors"),
-      h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft(blankVendor); setAddresses([]); },style:btnPrimary},"+ New vendor")
+      VR && VR.add ? h("button",{onClick:()=>{ setSelected(null); setCreatingNew(true); setDraft(blankVendor); setAddresses([]); },style:btnPrimary},"+ New vendor") : null
     ),
 
     (!selected && !creatingNew) ? h("div",null,
@@ -58484,7 +58503,7 @@ function VendorsScreen({ user }){
           field("SWIFT code","swift_code")
         ),
         h("div",{style:{display:"flex",gap:8}},
-          h("button",{onClick:saveVendor,style:btnPrimary},creatingNew?"Create vendor":"Save vendor"),
+          (creatingNew ? (VR && VR.add) : (VR && VR.edit)) ? h("button",{onClick:saveVendor,style:btnPrimary},creatingNew?"Create vendor":"Save vendor") : h("span",{style:{fontSize:12,color:colors.muted}},"View only \u2014 ask an Admin for vendor rights (Admin \u2192 Permissions)."),
           h("button",{onClick:()=>{setSelected(null);setCreatingNew(false);},style:btnSecondary},"Back to list")
         )
       ),
@@ -61515,6 +61534,7 @@ const POST_BOARD_RULES = [
   ["sales_coordinator",  [/sales/i],                             []],
   ["accounts",           [/account/i],                           [/account/i]],
   ["stores",             [/store/i],                             []],
+  ["factory_manager",    [/factory/i, /maint/i, /safety/i, /security/i, /logistic/i, /store/i], [/factory/i, /maint/i, /safety/i, /security/i, /logistic/i]],   // 2026-10-28T06:00:00Z
 ];
 let BOARD_CACHE = { loaded:false, extras:{}, auto:{}, autoWhy:{}, autoApprovers:[], depts:[], rows:[] };
 async function loadBoardMembership(){
@@ -64976,13 +64996,13 @@ async function despPeople(){
   await loadPostPeople(true);
   let supers = [];
   try{ const { data } = await sb.from("app_users").select("employee_name,role").eq("role","super_admin"); supers = (data||[]).map(r=>r.employee_name).filter(Boolean); }catch(e){}
-  return { stores:postHolders("stores"), pm:postHolders("production_manager"), qc:postHolders("qc"), acc:postHolders("accounts"), supers };
+  return { stores:postHolders("stores"), fm:postHolders("factory_manager"), pm:postHolders("production_manager"), qc:postHolders("qc"), acc:postHolders("accounts"), supers };   // 2026-10-28T06:00:00Z: fm = Factory Manager (Stores rights)
 }
 // Who may act at a step. Admins and super admins may act at any step (logged as such).
 function despCan(step, user, me, P){
   if(!user) return false;
   if(user.role==="admin" || user.role==="super_admin") return true;
-  if(step==="stores") return P.stores.includes(me);
+  if(step==="stores") return P.stores.includes(me) || (P.fm||[]).includes(me);   // the Factory Manager has Stores rights
   if(step==="pm") return P.pm.includes(me);
   if(step==="qc") return P.qc.includes(me) || user.role==="qc";
   if(step==="acc") return P.acc.includes(me) || user.role==="accounts_admin";
@@ -65966,7 +65986,7 @@ function OsLotPanel({ lotId, user, me, P, so, onClose, onChanged, sessionCompany
     setBusy(false); await after();
   };
   // Stores: the DC
-  const makeDc = ()=>{ if(!can("stores")){ noPermission("make the DC",{ posts:["stores"] }); return; } window.__despOpenId = dc && dc.status!=="Cancelled" ? dc.id : { new:L.contract_number, lot:L.id }; onClose(); appOpenTab("despatch_dc"); };
+  const makeDc = ()=>{ if(!can("stores")){ noPermission("make the DC",{ posts:["stores","factory_manager"] }); return; } window.__despOpenId = dc && dc.status!=="Cancelled" ? dc.id : { new:L.contract_number, lot:L.id }; onClose(); appOpenTab("despatch_dc"); };
   const openDc = ()=>{ window.__despOpenId = dc.id; onClose(); appOpenTab("despatch_dc"); };
   // Production Manager: ask Accounts
   const reqClear = async()=>{
