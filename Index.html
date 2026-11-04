@@ -52,7 +52,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-04T02:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-04T03:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -35322,6 +35322,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"4 Nov 2026 (315)", summary:"Built on 2026-11-04T03:00:00Z, on top of 2026-11-04T02:00:00Z. No structure SQL; data SQL data_so_pending_sales_head_list_FLOMETRIQ_2026-11-04.sql after deploying (Flometriq). SO PENDING UNTIL THE O.A IS OUT: once a contract is on the Contract Register it stays in Order Status \u203a 3 \u00b7 Sale Order pending until its Sale Order is made, approved (Accounts, Commercial Terms) AND marked sent (Record when the OA was sent). A badge says where it is stuck: Not made \u00b7 Waiting approval \u00b7 Not marked sent. The task (Document Controller and Technical Head posts), the 3-working-day clock and the escalation (Sales Head, VP Projects, Technical Head) cover all three. Sale Orders made before 20 Oct 2026 are left alone unless flagged. EVERY SALE ORDER GETS ITS CONTRACT REGISTER LINE: a Sale Order made from the quote or the Sale Order screen now adds its register line (17 had none, 24 Oct \u2013 3 Nov; filled by the one-time SQL). A quote already on another line goes in Remarks." },
   { date:"4 Nov 2026 (314)", summary:"Built on 2026-11-04T02:00:00Z, on top of 2026-11-03T08:00:00Z. No SQL. IMPORTED (ZOHO / FFS) VOUCHERS CAN BE CHANGED AND DELETED, both companies. Any voucher not entered in the app and not posted from an invoice shows \u201cImported from Zoho\u201d (or FFS) and has Edit voucher and Delete voucher. Edit asks why first; the reason is kept with the before / after copy (Change log, can be rolled back). Delete: Finance Director / Finance & Accounts Manager / Super Admin at once, Accountant asks. A cancelled imported voucher can be deleted. A bill with payments marked against it can\u2019t be deleted until they are unmarked; a deleted payment takes its marks with it and gets them back on roll-back. Bank Reconciliation ticks now stay on a changed voucher (same ledger and amount), otherwise you are told to tick again. Voucher Register: Source = Zoho \u2192 Delete selected (Finance Director / Super Admin, one reason, locked months and marked bills skipped)." },
   { date:"3 Nov 2026 (313)", summary:"Built on 2026-11-03T08:00:00Z, on top of 2026-11-03T07:00:00Z. No SQL. QUOTES REPORT PDFs MADE FROM THE REPORT. Clicking Quote / Datasheets / Commercial on a quote with no saved PDF now asks: \u201cNo PDF is saved for FXDS260099 (Offer Sent). Make it now and save it?\u201d \u2014 Make & save opens the quote out of sight, runs the quote screen\u2019s own Generate (so the PDF is identical), saves the Quote, Datasheets and Commercial PDFs and shows the one clicked. A Draft quote gets \u201cMake a DRAFT preview\u201d (shown, not saved). A quote that is not complete (missing items, price not checked) is shown as a DRAFT / PRICE NOT CHECKED preview, not saved, with what is missing; nothing is approved in the background. Super Admin: \u201cSave PDFs for all sent quotes\u201d makes and saves them one after another for every sent quote shown that has none, with progress and a list of the ones skipped and why. If saving fails, the reason is shown (no more silent failures)." },
   { date:"3 Nov 2026 (312)", summary:"Built on 2026-11-03T07:00:00Z, on top of 2026-11-03T05:00:00Z. No SQL. (1) PURCHASE OWNERS \u2014 Purchase \u203a Procurement, Document Control and Accounts \u203a Vouchers & Books \u203a Purchase Owners (Document Controller, Purchase, Accounts and Super Admins only). \u201cFind the owner\u201d: a drop-down of the listed contracts only (type the contract number or the customer \u2014 \u201c260112 \u00b7 Zeeco India\u201d), and it answers at once: the owner and since when, or No owner yet (with the Purchase Manager to assign, or waiting for the BOM summary). Buttons per owner with counts, No owner yet in red; list: contract, customer, PO date, value, BOM summary approved, purchase owner, owner since, planning (Planned / Partly planned / Overdue / Not planned), POs released; filters open / all / closed, planning, text; Excel and PDF. Assign / Reassign (Purchase Manager post and Super Admins) moves the procurement card \u2014 the same as Purchase Insights. The owner also shows on the Sale Order (under the status flag) and on each contract card of the Order Status board. (2) ACCOUNTS \u2014 ROUND-OFF IS THE USER\u2019S CHOICE: sales and purchase vouchers no longer round to the rupee by themselves. Round off: None (new vouchers), To the rupee (when clicked), or Type it (the round-off on the bill); more than \u20b9 0.99 is flagged in red. A voucher being changed keeps the round-off it was saved with. TDS stays rounded to the rupee." },
@@ -37672,8 +37673,31 @@ async function recordOrderBasis(contractNumber, basis, username){
     basis_currency: basis.currency||null
   }).eq("contract_number",contractNumber);
   if(soErr) console.error("Order basis columns not saved for "+contractNumber+" — run order_basis_po_loi_20260922_v1.sql", soErr);
+  try{ await crEnsureFromSo(contractNumber, basis, username); }catch(e){ console.warn("register line from SO", e); }   // 2026-11-04
   await logAudit("INSERT","universal_documents_tbl",contractNumber,
     (isPo?"Customer PO ":"LOI ")+basis.number.trim()+" recorded with the order", username||"unknown",null,null);
+}
+// 2026-11-04T03:00:00Z: every contract has a Contract Register line. A Sale Order made from the quote or the
+// Sale Order screen used to skip the register (17 contracts, 24 Oct – 3 Nov); now its line is added here.
+// A quote already on another line (call-off POs on one quote) goes in Remarks instead.
+async function crEnsureFromSo(contractNumber, basis, username){
+  const cn = String(contractNumber||"").trim(); if(!cn) return false;
+  const { data: ex } = await sb.from("contract_register_tbl").select("contract_number").eq("contract_number",cn).limit(1);
+  if((ex||[]).length) return false;
+  const { data: so } = await sb.from("sale_order_tbl").select("customer_name,quote_reference_number,basis_currency,created_at").eq("contract_number",cn).maybeSingle();
+  let q = String((so && so.quote_reference_number)||"").trim() || null; let qNote = "";
+  if(q){ const { data: qx } = await sb.from("contract_register_tbl").select("contract_number").eq("quote_number",q).limit(1); if((qx||[]).length){ qNote = ". Quote "+q+" (also on "+qx[0].contract_number+")"; q = null; } }
+  const isLoi = basis && basis.kind==="LOI";
+  const row = { contract_number:cn, source:"register", quote_number:q, client:(so && so.customer_name)||null,
+    po_no: isLoi ? null : (String((basis&&basis.number)||"").trim()||null), po_date: isLoi ? null : ((basis&&basis.date)||null),
+    currency:(basis&&basis.currency)||(so&&so.basis_currency)||"INR", status:"Pending", order_basis: isLoi ? "LOI" : "PO",
+    loi_ref: isLoi ? String(basis.number||"").trim() : null, loi_date: isLoi ? (basis.date||null) : null,
+    remarks:"Added when the Sale Order was made"+qNote, created_by:username||"unknown" };
+  let { error } = await sb.from("contract_register_tbl").insert(row);
+  if(error && /duplicate|unique/i.test(error.message||"") && row.quote_number){ row.remarks += ". Quote "+row.quote_number; row.quote_number = null; ({ error } = await sb.from("contract_register_tbl").insert(row)); }
+  if(error){ console.warn("register line from SO", error); return false; }
+  try{ await sb.from("contract_register_hist_tbl").insert({ contract_number:cn, by_user:username||"unknown", what:"Register line added when the Sale Order was made" }); }catch(e){}
+  return true;
 }
 // The gate itself. Nothing is written here — onConfirm hands the answers
 // back, and the caller creates the contract and then records them.
@@ -69392,6 +69416,7 @@ function OrderStatusBoard({ user, sessionCompany, startView }){
     if(ti===fi+1){   // one step on: the step's own gateway
       if(from==="doc" || from==="ph"){ if(!isSA){ appToast("This card moves on by itself when its Full Hold documents reach Code 2 — log the client's replies on Document Control."); return; }
         const w = why("Documents are still open on "+x.cn+".\n\nPlace it at “"+ospLabelOf(to)+"” anyway? Why:"); if(!w) return; return run(()=>ospPlace(x.cn, from, to, user, w)); }
+      if(from==="so" && x.ps && x.ps.so){ osGotoSo(x.cn, null); return; }   // 2026-11-04: made — approve / mark sent on the Sale Order
       if(from==="so"){ const r = (x.ps && x.ps.reg) || {}; try{ window.dispatchEvent(new CustomEvent("flo-so-start",{ detail:{ num:x.cn, quoteRef:r.quote_number||"", client:r.client||"", po:r.po_no||"", poDate:r.po_date||"", ccy:r.currency||"INR", basis:r.order_basis||"", loiRef:r.loi_ref||"", loiDate:r.loi_date||"", vBy:r.verbal_by||"", vWith:r.verbal_with||"", vOn:r.verbal_on||"" } })); }catch(e){} return; }
       if(from==="wo"){ appToast("Release the work order on the Sale Order (or W/O Release pending) — the card moves on by itself."); osGotoSo(x.cn, null); return; }
       if(from==="bom"){ appToast("Approve the Production BOM on the Sale Order — that makes the Gantt and moves the card."); osGotoSo(x.cn, null); return; }
@@ -69469,7 +69494,9 @@ function OrderStatusBoard({ user, sessionCompany, startView }){
       btn = h("button",{onClick:()=>appOpenTab("doc_board"),style:{...btnSmall,fontSize:11.5}},"Document Control →"); }
     if(k==="ph"){ body = pill("Client: Code 2 – Production Hold",["#e6f1fb","#1d5f9e"]);
       btn = h("button",{onClick:()=>appOpenTab("doc_board"),style:{...btnSmall,fontSize:11.5}},"Document Control →"); }
-    if(k==="so"){ body = pill(late ? "SO overdue "+(wd-3)+" d" : "SO pending · day "+wd+" of 3", late?["#fdecea","#a3312a"]:["#e6f1fb","#0c447c"]);
+    if(k==="so" && ps.so){ body = h("div",{style:{display:"flex",flexWrap:"wrap",gap:4}}, pill(ospSoStuckTxt(ps),["#fff4d6","#854f0b"]), pill(late ? "SO overdue "+(wd-3)+" d" : "SO pending · day "+wd+" of 3", late?["#fdecea","#a3312a"]:["#e6f1fb","#0c447c"]));   // 2026-11-04
+      btn = h("button",{"data-testid":"osp-so-open",onClick:()=>osGotoSo(x.cn, null),style:{...btnSmall,fontSize:11.5}},"Open Sale Order →"); }
+    else if(k==="so"){ body = h("div",{style:{display:"flex",flexWrap:"wrap",gap:4}}, pill("Not made",["#fff4d6","#854f0b"]), pill(late ? "SO overdue "+(wd-3)+" d" : "SO pending · day "+wd+" of 3", late?["#fdecea","#a3312a"]:["#e6f1fb","#0c447c"]));
       btn = h("button",{"data-testid":"osp-so",onClick:()=>{ try{ window.dispatchEvent(new CustomEvent("flo-so-start",{ detail:{ num:x.cn, quoteRef:reg.quote_number||"", client:reg.client||"", po:reg.po_no||"", poDate:reg.po_date||"", ccy:reg.currency||"INR", basis:reg.order_basis||"", loiRef:reg.loi_ref||"", loiDate:reg.loi_date||"", vBy:reg.verbal_by||"", vWith:reg.verbal_with||"", vOn:reg.verbal_on||"" } })); }catch(e){} },style:{...btnSmall,fontSize:11.5,background:"#0c447c",color:"#fff",borderColor:"#0c447c"}},"Sale Order +"); }
     if(k==="wo"){ body = h("div",null, pill(so.go_ahead_state?woLabel(so.go_ahead_state):"On Hold",["#fdecea","#a3312a"]), h("div",{style:{fontSize:11,color:colors.muted,marginTop:3}},"Released on the Sale Order"+(op?" · "+osDays(op)+" d here":"")));
       btn = h("button",{onClick:()=>osGotoSo(x.cn, null),style:{...btnSmall,fontSize:11.5}},"Open Sale Order →"); }
@@ -70193,7 +70220,7 @@ async function ospLoad(){
   const safe = async(fn)=>{ try{ return await fn(); }catch(e){ return []; } };
   const [reg, sos, plans, lines, pos, st, lots, pl] = await Promise.all([
     safe(()=>fetchPaged(()=>sb.from("contract_register_tbl").select("*").order("contract_number"))),
-    safe(()=>fetchPaged(()=>sb.from("sale_order_tbl").select("contract_number,customer_name,status,go_ahead_state,go_ahead_at,quote_reference_number,basis_number,created_at,prod_bom_link").order("contract_number"))),
+    safe(()=>fetchPaged(()=>sb.from("sale_order_tbl").select("contract_number,customer_name,status,go_ahead_state,go_ahead_at,quote_reference_number,basis_number,created_at,prod_bom_link,commercial_approved_by,oa_issued_on").order("contract_number"))),
     safe(()=>fetchPaged(()=>sb.from("proc_plan_tbl").select("id,contract_number,forms,created_at,prod_bom_approved_at").order("id"))),
     safe(()=>fetchPaged(()=>sb.from("proc_line_tbl").select("plan_id,line_key,act_date").not("act_date","is",null).order("id"))),
     safe(()=>fetchPaged(()=>sb.from("po_register").select("contract_ref,stage,status").order("id"))),
@@ -70222,6 +70249,22 @@ function ospStage(cn, M){
   if(ov && ov.k && OSP_ORDER.includes(ov.k) && !(x.so && /cancel|closed/i.test(x.so.status||""))){ x.dataStage = x.stage; x.stage = ov.k; x.ov = ov; }
   return x;
 }
+// 2026-11-04T03:00:00Z: SO PENDING lasts until the Sale Order is made, approved AND marked sent (O.A out).
+// Where it is stuck shows as a badge: Not made · Waiting approval · Not marked sent.
+// Old orders are left alone: Sale Orders made before SO_SENT_RULE_FROM count as sent, unless flagged on
+// order_stage_tbl.esc.so_track (one-time list from the Sales Head, 4 Nov 2026).
+const SO_SENT_RULE_FROM = "2026-10-20";
+const OSP_SO_STUCK = { made:"Not made", approval:"Waiting approval", sent:"Not marked sent" };
+function ospSoStuck(so, st){
+  if(!so) return "made";
+  if(/cancel|closed/i.test(so.status||"")) return null;
+  const tracked = String(so.created_at||"").slice(0,10) >= SO_SENT_RULE_FROM || !!(st && st.esc && st.esc.so_track);
+  if(!tracked) return null;
+  if(!so.commercial_approved_by) return "approval";
+  if(soBeforeOa(so.status)) return "sent";
+  return null;
+}
+const ospSoStuckTxt = (x)=> OSP_SO_STUCK[(x && x.soStuck) || "made"] || "Not made";
 function ospStageData(cn, M){
   cn = String(cn); const reg = M.reg.get(cn)||null, so = M.so.get(cn)||null, plan = M.plan.get(cn)||null, st = M.st.get(cn)||{};
   const forms = plan ? pgForms(plan).map(f=>f.form) : []; const fac = M.fac.get(cn)||new Set();
@@ -70231,10 +70274,11 @@ function ospStageData(cn, M){
   if(!so){
     if(!reg || reg.status!=="Pending") return x;
     if(!(reg.source==="register" || String(reg.quote_number||"").trim())) return x;   // legacy lines without a quote cannot get a Sale Order
-    x.stage = "so"; return x;
+    x.stage = "so"; x.soStuck = "made"; return x;
   }
   if(/cancel|closed/i.test(so.status||"")) return x;
   if(M.lots.get(cn) || M.placed.has(cn)){ x.stage = "prod"; return x; }
+  { const stuck = ospSoStuck(so, st); if(stuck){ x.stage = "so"; x.soStuck = stuck; return x; } }   // 2026-11-04
   if(!woReleased(so.go_ahead_state)){ const dd = ospDocs(cn, M); x.stage = dd.phold ? "ph" : dd.open.length ? "doc" : "wo"; return x; }
   if(!plan){ x.stage = "bom"; return x; }
   if(!(st.pr_released_at || relPo)){ x.stage = "pr"; return x; }
@@ -70268,7 +70312,7 @@ async function ospTaskCards(cn, client, names, postOf, title, due, note){
 async function ospTasksClose(ids, by, what){ for(const id of (ids||[])){ try{ const now = new Date().toISOString();
   await sb.from("task_tbl").update({ status:"done", approved_by:"App ("+(by||"")+")", approved_at:now, moved_by:by||"App", moved_at:now, moved_what:what||"Done" }).eq("id",id).neq("status","done"); await taskLog(id, by||"App", what||"Done"); }catch(e){} } }
 const OSP_TITLE = {
-  so:(cn,cl)=>"Make the Sale Order — "+cn+(cl?" "+cl:""),
+  so:(cn,cl)=>"Sale Order (O.A) — "+cn+(cl?" "+cl:"")+": make it, get it approved, send it and mark it sent",
   wo:(cn,cl)=>"Release the W/O — "+cn+(cl?" "+cl:""),
   pr:(cn,cl)=>"Stock check and PR release — "+cn+(cl?" "+cl:""),
   pa:(cn,cl)=>"Approve purchase — "+cn+(cl?" "+cl:""),
@@ -70278,7 +70322,7 @@ const OSP_TITLE = {
   chase:(cn,cl)=>"Chase the PO — "+cn+(cl?" "+cl:""),
 };
 const OSP_DO = {
-  so:["Open the Contract Register line (or the Order Status board, column 3).","Press Sale Order + and make the Sale Order."],
+  so:["Not made: open the Contract Register line (or the Order Status board, Sale Order pending) and press Sale Order +.","Waiting approval: Accounts approves Commercial Terms on the Sale Order.","Not marked sent: send the O.A to the client, then press “Record when the OA was sent” on the Sale Order."],
   wo:["Open the Sale Order.","Release the work order (Code 2 or Code 1) when the documents allow."],
   pr:["Check the stock against the Production BOM.","Press PR released on the Order Status board (column 6)."],
   pa:["Open the comparison sheet on the card and look at the material %.","Press Approve on the Order Status board (column 7), or Send back with a note. Until then its POs cannot be approved."],
@@ -70340,7 +70384,7 @@ async function ospSync(only, by, Min){
       // escalations (once a day)
       if(want.has("so") && opened.so && wdSince(opened.so)>3 && esc.so!==today){
         const late = wdSince(opened.so)-3; const to = OSP_ESC_SO.flatMap(p=>postHolders(p));
-        await notifyPeople(to, "⏰ "+cn+(client?" "+client:"")+": Sale Order not made — "+late+" working day"+(late>1?"s":"")+" late. Owners: Document Controller, Technical Head.", "order_status", { kind:"open", open:{ tab:"order_board" } });
+        await notifyPeople(to, "⏰ "+cn+(client?" "+client:"")+": Sale Order pending ("+ospSoStuckTxt(x)+") — "+late+" working day"+(late>1?"s":"")+" late. Owners: Document Controller, Technical Head.", "order_status", { kind:"open", open:{ tab:"order_board" } });
         esc.so = today; dirty = true;
       }
       if(want.has("chase")){
@@ -71004,7 +71048,7 @@ async function ctfInfo(cn, force){
     else { const c = OSP_COLS.find(z=>z.k===cur); const n = OSP_COLS.findIndex(z=>z.k===cur);
       if(c){ info.label = c.label; info.tone = c.tone; info.stepNo = n+1; info.waitPosts = c.posts||[]; if(c.sa) info.waiting = sas.slice(); }
       else if(cur==="prod"){ info.label = "Production in progress"; info.tone = OS_COLS[0].tone; info.waitPosts = ["production_manager"]; }
-      const fall = { so:reg&&reg.created_at, doc:so&&so.created_at, ph:so&&so.created_at, wo:so&&so.created_at, bom:so&&so.go_ahead_at, pr:x.plan&&(x.plan.prod_bom_approved_at||x.plan.created_at),
+      const fall = { so:(reg&&reg.created_at)||(so&&so.created_at), doc:so&&so.created_at, ph:so&&so.created_at, wo:so&&so.created_at, bom:so&&so.go_ahead_at, pr:x.plan&&(x.plan.prod_bom_approved_at||x.plan.created_at),
         pa:st.pr_released_at, pur:st.pur_approved_at, prod:st.prod_started_at };
       info.since = movedAt(cur) || fall[cur] || null;
       if(c && c.days && info.since){ info.late = wdSince(info.since) > c.days; } }
@@ -71021,7 +71065,7 @@ async function ctfInfo(cn, force){
     return d.name+" not submitted yet"; };
   if(info.kind==="step"){
     if(cur==="doc" || cur==="ph"){ dd.open.forEach(d=>info.holding.push(docTxt(d))); info.holding.push(dd.open.length+" of "+dd.fh.length+" Full Hold document"+(dd.fh.length===1?"":"s")+" open"); }
-    else if(cur==="so") info.holding.push("The Sale Order is not made yet"+(info.since?" ("+wdSince(info.since)+" working days since the register line)":""));
+    else if(cur==="so") info.holding.push("Sale Order pending — "+ospSoStuckTxt(x)+(info.since?" ("+wdSince(info.since)+" working days)":""));
     else if(cur==="wo") info.holding.push("Documents allow it; the work order is not released ("+(so&&so.go_ahead_state?woLabel(so.go_ahead_state):"Hold")+")");
     else if(cur==="bom") info.holding.push("The Production BOM / BOM summary is not approved");
     else if(cur==="pr") info.holding.push("Stock check and PR release not done");
@@ -71055,7 +71099,7 @@ async function ctfInfo(cn, force){
         else A(true, ["doc_controller"], "Submit "+d.name+" to the client.", "Not submitted; it is a Full Hold document."); });
       if(info.daysLeft!=null && info.daysLeft<=60) A(false, ["technical_head"], "Get the BOM summary and work order ready now, so they go out the day the documents reach Code 2.", "Delivery "+insDmy(info.delivery.date)+" is "+info.daysLeft+" days away.");
     }
-    else if(cur==="so") A(info.late, CTF_POSTS.so, "Make the Sale Order from the Contract Register line.", info.late?"Past its 3 working days.":"Due within 3 working days of the register line.");
+    else if(cur==="so") A(info.late, CTF_POSTS.so, x.soStuck==="approval" ? "Get the Sale Order approved (Accounts, Commercial Terms)." : x.soStuck==="sent" ? "Send the O.A to the client and press Record when the OA was sent." : "Make the Sale Order from the Contract Register line.", info.late?"Past its 3 working days.":"Due within 3 working days of the register line.");
     else if(cur==="wo") A(info.late, ["technical_head"], "Release the work order (the documents allow it).", info.late?"Past its 7 days.":"Production waits on the release.");
     else if(cur==="bom") A(true, ["technical_head"], "Approve the BOM summary so Stores can check stock and Purchase can plan.", "The purchase clock starts from this approval.");
     else if(cur==="pr") A(info.late, ["stores","purchase_manager"], "Check stock against the Production BOM and release the PR.", info.late?"Past its 2 days.":"Due within 2 days.");
@@ -71646,7 +71690,7 @@ function insBuild(D, scope, one){
   X.forEach(o=>{ const c = cl(o);
     o.d.open.filter(d=>d.list==="client" && (osDays(d.since)||0)>7).forEach(d=>act.push({ sev:osDays(d.since), cn:o.cn, client:c, what:d.name+" with the client "+osDays(d.since)+" days", todo:"Chase the client (chase letter)", who:"Document Controller", tab:"doc_letters" }));
     o.d.open.filter(d=>d.list==="our" && (osDays(d.since)||0)>7).forEach(d=>act.push({ sev:osDays(d.since), cn:o.cn, client:c, what:d.name+" ours to submit — "+(d.since?osDays(d.since)+" days":"not started"), todo:"Submit / resubmit it", who:"Document Controller", tab:"doc_board" }));
-    if(o.x.stage==="so" && wdIn(o,"so")>INS_TARGET.so) act.push({ sev:wdIn(o,"so")*2, cn:o.cn, client:c, what:"Sale Order not made — "+wdIn(o,"so")+" working days (target "+INS_TARGET.so+")", todo:"Make the Sale Order", who:"Document Controller · Technical Head", tab:"order_board" });
+    if(o.x.stage==="so" && wdIn(o,"so")>INS_TARGET.so) act.push({ sev:wdIn(o,"so")*2, cn:o.cn, client:c, what:"Sale Order pending ("+ospSoStuckTxt(o.x)+") — "+wdIn(o,"so")+" working days (target "+INS_TARGET.so+")", todo: o.x.soStuck==="approval" ? "Approve the Sale Order" : o.x.soStuck==="sent" ? "Send the O.A and mark it sent" : "Make the Sale Order", who:"Document Controller · Technical Head", tab:"order_board" });
     if(o.x.stage==="wo" && wdIn(o,"wo")>INS_TARGET.wo) act.push({ sev:wdIn(o,"wo")*2, cn:o.cn, client:c, what:"Documents clear, work order not released — "+wdIn(o,"wo")+" working days", todo:"Release the W/O", who:"Technical Head", tab:"os_wo_pending" });
     if(o.x.stage==="pr" && wdIn(o,"pr")>INS_TARGET.pr) act.push({ sev:wdIn(o,"pr")*3, cn:o.cn, client:c, what:"PR release "+wdIn(o,"pr")+" working days (target "+INS_TARGET.pr+")", todo:"Stock check and PR release", who:"Stores · Purchase Manager", tab:"order_board" });
     if(o.x.stage==="pa"){ const k = (o.x.st||{}).pa_sent_at ? "pa" : "pas"; if(wdIn(o,k)>INS_TARGET.pa) act.push({ sev:wdIn(o,k)*3, cn:o.cn, client:c, what:(k==="pa"?"Purchase approval waiting ":"Purchase summary not sent ")+wdIn(o,k)+" working days", todo:k==="pa"?"Approve or send back":"Send the purchase summary", who:k==="pa"?"Super Admin":"Purchase Manager", tab:"order_board" }); }
