@@ -55,7 +55,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-05T14:30:00Z";
+  var APP_BUILD_VERSION = "2026-11-06T00:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -35335,6 +35335,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"6 Nov 2026 (324)", summary:"Built on 2026-11-06T00:30:00Z, on top of 2026-11-05T15:30:00Z (which carries 2026-11-05T14:30:00Z). SQL: structure_dc_qc_skip_2026-11-05.sql (both companies). INVOICE OPTIONS: Option 1 is the DC screen exactly as before. Option 2 is one extra button, Option 2 — bill first, QC later…, opening a pop-up; it names who gives the code (Flometriq: the Finance Director post holder and the Super Admins, e.g. Ponnarasi or Deepak or Bala Boopathy; Levaflow: the Super Admins), read live from the posts." },
+  { date:"5 Nov 2026 (323)", summary:"Built on 2026-11-05T15:30:00Z, on top of 2026-11-05T14:30:00Z. SQL: structure_dc_qc_skip_2026-11-05.sql (both companies). INVOICE GATEWAYS: Gateway 1 is as before (DC & packing slip, QC, Accounts). Gateway 2 = straight to billing, QC later: on a lot's DC (Draft, before QC) or a DC with the Production Manager, the Production Head asks for a code; the Super Admin or the Finance Director (Levaflow: Super Admin only) presses Give a code on the DC - a one-time code for that DC, 24 hours, sent to the asker's bell. With the code and a reason the DC goes straight to Accounts. QC is marked red (DC, lot, board card, Stage report); the Finance Director and Accounts posts get Chase QC documents cards and the QC Head gets Issue the QC documents (the documents are checklist lines); a daily reminder runs until QC issues them. Accounts makes the bill (Approve and number) but the goods do not leave: the lot stays in With Accounts, no gate pass, no despatch. When QC issues the documents (lot: Issue QC documents; other DCs: QC documents done) the cards close, the badge turns green and Stores is told the despatch can go." },
   { date:"5 Nov 2026 (322)", summary:"Built on 2026-11-05T14:30:00Z, on top of 2026-11-05T13:30:00Z. No SQL. W/O RELEASE GATE: only GAD and ITP hold the W/O release now - each needs Code 1 or Code 2, read as the last code the client awarded in the revision history (a resubmission after a Code 2 keeps the Code 2). No ITP on file = the GAD alone decides (badge ITP · not on file). Contracts with neither GAD nor ITP on file keep the old rule (every Full Hold document). Code 2 with production hold = Production hold. Other Full Hold documents are still shown and chased but no longer hold the W/O. A Code 3 after a Code 1 / 2 sends the order back to doc approval by itself, with a line on the card history and a message to the Document Controller. BADGE COLOURS: green Code 1, yellow with the client, red pending on our side, blue Code 2 with production hold; the code awarded is in the text. Stage report rows at doc approval / production hold / W/O show a W/O gate line (GAD ✓ · ITP ✗ (Code 3)); the board card at doc approval shows it too." },
   { date:"5 Nov 2026 (321)", summary:"Built on 2026-11-05T13:30:00Z, on top of 2026-11-05T12:00:00Z. No SQL. BADGES: GAD and ITP now lead on every Stage report row at every stage - CODE 1 ✓ (solid dark green), CODE 2 ✓ · resubmit owed / resubmitted (solid green), CODE 2 – PROD. HOLD (solid blue), Code 3, with client N d, resubmit (ours), for info only, not submitted, status to confirm; several GADs / ITPs on a contract show the weakest with n of m approved. Fixed on the Board cards too: For Info / For Internal Info Only and Code 1 - Fully Approved - Submit for Info no longer show as Code 2. STAGE REPORT GATEWAYS IN PLACE: W/O release pending - Release the W/O here (same release routine as the Sale Order: MTC check, automatic work order, tasks); Sale Order pending and not marked sent - Record the O.A sent here (date, customer email, CC deepak@flometriq.com). Waiting approval, not made and the Production BOM still open the Sale Order." },
   { date:"5 Nov 2026 (320)", summary:"Built on 2026-11-05T12:00:00Z, on top of 2026-11-05T04:00:00Z. No SQL. STAGE REPORT: a Badges column shows the same badges as the Board cards - document badges (Code 2, with client N d, comments - resubmit, not submitted, Production Hold) on doc approval, Sale Order and W/O rows, and material badges on BOM / PR / purchase / production rows; on screen it follows the Board's Badges Show/Hide switch; Download PDF and Excel always carry it as text. LOTS: a Super Admin can place a lot at 14 Despatched - payment awaited or 15 Payment received from its Update stage list (reason kept on the lot; one message to Accounts). 11-13 need a DC, so they stay with the lot's own steps. A lot placed at Payment received closes the contract only when every lot is paid and nothing is left to lot." },
@@ -68405,8 +68407,64 @@ function qcsrPick(RG, sl, q, cur){ const p = qcsrPool(RG, sl); if(!p) return cur
   const all = p.line.concat(p.loose); const keep = (cur||[]).map(String).filter(x=>all.includes(x));
   return keep.concat(p.line.filter(x=>!keep.includes(x))).slice(0, Math.max(0,q||0)); }
 // ---- the DC editor / viewer -------------------------------------------------------------------------
+// 2026-11-05 (invoice gateways): Gateway 1 = DC & packing slip -> QC -> Accounts (as before). Gateway 2 = straight to Accounts
+// for the bill with a one-time code from the Super Admin or the Finance Director (Levaflow: Super Admin only); QC is marked red,
+// the Finance Director and Accounts posts chase it, the QC Head issues the documents. The goods do not leave (no gate pass,
+// no despatch) until the QC documents are in. Kept on dc_tbl.qc_skip (jsonb).
+const QCSKIP_SQL = "structure_dc_qc_skip_2026-11-05.sql";
+const QCSKIP_HOURS = 24;
+const QCSKIP_DOCS = ["QC clearance letter","Inspection / test reports","Material certificates"];
+const qcSkipOn = (dc)=> !!(dc && dc.qc_skip && dc.qc_skip.at);
+const qcSkipPending = (dc)=> qcSkipOn(dc) && !dc.qc_skip.docs_at;
+const qcSkipWhoTxt = ()=> IS_LEVAFLOW_SITE ? "the Super Admin" : "the Super Admin or the Finance Director";
+async function qcSkipApprovers(){ try{ await loadPostPeople(true); }catch(e){} let sa = []; try{ sa = await superAdminNames(); }catch(e){}
+  return Array.from(new Set([...(IS_LEVAFLOW_SITE ? [] : postHolders("finance_director")), ...(sa||[])])); }
+function qcSkipCanGive(user, me){ if(user && user.role==="super_admin") return true; return !IS_LEVAFLOW_SITE && !!me && postHolders("finance_director").includes(me); }
+async function qcSkipSave(dcId, patch){
+  const { data: cur, error: e1 } = await sb.from("dc_tbl").select("qc_skip").eq("id",dcId).maybeSingle();
+  if(e1) throw new Error(/qc_skip/.test(e1.message||"") ? "Run "+QCSKIP_SQL+" first (both companies)." : e1.message);
+  const v = { ...((cur && cur.qc_skip) || {}), ...patch };
+  const { error } = await sb.from("dc_tbl").update({ qc_skip:v }).eq("id",dcId);
+  if(error) throw new Error(/qc_skip/.test(error.message||"") ? "Run "+QCSKIP_SQL+" first (both companies)." : error.message);
+  return v; }
+// chase cards (Finance Director + Accounts posts) and the QC Head's card; the documents are checklist lines inside each card
+async function qcSkipTasks(cn, client, label, why){
+  try{ await loadPostPeople(true); }catch(e){}
+  const due = wdAdd(toISODate(new Date()), 2);
+  const items = QCSKIP_DOCS.map((t,i)=>({ id:"qcs|"+i, text:t, due, done:false, items:[] }));
+  const mk = async(pairs, title, note)=>{ const ids = []; const seen = new Set();
+    for(const [n, post] of pairs){ if(!n || seen.has(n)) continue; seen.add(n);
+      const row = { title, assignee:n, department:null, labels:["Order Status","QC skipped"], links:[], ref:String(cn), customer:client||null, created_by:"App", status:"open",
+        checklists:[{ id:"qcskip", name:"QC documents", items }], due_date:due, notes:note, post_key:post };
+      let { data: t, error } = await sb.from("task_tbl").insert(row).select().single();
+      if(error && /post_key/.test(error.message||"")){ delete row.post_key; ({ data: t, error } = await sb.from("task_tbl").insert(row).select().single()); }
+      if(t){ ids.push(t.id); try{ await taskLog(t.id, "App", "Made by the app: "+title); }catch(x){} } }
+    return { ids, names:Array.from(seen) }; };
+  const note = "Billed before QC (Gateway 2): "+(why||"")+". The app closes this card when the QC Head issues the QC documents.";
+  const ch = await mk([...postHolders("finance_director").map(n=>[n,"finance_director"]), ...postHolders("accounts").map(n=>[n,"accounts"])], "Chase QC documents — "+label+(client?" "+client:"")+" (billed before QC)", note);
+  const qc = await mk(postHolders("qc").map(n=>[n,"qc"]), "Issue the QC documents — "+label+(client?" "+client:"")+" (billed before QC)", note);
+  try{ if(ch.names.length) await notifyPeople(ch.names, "🔴 "+label+(client?" "+client:"")+" went to billing before QC. Chase the QC documents — by "+fmtDMY(due)+".", "order_status", { kind:"open", open:{ tab:"order_board" } }); }catch(e){}
+  try{ if(qc.names.length) await notifyPeople(qc.names, "🔴 "+label+(client?" "+client:"")+" was billed before QC. Issue the QC documents — by "+fmtDMY(due)+". The goods leave only after that.", "order_status", { kind:"open", open:{ tab:"order_board" } }); }catch(e){}
+  return { chase:ch.ids, qc:qc.ids };
+}
+// QC documents in: close the cards; if the DC is already billed, the despatch goes ahead
+async function qcSkipDocsIn(dc, lot, by, username, P){
+  if(!qcSkipPending(dc)) return;
+  const v = await qcSkipSave(dc.id, { docs_at:new Date().toISOString(), docs_by:by||username||"" });
+  const t = v.tasks || {}; try{ await ospTasksClose([...(t.chase||[]), ...(t.qc||[])], by||username, "Done — QC documents issued"); }catch(e){}
+  try{ await despHist(dc.id, null, "QC documents issued after billing (Gateway 2)", username, null); }catch(e){}
+  const name = lot ? osLotName(lot) : "DC "+despNo(dc);
+  const st = P ? [...(P.stores||[]), ...(P.fm||[])] : [];
+  if(dc.status==="Approved"){
+    if(lot) await osHand(lot, "ship", st, "QC documents in for "+name+" — the despatch can go: make the gate pass, despatch, then hand over to Accounts.",
+      { kind:"act", open:{ oslot:lot.id }, target:'[data-testid="os-shipped"]', help:{ btn:"Open the lot", what:"Despatch "+name, do:["Make the gate pass (Stores → Gate Passes), record the exit and paste the signed scan.","Press Despatched – hand over to Accounts."] } }, username);
+    else if(st.length) await notifyPeople(st, "QC documents in for "+name+" — the gate pass can be made now.", "despatch", { kind:"open", open:{ tab:"gate_pass" } });
+  }
+  try{ await notifyPeople(Array.from(new Set([...postHolders("finance_director"), ...((P && P.acc)||postHolders("accounts"))])), "✓ QC documents in for "+name+" (billed before QC). The chase cards are closed.", "order_status"); }catch(e){}
+}
 function DcEditor({ user, me, P, S, dcId, contract, lot, onClose, onChanged }){
   const [lotRow,setLotRow] = useState(null);   // 2026-10-28T05:00:00Z: a DC made for a lot of the Order Status board
+  const [skip,setSkip] = useState({ code:"", why:"", given:"", open:false, names:[] });   // 2026-11-05: Option 2 (pop-up; names = who holds the code posts)
   const [D,setD] = useState(null);      // {dc, lines, serials, boxes, gp}
   const [C,setC] = useState(null);      // despContract()
   const [RG,setRG] = useState(null);    // 2026-10-30T16:30:00Z: the contract's serials in the Serial Number Register
@@ -68570,6 +68628,9 @@ function DcEditor({ user, me, P, S, dcId, contract, lot, onClose, onChanged }){
     }
     if(!dc.id) onClose && onClose(id); else await load(); };
   const lotAfterAcc = async(ok, why)=>{ if(!lotRow) return; const by = me || user?.username || "";
+    if(ok && qcSkipPending(D && D.dc)){   // 2026-11-05: Gateway 2 — billed; the goods wait for the QC documents
+      await osDone(lotRow, "acc", by, "Bill made — despatch held for the QC documents");
+      appToast("✓ Bill made. The despatch waits for the QC documents (QC skipped by code)."); return; }
     await osDone(lotRow, "acc", by, ok ? "Despatch clearance given" : "Sent back: "+why);
     if(ok) await osHand(lotRow, "ship", [...P.stores, ...(P.fm||[])], "Despatch clearance given for "+osLotName(lotRow)+" — make the gate pass, despatch, then hand over to Accounts.",
       { kind:"act", open:{ oslot:lotRow.id }, target:'[data-testid="os-shipped"]', help:{ btn:"Open the lot", what:"Despatch "+osLotName(lotRow), do:["Make the gate pass (Stores → Gate Passes), record the exit and paste the signed scan.","LR / AWB — or for own vehicle / hand delivery, the customer's signed DC acknowledgement.","Press Despatched – hand over to Accounts."] } }, user?.username);
@@ -68636,6 +68697,63 @@ function DcEditor({ user, me, P, S, dcId, contract, lot, onClose, onChanged }){
   if(st==="With QC" && despCan("qc",user,me,P)){ acts.push(h("button",{key:"b",onClick:()=>setBack({to:"Draft",label:"QC objects — back to Stores"}),style:btnSecondary},"QC objects — send back"));
     acts.push(h("button",{key:"q",onClick:()=>step("QC cleared",{ qc_by:who(), qc_at:now() },"QC consents to despatch"),disabled:busy,style:btnPrimary},"QC consents to despatch")); }
   if(st==="QC cleared" && despCan("pm",user,me,P)) acts.push(h("button",{key:"a",onClick:()=>step("With Accounts",{ pm_acc_by:who(), pm_acc_at:now() },"Sent to Accounts"),disabled:busy,style:btnPrimary},"Send to Accounts"));
+  // ---- 2026-11-05: Gateway 2 — straight to billing with a code, QC later ----
+  const skipFrom = lotRow ? (st==="Draft" && !lotRow.qc_at ? "Draft" : null) : (st==="With PM" ? "With PM" : null);
+  const skipLabel = lotRow ? osLotName(lotRow) : "DC "+despNo(dc);
+  const skipQ = dc.qc_skip || {};
+  const askCode = async()=>{
+    let id = dc.id; if(lotRow && st==="Draft"){ id = await save(true); if(!id) return; }
+    if(!id){ setMsg("Save the DC first."); return; }
+    try{ await qcSkipSave(id, { asked_by:me||who(), asked_at:now() }); }catch(e){ setMsg(e.message); return; }
+    const to = await qcSkipApprovers();
+    try{ await qcSkipSave(id, { asked_to:to }); }catch(e){}
+    await notifyPeople(to, "🔑 "+(me||who())+" asks for a code to send "+skipLabel+(C.customer?" "+C.customer:"")+" straight to billing (QC later).", "despatch",
+      { kind:"act", open:{ dc:id }, target:'[data-testid="dc-qcskip-give"]', help:{ btn:"Open the DC", what:"Code for straight to billing — "+skipLabel, do:["Check why QC is being skipped.","Press Give a code — it goes to "+(me||who())+"'s bell.","The goods still wait for the QC documents; only the bill goes early."] } });
+    await despHist(id, null, "Code asked: straight to billing, QC later", who(), null);
+    appToast("✓ Code asked from "+(to.join(", ")||qcSkipWhoTxt()));
+    if(!dc.id) onClose && onClose(id); else await load(); };
+  const giveCode = async()=>{
+    const code = String(Math.floor(100000+Math.random()*900000)); const expires_at = new Date(Date.now()+QCSKIP_HOURS*3600*1000).toISOString();
+    setBusy(true);
+    const { error } = await sb.from("authorization_codes").insert({ code, code_type:"qc_skip", generated_by:user?.username||"unknown", expires_at, reference_number:"DC:"+dc.id, note:"Straight to billing, QC later — "+skipLabel, used:false });
+    setBusy(false);
+    if(error){ setMsg("Could not make the code: "+error.message); return; }
+    try{ await qcSkipSave(dc.id, { gave_by:me||who(), gave_at:now() }); }catch(e){}
+    if(skipQ.asked_by) await notifyPeople([skipQ.asked_by], "🔑 Code to send "+skipLabel+" straight to billing: "+code+" (one use, this DC only, "+QCSKIP_HOURS+" h). Open the DC, enter it with the reason, press Straight to billing.", "despatch",
+      { kind:"act", open:{ dc:dc.id }, target:'[data-testid="dc-qcskip-code"]', help:{ btn:"Open the DC", what:"Straight to billing — "+skipLabel, do:["Enter the code and why QC is skipped.","Press Straight to billing."] } });
+    await logAudit("INSERT","authorization_codes","DC:"+dc.id,"Generated a straight-to-billing (QC later) code for "+skipLabel+" ("+QCSKIP_HOURS+" h)",who(),null,null);
+    setSkip(x=>({ ...x, given:code })); await load(); };
+  const goSkip = async()=>{
+    const c = String(skip.code||"").trim(), why = String(skip.why||"").trim();
+    if(!c){ setMsg("Enter the code from "+((skip.names||[]).join(" / ")||qcSkipWhoTxt())+"."); return; }
+    if(why.length<3){ setMsg("Write why QC is skipped (kept on the DC history)."); return; }
+    let id = dc.id; if(lotRow && st==="Draft"){ id = await save(true); if(!id) return; }
+    { const { error: ce } = await sb.from("dc_tbl").select("qc_skip").eq("id",id).maybeSingle(); if(ce){ setMsg(/qc_skip/.test(ce.message||"") ? "Run "+QCSKIP_SQL+" first (both companies)." : ce.message); return; } }
+    const { data: cr } = await sb.from("authorization_codes").select("*").eq("code",c).eq("code_type","qc_skip").eq("used",false).limit(1);
+    const row = (cr||[])[0];
+    if(!row){ setMsg("That code is not valid (or already used). Ask "+((skip.names||[]).join(" / ")||qcSkipWhoTxt())+" for one."); return; }
+    if(row.reference_number && row.reference_number!=="DC:"+id){ setMsg("That code is for another DC."); return; }
+    if(row.expires_at && new Date(row.expires_at) < new Date()){ setMsg("That code has expired ("+QCSKIP_HOURS+" h). Ask for a new one."); return; }
+    await sb.from("authorization_codes").update({ used:true, used_by:who(), used_at:now() }).eq("id",row.id);
+    const ok = await move(id, skipFrom, "With Accounts", { pm_acc_by:who(), pm_acc_at:now(), returned_note:null }, "Gateway 2: straight to billing — QC skipped (code from "+row.generated_by+")", why);
+    if(!ok){ await load(); return; }
+    const by = me || who();
+    const tasks = await qcSkipTasks(C.cn, C.customer, skipLabel, why);
+    try{ await qcSkipSave(id, { at:now(), by, why, code_by:row.generated_by, code_id:row.id, tasks }); }catch(e){ setMsg(e.message); }
+    if(lotRow){ const L = { ...lotRow, dc_id:id }; const nowI = now();
+      let r = await sb.from("so_lot_tbl").update({ dc_id:id, stores_done_by:by, stores_done_at:nowI, back_note:null }).eq("id",lotRow.id);
+      if(r.error && /back_note/.test(r.error.message||"")) r = await sb.from("so_lot_tbl").update({ dc_id:id, stores_done_by:by, stores_done_at:nowI }).eq("id",lotRow.id);
+      await osDone(L, "dc", by, "DC and packing slip done — straight to billing"); await osDone(L, "req", by, "Straight to billing (QC later)");
+      await osHand(L, "acc", P.acc, "Bill "+osLotName(lotRow)+(C.customer?" "+C.customer:"")+" — QC skipped by code ("+why+"). Approve and number the DC for the invoice; the goods wait for the QC documents.",
+        { kind:"act", open:{ oslot:lotRow.id }, target:'[data-testid="os-give-clear"]', help:{ btn:"Go and bill", what:"Bill before QC — "+osLotName(lotRow), do:["Open the DC and press Approve and number — that makes the bill.","The gate pass stays locked until QC issues the documents."] } }, user?.username);
+    } else await notifyPeople(P.acc, "Bill DC "+despNo(dc)+(C.customer?" "+C.customer:"")+" — QC skipped by code ("+why+"). Approve and number it; the gate pass stays locked until the QC documents are in.", "despatch", { kind:"act", open:{ dc:id }, target:'[data-testid="dc-acc-approve"]' });
+    await logAudit("UPDATE","dc_tbl",skipLabel,"Gateway 2: straight to billing, QC later — "+why+" (code by "+row.generated_by+")",who(),null,null);
+    setSkip({ code:"", why:"", given:"", open:false, names:[] });
+    appToast("✓ Sent to Accounts for the bill. QC is marked red and chased.");
+    await load(); };
+  const openOpt2 = async()=>{ setMsg(""); let n = []; try{ n = await qcSkipApprovers(); }catch(e){} setSkip(x=>({ ...x, open:true, names:n })); };
+  if(skipFrom && despCan("pm",user,me,P) && !qcSkipOn(dc)) acts.push(h("button",{key:"opt2","data-testid":"dc-qcskip-open",onClick:openOpt2,disabled:busy,style:{...btnSecondary,borderColor:"#c9302c",color:"#a3312a",fontWeight:600}},"Option 2 — bill first, QC later…"));
+  const qcDocsDone = async()=>{ setBusy(true); try{ await qcSkipDocsIn(dc, null, me||who(), user?.username, P); }catch(e){ setMsg(e.message); } setBusy(false); await load(); };
   if(st==="With Accounts" && despCan("acc",user,me,P)){ acts.push(h("button",{key:"b",onClick:()=>setBack({to:"Draft",label:lotRow?"Accounts sends back to the Production Manager":"Accounts sends back to Stores"}),style:btnSecondary},"Send back"));
     acts.push(h("button",{key:"a",onClick:approveAccounts,disabled:busy,"data-testid":"dc-acc-approve",style:btnPrimary},lotRow?"Approve and number (despatch clearance)":"Approve and number")); }
   if(dc.id && ["Draft","With PM","With QC","QC cleared","With Accounts"].includes(st) && (despCan(lotMaker,user,me,P)||despCan("acc",user,me,P)))
@@ -68739,6 +68857,38 @@ function DcEditor({ user, me, P, S, dcId, contract, lot, onClose, onChanged }){
       h("div",null,h("div",{style:{fontSize:11.5,color:colors.muted}},"Remarks"), editable ? h("textarea",{rows:2,value:hdr.remarks,onChange:e=>setHdr(x=>({...x,remarks:e.target.value})),style:inputStyle}) : h("div",{style:{fontSize:12.5}},hdr.remarks||"—"))),
     msg ? h("div",{style:{whiteSpace:"pre-wrap",color:colors.danger,fontSize:12.5,marginTop:8,background:"#fdecea",borderRadius:6,padding:"6px 10px"}},msg) : null,
     h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginTop:12}}, acts),
+    // 2026-11-05: Gateway 2 — straight to billing (code), QC later
+    qcSkipOn(dc) ? h("div",{"data-testid":"dc-qcskip-state",style:{marginTop:10,borderRadius:6,padding:"7px 10px",fontSize:12.5,background:qcSkipPending(dc)?"#c9302c":"#e4f3ed",color:qcSkipPending(dc)?"#fff":"#0b5a40",fontWeight:600}},
+      qcSkipPending(dc) ? "QC skipped — QC documents pending. Billed before QC by "+(skipQ.by||"")+" on "+fmtDMYTime(skipQ.at)+" (code from "+(skipQ.code_by||"")+"): "+(skipQ.why||"")+". "+(st==="Approved"?"The gate pass is locked until QC issues the documents.":"Accounts makes the bill; the goods wait for the QC documents.")
+        : "QC documents in ✓ — issued by "+(skipQ.docs_by||"")+" on "+fmtDMYTime(skipQ.docs_at)+" (this DC was billed before QC).",
+      qcSkipPending(dc) && !lotRow && despCan("qc",user,me,P) ? h("div",{style:{marginTop:6}}, h("button",{"data-testid":"dc-qcskip-docs",onClick:qcDocsDone,disabled:busy,style:{...btnSmall,background:"#fff"}},"QC: documents done (clearance letter issued)")) : null,
+      qcSkipPending(dc) && lotRow ? h("div",{style:{marginTop:4,fontWeight:400}},"QC issues the documents on the lot: Order Status → "+osLotName(lotRow)+" → Issue QC documents.") : null) : null,
+    dc.id && skipFrom && !qcSkipOn(dc) && skipQ.asked_at && qcSkipCanGive(user, me) ? h("div",{style:{marginTop:10,border:"1px solid #5b3fa3",borderRadius:8,padding:"8px 12px",fontSize:12.5,background:"#f6f2fd"}},
+      h("b",null,"Code asked by "+(skipQ.asked_by||"")+" ("+fmtDMYTime(skipQ.asked_at)+")"), " — straight to billing, QC later, for "+skipLabel+". ",
+      skip.given ? h("span",{"data-testid":"dc-qcskip-given",style:{fontFamily:"'IBM Plex Mono',Consolas,monospace",fontSize:16,fontWeight:700,letterSpacing:3,background:"#fff3a3",padding:"2px 8px",borderRadius:5}},skip.given) : null,
+      skip.given ? h("span",{style:{color:colors.muted}}," sent to "+(skipQ.asked_by||"")+"'s bell") : h("button",{"data-testid":"dc-qcskip-give",onClick:giveCode,disabled:busy,style:{...btnSmall,marginLeft:6,background:"#5b3fa3",color:"#fff",borderColor:"#5b3fa3"}},"Give a code")) : null,
+    skip.open && skipFrom && !qcSkipOn(dc) ? h("div",{onClick:e=>{ if(e.target===e.currentTarget) setSkip(x=>({...x,open:false})); },style:{position:"fixed",inset:0,background:"rgba(20,20,20,.45)",zIndex:3000,display:"grid",placeItems:"center",padding:16}},
+      h("div",{"data-testid":"dc-qcskip",role:"dialog","aria-label":"Option 2",style:{background:"#fff",borderRadius:10,maxWidth:560,width:"100%",padding:"18px 20px",display:"grid",gap:12,maxHeight:"90vh",overflow:"auto"}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",gap:10}},
+          h("div",null, h("div",{style:{fontWeight:700,fontSize:15}},"Option 2 — bill first, QC later"),
+            h("div",{style:{fontSize:12,color:colors.muted,marginTop:2}},skipLabel+(C.customer?" · "+C.customer:"")+". The bill goes out now; the goods do not leave until QC issues the documents. QC is marked red; the Finance Director and Accounts get cards to chase it.")),
+          h("button",{onClick:()=>setSkip(x=>({...x,open:false})),"aria-label":"Close",style:btnSmall},"✕")),
+        h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"10px 12px",display:"grid",gap:8}},
+          h("b",{style:{fontSize:13}},"1 · Ask for a code"),
+          h("div",{"data-testid":"dc-qcskip-names",style:{fontSize:12.5}},"The code is given by ", h("b",null,(skip.names||[]).length ? skip.names.join(" or ") : "—"), " ("+(IS_LEVAFLOW_SITE?"Super Admin":"Finance Director / Super Admin")+"). One use, this DC only, "+QCSKIP_HOURS+" h."),
+          !(skip.names||[]).length ? h("div",{style:{fontSize:12,color:colors.danger}},"Nobody holds the "+(IS_LEVAFLOW_SITE?"Super Admin role":"Finance Director post or the Super Admin role")+" — set it first.") : null,
+          h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
+            h("button",{"data-testid":"dc-qcskip-ask",onClick:askCode,disabled:busy||!!skipQ.asked_at||!(skip.names||[]).length,style:btnSecondary}, skipQ.asked_at ? "Code asked ✓" : "Ask "+((skip.names||[]).join(" / ")||"for a code")),
+            skipQ.asked_at ? h("span",{style:{fontSize:12,color:colors.muted}},"asked "+((skipQ.asked_to||skip.names||[]).join(", "))+" on "+fmtDMYTime(skipQ.asked_at)) : null)),
+        h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"10px 12px",display:"grid",gap:8}},
+          h("b",{style:{fontSize:13}},"2 · Enter the code and why"),
+          h("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
+            h("input",{"data-testid":"dc-qcskip-code",value:skip.code,onChange:e=>setSkip(x=>({...x,code:e.target.value.replace(/\D/g,"")})),placeholder:"Code",style:{...inputStyle,width:110,fontFamily:"'IBM Plex Mono',Consolas,monospace",letterSpacing:2}}),
+            h("input",{"data-testid":"dc-qcskip-why",value:skip.why,onChange:e=>setSkip(x=>({...x,why:e.target.value})),placeholder:"Why QC is skipped, e.g. client wants the bill this month",style:{...inputStyle,flex:1,minWidth:200}})),
+          msg ? h("div",{style:{whiteSpace:"pre-wrap",color:colors.danger,fontSize:12.5,background:"#fdecea",borderRadius:6,padding:"6px 10px"}},msg) : null,
+          h("div",{style:{display:"flex",gap:8}},
+            h("button",{"data-testid":"dc-qcskip-go",onClick:goSkip,disabled:busy,style:{...btnPrimary,background:"#c9302c",borderColor:"#c9302c"}},"Straight to billing"),
+            h("button",{onClick:()=>setSkip(x=>({...x,open:false})),style:btnSecondary},"Cancel"))))) : null,
     hist.length ? h("div",{style:{marginTop:14}},h("div",{style:{fontSize:12,fontWeight:700,color:colors.muted}},"History"),
       hist.map(x=>h("div",{key:x.id,style:{fontSize:11.5,color:colors.muted,padding:"2px 0"}},fmtDMYTime(x.at)+" · "+(x.by_user||"")+" · "+x.action+(x.note?" — "+x.note:"")))) : null,
     askDetails ? h(DespatchDetailsDialog,{C, user, reason: dc.id ? "Changed on DC "+despNo(dc) : "Asked on the first DC of the contract",
@@ -68785,6 +68935,7 @@ function osLotCol(l, dc){
   if(!l || l.status==="Returned") return 0;
   if(l.paid_at) return 7;
   if(l.shipped_at) return 6;
+  if(dc && dc.status==="Approved" && qcSkipPending(dc)) return 4;   // 2026-11-05: billed before QC — the goods wait for the QC documents
   if(dc && (dc.status==="Approved" || dc.status==="Despatched")) return 5;
   if(dc && dc.status==="With Accounts") return 4;
   if(!osDcLive(dc) || !l.stores_done_at) return 2;    // stores_done_* = "DC and packing slip done" (made by the Production Manager since 31 Oct)
@@ -68803,7 +68954,7 @@ function osLotNext(l, dc){
   const c = osLotCol(l, dc);
   if(c===2) return "pm";
   if(c===3) return "qc";
-  if(c===4) return dc && dc.status==="With Accounts" ? "acc" : "pm";
+  if(c===4) return dc && dc.status==="With Accounts" ? "acc" : (dc && dc.status==="Approved" && qcSkipPending(dc)) ? "qc" : "pm";
   if(c===5) return "stores";
   if(c===6) return "acc";
   return "";
@@ -68817,6 +68968,7 @@ function osLotWhere(l, dc){
     return "Production Manager: DC "+despNo(dc)+" being made";
   }
   if(c===3) return "QC: check and issue the clearance letter";
+  if(c===4 && qcSkipPending(dc)) return dc.status==="Approved" ? "Billed "+(dc.bill_no||"")+" — despatch held: QC documents pending" : "With Accounts for the bill — QC skipped by code, documents pending";
   if(c===4) return dc && dc.status==="With Accounts" ? "With Accounts for despatch clearance" : "Production Manager: send to Accounts";
   if(c===5) return "Stores: gate pass, despatch, hand over"+(dc && dc.bill_no ? " · "+dc.bill_no : "");
   if(c===6) return "Payment due "+(l.due_date?osDmy(l.due_date):"—")+(l._paidPart ? " · Part paid Rs "+accInr(l._paidPart)+" of "+accInr(l._due) : "");
@@ -69108,11 +69260,19 @@ function OsLotPanel({ lotId, user, me, P, so, onClose, onChanged, sessionCompany
     if(!can("qc")){ noPermission("issue the QC clearance letter",{ posts:["qc"], roles:["super_admin"] }); return; }
     if(!osDcLive(dc) || !L.stores_done_at){ setMsg("The Production Manager has not finished the DC and packing slip yet."); return; }
     if(!osLinksOk(qcDocs)){ setMsg("Link at least one QC document (MTC, hydro, NDE, PMI or inspection report) — a full https:// link."); return; }
-    if(!confirm("Issue the QC clearance letter for "+osLotName(L)+"?\n\nThis is the green signal: DC "+osDcNo(dc)+" goes to Accounts for the despatch clearance.")) return;
+    const skipP = qcSkipPending(dc) && dc.status!=="Draft";   // 2026-11-05: billed before QC — these are the documents being chased
+    if(!confirm(skipP ? "Issue the QC documents for "+osLotName(L)+"?\n\nIt was billed before QC. This closes the chase cards"+(dc.status==="Approved"?" and lets the goods go (gate pass, despatch).":".") : "Issue the QC clearance letter for "+osLotName(L)+"?\n\nThis is the green signal: DC "+osDcNo(dc)+" goes to Accounts for the despatch clearance.")) return;
     setBusy(true);
     const no = "QCR/"+L.contract_number+"/L"+L.lot_no;
     const docsOk = qcDocs.filter(r=>String(r.link||"").trim());
-    const ok = await upd({ qc_docs:docsOk, qc_note:qcNote||null, qc_letter_no:no, qc_by:by, qc_at:osIso(), clear_req_by:by, clear_req_at:osIso() }, "QC clearance letter "+no+" issued — to Accounts");
+    const ok = await upd({ qc_docs:docsOk, qc_note:qcNote||null, qc_letter_no:no, qc_by:by, qc_at:osIso(), clear_req_by:by, clear_req_at:osIso() }, skipP ? "QC documents "+no+" issued (billed before QC)" : "QC clearance letter "+no+" issued — to Accounts");
+    if(ok && skipP){
+      await qcSkipDocsIn(dc, L, by, user?.username, P);
+      await osDone(L, "qc", by, "QC documents "+no+" issued (billed before QC)");
+      await osQcLetterPdf({ ...L, qc_docs:docsOk, qc_note:qcNote, qc_letter_no:no, qc_by:by, qc_at:osIso() }, so, sessionCompany);
+      setBusy(false); await after(); return;
+    }
+    if(ok && qcSkipPending(dc)) await qcSkipDocsIn(dc, L, by, user?.username, P);   // held back to Draft after a skip: QC went the normal way
     if(ok){
       if(dc.status==="Draft"){
         const { data: u } = await sb.from("dc_tbl").update({ status:"With Accounts", pm_acc_by:user?.username||"", pm_acc_at:osIso(), returned_note:null }).eq("id",dc.id).eq("status","Draft").select();
@@ -69263,11 +69423,17 @@ function OsLotPanel({ lotId, user, me, P, so, onClose, onChanged, sessionCompany
         can("qc") ? h("textarea",{key:"n",rows:2,value:qcNote,onChange:e=>setQcNote(e.target.value),placeholder:"Remarks (optional)",style:{...inputStyle,marginTop:6}}) : null,
         h("div",{key:"b",style:{display:"flex",gap:8,marginTop:8}}, btn("os-qc-issue","Issue QC clearance",qcIssue,true,!can("qc")), btn("os-qc-object","QC objects — back to Production Manager",qcBack,false,!can("qc")))])
     : col===4 ? box("Despatch clearance — "+osWhoText("acc"),[
-        box("Documents (QC)",[h(OsLinks,{key:"q",list:L.qc_docs||[],editable:false})]),
+        qcSkipOn(dc) ? h("div",{key:"sk","data-testid":"os-qcskip",style:{background:qcSkipPending(dc)?"#c9302c":"#e4f3ed",color:qcSkipPending(dc)?"#fff":"#0b5a40",borderRadius:6,padding:"6px 10px",fontSize:12.5,fontWeight:600,marginBottom:6}},
+          qcSkipPending(dc) ? "QC skipped by code — QC documents pending. "+(dc.qc_skip.why||"")+" (code from "+(dc.qc_skip.code_by||"")+"). "+(dc.status==="Approved"?"Billed "+(dc.bill_no||"")+"; the goods wait for the QC documents.":"Accounts makes the bill; the goods wait for the QC documents.") : "QC documents in ✓ (billed before QC)") : null,
+        qcSkipPending(dc) ? box("QC documents — "+osWhoText("qc"),[
+            h(OsLinks,{key:"l",list:qcDocs,onChange:setQcDocs,labels:OS_QC_DOCS,editable:can("qc")}),
+            h("div",{key:"b",style:{display:"flex",gap:8,marginTop:8}}, btn("os-qc-issue","Issue QC documents",qcIssue,true,!can("qc")))])
+          : box("Documents (QC)",[h(OsLinks,{key:"q",list:L.qc_docs||[],editable:false})]),
         payBox,
         h("div",{key:"b",style:{display:"flex",gap:8,flexWrap:"wrap"}},
           dc && dc.status==="With Accounts"
-            ? [h(React.Fragment,{key:"a"},btn("os-give-clear","Give despatch clearance",giveClear,true,!can("acc"))), h(React.Fragment,{key:"h"},btn("os-hold","Hold",hold,false,!can("acc")))]
+            ? [h(React.Fragment,{key:"a"},btn("os-give-clear",qcSkipPending(dc)?"Make the bill (despatch held for QC)":"Give despatch clearance",giveClear,true,!can("acc"))), h(React.Fragment,{key:"h"},btn("os-hold","Hold",hold,false,!can("acc")))]
+            : dc && dc.status==="Approved" && qcSkipPending(dc) ? h("div",{style:{fontSize:12.5,color:"#a3312a"}},"Billed "+(dc.bill_no||"")+". No gate pass, no despatch until QC issues the documents.")
             : btn("os-req-clear","Send to Accounts",reqClear,true,!can("pm")))])
     : col===5 ? box("Despatch — "+osWhoText("stores"),[
         gpLine,
@@ -69716,6 +69882,7 @@ function OrderStatusBoard({ user, sessionCompany, startView }){
         h("button",{title:"Documents (QC and shipping)","data-testid":"os-card-docs",onClick:e=>{ e.stopPropagation(); setDocsFor(l.id); },style:{border:"1px solid "+colors.border,background:"#fff",borderRadius:5,fontSize:11,padding:"0 5px",cursor:"pointer"}},"📎"+(nd?" "+nd:""))),
       h("div",{style:{fontSize:11.5,color:colors.muted}},(x.s.customer_name||"")+(x.s.basis_number?" · PO "+x.s.basis_number:"")),
       h("div",{style:{fontSize:11.5,marginTop:3,color:overdue?"#a3312a":colors.text}}, osLotWhere(l, x.dc)),
+      qcSkipOn(x.dc) ? h("div",{style:{marginTop:2}}, ospBadge(qcSkipPending(x.dc) ? "QC skipped — QC documents pending" : "QC documents in ✓ (after billing)", qcSkipPending(x.dc) ? "rd" : "ok", "qs")) : null,
       h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:3}}, (l.lines||[]).length+" Sl No"+((l.lines||[]).length===1?"":"s")+" · "+(l.lines||[]).reduce((n,z)=>n+Number(z.qty||0),0)+" Nos"+(x.nextK?" · next: "+whoName(x.nextK):"")+(age?" · "+age+" d here":"")),
       mineNow ? h("div",{style:{fontSize:10.5,fontWeight:700,color:"#0f7a5c",marginTop:3}},"⚑ your move"+(strict(x.nextK)?"":" (as admin)")+" — drag it to the next column or open it") : null);
   };
@@ -69800,6 +69967,7 @@ function OrderStatusBoard({ user, sessionCompany, startView }){
       if(M && !M.missing){ const dd = ospDocs(String(r.cn), M);
         ospKeyDocBadges(dd.fh).forEach(b=>out.push(b));   // GAD and ITP first, on every row
         if(["doc","ph","wo"].includes(k) && dd.gateTxt) out.push([dd.gateTxt, "gate"]);   // 2026-11-05: what holds the W/O
+        if(x.kind==="lot" && x.dc && qcSkipOn(x.dc)) out.push(qcSkipPending(x.dc) ? ["QC skipped by code — QC documents pending","rd"] : ["QC documents in ✓ (after billing)","ok"]);   // 2026-11-05: Gateway 2
         if(["doc","ph","so","wo"].includes(k)) (dd.fh||[]).filter(d=>!ospIsKeyDoc(d)).forEach(d=>out.push(ospDocBadgeTxt(d))); }
       const ps = x.ps; if(ps && ps.forms && ["bom","pr","pa","pur","prod"].includes(k)) ps.forms.forEach(f=>out.push([f+(ps.fac && ps.fac.has(f)?" ✓":""), ps.fac && ps.fac.has(f)?"ok":"gy"]));
       if(ps && ps.st && ps.st.pur_approved_at && ps.st.pa_pct!=null) out.push(["Approved "+ps.st.pa_pct+"%","bl"]);
@@ -70782,6 +70950,15 @@ async function ospSync(only, by, Min){
       if(dirty){ esc.closed = closed; M.st.set(cn, { ...st, tasks, opened, esc });
         try{ await ospStageUpsert(cn, { tasks, opened, esc }); }catch(e){ console.warn("order stage", e.message); } }
     }
+    // 2026-11-05: billed before QC — a daily reminder to the Finance Director, Accounts and the QC Head while the QC documents are pending
+    if(!only){ try{ const D0 = M.st.get("__daily__") || {}; const d0 = { ...(D0.esc||{}) };
+      if(d0.qcskip!==today){ const { data: ds, error: de0 } = await sb.from("dc_tbl").select("id,status,contract_number,customer_name,draft_no,bill_no,fy,dc_kind,qc_skip").neq("status","Cancelled");
+        if(!de0){ const pend = (ds||[]).filter(qcSkipPending);
+          if(pend.length){ const list = pend.slice(0,12).map(d=>d.contract_number+" ("+(d.bill_no||d.draft_no||("DC "+d.id))+", "+osDays(d.qc_skip.at)+" d)").join(", ");
+            const to = Array.from(new Set([...postHolders("finance_director"), ...postHolders("accounts")]));
+            await notifyPeople(to, "🔴 QC documents still pending on "+pend.length+" DC"+(pend.length>1?"s":"")+" billed before QC: "+list+(pend.length>12?" …":"")+".", "order_status", { kind:"open", open:{ tab:"order_board" } });
+            await notifyPeople(postHolders("qc"), "🔴 Issue the QC documents — billed before QC: "+list+(pend.length>12?" …":"")+". The goods leave only after that.", "order_status", { kind:"open", open:{ tab:"order_board" } }); }
+          d0.qcskip = today; M.st.set("__daily__", { ...D0, esc:d0 }); try{ await ospStageUpsert("__daily__", { esc:d0 }); }catch(e){} } } }catch(e){ console.warn("qc skip reminder", e); } }
     // the daily PO-awaited list (Sales Coordinator, Sales Head, Super Admins) — once a day for the company
     if(!only){
       const D = M.st.get("__daily__") || {}; const de = { ...(D.esc||{}) };
@@ -73499,7 +73676,7 @@ function GatePassScreen({ user }){
   useEffect(()=>{ load(); },[load]);
   if(!list) return h("div",{style:{padding:20,color:colors.muted}},"Reading the gate passes…");
   const canStores = despCan("stores",user,me,P);
-  const free = dcs.filter(d=>d.status==="Approved" && !d.gate_pass_id && !d.is_test);
+  const free = dcs.filter(d=>d.status==="Approved" && !d.gate_pass_id && !d.is_test && !qcSkipPending(d));   // 2026-11-05: billed before QC = held until the QC documents
   const boxCount = async(ids)=>{ const m = new Map(); if(ids.length){ const { data } = await sb.from("dc_box_tbl").select("dc_id").in("dc_id",ids); (data||[]).forEach(b=>m.set(b.dc_id,(m.get(b.dc_id)||0)+1)); } return m; };
   const printGp = async(gp)=>{ const ds = dcs.filter(d=>d.gate_pass_id===gp.id); despGatePassPdf(gp, ds, await boxCount(ds.map(d=>d.id))).catch(e=>alert("PDF: "+e.message)); };
   const create = async()=>{
@@ -73600,7 +73777,7 @@ async function despPendingItems(){
     else if(d.status==="With QC"){ who = P.qc; role = "qc"; what = "DC "+no+" — QC consent to despatch"; since = d.pm_qc_at; }
     else if(d.status==="QC cleared"){ who = P.pm; role = "production_manager"; what = "DC "+no+" — QC cleared, send to Accounts"; since = d.qc_at; }
     else if(d.status==="With Accounts"){ who = P.acc; role = "accounts"; what = "DC "+no+" — approve and number"; since = d.pm_acc_at; }
-    else if(d.status==="Approved" && !d.gate_pass_id && !d.is_test && days(d.acc_at)>=1){ who = P.stores; role = "stores"; what = "DC "+no+" approved — make the gate pass when the truck is ready"; since = d.acc_at; }
+    else if(d.status==="Approved" && !d.gate_pass_id && !d.is_test && !qcSkipPending(d) && days(d.acc_at)>=1){ who = P.stores; role = "stores"; what = "DC "+no+" approved — make the gate pass when the truck is ready"; since = d.acc_at; }
     if(!who) return;
     const dw = days(since);
     to(who, { what, entity_key:despNo(d), detail_key:"dc|"+d.id+"|"+d.status, owed_by_role:role, days_waiting:dw||null, urgency: dw>=2 ? "overdue" : "due", source:"despatch_dc" });
