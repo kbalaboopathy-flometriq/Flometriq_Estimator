@@ -55,7 +55,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-06T06:30:00Z";
+  var APP_BUILD_VERSION = "2026-11-06T07:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -35337,6 +35337,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"6 Nov 2026 (332)", summary:"Built on 2026-11-06T07:30:00Z, on top of 2026-11-06T06:30:00Z. No SQL. DC serials: rows of the same item code and size share their serials — what one row leaves, the next row takes, ticked by itself, row by row in Sl No order (the last row gets what is left). A serial taken from another row is marked ↪ Sl n and is moved to this row's Sl No in the register when the DC is saved (history: moved by DC — same item, same size). Rows touched by hand are not refilled." },
   { date:"6 Nov 2026 (331)", summary:"Built on 2026-11-06T06:30:00Z, on top of 2026-11-06T06:00:00Z. SQL: structure_serial_fix_2026-11-06.sql (both companies) then data_serial_fix_FLOMETRIQ_2026-11-06.sql. SERIALS: the DC picks serials with tick boxes (scrolling box, shift-click for a run, Tick the first N, Clear, ranges shown; fewer / more than Send now asks and keeps the ticks; changing Send now keeps them). A line short of serials asks QC and names the same item's spare serials on another Sl No. QC → Serial Number Register → Register check: serials in two places and Sl Nos with none / too many / too few; any QC person moves serials to the right Sl No or removes them from a contract with a one-time code from the QC Head or a Super Admin (they need no code); each change goes into the serial's history. The register refuses a serial number that is already in it. Data fix: copies loaded twice, 260107's 29013-29018 (belong to 260018), stock (UL) copies of serials sold on contracts, 7 contracts with identical lines re-split in Sl No order." },
   { date:"6 Nov 2026 (330)", summary:"build calender (day report decisions of 6 Nov). Built on 2026-11-06T06:00:00Z, on top of 2026-11-06T05:30:00Z. No SQL. DAY REPORT: 📝 My day report on every task board (Tasks › Task Boards & Dashboards), besides 📅 and the Calendar. Done today now has three parts: cards completed, CHECKLIST LINES TICKED today (a tick now records when and by whom) and cards MOVED ON (sent for approval, moved, handed over, edited); the Done count on the report adds all three. Saturday stays a working day (only Sundays and approved holidays are skipped). PENDING ACTIONS: a day report not sent on the last working day, by someone who was in the app that day, is owed by the head of his department (by post) the next morning; it clears when he sends it. Super Admins are never asked. TASKS › DAY REPORTS: everyone who is not HR, a head or a Super Admin now sees his own reports for the last 31 days (View, Send now for a missed day, Today's day report); HR and Super Admins see all, heads their people. User Manual: new page \u201c📝 Day report\u201d." },
   { date:"6 Nov 2026 (329)", summary:"Built on 2026-11-06T05:30:00Z, on top of 2026-11-06T04:30:00Z. No SQL. ONE CONTRACT LOOKUP everywhere, in the quote screen's FIND style (dark blue box, yellow text): type the number or any part of the customer, pick from \"260105 – customer\"; ↑ ↓ Enter Esc, ✕ clears. Lists the OPEN orders only (a Sale Order closes when every lot is paid; closed / cancelled are left out; Sale Order › open a contract has a tick to list closed ones). Replaces 23 contract boxes (Sale Order picker, follow-ups, customer requests, Document Control add / report / one contract, Purchase Owners, Order Status Board one order, Insights, PO header with Stock, Procurement reports, Gantt upload, New DC, QC serial new entry, Bill a service, Make a proforma, Direct invoices, Petty purchases, Task Board filter, task link, calendar event). Beside 15 free search boxes a second box for one contract (Offers & Orders, Contract Register, W/O release, Document Register, Place old contracts, Delivery, Purchase Register, Procurement list, Gantt list, QC Serial Register, Invoice & PI Register, Legacy Proforma, Sales voucher, Contract Profitability). Purchase Insights gets the contract box: with a buyer picked it shows only his lines; KPIs, Excel and PDF follow. The picked contract is carried across screens for the session (Purchase Insights, Gantt, Procurement reports, Order Status Board / Stage report, Insights, Document Control)." },
@@ -68729,17 +68730,20 @@ function QcSerialRegister({ user }){
 // A line with too few serials asks QC — and says so when the same item's other Sl No has spare ones. Stores never ticks another Sl No's serials.
 function DcSerialTicks({ r, q, RG, rows, setRow, user, C }){
   const lastRef = useRef(null);
-  const pool = qcsrPool(RG, r.item_sl_no) || { line:[], loose:[] }; const all = pool.line.concat(pool.loose);
-  const otherT = new Set(rows.filter(x=>x.key!==r.key).flatMap(x=>(x.serials||[]).map(String)));
-  const free = all.filter(s=>!otherT.has(s));
+  const pool = qcsrPool(RG, r.item_sl_no) || { line:[], loose:[] };
+  const offer = dcSerOffer(RG, rows, r); const all = offer.map(o=>o.s); const fromOf = new Map(offer.filter(o=>o.from!=null).map(o=>[o.s,o.from]));
+  const free = all;
   const cur = (r.serials||[]).map(String).filter(Boolean); const T = new Set(cur); const n = cur.length;
-  const put = (set)=> setRow(r.key,{ serials: all.filter(s=>set.has(s)), no_serial:false });
+  const put = (set)=> setRow(r.key,{ serials: all.filter(s=>set.has(s)).concat(cur.filter(s=>set.has(s) && !all.includes(s))), no_serial:false, ser_touched:true });
   const lc = (x)=> String(x||"").trim().toLowerCase();
+  const sib = dcSerGroup(rows, r).filter(x=>x.key!==r.key);
   const spare = [];
-  rows.filter(x=>x.key!==r.key && lc(x.item)===lc(r.item) && lc(x.description)===lc(r.description)).forEach(x=>{
-    const p = qcsrPool(RG, x.item_sl_no); if(!p) return; const need = Number(x.balance)||0;
-    if(p.line.length > need){ const mine = new Set((x.serials||[]).map(String)); const extra = p.line.filter(s=>!mine.has(s)).slice(-(p.line.length-need)); if(extra.length) spare.push({ sl:x.item_sl_no, ss:extra }); } });
-  const hint = spare.length ? spare.map(s=>despSerialRanges(s.ss)+" spare on Sl No "+s.sl+" (same item)").join("; ") : "";
+  const tickedAny = new Set(rows.flatMap(x=>(x.serials||[]).map(String)));   // spare = not ticked on any row, beyond what that Sl No's own group still needs
+  rows.filter(x=>x.key!==r.key && !sib.includes(x) && lc(x.item)===lc(r.item)).forEach(x=>{
+    const p = qcsrPool(RG, x.item_sl_no); if(!p) return;
+    const need = dcSerGroup(rows, x).reduce((a,y)=>a+Math.max(0,(Number(y.balance)||0)-((y.serials||[]).filter(Boolean).length)),0);
+    const loose = p.line.filter(s=>!tickedAny.has(s)); if(loose.length > need){ const extra = loose.slice(need); if(extra.length && !spare.some(z=>z.sl===x.item_sl_no)) spare.push({ sl:x.item_sl_no, ss:extra }); } });
+  const hint = spare.length ? spare.map(s=>despSerialRanges(s.ss)+" spare on Sl No "+s.sl+" (same item, other size)").join("; ") : "";
   const ask = (k)=> dcAskQcSerials(user, C.cn, C.customer, r.item_sl_no, k, r.item, hint ? "Spare serials of the same item: "+hint+" — move them to Sl No "+r.item_sl_no+" if they are this line's (QC → Serial Number Register → Register check)." : "");
   const hintEl = hint ? h("div",{"data-testid":"dc-spare-hint",style:{fontSize:11,color:"#1e528a",marginTop:3}},"ℹ "+hint+" — QC can move them to this Sl No.") : null;
   if(!free.length && !n) return h("div",{"data-testid":"dc-no-reg-serials",style:{fontSize:11.5,color:"#a3312a"}},
@@ -68751,7 +68755,8 @@ function DcSerialTicks({ r, q, RG, rows, setRow, user, C }){
     lastRef.current = s; put(nx); };
   const chip = (s)=>{ const on = T.has(s); return h("label",{key:s,style:{display:"inline-flex",gap:4,alignItems:"center",fontFamily:"'IBM Plex Mono',Consolas,monospace",fontSize:11.5,padding:"2px 7px",borderRadius:5,cursor:"pointer",userSelect:"none",
       border:"1.5px solid "+(on?"#0b6e4f":colors.border),background:on?"#e2f3ec":"#fff",color:on?"#0b5a40":colors.text,fontWeight:on?700:400}},
-    h("input",{type:"checkbox","data-testid":"dc-serial-tick","data-s":s,checked:on,onChange:()=>{},onClick:e=>click(e,s),style:{margin:0,accentColor:"#0b6e4f"}}), s+(pool.loose.includes(s)?" *":"")); };
+    h("input",{type:"checkbox","data-testid":"dc-serial-tick","data-s":s,checked:on,onChange:()=>{},onClick:e=>click(e,s),style:{margin:0,accentColor:"#0b6e4f"}}), s+(pool.loose.includes(s)?" *":""),
+    fromOf.has(s) ? h("span",{style:{fontSize:10,color:"#1c4a8a",fontWeight:600}},"↪ Sl "+fromOf.get(s)) : null); };
   const bal = Number(r.balance)||0;
   return h("div",{"data-testid":"dc-reg-serials"},
     h("div",{style:{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginBottom:4}},
@@ -68767,6 +68772,7 @@ function DcSerialTicks({ r, q, RG, rows, setRow, user, C }){
       h("div",{style:{display:"flex",gap:6,marginTop:4,flexWrap:"wrap"}},
         h("button",{"data-testid":"dc-tick-setq",disabled:n>bal,title:n>bal?"The balance is "+bal:"",onClick:()=>setRow(r.key,{ qty:String(n) }),style:{...btnSmall,fontSize:11,padding:"2px 7px",background:"#fff"}},"Make Send now = "+n+(n>bal?" (balance is "+bal+")":"")))) : null,
     pool.loose.length ? h("div",{style:{fontSize:10.5,color:colors.muted,marginTop:3}},"* from the Excel, with no Sl No on record") : null,
+    sib.length ? h("div",{"data-testid":"dc-same-item",style:{fontSize:10.5,fontWeight:700,color:"#1c4a8a",background:"#e3edfb",borderRadius:4,padding:"1px 6px",display:"inline-block",marginTop:3}},"same item and size as Sl "+sib.map(x=>x.item_sl_no).join(", ")+" — serials shared"+(fromOf.size?"; ↪ = moves to this Sl No on saving":"")) : null,
     free.length<q ? hintEl : null);
 }
 
@@ -69006,6 +69012,27 @@ function qcsrPool(RG, sl){ if(!RG || RG.missing) return null; const ok = r=> !RG
 function qcsrPick(RG, sl, q, cur){ const p = qcsrPool(RG, sl); if(!p) return cur||[];
   const all = p.line.concat(p.loose); const keep = (cur||[]).map(String).filter(x=>all.includes(x));
   return keep.concat(p.line.filter(x=>!keep.includes(x))).slice(0, Math.max(0,q||0)); }
+// 2026-11-06: DC rows of the same item code and size share their serials — what one row leaves, the next row takes (ticked by itself).
+// On saving the DC, a serial taken from another row is moved to this row's Sl No in the register (history: moved by DC — same item, same size).
+const dcSerSize = (r)=>{ const t = String((r&&r.description)||"")+" "+String((r&&r.item)||""); const m = t.match(/(\d+(?:\.\d+)?)\s*nb\b/i) || t.match(/\bdn\s*(\d+)/i); return m ? String(Number(m[1])) : ""; };
+const dcSerKey = (r)=>{ const it = String((r&&r.item)||"").trim().toLowerCase(); const sz = dcSerSize(r); return it && sz ? it+"|"+sz : ""; };
+function dcSerGroup(rows, r){ const k = dcSerKey(r); if(!k) return [r]; return rows.filter(x=>dcSerKey(x)===k).sort((a,b)=>Number(a.item_sl_no)-Number(b.item_sl_no)); }
+function dcSerOffer(RG, rows, r){   // own Sl No first, then the same-item rows' serials; minus what other rows have ticked
+  const own = qcsrPool(RG, r.item_sl_no) || { line:[], loose:[] }; const list = [];
+  own.line.forEach(s=>list.push({ s, from:null })); own.loose.forEach(s=>list.push({ s, from:null, loose:true }));
+  dcSerGroup(rows, r).filter(x=>x.key!==r.key).forEach(x=>{ const p = qcsrPool(RG, x.item_sl_no); if(p) p.line.forEach(s=>{ if(!list.some(o=>o.s===s)) list.push({ s, from:x.item_sl_no }); }); });
+  const taken = new Set(rows.filter(x=>x.key!==r.key).flatMap(x=>(x.serials||[]).map(String)));
+  return list.filter(o=>!taken.has(o.s)); }
+function dcSerAutofill(RG, rows){   // rows not touched by hand: drop serials another row took, top up to Send now — row by row in Sl No order, so the last row gets what's left
+  if(!RG || RG.missing) return null;
+  const out = rows.map(x=>({ ...x })); let changed = false;
+  out.slice().sort((a,b)=>Number(a.item_sl_no)-Number(b.item_sl_no)).forEach(r0=>{
+    const r = out.find(x=>x.key===r0.key); const q = Number(r.qty)||0; if(r.ser_touched || !q) return;
+    const offer = dcSerOffer(RG, out, r).map(o=>o.s); const cur = (r.serials||[]).map(String).filter(Boolean);
+    const keep = cur.filter(x=>offer.includes(x)); let nx = keep;
+    if(keep.length < q) nx = keep.concat(offer.filter(x=>!keep.includes(x))).slice(0, q);
+    if(nx.join(",")!==cur.join(",")){ r.serials = nx; changed = true; } });
+  return changed ? out : null; }
 // ---- the DC editor / viewer -------------------------------------------------------------------------
 // 2026-11-05 (invoice gateways): Gateway 1 = DC & packing slip -> QC -> Accounts (as before). Gateway 2 = straight to Accounts
 // for the bill with a one-time code from the Super Admin or the Finance Director (Levaflow: Super Admin only); QC is marked red,
@@ -69192,6 +69219,7 @@ function DcEditor({ user, me, P, S, dcId, contract, lot, onClose, onChanged }){
     }
   },[dcId, contract]);
   useEffect(()=>{ load(); },[load]);
+  useEffect(()=>{ if(!D || !D.dc || D.dc.status!=="Draft") return; const nx = dcSerAutofill(RG, rows); if(nx) setRows(nx); },[rows, RG, D]);   // 2026-11-06: same item + size share serials
   useEffect(()=>{ if(D && D.dc && window.__despOpt2 && window.__despOpt2===D.dc.id){ window.__despOpt2 = null; (async()=>{ let n = []; try{ n = await qcSkipApprovers(); }catch(e){} setSkip(x=>({ ...x, open:true, names:n })); })(); } },[D]);   // 2026-11-06: from Stores › Bill first, QC later
   if(!D || !C) return h("div",{style:{padding:20,color:colors.muted}}, msg || "Reading the contract…");
   const dc = D.dc; const st = dc.status;
@@ -69211,10 +69239,11 @@ function DcEditor({ user, me, P, S, dcId, contract, lot, onClose, onChanged }){
       if(!RG || RG.missing){ p.push("Run "+QCSR_SQL+" first — the DC takes its serial numbers only from QC → Serial Number Register."); return; }   // 2026-11-01T17:00:00Z: register only
       {
         const ss = (r.serials||[]).map(s=>String(s||"").trim()).filter(Boolean);
-        if(strict && ss.length!==q) p.push("Sl No "+r.item_sl_no+": "+ss.length+" of "+q+" serial numbers ticked. Tick one for every piece"+(qcsrPool(RG, r.item_sl_no) && !(qcsrPool(RG, r.item_sl_no).line.length+qcsrPool(RG, r.item_sl_no).loose.length) ? " — QC has not given serials for this Sl No yet (Ask QC)." : "."));
+        if(strict && ss.length!==q) p.push("Sl No "+r.item_sl_no+": "+ss.length+" of "+q+" serial numbers ticked. Tick one for every piece"+(qcsrPool(RG, r.item_sl_no) && !dcSerOffer(RG, rows, r).length ? " — QC has not given serials for this Sl No yet (Ask QC)." : "."));
         ss.forEach(s=>{ if(!DESP_SERIAL_RE.test(s)) p.push("Sl No "+r.item_sl_no+": serial “"+s+"” is not a serial number."); });
-        const pool = qcsrPool(RG, r.item_sl_no);   // 2026-10-30T16:30:00Z
-        if(pool){ const okS = new Set(pool.line.concat(pool.loose)); const bad = ss.filter(s=>!okS.has(s)); if(bad.length) p.push("Sl No "+r.item_sl_no+": "+bad.join(", ")+" "+(bad.length>1?"are":"is")+" not given to this Sl No in QC → Serial Number Register, or already on another DC."); }
+        const pool = qcsrPool(RG, r.item_sl_no);   // 2026-10-30T16:30:00Z; 2026-11-06: also the same-item rows' serials
+        if(pool){ const okS = new Set(pool.line.concat(pool.loose)); dcSerGroup(rows, r).forEach(x=>{ const px = qcsrPool(RG, x.item_sl_no); if(px) px.line.forEach(v=>okS.add(v)); });
+          const bad = ss.filter(s=>!okS.has(s)); if(bad.length) p.push("Sl No "+r.item_sl_no+": "+bad.join(", ")+" "+(bad.length>1?"are":"is")+" not given to this Sl No (or a row of the same item and size) in QC → Serial Number Register, or already on another DC."); }
       }
     });
     const all = shipRows.flatMap(r=>(r.serials||[]).map(s=>String(s||"").trim()).filter(Boolean));
@@ -69265,6 +69294,14 @@ function DcEditor({ user, me, P, S, dcId, contract, lot, onClose, onChanged }){
         if(error) throw error; lineIdBySl.set(r.item_sl_no, dl.id);
         const ss = (r.serials||[]).map(s=>String(s).trim()).filter(Boolean);
         if(ss.length){ const { error: se } = await sb.from("dc_serial_tbl").insert(ss.map(s=>({ dc_id:id, dc_line_id:dl.id, serial:s }))); if(se) throw new Error("Serial numbers not saved: "+se.message); }
+        // 2026-11-06: serials taken from a row of the same item and size move to this Sl No in the register
+        const mv = RG && !RG.missing ? ss.filter(v=>{ const g = RG.rows.find(x=>String(x.serial)===v); return g && g.item_sl_no!=null && Number(g.item_sl_no)!==Number(r.item_sl_no); }) : [];
+        if(mv.length){ try{
+          const { data: rr } = await sb.from("qc_serial_register_tbl").select("*").eq("contract_number",C.cn).in("serial", mv.map(Number));
+          const lab = dc.dc_no || dc.draft_no || ("DC "+id);
+          await qcsrApply((rr||[]).filter(x=>!x.void_at), ()=>({ item_sl_no:Number(r.item_sl_no) }), x=>({ at:new Date().toISOString(), by:me||user?.username, what:"Sl No "+x.item_sl_no+" → "+r.item_sl_no, why:"moved by "+lab+" — same item, same size" }));
+          RG.rows.forEach(x=>{ if(mv.includes(String(x.serial))) x.item_sl_no = Number(r.item_sl_no); });
+        }catch(e){ console.warn("register move", e); } }
       }
       for(const b of boxes){
         const { data: bx, error } = await sb.from("dc_box_tbl").insert({ dc_id:id, box_no:Number(b.box_no), packing_mode:b.packing_mode||null, length_mm:b.length_mm===""?null:Number(b.length_mm), width_mm:b.width_mm===""?null:Number(b.width_mm),
