@@ -55,7 +55,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-06T09:30:00Z";
+  var APP_BUILD_VERSION = "2026-11-07T03:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -2030,6 +2030,7 @@ function generateMultiColumnListPDF({ title, subtitle, items, columnsCount, crea
 
 /* ---- LOGIN ---- */
 function LoginScreen({ onLogin }) {
+  const [outMsg] = useState(()=>{ try{ const m = sessionStorage.getItem("flo_signed_out_msg"); sessionStorage.removeItem("flo_signed_out_msg"); return m||""; }catch(e){ return ""; } });   // load build
   const [username, setUsername] = useState(""); const [password, setPassword] = useState("");
   const [error, setError] = useState(""); const [loading, setLoading] = useState(false);
   const submit = async(e) => {
@@ -2062,6 +2063,7 @@ function LoginScreen({ onLogin }) {
         APP_INSTANCE_LABEL && h("div",{style:{fontSize:13,fontWeight:700,color:colors.text,marginTop:4}},APP_INSTANCE_LABEL),
         h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"Authored by K.Bala Boopathy")
       ),
+      outMsg ? h("div",{"data-testid":"login-out-msg",style:{background:"#fff4d6",color:"#5c3d06",borderRadius:6,padding:"7px 10px",fontSize:12.5,marginBottom:14}},outMsg) : null,
       h("form",{onSubmit:submit},
         h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Username"),
         h("input",{value:username,onChange:e=>setUsername(e.target.value),style:inputStyle,placeholder:"username",autoFocus:true}),
@@ -2184,7 +2186,7 @@ function NotificationBell({ user }){
     setItems(data||[]);
     try{ const { data: u } = await sb.from("notifications_tbl").select("id").eq("employee_name",emp.employee_name).eq("is_read",false).limit(500); setUnread((u||[]).length); }catch(e){}
   },[user?.id, view, lim]);
-  useEffect(()=>{ load(); const t=setInterval(load,60000); return ()=>clearInterval(t); },[load]);
+  useEffect(()=>{ load(); },[load]);   // 2026-11-07: read at sign-in and when the bell is pressed — no checking in between
   useEffect(()=>{
     const onDocClick = e => { if(rootRef.current && !rootRef.current.contains(e.target)) setOpen(false); };
     document.addEventListener("mousedown", onDocClick);
@@ -2240,7 +2242,7 @@ function NotificationBell({ user }){
         (help.do||[]).length ? h("ol",{style:{margin:"3px 0 0",paddingLeft:18}},help.do.map((d,i)=>h("li",{key:i},d))) : null) : null);
   };
   return h("div",{ref:rootRef,style:{position:"relative"}},
-    h("button",{onClick:()=>setOpen(v=>!v),"data-testid":"bell",style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 10px",fontSize:12,cursor:"pointer",borderRadius:6,position:"relative"}},
+    h("button",{onClick:()=>{ if(!open) load(); setOpen(v=>!v); },"data-testid":"bell",style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 10px",fontSize:12,cursor:"pointer",borderRadius:6,position:"relative"}},
       "🔔",
       unread>0 && h("span",{style:{position:"absolute",top:-4,right:-4,background:"#e24b4a",color:"#fff",fontSize:9,borderRadius:8,padding:"1px 5px",fontWeight:700}},unread)
     ),
@@ -2300,10 +2302,169 @@ function useNavState(key, init){
   const set = (x)=> setV(old=>{ const n = typeof x==="function" ? x(old) : x; window.__navMem[key] = n; return n; });
   return [v,set];
 }
+// ===== 2026-11-06T13:00 "load" build: activity, quiet timers, two sessions per login, idle / nightly sign-out =====
+// Activity: the last time the person clicked, typed, scrolled or touched this tab. A tab nobody looks at (hidden)
+// or nobody has used for 10 minutes is "quiet": its background checks pause and run once when the person is back.
+const APP_QUIET_MS = 10*60*1000;
+window.__lastAct = window.__lastAct || Date.now();
+const appIdleMs = ()=> Date.now() - (window.__lastAct||Date.now());
+const appQuiet = ()=> document.visibilityState==="hidden" || appIdleMs() > APP_QUIET_MS;
+(function(){
+  if(window.__actWired) return; window.__actWired = true;
+  let lastMove = 0;
+  const bump = (e)=>{ const n = Date.now(); if(e && e.type==="mousemove"){ if(n-lastMove<5000) return; lastMove = n; }
+    const wasQuiet = n-(window.__lastAct||n) > APP_QUIET_MS; window.__lastAct = n; if(wasQuiet) try{ window.dispatchEvent(new Event("flo-wake")); }catch(x){} };
+  ["mousedown","keydown","wheel","touchstart","mousemove","scroll"].forEach(t=>window.addEventListener(t, bump, { passive:true, capture:true }));
+  document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState==="visible"){ window.__lastAct = Date.now(); try{ window.dispatchEvent(new Event("flo-wake")); }catch(x){} } });
+})();
+// setInterval that skips while the tab is quiet; a skipped run happens once when the person is back
+function quietInterval(fn, ms){
+  let missed = false;
+  const t = setInterval(()=>{ if(appQuiet()){ missed = true; return; } try{ fn(); }catch(e){} }, ms);
+  const wake = ()=>{ if(missed && !appQuiet()){ missed = false; try{ fn(); }catch(e){} } };
+  window.addEventListener("flo-wake", wake);
+  return ()=>{ clearInterval(t); window.removeEventListener("flo-wake", wake); };
+}
+
+// ---- two open sessions per login (every login, no exceptions) ----
+// app_session_tbl: one row per open tab. A tab says "still here" every 2 minutes; one not heard from for 5 minutes
+// does not count. A third tab can close the oldest of the two and open. Signing out frees the place at once.
+const SESS_SQL = "structure_app_sessions_2026-11-06.sql";
+const SESS_MAX = 2, SESS_BEAT_MS = 2*60*1000, SESS_STALE_MS = 5*60*1000;
+const SESS_IDLE_MS = 30*60*1000, SESS_WARN_MS = 2*60*1000;   // 2026-11-07: 30 minutes; no night sign-out (staff work in many time zones)
+const sessT = (k, v)=> (window.__sessTest && window.__sessTest[k]!=null) ? window.__sessTest[k] : v;   // test hook (headless tests only)
+function sessId(){ try{ let x = sessionStorage.getItem("flo_sess_id"); if(!x){ x = "s"+Date.now().toString(36)+Math.random().toString(36).slice(2,8); sessionStorage.setItem("flo_sess_id", x); } return x; }catch(e){ return window.__sessIdMem || (window.__sessIdMem = "m"+Date.now().toString(36)); } }
+function sessDevice(){ const u = navigator.userAgent||"";
+  const b = /Edg\//.test(u) ? "Edge" : /OPR\//.test(u) ? "Opera" : /Firefox\//.test(u) ? "Firefox" : /Chrome\//.test(u) ? "Chrome" : /Safari\//.test(u) ? "Safari" : "Browser";
+  const p = /Android/.test(u) ? "Android phone" : /iPhone|iPad/.test(u) ? "iPhone / iPad" : /Windows/.test(u) ? "Windows PC" : /Mac OS/.test(u) ? "Mac" : /Linux/.test(u) ? "Linux PC" : "computer";
+  return b+" on "+p; }
+const sessMissing = (err)=> !!err && /app_session_tbl|does not exist|schema cache/i.test(err.message||"");
+async function sessLive(username){
+  const since = new Date(Date.now()-SESS_STALE_MS).toISOString();
+  const { data, error } = await sb.from("app_session_tbl").select("id,username,device,opened_at,last_seen").eq("username",username).is("closed_at",null).gt("last_seen",since).order("opened_at",{ ascending:true }).limit(20);
+  if(error) throw error; return data||[]; }
+async function sessRegister(username){
+  const now = new Date().toISOString(); const id = sessId();
+  const { data: ex } = await sb.from("app_session_tbl").select("id,opened_at").eq("id",id).maybeSingle();
+  const row = { id, username, device:sessDevice(), last_seen:now, closed_at:null, closed_reason:null };
+  if(!ex) row.opened_at = now;
+  const { error } = await sb.from("app_session_tbl").upsert(row, { onConflict:"id" });
+  if(error) throw error;
+  try{ if(Math.random()<0.1) await sb.from("app_session_tbl").delete().lt("last_seen", new Date(Date.now()-7*864e5).toISOString()); }catch(e){}   // old rows go after a week
+}
+async function sessClose(reason, id){
+  try{ await sb.from("app_session_tbl").update({ closed_at:new Date().toISOString(), closed_reason:reason||"closed" }).eq("id", id||sessId()); }catch(e){}
+}
+// a tab being closed: tell the server without waiting (fetch keepalive works while the page unloads)
+function sessCloseOnUnload(){
+  try{ const S = window.APP_SETTINGS||{}; if(!S.supabaseUrl || !S.supabaseKey || !window.__sessUser) return;
+    fetch(S.supabaseUrl.replace(/\/$/,"")+"/rest/v1/app_session_tbl?id=eq."+encodeURIComponent(sessId()), { method:"PATCH", keepalive:true,
+      headers:{ apikey:S.supabaseKey, Authorization:"Bearer "+S.supabaseKey, "Content-Type":"application/json", Prefer:"return=minimal" },
+      body:JSON.stringify({ closed_at:new Date().toISOString(), closed_reason:"tab closed" }) }).catch(()=>{});
+  }catch(e){} }
+if(!window.__sessUnloadWired){ window.__sessUnloadWired = true; window.addEventListener("pagehide", ()=>{ if(!(window.__unsavedGuard && window.__unsavedGuard.dirty)) sessCloseOnUnload(); }); }
+const sessAgo = (iso)=>{ const m = Math.max(0, Math.round((Date.now()-new Date(iso).getTime())/60000)); return m<1 ? "just now" : m<60 ? m+" min ago" : Math.round(m/60)+" h ago"; };
+const sessTime = (iso)=>{ try{ return new Date(iso).toLocaleTimeString("en-IN",{ hour:"2-digit", minute:"2-digit" }); }catch(e){ return ""; } };
+// The gate: decides whether this tab may open the app, keeps it alive, and signs it out when idle / at night.
+function useSessionGate(user, signOut){
+  const [S,setS] = useState({ st:"checking" });
+  const uname = user && user.username;
+  const check = useCallback(async()=>{
+    if(!uname){ setS({ st:"none" }); return; }
+    try{
+      const live = await sessLive(uname); const me = sessId();
+      const others = live.filter(r=>r.id!==me);
+      if(others.length >= SESS_MAX){ setS({ st:"full", others }); return; }
+      await sessRegister(uname); window.__sessUser = uname; setS({ st:"ok" });
+    }catch(e){ if(!sessMissing(e)) console.warn("Session check failed — the app opens anyway", e); window.__sessUser = null; setS({ st:"ok", off:true }); }
+  },[uname]);
+  useEffect(()=>{ check(); },[check]);
+  // heartbeat
+  useEffect(()=>{ if(S.st!=="ok" || S.off || !uname) return;
+    const beat = async()=>{ try{
+      const { data, error } = await sb.from("app_session_tbl").update({ last_seen:new Date().toISOString() }).eq("id",sessId()).select("closed_at,closed_reason");
+      if(error) return;
+      const r = (data||[])[0];
+      if(!r){ await sessRegister(uname); return; }
+      if(r.closed_at){ window.__sessUser = null;
+        if(window.__unsavedGuard && window.__unsavedGuard.dirty) setS({ st:"kicked_dirty", reason:r.closed_reason, until:Date.now()+sessT("warn", SESS_WARN_MS) });
+        else setS({ st:"closed", reason:r.closed_reason }); }
+    }catch(e){} };
+    const t = setInterval(beat, sessT("beat", SESS_BEAT_MS));
+    return ()=>clearInterval(t); },[S.st, S.off, uname]);
+  // kicked while there was unsaved work: 2 minutes to save, then closed
+  useEffect(()=>{ if(S.st!=="kicked_dirty") return;
+    const t = setInterval(()=>{ const clean = !(window.__unsavedGuard && window.__unsavedGuard.dirty);
+      if(clean || Date.now()>=S.until) setS(s=>({ st:"closed", reason:s.reason })); else setS(s=>({ ...s })); }, 1000);
+    return ()=>clearInterval(t); },[S.st]);
+  // idle and nightly sign-out: a 2-minute warning bar; unsaved work is never thrown away
+  const [warn,setWarn] = useState(null);   // { why, until }
+  const startRef = useRef(Date.now());
+  useEffect(()=>{ if(S.st!=="ok" || !uname) return;
+    const started = startRef.current;
+    const t = setInterval(()=>{
+      if(warn) return;
+      void started;
+      if(appIdleMs() >= SESS_IDLE_MS) setWarn({ why:"idle", until:Date.now()+sessT("warn", SESS_WARN_MS) });
+    }, sessT("tick", 15000));
+    return ()=>clearInterval(t); },[S.st, uname, warn]);
+  useEffect(()=>{ if(!warn) return;
+    const t = setInterval(async()=>{
+      const dirty = !!(window.__unsavedGuard && window.__unsavedGuard.dirty);
+      if(Date.now() < warn.until || dirty){ setWarn(w=>w ? { ...w, dirty } : w); return; }
+      clearInterval(t); setWarn(null);
+      await sessClose(warn.why==="night" ? "signed out at night" : "signed out after "+Math.round(SESS_IDLE_MS/60000)+" min without use");
+      window.__sessUser = null;
+      try{ sessionStorage.setItem("flo_signed_out_msg", warn.why==="night" ? "You were signed out for the night. Sign in again to carry on." : "You were signed out after "+Math.round(SESS_IDLE_MS/60000)+" minutes without use. Sign in again to carry on."); }catch(e){}
+      signOut && signOut();
+    }, 1000);
+    return ()=>clearInterval(t); },[warn]);
+  const stay = ()=>{ window.__lastAct = Date.now(); setWarn(null); };
+  const takeOver = async()=>{ const oldest = (S.others||[])[0]; if(!oldest) return check();
+    setS(s=>({ ...s, busy:true }));
+    await sessClose("closed because the app was opened on "+sessDevice()+" at "+sessTime(new Date().toISOString()), oldest.id);
+    try{ await logAudit("UPDATE","app_session_tbl",uname,"Third session: closed the oldest ("+(oldest.device||"")+", since "+sessTime(oldest.opened_at)+") and opened here",uname,null,null); }catch(e){}
+    await check(); };
+  return { S, check, takeOver, warn, stay };
+}
+// The screens the gate shows instead of the app (third tab, closed tab)
+function SessionGateScreen({ user, G, onSignOut }){
+  const S = G.S;
+  const box = (kids)=> h("div",{style:{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:colors.bg||"#f4f2ea",padding:16}},
+    h("div",{"data-testid":"sess-gate",style:{width:520,maxWidth:"100%",background:"#fff",border:"1px solid "+colors.border,borderRadius:10,padding:"22px 24px"}}, kids));
+  if(S.st==="checking") return box([h("div",{key:"c",style:{color:colors.muted,fontSize:13}},"Opening…")]);
+  if(S.st==="full") return box([
+    h("div",{key:"t",style:{fontWeight:700,fontSize:16,marginBottom:6}},"The app is already open in "+SESS_MAX+" places"),
+    h("div",{key:"s",style:{fontSize:13,color:colors.muted,marginBottom:12,lineHeight:1.5}},"Each login can have the app open in at most "+SESS_MAX+" places (tabs or devices) at a time. "+user.username+" is open in:"),
+    h("div",{key:"l",style:{border:"1px solid "+colors.border,borderRadius:8,marginBottom:14}}, S.others.map((r,i)=>h("div",{key:r.id,"data-testid":"sess-other",style:{padding:"8px 12px",borderTop:i?"1px solid "+colors.border:"none",fontSize:13}},
+      h("b",null,r.device||"a browser"), " — open since "+sessTime(r.opened_at)+", active "+sessAgo(r.last_seen), i===0 ? h("span",{style:{marginLeft:6,fontSize:11.5,color:"#a3312a"}},"(oldest)") : null))),
+    h("div",{key:"b",style:{display:"flex",gap:8,flexWrap:"wrap"}},
+      h("button",{"data-testid":"sess-takeover",disabled:!!S.busy,onClick:G.takeOver,style:btnPrimary},S.busy?"Closing…":"Close the oldest and open here"),
+      h("button",{onClick:G.check,style:btnSecondary},"Check again"),
+      h("button",{onClick:onSignOut,style:btnSecondary},"Sign out")),
+    h("div",{key:"n",style:{fontSize:11.5,color:colors.mutedLight,marginTop:10}},"The oldest one shows that it was closed; unsaved work there gets two minutes to be saved. A tab not used for 5 minutes stops counting by itself.")]);
+  if(S.st==="closed") return box([
+    h("div",{key:"t",style:{fontWeight:700,fontSize:16,marginBottom:6}},"This tab was closed"),
+    h("div",{key:"s","data-testid":"sess-closed",style:{fontSize:13,color:colors.muted,marginBottom:14,lineHeight:1.5}},"Reason: "+(S.reason||"closed")+". Each login can have the app open in "+SESS_MAX+" places at most."),
+    h("div",{key:"b",style:{display:"flex",gap:8}}, h("button",{onClick:G.check,style:btnPrimary},"Open here again"), h("button",{onClick:onSignOut,style:btnSecondary},"Sign out"))]);
+  return null;
+}
+// The bars shown over the app: closed-elsewhere with unsaved work, and the idle / night sign-out warning
+function SessionBars({ G }){
+  const S = G.S, w = G.warn;
+  const bar = (bg, kids, tid)=> h("div",{"data-testid":tid,style:{position:"fixed",top:0,left:0,right:0,zIndex:3200,background:bg,color:"#fff",padding:"8px 14px",fontSize:13,display:"flex",gap:12,alignItems:"center",justifyContent:"center",flexWrap:"wrap",boxShadow:"0 2px 8px rgba(0,0,0,.2)"}}, kids);
+  const left = (u)=> { const s = Math.max(0, Math.ceil((u-Date.now())/1000)); return Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); };
+  if(S.st==="kicked_dirty") return bar("#a3312a", [h("b",{key:"a"},"This tab was closed from another place ("+(S.reason||"")+")."), h("span",{key:"b"}," Save your work now — the tab closes in "+left(S.until)+".")], "sess-kicked");
+  if(w) return bar(w.dirty && Date.now()>=w.until ? "#854f0b" : "#1f5c40", [
+    h("span",{key:"a"}, w.why==="night" ? "Night sign-out: " : "No activity for "+Math.round(SESS_IDLE_MS/60000)+" minutes: "),
+    h("b",{key:"b"}, w.dirty && Date.now()>=w.until ? "you have unsaved changes — save them and this tab signs out." : "this tab signs out in "+left(w.until)+"."),
+    h("button",{key:"c","data-testid":"sess-stay",onClick:G.stay,style:{background:"#fff",color:"#1f1f1f",border:0,borderRadius:6,padding:"4px 12px",fontWeight:700,cursor:"pointer"}},"Stay signed in")], "sess-warn");
+  return null;
+}
 // 2026-10-28T09:00:00Z: always run the latest build. version.txt is read on load, every 10 minutes and when the window comes back;
 // a newer build reloads the page (with ?v= so no cache can serve the old one). Unsaved work: a banner waits for the user.
 function appVerOf(t){ const m = String(t||"").match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/); return m ? m[0] : ""; }
-async function appVersionCheck(){
+async function appVersionCheck(returning){
   try{
     if(!/^https?:/.test(location.protocol)) return;
     const r = await fetch("version.txt?t="+Date.now(), { cache:"no-store" }); if(!r.ok) return;
@@ -2311,22 +2472,22 @@ async function appVersionCheck(){
     const sp = new URLSearchParams(location.search);
     if(sp.get("v")===v){ window.dispatchEvent(new CustomEvent("flo-version",{ detail:{ v, stale:true } })); return; }
     if(window.__unsavedGuard && window.__unsavedGuard.dirty){ window.dispatchEvent(new CustomEvent("flo-version",{ detail:{ v, wait:true } })); return; }
+    // 2026-11-07: a new build loads only when the app is opened or someone signs in — never in the middle of work
     appVersionGo(v);
   }catch(e){}
 }
 function appVersionGo(v){ const sp = new URLSearchParams(location.search); sp.set("v", v); location.replace(location.pathname+"?"+sp.toString()+location.hash); }
-if(!window.__appVerTimer){
-  window.__appVerTimer = setInterval(appVersionCheck, 10*60*1000);
-  document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState==="visible") appVersionCheck(); });
-  setTimeout(appVersionCheck, 1500);
-}
+// 2026-11-07: checked once when the app opens and once at sign-in; no checks in between (the old 10-minute check
+// made every open tab reload after each deploy). The top bar's "Reload app" button does a Ctrl+F5.
+if(!window.__appVerTimer){ window.__appVerTimer = 1; setTimeout(appVersionCheck, 1500); }
+function appHardReload(){ const sp = new URLSearchParams(location.search); sp.set("v", String(Date.now())); location.replace(location.pathname+"?"+sp.toString()+location.hash); }
 function AppVersionBanner(){
   const [s,setS] = useState(null);
   useEffect(()=>{ const f = (e)=>setS(e.detail||null); window.addEventListener("flo-version", f); return ()=>window.removeEventListener("flo-version", f); },[]);
   if(!s) return null;
   return h("div",{"data-testid":"ver-banner",style:{position:"fixed",top:0,left:0,right:0,zIndex:3000,background:"#fff4d6",borderBottom:"1px solid #e0b84a",padding:"7px 14px",fontSize:13,display:"flex",gap:12,alignItems:"center",justifyContent:"center"}},
     s.stale ? h("span",null,"A newer build ("+s.v+") is on the server but this computer still gets the old page. Press Ctrl+Shift+R; if that does not help, tell the admin.")
-      : h("span",null,h("b",null,"A newer version of the app is ready. "),"Save your work, then reload."),
+      : h("span",null,h("b",null,"A newer version of the app is ready. "),s.ask ? "Reload when convenient." : "Save your work, then reload."),
     s.stale ? null : h("button",{"data-testid":"ver-reload",onClick:()=>{ if(window.__unsavedGuard && window.__unsavedGuard.dirty && !confirm(window.__unsavedGuard.message||"You have unsaved changes. Reload anyway?")) return; window.__unsavedGuard && (window.__unsavedGuard.dirty=false); appVersionGo(s.v); },style:{background:colors.dark,color:"#fff",border:0,borderRadius:6,padding:"5px 12px",cursor:"pointer",fontSize:12.5}},"Reload now"),
     h("button",{onClick:()=>setS(null),style:{background:"none",border:0,cursor:"pointer",fontSize:15,color:colors.muted}},"×"));
 }
@@ -2548,6 +2709,7 @@ function TopBar({ user, sessionCompanyId, sessionCompany, onChangeCompany, onLog
       onFull ? h("button",{onClick:onFull,title:inFull?"Leave full screen (Esc)":"Full screen: hide the Windows taskbar, the browser bars and this ribbon for more room (Esc to leave)",style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 12px",fontSize:12,cursor:"pointer",borderRadius:6}},inFull?"✕ Exit full screen":"⛶ Full screen") : null,   // 225
       onRef ? h("button",{"data-testid":"ref-btn",onClick:onRef,"aria-pressed":!!refOn,title:refOn?"Close the Reference window":"Reference window: keep a scan, bill or PDF open beside this screen",style:{background:refOn?"#0f6b4f":"none",border:"1px solid "+(refOn?"#0f6b4f":"#3a3f33"),color:"#fff",padding:"6px 12px",fontSize:12,cursor:"pointer",borderRadius:6,fontWeight:refOn?700:400}},"📌 Reference") : null,
       onBars ? h("button",{"data-testid":"bars-btn",onClick:onBars,title:barsHidden?"Show the browser tabs, address bar and bookmarks":"Hide the browser tabs, address bar and bookmarks",style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 12px",fontSize:12,cursor:"pointer",borderRadius:6}}, barsHidden?"▾ Show browser bars":"▴ Hide browser bars") : null,
+      h("button",{"data-testid":"reload-app",onClick:appHardReload,title:"Load the app again from the server, as Ctrl+F5 does — picks up a new version",style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 12px",fontSize:12,cursor:"pointer",borderRadius:6}},"⟳ Reload app"),   // 2026-11-07
       h("button",{onClick:()=>window.open(window.location.href,"_blank"),style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 12px",fontSize:12,cursor:"pointer",borderRadius:6}},"⧉ New tab"),
       h("button",{onClick:()=>calLogoutGate(user, onLogout),style:{background:"none",border:"1px solid #3a3f33",color:"#fff",padding:"6px 12px",fontSize:12,cursor:"pointer",borderRadius:6}},"Sign out")
     )
@@ -4817,11 +4979,11 @@ function QuoteStageTrack({ referenceNumber, customerName, current, changedAt, ch
   },[referenceNumber, loadTrail, onMoved]);
   useEffect(()=>{
     loadTrail(); recheck();
-    const t = setInterval(recheck, 60000);
+    const stopQ = quietInterval(recheck, 5*60000);   // load build: was every minute
     const onFocus = ()=>recheck();
     const onVis = ()=>{ if(document.visibilityState==="visible") recheck(); };
     window.addEventListener("focus", onFocus); document.addEventListener("visibilitychange", onVis);
-    return ()=>{ clearInterval(t); window.removeEventListener("focus", onFocus); document.removeEventListener("visibilitychange", onVis); };
+    return ()=>{ stopQ(); window.removeEventListener("focus", onFocus); document.removeEventListener("visibilitychange", onVis); };
   },[referenceNumber]);
 
   const ladder = stages.filter(r=>r.kind==="open"||r.kind==="won");
@@ -35385,6 +35547,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"7 Nov 2026 (335)", summary:"Built on 2026-11-07T03:00:00Z, on top of 2026-11-06T13:00:00Z. No new SQL (structure_app_sessions_2026-11-06.sql from 13:00 if not yet run). (1) BELL: read when you sign in and when you press it — no checking in between. (2) NEW VERSION: loads only when the app is opened or someone signs in; no more checks every 10 minutes, so a deploy never reloads people in the middle of work. (3) ⟳ RELOAD APP button in the top bar: the same as Ctrl+F5 (loads the app again from the server, picking up a new version). (4) SIGN-OUT after 30 minutes without use (was 60); the 9 pm night sign-out is removed — staff work in many time zones." },
+  { date:"6 Nov 2026 (334)", summary:"Built on 2026-11-06T13:00:00Z, on top of 2026-11-06T09:30:00Z. SQL: structure_app_sessions_2026-11-06.sql (both companies). LOAD BUILD — after the 6 Nov slowdown. (1) TWO SESSIONS PER LOGIN, everyone: a third tab or device shows where the login is already open (browser, since when, last active) with Close the oldest and open here; the closed tab says why (unsaved work gets 2 minutes). A tab not heard from for 5 minutes stops counting; Sign out frees the place at once. (2) QUIET TABS: a hidden tab, or one not used for 10 minutes, stops its background checks and catches up once when the person is back. (3) SLOWER CHECKS: bell and day-report check every 3 min (was 1), quote stage every 5 min (was 1), Order Status flag, stale items and approvals every 5 min (was 2). (4) DEPLOYS: tabs no longer all reload together — a tab in use is asked (Reload when convenient), an idle tab reloads some time in the next 15 minutes, a hidden tab only when someone comes back to it. (5) SIGN-OUT: after 60 minutes without use (2-minute warning bar, Stay signed in) and every night at 9 pm; unsaved work is never thrown away; the sign-in screen says why." },
   { date:"6 Nov 2026 (333)", summary:"Built on 2026-11-06T09:30:00Z, on top of 2026-11-06T07:30:00Z. No SQL. (1) STORES › DESPATCH › DELIVERY CHALLANS (DC) now has a sub-menu: All DCs (the register, with a Gateway column: Option 1 / Option 2 / Option 2 — code asked), Option 1 — DC → QC → bill (new: DCs going the normal way in four groups — Ready for QC, With QC, With Accounts for the bill, Billed — despatch clearance / gate pass — with days waiting and who acts) and Option 2 — bill first, QC later (the old Bill first, QC later screen). A red count beside each option: Option 1 = DCs with QC or Accounts; Option 2 = Bill-first codes asked + QC documents pending. (2) APPROVAL BUILD: every box, prompt, bell and error that asks for a code now says which code — Edit code, Delete code, Deletion code, Direct Price code, Price-check code, PDF unblock code, Stale close code, Task reopen code, GRN no-bill code, Bill-first code, Serial-correction code, Add-document code, Open-entry extension code, Accounts Export / Roll-back code, Board Membership code and the Admin one-time codes (Bulk-upload new-master, Rate-restore, Dropdown-add, Title-Case override, Skip-BOM-line, BOM-exception, Permanent BOM-exemption, Incomplete-PDF, Chase-outcome, Package-type, BOM-fix). The code boxes name who gives the code. An Edit box takes only an Edit code (or a Super Admin's Delete code) — other kinds no longer pass. Generate Delete code: Super Admins only. New: Generate BOM-fix code (on the quote's admin panel), so Correct the BOM Master can be unlocked. Authorization Codes shows plain type names." },
   { date:"6 Nov 2026 (332)", summary:"Built on 2026-11-06T07:30:00Z, on top of 2026-11-06T06:30:00Z. No SQL. DC serials: rows of the same item code and size share their serials — what one row leaves, the next row takes, ticked by itself, row by row in Sl No order (the last row gets what is left). A serial taken from another row is marked ↪ Sl n and is moved to this row's Sl No in the register when the DC is saved (history: moved by DC — same item, same size). Rows touched by hand are not refilled." },
   { date:"6 Nov 2026 (331)", summary:"Built on 2026-11-06T06:30:00Z, on top of 2026-11-06T06:00:00Z. SQL: structure_serial_fix_2026-11-06.sql (both companies) then data_serial_fix_FLOMETRIQ_2026-11-06.sql. SERIALS: the DC picks serials with tick boxes (scrolling box, shift-click for a run, Tick the first N, Clear, ranges shown; fewer / more than Send now asks and keeps the ticks; changing Send now keeps them). A line short of serials asks QC and names the same item's spare serials on another Sl No. QC → Serial Number Register → Register check: serials in two places and Sl Nos with none / too many / too few; any QC person moves serials to the right Sl No or removes them from a contract with a one-time code from the QC Head or a Super Admin (they need no code); each change goes into the serial's history. The register refuses a serial number that is already in it. Data fix: copies loaded twice, 260107's 29013-29018 (belong to 260018), stock (UL) copies of serials sold on contracts, 7 contracts with identical lines re-split in Sl No order." },
@@ -57410,6 +57574,7 @@ function App() {
     try{ return sessionStorage.getItem("flometriq_session_company")||null; } catch(e){ return null; }
   });
   const setUserPersisted = (u)=>{
+    if(!u && window.__sessUser){ sessClose("signed out"); window.__sessUser = null; }   // load build: frees the place at once
     setUser(u);
     try{ if(u) sessionStorage.setItem("flometriq_user",JSON.stringify(u)); else sessionStorage.removeItem("flometriq_user"); }catch(e){}
   };
@@ -57633,10 +57798,10 @@ function App() {
   },[user?.username, overdueGateEmployee, isFseOrTelecaller]);
   useEffect(()=>{
     loadMyDay();
-    const t = setInterval(loadMyDay, 5*60*1000);
+    const stopQ = quietInterval(loadMyDay, 5*60*1000);   // load build: paused in a quiet tab
     const f = ()=>loadMyDay();
     window.addEventListener("myday:refresh", f);
-    return ()=>{ clearInterval(t); window.removeEventListener("myday:refresh", f); };
+    return ()=>{ stopQ(); window.removeEventListener("myday:refresh", f); };
   },[loadMyDay]);
   const openMyDay = ()=>{ setMyDayBack(false); setMyDayForced(true); setShowMyDay(true); loadMyDay(); };
   useEffect(()=>{ if(tab!=="task_board") setMyDayTaskId(null); if(tab!=="proc_gantt") setPgNav(null); },[tab]);
@@ -57754,7 +57919,11 @@ function App() {
     return ()=>window.removeEventListener("beforeunload",handler);
   },[]);
 
-  if(!user) return h(LoginScreen,{onLogin:setUserPersisted});
+  // 2026-11-06T13:00 (load build): two sessions per login, idle / night sign-out
+  const appSignOut = ()=>{ setUserPersisted(null); setSessionCompanyIdPersisted(null); setMasterData({models:[],gradesBySpec:new Map(),rateBySpecGrade:new Map(),allSpecs:[],loadingMaster:true}); };
+  const sessG = useSessionGate(user, appSignOut);
+  if(!user) return h(LoginScreen,{onLogin:(u)=>{ setUserPersisted(u); appVersionCheck(); }});   // 2026-11-07: a newer build loads at sign-in
+  if(["checking","full","closed"].includes(sessG.S.st)) return h(SessionGateScreen,{user,G:sessG,onSignOut:appSignOut});
   if(user.role==="super_admin" && !sessionCompanyId) return h(CompanySessionPicker,{user,onPicked:setSessionCompanyIdPersisted});
 
   const _mLv = (user && user.role!=="super_admin") ? modTabLevel(tab) : "";   // 2026-10-30T08:00:00Z: Rights Grid wins over the department rule
@@ -57765,6 +57934,7 @@ function App() {
   if(tab==="purchase_owners" && accTabMode==="none") accTabMode = "view";   // 2026-11-03T07:00:00Z: the screen checks its own access
   { const _mk = modOfTab(tab); const _md = MOD_DEFS.find(m=>m.key===_mk); window.__modCur = { tab, module:_mk, level:_mLv, codeFree:!!(_md && _md.codeFree) }; window.__roGuard = _mLv==="view" || _mLv==="link"; }   // 2026-10-28T08:00:00Z
   return h("div",{style:{minHeight:"100vh"}},
+    h(SessionBars,{G:sessG}),   // load build
     h(ReferencePanel,{user,open:refOpen,onClose:()=>setRefOpen(false)}),   // 2026-10-30T15:00:00Z
     user.role==="super_admin" && !monthlyArchiveDone && h(MonthlyArchivePrompt,{user,onDone:()=>setMonthlyArchiveDone(true)}),
     overdueGateEmployee!==undefined && !isFseOrTelecaller && showOverduePrompt && h(OverdueCallsPrompt,{user,onDone:dismissOverduePrompt,onEmpty:()=>setOverduePromptEmpty(true)}),
@@ -58523,8 +58693,8 @@ function StaleWatch({ user }){
     (async()=>{ const k = "staleSweep|"+user.username; let first = true; try{ if(sessionStorage.getItem(k)) first = false; else sessionStorage.setItem(k,"1"); }catch(e){}
       if(first) await stepSweep(user.username);
       if(!dead) oaSweep(); /* 2026-10-30T12:00:00Z */ if(!dead) socSweep(); /* 2026-10-31T10:00:00Z */ if(!dead) diSweep(user.username); /* 247: direct invoice approvals — reminders and overdue bells */ if(!dead) pettySweep(user.username); /* 248 */ if(!dead) accSalesSweep(user.username); /* 249 */ if(!dead) await stepLoadMine(user, true); if(!dead) billSweepOnce(user); if(first && !dead) purDocsReminderSweep(); })();   // 217   // 212: advance-PI cards, send steps
-    const t = setInterval(()=>{ stepLoadMine(user, true); }, 120000);
-    return ()=>{ dead = true; clearInterval(t); }; },[user && user.username]);
+    const stopQ = quietInterval(()=>{ stepLoadMine(user, true); }, 5*60000);   // load build: was every 2 min
+    return ()=>{ dead = true; stopQ(); }; },[user && user.username]);
   return null;
 }
 // The log-in dialog (once per log-in): your open steps (reminder for 3 days, then stale), and for managers / admins
@@ -59295,7 +59465,7 @@ function apprRefresh(){ APPR_CACHE.at = 0; }
 function ApprovalsLists({ who, me, user, tasks, approversFor, regretProposed, onOpenTask, onGoToTab }){
   const [D,setD] = useState(null); const [poOpen,setPoOpen] = useState(null); const [tick,setTick] = useState(0);
   useEffect(()=>{ let dead = false; apprLoad(tick>0).then(d=>{ if(!dead) setD({ items:d.items.slice(), notSent:d.notSent.slice(), toSend:(d.toSend||[]).slice() }); }); return ()=>{ dead = true; }; },[tick, who]);
-  useEffect(()=>{ const t = setInterval(()=>setTick(x=>x+1), 120000); return ()=>clearInterval(t); },[]);
+  useEffect(()=>quietInterval(()=>setTick(x=>x+1), 5*60000),[]);   // load build: was every 2 min
   const isSuperBoard = user && user.role==="super_admin" && who===me;
   const taskItems = (name)=> (tasks||[]).filter(t=>!t.parent_id && t.assignee!==name && (t.status==="approval" || (regretProposed && regretProposed(t))) && (approversFor(t)||[]).includes(name))
     .map(t=>{ const rg = regretProposed && regretProposed(t); return { key:"task"+t.id, type:rg?"regret":"task", ref:t.ref||t.title||"Card", what:t.title||"", by:t.assignee||"", since:t.sent_at||t.moved_at, days:apprDays(t.sent_at||t.moved_at), open:{ task:t.id } }; });
@@ -71000,8 +71170,8 @@ function osWaitAge(n){ return osDays(n.created_at); }
 function OsFlag({ user }){
   const [W,setW] = useState({ me:"", items:[] });
   const load = useCallback(async()=>{ setW(await osMyWaiting(user)); },[user && user.username]);
-  useEffect(()=>{ load(); const t = setInterval(load, 120000); const f = ()=>load(); window.addEventListener("flo-os-changed", f); window.addEventListener("flo-notif-changed", f);
-    return ()=>{ clearInterval(t); window.removeEventListener("flo-os-changed", f); window.removeEventListener("flo-notif-changed", f); }; },[load]);
+  useEffect(()=>{ load(); const stopQ = quietInterval(load, 5*60000); const f = ()=>load(); window.addEventListener("flo-os-changed", f); window.addEventListener("flo-notif-changed", f);   // load build: was every 2 min
+    return ()=>{ stopQ(); window.removeEventListener("flo-os-changed", f); window.removeEventListener("flo-notif-changed", f); }; },[load]);
   const n = W.items.length; if(!n) return null;
   const old = W.items.some(x=>osWaitAge(x)>=1);
   return h("button",{"data-testid":"os-flag",onClick:()=>{ window.__osMine = true; appOpenTab("order_board"); },title:"Lots on the Order Status board waiting on you — click to open the board (Mine)",
@@ -74208,7 +74378,7 @@ function CalTopButton({ user, company }){
     const mine = await calLoad(today, nx, [ctx.me]);
     const dept = ctx.headDepts.length ? await calLoad(today, nx, ctx.visible) : null;
     setSt({ ctx, today, nx, mine:mine.items, dept: dept ? dept.items : null }); }catch(e){} };
-  useEffect(()=>{ load(); const t = setInterval(load, 10*60000); const f = ()=>load(); window.addEventListener("flo-cal-changed", f); return ()=>{ clearInterval(t); window.removeEventListener("flo-cal-changed", f); }; },[user?.id]);
+  useEffect(()=>{ load(); const stopQ = quietInterval(load, 10*60000); const f = ()=>load(); window.addEventListener("flo-cal-changed", f); return ()=>{ stopQ(); window.removeEventListener("flo-cal-changed", f); }; },[user?.id]);
   useEffect(()=>{ const f = (e)=> setRep(e.detail||null); window.addEventListener("flo-day-report", f); return ()=> window.removeEventListener("flo-day-report", f); },[]);
   useEffect(()=>{ if(!open) return; const f = (e)=>{ if(ref.current && !ref.current.contains(e.target)) setOpen(false); }; document.addEventListener("mousedown", f); return ()=> document.removeEventListener("mousedown", f); },[open]);
   // the gateway
@@ -74220,8 +74390,8 @@ function CalTopButton({ user, company }){
           if(count>0 && !dead){ calOpenDayReport(user, prev, true); return; } } }
       if(calNowHM()>=CAL_DR_TIME){ const k = "dayrep|"+user.username+"|"+today; let shown = false; try{ shown = !!localStorage.getItem(k); }catch(e){}
         if(!shown){ const s = await calReportSent(ctx.me, today); if(!s && !dead){ try{ localStorage.setItem(k,"1"); }catch(e){} calOpenDayReport(user, today, false); } } } }catch(e){} };
-    const t0 = setTimeout(()=>check(true), 20000);   /* after the login pop-ups */ const t = setInterval(()=>check(false), 60000);
-    return ()=>{ dead = true; clearTimeout(t0); clearInterval(t); }; },[user?.id]);
+    const t0 = setTimeout(()=>check(true), 20000);   /* after the login pop-ups */ const stopQ = quietInterval(()=>check(false), 3*60000);   // load build: was every minute
+    return ()=>{ dead = true; clearTimeout(t0); stopQ(); }; },[user?.id]);
   const its = !st ? [] : (scope==="dept" && st.dept ? st.dept : st.mine).filter(it=>it.kind!=="done");
   const todayN = !st ? 0 : st.mine.filter(it=>it.date===st.today && it.kind!=="done" && it.kind!=="holiday" && it.kind!=="moved").length;
   const line = (it)=> h("div",{key:it.key,onClick:()=>{ setOpen(false); if(it.task) appOpenCard(it.task.id); else appOpenTab("calendar"); },style:{padding:"5px 12px",borderBottom:"1px solid #f1efe8",display:"flex",gap:8,fontSize:12.5,cursor:"pointer",color:colors.text}},
@@ -76019,7 +76189,7 @@ async function diCardsClose(di, by, what){
 let DI_SWEEP_AT = 0;
 async function diSweep(by){
   if(Date.now()-DI_SWEEP_AT < 5*60000) return; DI_SWEEP_AT = Date.now();
-  try{ if(!window.__diTimer) window.__diTimer = setInterval(()=>diSweep("App"), 30*60000); }catch(e){}
+  try{ if(!window.__diTimer) window.__diTimer = quietInterval(()=>diSweep("App"), 30*60000); }catch(e){}
   try{
     const { data, error } = await sb.from("direct_invoice_tbl").select("id,di_no,contract_number,customer_name,status,sent_at,sent_by,reminded_at,last_alert_at,superadmin_told_at,created_by").eq("status","Waiting");
     if(error || !(data||[]).length) return;
