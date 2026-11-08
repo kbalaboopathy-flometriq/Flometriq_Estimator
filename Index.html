@@ -55,7 +55,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-07T06:30:00Z";
+  var APP_BUILD_VERSION = "2026-11-08T04:47:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -3050,7 +3050,7 @@ const CODE_FREE_TYPES = ["stale_close","task_reopen","pdf_unblock","acc_export",
 // 2026-11-06T09:30 (approval build): every code is named by its kind — never just "code"
 const CODE_NAMES = { edit:"Edit code", delete:"Delete code", direct_price:"Direct Price code", price_check:"Price-check code", pdf_unblock:"PDF unblock code",
   stale_close:"Stale close code", task_reopen:"Task reopen code", acc_export:"Accounts Export code", acc_rollback:"Accounts Roll-back code", rollback:"Accounts Roll-back code",
-  grn_no_bill:"GRN no-bill code", qc_skip:"Bill-first code", qcsr_fix:"Serial-correction code", doc_add:"Add-document code", open_entry_ext:"Open-entry extension code", deletion:"Deletion code" };
+  grn_no_bill:"GRN no-bill code", qc_skip:"Bill-first code", qcsr_fix:"Serial-correction code", doc_add:"Add-document code", open_entry_ext:"Open-entry extension code", deletion:"Deletion code", irn_cancel:"E-invoice cancel code", ewb_cancel:"E-way bill cancel code" };
 const codeName = (t)=> CODE_NAMES[t] || (t ? String(t).replace(/_/g," ")+" code" : "code");
 const aCode = (t)=>{ const n = codeName(t); return (/^[AEIOU]/i.test(n) ? "an " : "a ")+n; };
 // the one-time PINs (Admin generates one per action)
@@ -5883,6 +5883,7 @@ function MasterEditor({ tableKey, user }) {
       payload[c]=v;
     });
     if(tableKey==="material_rates"){ payload.created_at = new Date().toISOString(); payload.created_by = user?.username||"unknown"; }
+    if(tableKey==="doc_category_tbl"){ const { data:allC } = await sb.from("doc_category_tbl").select("id,value,number_prefix"); const e2 = docCatPrefixFix(payload, allC||[], editingId); if(e2){ alert(e2); return; } }   // 2026-11-08: every category keeps its own prefix
     const { error:err } = await sb.from(tableKey).update(payload).eq("id",editingId);
     if(err) { alert("Save failed: "+err.message); return; }
     setEditingId(null); setEditDraft({}); load();
@@ -5989,6 +5990,7 @@ function MasterEditor({ tableKey, user }) {
       payload.created_by = user?.username||"unknown";
       payload.spec_grade = ((addDraft.material_spec||"")+" "+(addDraft.material_grade||"")).trim(); // locked/auto — never trust a typed value
     }
+    if(tableKey==="doc_category_tbl"){ const { data:allC } = await sb.from("doc_category_tbl").select("id,value,number_prefix"); const e2 = docCatPrefixFix(payload, allC||[], null); if(e2){ alert(e2); return; } }   // 2026-11-08
     const { data, error:err } = await sb.from(tableKey).insert(payload).select().single();
     if(err) { alert("Add failed: "+err.message); return; }
     if(data && data.id!==undefined) setFreshIds(prev=>new Set(prev).add(data.id));
@@ -6178,6 +6180,12 @@ function MasterEditor({ tableKey, user }) {
   const cancelGenericEditAll = ()=>{ setGenericEditAllMode(false); setGenericEditAllDrafts({}); };
   const setGenericAllField = (id,field,value)=> setGenericEditAllDrafts(d=>({...d,[id]:{...(d[id]||{}),[field]:value}}));
   const saveGenericAllEdits = async()=>{
+    const pfxFill = {};
+    if(tableKey==="doc_category_tbl"){   // 2026-11-08: check every prefix before anything is saved
+      const { data:allC } = await sb.from("doc_category_tbl").select("id,value,number_prefix");
+      const all = (allC||[]).map(x=>({ ...x, ...(genericEditAllDrafts[x.id] ? { value:genericEditAllDrafts[x.id].value, number_prefix:genericEditAllDrafts[x.id].number_prefix } : {}) }));
+      for(const x of all){ const pl = { value:x.value, number_prefix:x.number_prefix }; const e2 = docCatPrefixFix(pl, all, x.id); if(e2){ alert(e2+"\n\nNothing was saved."); return; } x.number_prefix = pl.number_prefix; pfxFill[x.id] = pl.number_prefix; }
+    }
     if(!confirm("Save changes to all "+sortedFilteredRows.length+" line(s)?")) return;
     setGenericSavingAll(true);
     try{
@@ -6193,6 +6201,7 @@ function MasterEditor({ tableKey, user }) {
           else v = v===undefined ? "" : v;
           payload[c]=v;
         });
+        if(pfxFill[r.id]) payload.number_prefix = pfxFill[r.id];
         await sb.from(tableKey).update(payload).eq("id",r.id);
         updates.push({id:r.id,...payload});
       }
@@ -13013,7 +13022,120 @@ function docInfoOnly(row, cats, req){ const a = docInfoOwn(row); if(a!==null) re
 function docHoldOf(row, cats){ if(docInfoOnly(row, cats)) return ""; const o = docHoldSet(row); if(o) return o===DOC_HOLD_NONE ? "" : o; return (docCategoryRow(cats, row && row.category)||{}).hold_level || ""; }
 function docNumberPrefix(cats, name){
   const c = docCategoryRow(cats, name);
-  return (c && String(c.number_prefix||"").trim()) || DOC_PREFIX_DEFAULT[name] || "DOC";
+  return (c && String(c.number_prefix||"").trim().toUpperCase()) || DOC_PREFIX_DEFAULT[name] || docAutoPrefixes(cats)[String(name||"").trim().toLowerCase()] || "DOC";
+}
+// ---- 2026-11-08 Documents build ----
+// Prefix for every category: 2 letters from the name's initials, 3 where 2 clash. Set prefixes (and the old defaults) count as taken.
+const DOC_PFX_STOP = new Set(["of","and","the","for","on"]);
+function docPfxWords(n){ return String(n||"").replace(/\(.*?\)/g," ").replace(/[.\/\-,&]/g," ").split(/\s+/).map(w=>w.replace(/[^A-Za-z0-9]/g,"")).filter(w=>w && !DOC_PFX_STOP.has(w.toLowerCase())); }
+function docPfxPropose(name, taken){
+  const w = docPfxWords(name); if(!w.length) return "";
+  const t2 = w.length>1 ? w[0][0]+w[1][0] : w[0].slice(0,2);
+  const t3 = w.length>2 ? w[0][0]+w[1][0]+w[2][0] : w.length>1 ? w[0].slice(0,2)+w[1][0] : w[0].slice(0,3);
+  const tries = [t2, t3]; if(w.length>1) tries.push(w[0][0]+w[1][0]+w[w.length-1][0], w[0].slice(0,2)+w[w.length-1][0], w[0][0]+w[1].slice(0,2));
+  for(let i=1;i<10;i++) tries.push(t3+i);
+  for(const t of tries){ const u = String(t).toUpperCase(); if(u && !taken.has(u)) return u; }
+  return "";
+}
+let DOC_PFX_MEMO = { cats:null, map:{} };
+function docAutoPrefixes(cats){
+  if(cats && DOC_PFX_MEMO.cats===cats) return DOC_PFX_MEMO.map;
+  const taken = new Set(Object.values(DOC_PREFIX_DEFAULT)); const map = {};
+  (cats||[]).forEach(c=>{ const p = String(c.number_prefix||"").trim().toUpperCase(); if(p) taken.add(p); });
+  (cats||[]).filter(c=>!String(c.number_prefix||"").trim() && !DOC_PREFIX_DEFAULT[c.value]).map(c=>String(c.value||"").trim()).filter(Boolean)
+    .sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase())).forEach(n=>{ if(map[n.toLowerCase()]) return; const p = docPfxPropose(n, taken); if(p){ taken.add(p); map[n.toLowerCase()] = p; } });
+  DOC_PFX_MEMO = { cats, map }; return map;
+}
+// Masters › Document Categories: every name keeps a prefix, used once. Blank → proposed by the rule above.
+function docCatPrefixFix(payload, allRows, selfId){
+  const name = String(payload.value||"").trim(); if(!name) return "";
+  let p = String(payload.number_prefix||"").trim().toUpperCase().replace(/\s+/g,"");
+  const others = (allRows||[]).filter(r=>String(r.id)!==String(selfId));
+  const taken = new Set(others.map(r=>String(r.number_prefix||"").trim().toUpperCase()).filter(Boolean));
+  if(!p){ p = docPfxPropose(name, taken); if(!p) return "Give \u201c"+name+"\u201d a number prefix."; }
+  else if(!/^[A-Z0-9]{1,10}$/.test(p)) return "The number prefix may hold only letters and digits (up to 10), e.g. HYR.";
+  else if(taken.has(p)){ const who = others.find(r=>String(r.number_prefix||"").trim().toUpperCase()===p); return "Prefix "+p+" is already used by \u201c"+(who?who.value:"another category")+"\u201d. Every category needs its own prefix (try "+docPfxPropose(name, taken)+")."; }
+  payload.number_prefix = p; return "";
+}
+// New document numbers: PREFIX-your number-DDMMYY-HHMMSS (India time); the Rev shows after it (-Rev0). Older numbers stay as they are.
+function docStamp(d){ const x = new Date((d||new Date()).getTime()+330*60000); const z = n=>String(n).padStart(2,"0"); return z(x.getUTCDate())+z(x.getUTCMonth()+1)+String(x.getUTCFullYear()).slice(2)+"-"+z(x.getUTCHours())+z(x.getUTCMinutes())+z(x.getUTCSeconds()); }
+function docTypedClean(t){ return String(t||"").trim().replace(/\s+/g,"").replace(/^-+|-+$/g,""); }
+function docMakeNumber(prefix, typed, d){ return String(prefix||"DOC").toUpperCase()+"-"+(docTypedClean(typed)||"GEN")+"-"+docStamp(d); }
+function docNewFmt(no){ return /-\d{6}-\d{6}$/.test(String(no||"")); }
+function docNoRev(no, rev){ return docNewFmt(no) ? no+"-Rev"+(Number(rev)||0) : String(no||""); }
+// The client's own document number comes first wherever a document is shown; ours follows in brackets.
+function docNoShow(no, cno, rev){ const ours = rev===undefined ? String(no||"") : docNoRev(no, rev); const c = String(cno||"").trim(); return c ? c+(ours?" ("+ours+")":"") : ours; }
+async function docNumberFree(no){ const { data } = await sb.from("universal_documents_tbl").select("id").ilike("doc_number",String(no).replace(/[%_]/g,"\\$&")).limit(1); return !(data&&data.length); }
+async function docMakeFreeNumber(prefix, typed){ let no = docMakeNumber(prefix, typed); for(let i=0;i<3 && !(await docNumberFree(no)); i++){ await new Promise(r=>setTimeout(r,1100)); no = docMakeNumber(prefix, typed); } return no; }
+let DOC_CNO_OK = null;
+const DOC_CNO_SQL = "structure_doc_client_no_2026-11-08.sql";
+async function docCnoCheck(){ if(DOC_CNO_OK!==null) return DOC_CNO_OK; try{ const r = await sb.from("universal_documents_tbl").select("client_doc_no").limit(1); DOC_CNO_OK = !r.error; }catch(e){ DOC_CNO_OK = false; } return DOC_CNO_OK; }
+// Names made on their own screens never go in through + Missing document.
+const DOC_ADD_SKIP = /^(purchase order|customer po|po|letter of intent|loi|order acceptance|oa|quote|invoice|tax invoice|proforma invoice|delivery challan|draft wo|g\.?\s*s\.?\s*t\.?\s*details|gst details|customer correspondence)$/i;
+// One list of document names everywhere: the Sale Order checklist's (purchase-only names left out), one entry per name.
+function docOrderCatNames(cats){ const all = cats||[]; const hasPo = all.some(x=>"po_use" in x); const seen = new Set(); const out = [];
+  all.filter(x=>String(x.value||"").trim() && (!hasPo || x.so_use!==false)).forEach(x=>{ const n = String(x.value).trim(); const k = n.toLowerCase(); if(!seen.has(k)){ seen.add(k); out.push(n); } });
+  return out.sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase())); }
+// What a contract / quote already has, per category: its documents, its open requirements, and the Sl Nos they cover (no Sl No = the whole order).
+function docEntityHave(docs, reqs, ref){
+  const m = {}; const R = String(ref||""); const k = s=>String(s||"").trim().toLowerCase();
+  const put = (cat, row, kind)=>{ const key = k(cat); if(!key) return; const e = m[key] = m[key] || { name:String(cat).trim(), docs:[], reqs:[], sls:new Set(), whole:false, by:{} };
+    e[kind].push(row); const sl = row.item_sl_no; if(sl==null || sl==="") e.whole = true; else { e.sls.add(String(sl)); e.by[String(sl)] = row; } };
+  const ids = {};
+  (docs||[]).filter(d=>String(d.entity_id||"")===R && !d.is_archived).forEach(d=>{ ids[String(d.id)] = d; put(d.category, d, "docs"); });
+  (reqs||[]).filter(r=>String(r.entity_id||"")===R).forEach(r=>{
+    const d = r.fulfilled_document_id ? ids[String(r.fulfilled_document_id)] : null;
+    if(d){ const e = m[k(r.category)]; if(e && r.item_sl_no!=null && r.item_sl_no!==""){ e.sls.add(String(r.item_sl_no)); e.by[String(r.item_sl_no)] = d; } return; }
+    if(r.fulfilled_document_id) return;
+    put(r.category, r, "reqs"); });
+  return m;
+}
+function docHaveFull(e, perSl, sls){ if(!e) return false; if(!perSl || !(sls||[]).length || e.whole) return true; return sls.every(s=>e.sls.has(String(s.item_sl_no))); }
+function docItNo(it, rev){ return it && it.no ? docNoShow(it.no, it.cno, rev ? (it.last ? it.last.rev_number : 0) : undefined) : ""; }   // board items: client's number first
+function docRowLabel(row){ return row ? (row.doc_number ? docNoShow(row.doc_number, row.client_doc_no) : "requested, not sent") : ""; }
+// The category box of + Missing document: type to narrow; names already there are greyed with where they stand.
+function DocCatPick({ names, have, perSl, sls, value, onPick, onTaken, stageOf, testid }){
+  const [q,setQ] = useState(value||""); const [open,setOpen] = useState(false);
+  useEffect(()=>{ setQ(value||""); },[value]);
+  const f = String(q||"").trim().toLowerCase();
+  const shown = (names||[]).filter(n=>!f || n.toLowerCase().includes(f) || (value && n===value));
+  const row = (n)=>{
+    const e = (have||{})[n.toLowerCase()]; const ps = perSl(n); const full = docHaveFull(e, ps, sls);
+    const part = e && ps && !full ? Array.from(e.sls).sort((a,b)=>Number(a)-Number(b)) : [];
+    return h("div",{key:n,"data-testid":(testid||"add-cat")+"-opt","data-name":n,"data-taken":full?"1":"0",onMouseDown:ev=>{ ev.preventDefault(); setOpen(false); if(full) onTaken(n); else { setQ(n); onPick(n); } },
+      style:{display:"flex",alignItems:"center",gap:6,padding:"5px 9px",fontSize:12,cursor:full?"help":"pointer",borderBottom:"1px solid #f1efe7",background:full?"#f3f3f1":value===n?"#e4f3ed":"#fff",color:full?"#9a9a94":colors.text}},
+      h("span",{style:{flex:1,minWidth:0}},n),
+      ps ? h("span",{style:{fontSize:9.5,border:"1px solid "+colors.border,borderRadius:8,padding:"0 5px",color:colors.muted,whiteSpace:"nowrap"}},"per Sl No") : null,
+      part.length ? h("span",{style:{fontSize:10.5,color:colors.mutedLight,whiteSpace:"nowrap"}},"Sl "+part.join(", ")+" covered") : null,
+      full ? h("span",{style:{fontSize:10,borderRadius:8,padding:"0 7px",whiteSpace:"nowrap",...((stageOf&&stageOf(e))||{}).style}},((stageOf&&stageOf(e))||{}).text||"already there") : null,
+      full ? h("span",{style:{fontSize:10,color:"#9a9a94",whiteSpace:"nowrap"}},ps&&e&&!e.whole?"all Sl Nos covered":"already there") : null);
+  };
+  return h("div",{style:{position:"relative"}},
+    h("input",{"data-testid":(testid||"add-cat")+"-input",value:q,placeholder:"Type to search, e.g. hyd…",onFocus:()=>setOpen(true),onBlur:()=>setTimeout(()=>{ setOpen(false); setQ(value||""); },150),
+      onChange:e=>{ setQ(e.target.value); setOpen(true); if(value && e.target.value!==value) onPick(""); },style:{...inputStyle,padding:"6px 8px",fontSize:12}}),
+    open ? h("div",{style:{position:"absolute",left:0,right:0,top:"100%",zIndex:30,background:"#fff",border:"1px solid "+colors.border,borderRadius:6,maxHeight:270,overflowY:"auto",boxShadow:"0 6px 18px rgba(0,0,0,.12)"}},
+      shown.length ? shown.map(row) : h("div",{style:{padding:"7px 9px",fontSize:12,color:colors.muted}},"No name matches \u201c"+q+"\u201d. Only names in Masters \u203a Document Categories are accepted."),
+      h("div",{style:{padding:"5px 9px",fontSize:10.5,color:colors.muted,background:"#faf9f4",borderTop:"1px dashed "+colors.border}},"Grey = already on it (pick it to see how to add another). Purchase Order, LOI, Order Acceptance, Quote, Invoices, Delivery Challan, Draft WO and GST details come in through their own screens.")) : null);
+}
+// The Sl Nos a document kept per Sl No covers: tick one or several; Sl Nos already covered show the document that covers them.
+function DocSlTicks({ sls, have, value, onChange, testid }){
+  const on = new Set((value||[]).map(String));
+  return h("div",{style:{border:"1px solid "+colors.border,borderRadius:6,padding:"4px 9px",background:"#faf9f4",maxHeight:180,overflowY:"auto"}},
+    (sls||[]).map(s=>{ const k = String(s.item_sl_no); const by = have && have.by ? have.by[k] : null; const cov = !!by || !!(have && have.whole);
+      return h("label",{key:k,style:{display:"flex",gap:7,alignItems:"center",padding:"3px 0",fontSize:12,color:cov&&!on.has(k)?"#9a9a94":colors.text,borderBottom:"1px solid #efeee8"}},
+        h("input",{type:"checkbox","data-testid":(testid||"add-sl")+"-"+k,checked:on.has(k),onChange:e=>{ const n = new Set(on); e.target.checked ? n.add(k) : n.delete(k); onChange(Array.from(n).sort((a,b)=>Number(a)-Number(b))); },style:{accentColor:"#1f5c40"}}),
+        h("span",{style:{flex:1,minWidth:0}},"Sl "+k+(s.item?" \u2014 "+s.item:"")),
+        cov ? h("span",{style:{fontSize:10.5,color:"#9a9a94",whiteSpace:"nowrap"}},"on "+(by ? docRowLabel(by) : "a whole-order document")) : null); }),
+    !(sls||[]).length ? h("div",{style:{fontSize:11.5,color:colors.muted,padding:"3px 0"}},"No Sl Nos on this order yet \u2014 the document covers the whole order.") : null);
+}
+// The document number box: the prefix comes from the category, you type your part, the date and time are added when it is saved.
+function DocNumberBox({ prefix, typed, onTyped, testid }){
+  return h("div",null,
+    h("div",{style:{display:"flex",alignItems:"center",gap:4,flexWrap:"wrap"}},
+      h("span",{style:{fontFamily:"monospace",fontSize:12,fontWeight:700,background:"#eef1f4",borderRadius:4,padding:"5px 7px"}},(prefix||"—")+"-"),
+      h("input",{"data-testid":testid||"doc-typed",value:typed||"",onChange:e=>onTyped(e.target.value),placeholder:"your number",style:{...inputStyle,padding:"5px 8px",fontSize:12,width:150,fontFamily:"monospace"}}),
+      h("span",{style:{fontFamily:"monospace",fontSize:12,color:colors.muted}},"-DDMMYY-HHMMSS-Rev0")),
+    h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:2}},"The date and time are added when you save; only the Rev changes after that. e.g. "+docMakeNumber(prefix||"DOC", typed)+"-Rev0"));
 }
 // Code 1 / Code 2 / cleared statuses: these hand over to production cleanly.
 function docIsCleared(status){
@@ -13176,7 +13298,7 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
   // ---- the tabs ----
   const openReqs = reqs.filter(r=>!r.fulfilled_document_id);
   const tabItems = [
-    ...docs.map(d=>({ kind:"doc", key:"d"+d.id, category:d.category||"Other Documents", sl:d.item_sl_no, label:d.doc_number, latest:(d.revisions||[])[0]||null, doc:d,
+    ...docs.map(d=>({ kind:"doc", key:"d"+d.id, category:d.category||"Other Documents", sl:d.item_sl_no, label:docNoShow(d.doc_number, d.client_doc_no), latest:(d.revisions||[])[0]||null, doc:d,
       mandatory: reqs.some(r=>r.fulfilled_document_id===d.id && r.is_mandatory) })),
     ...openReqs.map(r=>({ kind:"req", key:"r"+r.id, category:r.category||"Other Documents", sl:r.item_sl_no, label:(r.item_sl_no!=null?"Sl "+r.item_sl_no:"Not sent"), req:r, mandatory:!!r.is_mandatory }))
   ];
@@ -13217,30 +13339,56 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
   };
 
   // ---- + tab: add a requirement, or a requirement with Rev 0 ----
-  const blankAdd = { cat:"", sl:"", how:"rev0", num:"", title:"", dir:"", status:"", link:"", file:null, mand:false };
+  const blankAdd = { cat:"", sl:"", sls:[], how:"rev0", num:"", cno:"", title:"", dir:"", status:"", link:"", file:null, mand:false, taken:"", another:false };
+  const boxHave = docEntityHave(docs, reqs, entityRef);   // 2026-11-08: what this order / quote already has
+  const [cnoOk,setCnoOk] = useState(DOC_CNO_OK);
+  useEffect(()=>{ docCnoCheck().then(v=>setCnoOk(v)); },[]);
   const [add,setAdd] = useState(blankAdd);
   const [newCatOpen,setNewCatOpen] = useState(false);
   const pickAddCategory = async(cat)=>{
     if(cat==="__new__"){ setNewCatOpen(true); return; }
-    const num = cat ? await suggestNumber(cat) : "";
-    setAdd(a=>({ ...a, cat, sl: perSl(cat) ? (a.how==="req" ? "__all__" : (slNos[0]?String(slNos[0].item_sl_no):"")) : "", num }));
-    checkNumber(num);
+    const e = boxHave[String(cat||"").toLowerCase()];
+    if(cat && docHaveFull(e, perSl(cat), slNos)){ setAdd(a=>({ ...a, cat:"", taken:cat, another:false })); return; }   // 2026-11-08: already there — say how to add another
+    setAdd(a=>({ ...a, cat, taken:"", another:false, sl: perSl(cat) ? (a.how==="req" ? "__all__" : (slNos[0]?String(slNos[0].item_sl_no):"")) : "",
+      sls: perSl(cat) ? slNos.map(s=>String(s.item_sl_no)).filter(k=>!(e && (e.whole || e.sls.has(k)))) : [], num: a.num || entityRef }));
   };
   const saveAdd = async()=>{
     if(!add.cat){ alert("Pick a category."); return; }
     const whole = add.sl==="" ; const all = add.sl==="__all__";
     if(add.how==="rev0"){
       if(all){ alert("Rev 0 is one document — pick the Sl No it belongs to."); return; }
-      if(perSl(add.cat) && whole){ alert(add.cat+" is kept per Sl No. Pick the Sl No."); return; }
-      if(!String(add.num).trim()){ alert("Give the document a number."); return; }
-      if(numCheck.value===String(add.num).trim() && numCheck.state==="taken"){ alert(String(add.num).trim()+" is already used. Pick another number."); return; }
+      if(perSl(add.cat) && slNos.length && !(add.sls||[]).length){ alert("Tick the Sl No(s) this "+add.cat+" covers."); return; }
+      if(!docTypedClean(add.num)){ alert("Type your part of the document number (e.g. the order number)."); return; }
       if(add.dir!=="Out" && add.dir!=="In"){ setDirMissing(true); alert("Tick Out (we are sending) or In (we are receiving)."); return; }
       if(!add.status){ alert("Pick a status."); return; }
       if(!confirmDocumentLink(add.link, "Document "+String(add.num).trim())) return;
     }
+    { const e = boxHave[String(add.cat).toLowerCase()]; const ps = perSl(add.cat) && slNos.length;   // 2026-11-08: one of each, unless added as another on purpose
+      if(!add.another && e && !ps && add.how==="rev0"){ alert(add.cat+" is already on "+entityRef+". Pick it again in the list to see how to add another one."); return; }
+      if(!add.another && e && ps && add.how==="rev0"){ const clash = (add.sls||[]).filter(k=>e.whole || e.sls.has(String(k))); if(clash.length){ alert("Sl "+clash.join(", ")+" already "+(clash.length>1?"have":"has")+" a "+add.cat+". Untick "+(clash.length>1?"them":"it")+", or pick the name again and choose Add another."); return; } }
+      if(add.another){ const t = String(add.title||"").trim().toLowerCase(); if(!t || t===String(add.cat).trim().toLowerCase() || (e && e.docs.some(d=>String(d.doc_name||"").trim().toLowerCase()===t))){ alert("Give this "+add.cat+" a title that says what makes it different from the one already there (e.g. "+add.cat+" \u2013 150NB CF8M)."); return; } } }
     const doIt = async()=>{
       setBusy(true);
       try{
+        if(add.how==="rev0" && perSl(add.cat) && slNos.length){   // 2026-11-08: one document covering one or several Sl Nos
+          const sls = (add.sls||[]).map(Number); const cno = String(add.cno||"").trim();
+          const path = await uploadDocFile(entityRef, add.file);
+          const docNumber = await docMakeFreeNumber(docNumberPrefix(cats, add.cat), add.num);
+          const ins = await insertTolerant("universal_documents_tbl",{ doc_number:docNumber, doc_name:String(add.title||"").trim(), category:add.cat, entity_type: entType, entity_id:entityRef,
+            is_mandatory:false, is_archived:false, item_sl_no: sls[0], for_production: prodDefault(add.cat), created_by:user?.username||"unknown", ...(cno ? { client_doc_no:cno } : {}) }, ["item_sl_no","for_production"], true);
+          if(ins.error){ if(/client_doc_no/.test(ins.error.message||"")) throw new Error("Run "+DOC_CNO_SQL+" first (both companies) \u2014 the client's document number has nowhere to go yet."); throw ins.error; }
+          const { error: hErr } = await sb.from("universal_document_history_tbl").insert({ document_id:ins.data.id, doc_number:docNumber, rev_number:0, direction:add.dir, status:add.status,
+            link:String(add.link).trim(), file_path:path, lives_in_supabase:!!path, reason:"Initial entry", changed_by:user?.username||"unknown" });
+          if(hErr) throw hErr;
+          for(const n of sls){
+            const ex = reqs.find(r=>!r.fulfilled_document_id && String(r.category).trim().toLowerCase()===String(add.cat).trim().toLowerCase() && String(r.item_sl_no??"")===String(n));
+            if(ex) await sb.from("document_requests_tbl").update({ fulfilled_document_id:ins.data.id }).eq("id",ex.id);
+            else { const res = await insertTolerant("document_requests_tbl",{ entity_type: entType, entity_id:entityRef, category:add.cat, item_sl_no:n, is_mandatory: isContract && add.mand, fulfilled_document_id:ins.data.id,
+              source: isContract?"Sale Order":isPo?"PO":"Customer request", requested_by:user?.username||"unknown" }, ["item_sl_no"], false); if(res.error) throw res.error; }
+          }
+          await logAudit("INSERT","universal_documents_tbl",entityRef,"Logged "+docNumber+(cno?" (client no "+cno+")":"")+" ("+add.cat+", Sl "+sls.join(", ")+(add.another?", another of this kind":"")+") \u2014 Rev0-"+add.dir,user?.username||"unknown",null,null);
+          setAdd(blankAdd); setDirMissing(false); await refresh(); setSel("d"+ins.data.id); return;
+        }
         const targetSls = all ? slNos.map(s=>s.item_sl_no) : [whole ? null : Number(add.sl)];
         const have = new Set(reqs.map(r=>String(r.category||"").trim().toLowerCase()+"|"+(r.item_sl_no??"")));
         const reqRows = targetSls.filter(n=>!have.has(String(add.cat).trim().toLowerCase()+"|"+(n??""))).map(n=>({
@@ -13263,13 +13411,14 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
         let newKey = null;
         if(add.how==="rev0"){
           const path = await uploadDocFile(entityRef, add.file);
-          const docNumber = String(add.num).trim();
+          const docNumber = await docMakeFreeNumber(docNumberPrefix(cats, add.cat), add.num);   // 2026-11-08: PREFIX-your number-DDMMYY-HHMMSS
+          const cno = String(add.cno||"").trim();
           const ins = await insertTolerant("universal_documents_tbl",{
             doc_number:docNumber, doc_name:String(add.title||"").trim(), category:add.cat,
             entity_type: entType, entity_id:entityRef, is_mandatory:false, is_archived:false,
-            item_sl_no: targetSls[0], for_production: prodDefault(add.cat), created_by:user?.username||"unknown"
+            item_sl_no: targetSls[0], for_production: prodDefault(add.cat), created_by:user?.username||"unknown", ...(cno ? { client_doc_no:cno } : {})
           }, ["item_sl_no","for_production"], true);
-          if(ins.error) throw ins.error;
+          if(ins.error){ if(/client_doc_no/.test(ins.error.message||"")) throw new Error("Run "+DOC_CNO_SQL+" first (both companies) \u2014 the client's document number has nowhere to go yet."); throw ins.error; }
           const { error: hErr } = await sb.from("universal_document_history_tbl").insert({
             document_id:ins.data.id, doc_number:docNumber, rev_number:0, direction:add.dir, status:add.status,
             link:String(add.link).trim(), file_path:path, lives_in_supabase:!!path, reason:"Initial entry", changed_by:user?.username||"unknown" });
@@ -13288,33 +13437,35 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
   };
 
   // ---- requirement tab: log Rev 0 against it ----
-  const blankRq = { num:"", title:"", dir:"", status:"", link:"", file:null };
+  const blankRq = { num:"", cno:"", title:"", dir:"", status:"", link:"", file:null };
   const [rq,setRq] = useState(blankRq);
   useEffect(()=>{
     let cancelled=false;
     if(current && current.kind==="req"){
-      (async()=>{ const num = await suggestNumber(current.category); if(!cancelled){ setRq({ ...blankRq, num }); checkNumber(num); } })();
+      if(!cancelled) setRq({ ...blankRq, num:entityRef });   // 2026-11-08: your part of the number
     }
     setDirMissing(false);
     return ()=>{ cancelled=true; };
   },[sel, cats.length]);   // eslint-disable-line
   const saveRq = async()=>{
     const r = current && current.req; if(!r) return;
-    const docNumber = String(rq.num).trim();
-    if(!docNumber){ alert("Give the document a number."); return; }
-    if(numCheck.value===docNumber && numCheck.state==="taken"){ alert(docNumber+" is already used. Pick another number."); return; }
+    if(!docTypedClean(rq.num)){ alert("Type your part of the document number (e.g. the order number)."); return; }
+    const docNumber0 = docMakeNumber(docNumberPrefix(cats, r.category), rq.num);
     if(rq.dir!=="Out" && rq.dir!=="In"){ setDirMissing(true); alert("Tick Out (we are sending) or In (we are receiving)."); return; }
     if(!rq.status){ alert("Pick a status."); return; }
-    if(!confirmDocumentLink(rq.link, "Document "+docNumber)) return;
+    if(!confirmDocumentLink(rq.link, "Document "+docNumber0)) return;
     setBusy(true);
+    let docNumber = docNumber0;
     try{
       const path = await uploadDocFile(entityRef, rq.file);
+      docNumber = await docMakeFreeNumber(docNumberPrefix(cats, r.category), rq.num);
+      const cno = String(rq.cno||"").trim();
       const ins = await insertTolerant("universal_documents_tbl",{
         doc_number:docNumber, doc_name:String(rq.title||"").trim(), category:r.category,
         entity_type: entType, entity_id:entityRef, is_mandatory:false, is_archived:false,
-        item_sl_no: r.item_sl_no??null, for_production: prodDefault(r.category), created_by:user?.username||"unknown"
+        item_sl_no: r.item_sl_no??null, for_production: prodDefault(r.category), created_by:user?.username||"unknown", ...(cno ? { client_doc_no:cno } : {})
       }, ["item_sl_no","for_production"], true);
-      if(ins.error) throw ins.error;
+      if(ins.error){ if(/client_doc_no/.test(ins.error.message||"")) throw new Error("Run "+DOC_CNO_SQL+" first (both companies) \u2014 the client's document number has nowhere to go yet."); throw ins.error; }
       const { error: hErr } = await sb.from("universal_document_history_tbl").insert({
         document_id:ins.data.id, doc_number:docNumber, rev_number:0, direction:rq.dir, status:rq.status,
         link:String(rq.link).trim(), file_path:path, lives_in_supabase:!!path, reason:"Initial entry", changed_by:user?.username||"unknown" });
@@ -13582,19 +13733,33 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
     const cat = add.cat; const ps = cat && perSl(cat);
     return h("div",null,
       h("div",{style:{fontSize:14,fontWeight:700,marginBottom:2}},"Add a document"),
-      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:6}},"Pick the category; the number is suggested from its prefix and checked as you type."),
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:6}},"Pick the category. The number's prefix comes from the category; you type your part, and the date and time are added when you save."),
       twoCol(
         h("div",null, lbl("Category",true),
-          h("select",{value:cat,onChange:e=>pickAddCategory(e.target.value),style:fld},
+          h("select",{value:cat,"data-testid":"box-cat",onChange:e=>pickAddCategory(e.target.value),style:fld},
             h("option",{value:""},"Pick a document category…"),
-            catNames.map(c=>h("option",{key:c,value:c},c)),
+            catNames.map(c=>{ const e = boxHave[c.toLowerCase()]; const full = docHaveFull(e, perSl(c), slNos); const part = e && !full && perSl(c) ? Array.from(e.sls).sort((a,b)=>Number(a)-Number(b)) : [];
+              return h("option",{key:c,value:c,style:full?{color:"#9a9a94"}:null},c+(full?"  \u2014 already on this "+(isContract?"order":isPo?"PO":"quote"):part.length?"  \u2014 Sl "+part.join(", ")+" covered":"")); }),
             h("option",{value:"__new__"},"＋ Category not in the list…"))),
+        ps && add.how==="rev0" && slNos.length ? h("div",null, lbl("Covers Sl No (tick one or more)",true), h(DocSlTicks,{ sls:slNos, have:boxHave[String(cat).toLowerCase()], value:add.sls||[], onChange:v=>setAdd(a=>({...a,sls:v})), testid:"box-sl" })) :
         h("div",null, lbl(ps?"Sl No (kept per Sl No)":"Sl No", ps),
           h("select",{value:add.sl,onChange:e=>setAdd(a=>({...a,sl:e.target.value})),style:fld,disabled:!cat},
             !ps && h("option",{value:""},"Whole order"),
             ps && add.how==="req" && h("option",{value:"__all__"},"Every Sl No (one requirement each)"),
             slNos.map(s=>h("option",{key:s.item_sl_no,value:String(s.item_sl_no)},"Sl "+s.item_sl_no+(s.item?" — "+s.item:""))))))
       ,
+      add.taken ? (()=>{ const e = boxHave[add.taken.toLowerCase()]; const rows = e ? [...e.docs, ...e.reqs] : [];
+        return h("div",{"data-testid":"box-taken",style:{background:"#fff4d6",border:"1px solid #e9c46a",borderRadius:8,padding:"9px 11px",marginTop:8,fontSize:12,lineHeight:1.45}},
+          h("b",null,add.taken+" is already on "+entityRef),
+          h("div",{style:{color:colors.muted,margin:"2px 0 6px"}}, rows.map((r,i)=>h("div",{key:i},"\u2022 "+docRowLabel(r)+(r.doc_name?" \u2014 "+r.doc_name:"")+(r.item_sl_no!=null?" \u00b7 Sl "+r.item_sl_no:" \u00b7 whole order")))),
+          h("ol",{style:{margin:"4px 0 8px 18px",padding:0}},
+            h("li",null,h("b",null,"A new revision of that same document"),": don't add it here. Open its tab and add the revision there (or on the Document Control Board, Send resubmission \u25b8)."),
+            h("li",null,h("b",null,"A separate document of the same kind"),": press ",h("b",null,"Add another")," and give it a title that says what makes it different. It gets its own number.")),
+          h("div",{style:{display:"flex",gap:6,flexWrap:"wrap"}},
+            rows[0] ? h("button",{style:btnSmall,onClick:()=>{ const r0 = rows[0]; setAdd(blankAdd); setSel((r0.doc_number?"d":"r")+r0.id); }},"Open it \u25b8") : null,
+            h("button",{"data-testid":"box-taken-another",style:{...btnSmall,background:"#1f5c40",color:"#fff",borderColor:"#1f5c40",fontWeight:700},onClick:()=>setAdd(a=>({ ...a, cat:a.taken, taken:"", another:true, title:"", sls:[], sl: perSl(a.taken) ? (a.how==="req" ? "__all__" : (slNos[0]?String(slNos[0].item_sl_no):"")) : "", num:a.num||entityRef }))},"Add another "+add.taken),
+            h("button",{style:btnSmall,onClick:()=>setAdd(a=>({ ...a, taken:"" }))},"Pick a different name"))); })() : null,
+      add.another && cat ? h("div",{style:{background:"#e6f1fb",borderRadius:6,padding:"6px 9px",marginTop:6,fontSize:11.5}},"Adding another "+cat+" to "+entityRef+". Give it a title that says what makes it different from the one already there.") : null,
       h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",margin:"12px 0 4px"}},
         [["req","Requirement only","Required, not sent yet — shows as a dashed tab"],["rev0","Requirement and Rev 0 now","Log the first entry with its link"]].map(([v,t,s])=>
           h("label",{key:v,style:{flex:"1 1 220px",display:"flex",gap:8,alignItems:"flex-start",border:"1px solid "+(add.how===v?"#1f5c40":colors.border),background:add.how===v?"#e8f2ec":"#fff",borderRadius:7,padding:"8px 10px",cursor:"pointer"}},
@@ -13604,8 +13769,9 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
         h("input",{type:"checkbox",checked:add.mand,onChange:e=>setAdd(a=>({...a,mand:e.target.checked}))}),"Mandatory on this order (needs an Edit code)"),
       add.how==="rev0" && h("div",{style:{borderTop:"1px solid "+colors.border,marginTop:8,paddingTop:4}},
         twoCol(
-          h("div",null, lbl("Document number",true), h("input",{value:add.num,onChange:e=>{ setAdd(a=>({...a,num:e.target.value})); checkNumber(e.target.value); },style:fld}), numHint(add.num)),
-          h("div",null, lbl("Title / description"), h("input",{value:add.title,onChange:e=>setAdd(a=>({...a,title:e.target.value})),placeholder:"e.g. GA drawing — strainer assembly",style:fld}))),
+          h("div",null, lbl("Document number",true), h(DocNumberBox,{ prefix:cat ? docNumberPrefix(cats, cat) : "", typed:add.num, onTyped:v=>setAdd(a=>({...a,num:v})), testid:"box-typed" })),
+          h("div",null, lbl(add.another?"Title (what makes it different)":"Title / description", add.another), h("input",{"data-testid":"box-title",value:add.title,onChange:e=>setAdd(a=>({...a,title:e.target.value})),placeholder:"e.g. GA drawing — strainer assembly",style:fld}))),
+        h("div",{style:{marginTop:8}}, lbl("Client doc no (optional)"), h("input",{"data-testid":"box-cno",value:add.cno||"",disabled:cnoOk===false,onChange:e=>setAdd(a=>({...a,cno:e.target.value})),placeholder:cnoOk===false?"Run "+DOC_CNO_SQL+" first":"the client's own number, if they gave one — shown first wherever the document appears",style:fld})),
         h("div",{style:{marginTop:10}}, h(DocDirectionPick,{value:add.dir,onChange:v=>setAdd(a=>({...a,dir:v})),label:"This document (Rev 0) is:",missing:dirMissing&&!add.dir})),
         twoCol(
           h("div",null, lbl("Status",true), statusCombo(add.status, v=>setAdd(a=>({...a,status:v})))),
@@ -13615,7 +13781,7 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
         h("button",{onClick:saveAdd,disabled:busy||!cat,style:{...btnPrimary,background:"#1f5c40",padding:"8px 16px",fontSize:12.5,opacity:(busy||!cat)?0.5:1}},busy?"Saving…":(add.how==="req"?"Add requirement":"Add and log Rev 0"))),
       newCatOpen && h(AddToMasterPanel,{table:"doc_category_tbl",valueCol:"value",fieldLabel:"Document Category",
         onClose:()=>setNewCatOpen(false),
-        onAdded:async(v)=>{ const {data:c}=await sb.from("doc_category_tbl").select("*"); setCats((c||[]).slice().sort((a,b)=>String(a.value||"").localeCompare(String(b.value||"")))); const num=await suggestNumber(v); setAdd(a=>({...a,cat:v,num})); checkNumber(num); }})
+        onAdded:async(v)=>{ const {data:c}=await sb.from("doc_category_tbl").select("*"); setCats((c||[]).slice().sort((a,b)=>String(a.value||"").localeCompare(String(b.value||"")))); setAdd(a=>({...a,cat:v,taken:"",another:false,num:a.num||entityRef})); }})
     );
   };
 
@@ -13634,8 +13800,9 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
       h("div",{style:{border:"1px solid "+colors.border,borderRadius:8,padding:"10px 14px",background:"#fcfcf9"}},
         h("div",{style:{fontSize:12.5,fontWeight:700}},"Log Rev 0 now"),
         twoCol(
-          h("div",null, lbl("Document number",true), h("input",{value:rq.num,onChange:e=>{ setRq(x=>({...x,num:e.target.value})); checkNumber(e.target.value); },style:fld}), numHint(rq.num)),
+          h("div",null, lbl("Document number",true), h(DocNumberBox,{ prefix:docNumberPrefix(cats, r.category), typed:rq.num, onTyped:v=>setRq(x=>({...x,num:v})), testid:"rq-typed" })),
           h("div",null, lbl("Title / description"), h("input",{value:rq.title,onChange:e=>setRq(x=>({...x,title:e.target.value})),style:fld}))),
+        h("div",{style:{marginTop:8}}, lbl("Client doc no (optional)"), h("input",{value:rq.cno||"",disabled:cnoOk===false,onChange:e=>setRq(x=>({...x,cno:e.target.value})),placeholder:cnoOk===false?"Run "+DOC_CNO_SQL+" first":"the client's own number, if they gave one",style:fld})),
         h("div",{style:{marginTop:10}}, h(DocDirectionPick,{value:rq.dir,onChange:v=>setRq(x=>({...x,dir:v})),label:"This document (Rev 0) is:",missing:dirMissing&&!rq.dir})),
         twoCol(
           h("div",null, lbl("Status",true), statusCombo(rq.status, v=>setRq(x=>({...x,status:v})))),
@@ -13646,6 +13813,16 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
     );
   };
 
+  const editBoxCno = async(d)=>{   // 2026-11-08: the client's own number, added or changed later
+    if(docLockClosed){ closedMsg("change a document"); return; }
+    if(!(await docCnoCheck())){ alert("Run "+DOC_CNO_SQL+" first (both companies) \u2014 the client's document number has nowhere to go yet."); return; }
+    const v = prompt("Client's document number for "+d.doc_number+(d.doc_name?" ("+d.doc_name+")":"")+".\n\nLeave it empty to remove it.", d.client_doc_no||""); if(v===null) return;
+    const nv = String(v).trim(); if(nv===String(d.client_doc_no||"")) return;
+    const { error } = await sb.from("universal_documents_tbl").update({ client_doc_no: nv||null }).eq("id",d.id);
+    if(error){ alert("Could not save the client's number: "+error.message); return; }
+    await logAudit("UPDATE","universal_documents_tbl",entityRef,d.doc_number+": client doc no "+(d.client_doc_no||"\u2014")+" \u2192 "+(nv||"\u2014"),user?.username||"unknown",{client_doc_no:d.client_doc_no||null},{client_doc_no:nv||null});
+    await refresh();
+  };
   const renderDoc = (t)=>{
     const d = t.doc; const revs = d.revisions||[]; const last = revs[0]||null;
     const exp = expectedNext(revs);
@@ -13657,8 +13834,10 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
     const cell = {padding:"6px 8px",borderTop:"1px solid #eceae0",verticalAlign:"top",fontSize:11.5};
     return h("div",null,
       h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
-        h("div",{style:{fontSize:14,fontWeight:700}},d.doc_number+(d.doc_name?" — "+d.doc_name:"")),
+        h("div",{style:{fontSize:14,fontWeight:700}},docNoShow(d.doc_number, d.client_doc_no, last ? last.rev_number : 0)+(d.doc_name?" — "+d.doc_name:"")),
         last && last.status && h("span",{style:{fontSize:10.5,padding:"1px 8px",borderRadius:9,...chipStyle(last.status)}},last.status)),
+      h("div",{style:{fontSize:11.5,color:colors.muted,display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}},"Client doc no:",h("b",{"data-testid":"box-doc-cno",style:{color:colors.text}},d.client_doc_no||"\u2014"),
+        h("button",{"data-testid":"box-cno-edit",style:{...btnSmall,padding:"1px 7px",fontSize:11},onClick:()=>editBoxCno(d)},d.client_doc_no?"Change":"Add")),   // 2026-11-08
       h("div",{style:{fontSize:11.5,color:colors.muted,margin:"3px 0 8px"}},
         [d.category, d.item_sl_no!=null ? "Sl "+d.item_sl_no+(slItem(d.item_sl_no)?" — "+slItem(d.item_sl_no):"") : "Whole order",
          last ? "Latest: Rev "+last.rev_number+" "+(last.direction==="Out"?"Out (we sent)":last.direction==="In"?"In (we received)":"") : "No entries yet"].join("  ·  ")),
@@ -13988,7 +14167,9 @@ function AddToMasterPanel({ table, fieldLabel, valueCol, onClose, onAdded }){
   const doSave = async(value)=>{
     setSaving(true); setErr("");
     try {
-      const { error } = await sb.from(table).insert({ [col]: value });
+      let extra = {};
+      if(table==="doc_category_tbl"){ const { data:allC } = await sb.from("doc_category_tbl").select("id,value,number_prefix"); const pl = { value, number_prefix:"" }; if(!docCatPrefixFix(pl, allC||[], null)) extra = { number_prefix:pl.number_prefix }; }   // 2026-11-08
+      const { error } = await sb.from(table).insert({ [col]: value, ...extra });
       if(error){
         if(String(error.message||"").toLowerCase().includes("duplicate")){ onAdded(value); onClose(); return; }
         throw error;
@@ -25698,7 +25879,7 @@ async function fetchDocumentHistory(entityIds){
   (history||[]).forEach(hh=>{ if(!byDoc.has(hh.document_id)) byDoc.set(hh.document_id,[]); byDoc.get(hh.document_id).push(hh); });
   return parents.map(p=>({
     id:p.id, entity_id:p.entity_id, entity_type:p.entity_type, category:p.category,
-    doc_number:p.doc_number, doc_name:p.doc_name, is_archived:p.is_archived,
+    doc_number:p.doc_number, doc_name:p.doc_name, is_archived:p.is_archived, client_doc_no:p.client_doc_no||null,
     created_at:p.created_at, created_by:p.created_by,
     item_sl_no:p.item_sl_no??null, for_production:p.for_production??null, include_in_offer:p.include_in_offer,
     sequence_flagged:!!p.sequence_flagged, sequence_flag_note:p.sequence_flag_note||null,
@@ -35547,6 +35728,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"8 Nov 2026 (340)", summary:"Built on 2026-11-08T03:00:00Z. NEEDS SQL: structure_gst_gateway_2026-11-08.sql (BOTH companies). E-INVOICE AND E-WAY BILL — TWO GATEWAYS. MANUAL (as before, now checked): the Ack No must be 15 digits and not the IRN; the Ack date needs a time and cannot be before the invoice date; a manual e-way bill no must be 12 digits. Correct Ack No / date on an issued invoice (Edit code; the Finance Director needs none) also corrects the sales voucher. AUTOMATIC (through the Clear gateway, server function gst-gateway): Generate e-invoice (preview of what is sent, then issue from the reply), Cancel e-invoice within 24 hours (E-invoice cancel code), E-way bill from the IRN, Part B (vehicle) update, Cancel e-way bill (E-way bill cancel code). Every call is logged on the invoice. SWITCH: Despatch Settings > E-invoice gateway — Off / Sandbox / Live, Super Admin only; Sandbox gives the Super Admin a test button that never saves to the invoice. While Live, entering by hand needs a reason and an Edit code (Finance Director: reason only) and the Super Admins are told. RIGHTS BY POST: Accounts — e-invoice; Factory Manager — e-way bill; Finance Director — everything, no code; Super Admin — everything. Codes come from the Finance Director or a Super Admin." },
+  { date:"8 Nov 2026 (339)", summary:"Built on 2026-11-07T06:30:00Z. NEEDS SQL: structure_doc_client_no_2026-11-08.sql (BOTH companies); data_doc_categories_FLOMETRIQ_2026-11-08.sql (Flometriq). ONE LIST OF DOCUMENT NAMES: + Missing document now shows the Sale Order checklist's list (purchase-only names left out, one entry per name); Purchase Order, LOI, Order Acceptance, Quote, Invoices, Delivery Challan, Draft WO and GST details are left out (their own screens). Names the contract or quote already has are greyed with their stage; picking one explains the two routes — a new revision goes on the existing card (Send resubmission ▸), a separate document of the same kind is added with Add another and a title that says what makes it different. The same rule on the Sale Order / quote Documents box. PER SL NO: a category kept per Sl No asks which Sl Nos the document covers — one or several; Sl Nos already covered show the document that covers them; the name greys out only when every Sl No is covered. NEW DOCUMENT NUMBERS: PREFIX-your number-DDMMYY-HHMMSS (India time), shown with -Rev0, -Rev1 …; the prefix comes from the category, you type your part (the contract or quote number by default), the date and time are added on save. Older numbers stay as they are. PREFIXES: every category keeps its own prefix — Masters refuses a prefix already used and fills a blank one (2 letters from the initials, 3 where 2 clash). CLIENT DOC NO: every document can carry the client's own number; when filled it is shown first (board cards, card detail, table, reports, the Documents box) with ours in brackets; search finds either; add or change it from the card detail or the Documents box." },
   { date:"7 Nov 2026 (338)", summary:"Built on 2026-11-07T06:30:00Z, on top of the DC build 2026-11-07T04:30:00Z. No new SQL. DOCUMENT CONTROL — EVERY LIST SAYS IN OR OUT, AND COLOUR SAYS WHOSE COURT: a document's last move is In (the client returned it with a code — with us, red / pink) or Out (we sent it — with the client, shades of yellow); all clear is green. Lists, left to right: Status to confirm · Initial submission pending · Code 3 — In, resubmit · Out — awaiting code · Code 2 clear — In, resubmit · Code 2 clear — Out, awaiting code · Code 2 hold — In, resubmit · Code 2 hold — Out, awaiting code · Code 1 — In, all approved · Code 1 — In, info copy to send · Non Critical. Code 2 clear and Code 2 hold are each one list underneath, so chasing, task cards and the production release work as before; a card moves from In to Out by itself when the corrected copy is sent, and dragging it from In to Out in By stage opens the send box. Card strips: Our action (red), Code 3 – In, resubmit (pink), Out – with client (yellow), Code 2 – In, resubmit (pink-red), Code 2 – Out, with client (yellow), Hold – In, resubmit (red), Hold – Out, with client (amber-yellow), Code 1 – info copy to send (pink), Approved (green); the same strips on the Task board. Everywhere else the same: tiles (Out — awaiting client code; Code 2 hold — In / Out), Table summary and its PDF, By contract lanes and chips, list column, grouping, revision history order (red to green), Document Status Report stages and colours (Code 2 hold — In is red, Code 2 hold — Out is yellow; no more blue), Order Status badges and the Production hold (client) column and pill (red when the corrected copy is ours, yellow when it is with the client)." },
   { date:"7 Nov 2026 (337)", summary:"\"DC\" build, 2026-11-07T04:30:00Z, on top of 2026-11-07T04:00:00Z. No new SQL. FOR NOW, SO BILLING CAN MOVE: every DC line picks its serials from a free drop-down of all free serials of the contract (same spec first, ✓), or a serial can be typed. Nothing is checked except the serial format, the same serial twice, and a serial already on another DC. The strict rule for app-given serials is kept in the code, switched off (DC_SERIAL_FREE), for the proper fix later." },
   { date:"7 Nov 2026 (336)", summary:"Built on 2026-11-07T04:00:00Z, on top of 2026-11-07T03:00:00Z. No new SQL. DC SERIALS MATCH BY SPEC, NOT BY SL NO: the spec is item type + size NB + pressure class + material, read from the register's item, size and description and from the DC line; the Sl No is only a label. (1) App-given contracts (every serial given in the app): strict as before — a line offers only serials of its own spec (or on its own Sl No with nothing different), ticks must equal Send now. (2) Legacy contracts (any serial from the Excel): a drop-down per line with every free serial of the contract, labelled serial · Sl n · size/class, same spec first with ✓; pick one by one, a picked serial leaves every line's list, ✕ takes it out; not checked, the count is only shown; serials on another DC are left out. (3) Saving the DC moves a picked or matched serial to that line's Sl No in the register, with a history note (legacy pick / same spec). (4) Serial Number Register: new Spec column (also in the Excel)." },
@@ -62990,7 +63173,7 @@ async function docBoardLoad(){
     // 211: a "Next chase on" date set on the card, for the revision now with the client, replaces the automatic chase date
     const chaseDate = waitingClient && d.next_chase_on && last && String(d.next_chase_hist_id||"")===String(last.id) ? String(d.next_chase_on).slice(0,10) : chaseAuto;
     const req = (reqs||[]).find(r=>String(r.fulfilled_document_id)===String(d.id))||null;
-    items.push({ key:"d"+d.id, kind:"doc", doc:d, req, ct:String(d.entity_id||""), name:d.doc_name||d.category||d.doc_number, no:d.doc_number||"", cat:d.category||"", sl:d.item_sl_no,
+    items.push({ key:"d"+d.id, kind:"doc", doc:d, req, ct:String(d.entity_id||""), name:d.doc_name||d.category||d.doc_number, no:d.doc_number||"", cno:d.client_doc_no||"", cat:d.category||"", sl:d.item_sl_no,
       revs, last, status, bucket, list, sub, cx, needsUs: !skip && (cx && cx.task_on_enter!=null ? !!cx.task_on_enter : (bucket==="our_action" || !last)), waitingClient, chaseDate, chased:ltrs.length, lastChase, skip, holdNote: docHoldNoteOf(revs),
       since: last ? last.changed_at : d.created_at, owner: d.owner||null, round: last ? "h"+last.id : "new" });
   });
@@ -63170,7 +63353,7 @@ async function docLetterPdf(letter, rows, company, signer, so, contact){
   lines(letter.opening_text || DOC_LETTER_OPENING);
   y += 2;
   doc.autoTable({ startY:y, head:[["Sl","Document","Doc # / Rev","Submitted on","Days pending"]],
-    body: rows.map((it,i)=>[String(i+1), it.name+(it.hold==="Full Hold"?"  (Full Hold)":""), (it.no||"—")+" / Rev "+(it.last?it.last.rev_number:"0"), it.last?fmtDMY(([...it.revs].reverse().find(r=>r.direction==="Out")||it.last).changed_at):"—", String(it.days)]),
+    body: rows.map((it,i)=>[String(i+1), it.name+(it.hold==="Full Hold"?"  (Full Hold)":""), (docItNo(it)||"—")+" / Rev "+(it.last?it.last.rev_number:"0"), it.last?fmtDMY(([...it.revs].reverse().find(r=>r.direction==="Out")||it.last).changed_at):"—", String(it.days)]),
     theme:"grid", headStyles:{ fillColor:[244,242,234], textColor:[28,31,26], fontStyle:"bold", fontSize:8.5, lineColor:[216,212,197], lineWidth:0.2 },
     bodyStyles:{ fontSize:8.5, lineColor:[216,212,197], lineWidth:0.2 }, columnStyles:{ 0:{halign:"right",cellWidth:10}, 4:{halign:"right",cellWidth:24} }, margin:{ left:14, right:14 } });
   y = doc.lastAutoTable.finalY + 7;
@@ -63242,7 +63425,7 @@ async function docContractReportPdf(cts, data, ext, company, me, hx){
       ys.forEach((it,i)=>{
         const out = [...it.revs].reverse().find(r=>r.direction==="Out"), inn = [...it.revs].reverse().find(r=>r.direction==="In");
         const st = it.kind==="req" ? (ext?"To be submitted":"Requested — no document yet") : String(it.status||"").replace(/-Awarded|-Proceed/g,"");
-        const rev = (it.no||"—")+" / "+(it.last?"Rev "+it.last.rev_number:"—");
+        const rev = (docItNo(it)||"—")+" / "+(it.last?"Rev "+it.last.rev_number:"—");
         body.push(ext ? [String(i+1), it.name+(it.infoOnly?" (for information)":""), rev, st, out?fmtDMY(out.changed_at):"—", inn?fmtDMY(inn.changed_at):"—", it.list==="our"?((co&&co.company_name)||"Us"):it.list==="done"?"—":"Client"]
           : [String(i+1), it.name+(it.infoOnly?" (for information)":""), rev, holdLabel(it.hold), L.short, st, out?fmtDMY(out.changed_at):"—", inn?fmtDMY(inn.changed_at):"—", String(it.days)+(it.late?" (late)":""), it.owner||"Unassigned", it.chased?String(it.chased):""]);
         if(hsum) body[body.length-1].push(docRevTrail(it));   // 233
@@ -63333,6 +63516,20 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   const [del,setDel] = useState(null);       // 174: open contracts with a delivery date
   const [ad,setAd] = useState({});
   const [adCts,setAdCts] = useState(null); const [adQs,setAdQs] = useState(null); const [adHelp,setAdHelp] = useState(false);   // 245           // 183: + Missing document form
+  const [adEnt,setAdEnt] = useState(null);   // 2026-11-08: what the picked contract / quote already has, and its Sl Nos
+  useEffect(()=>{
+    if(panel!=="add") return;
+    const rel = ad.rel || (ad.ct ? "contract" : ""); const ref = rel==="other" ? "" : String(ad.ct||"");
+    docCnoCheck().then(()=>setAdEnt(e=>e ? { ...e } : e));
+    if(!ref){ setAdEnt(null); return; }
+    let off = false;
+    setAdEnt(e=> e && e.ref===ref ? e : { ref, loading:true, docs:[], reqs:[], sls:[] });
+    Promise.all([ sb.from("universal_documents_tbl").select("*").eq("entity_id",ref), sb.from("document_requests_tbl").select("*").eq("entity_id",ref), sb.from("estimates").select("item_sl_no,item").eq("reference_number",ref).order("item_sl_no") ])
+      .then(([d,r,s])=>{ if(off) return; const seen = new Set(); const sls = (s.data||[]).filter(x=>x.item_sl_no!=null && !seen.has(String(x.item_sl_no)) && seen.add(String(x.item_sl_no)));
+        setAdEnt({ ref, loading:false, docs:d.data||[], reqs:r.data||[], sls }); })
+      .catch(()=>{ if(!off) setAdEnt({ ref, loading:false, docs:[], reqs:[], sls:[] }); });
+    return ()=>{ off = true; };
+  },[panel, ad.rel, ad.ct]);
   const [lf,setLf] = useState(null);         // 183: ⚙ Lists form (Super Admin)
   const [fDue,setFDueS] = useState(()=>{ try{ return localStorage.getItem("doc_due")||"all"; }catch(e){ return "all"; } });   // 211
   const setFDue = (v)=>{ setFDueS(v); try{ localStorage.setItem("doc_due",v); }catch(e){} };
@@ -63433,7 +63630,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   const openCtHist = (c)=>{ setChx({ q:"", shut:{}, newest:true }); setPanel({ kind:"cthist", ct:c }); };
   const visBase = data.items.filter(it=>(!tileDef || !tileDef.f || tileDef.f(it)) && (!mine || it.owner===me) && (mode==="all" || it.ct===curCt) && (!fHold || (fHold==="info" ? it.infoOnly : fHold==="appr" ? !it.infoOnly : fHold==="none" ? !it.hold && !it.infoOnly : it.hold===fHold))
     && (!fOwner || (fOwner==="__none" ? !it.owner : it.owner===fOwner)) && (!fDept || it.dept===fDept)
-    && (!ql || [it.name,it.no,it.ct,it.customer,it.cat,it.owner].some(x=>hHas(x||"", ql)))
+    && (!ql || [it.name,it.no,it.cno,it.ct,it.customer,it.cat,it.owner].some(x=>hHas(x||"", ql)))
     && (!fSide || (fSide==="client" ? it.waitingClient : (!it.waitingClient && it.list!=="done" && it.list!=="confirm"))) && woOk(it.ct));   // 236
   const vis = visBase.filter(it=>docDueOk(fDue, it, today));   // 211
   const cmp = { due:(a,b)=>String(a.due||"9").localeCompare(String(b.due||"9")), ct:(a,b)=>a.ct.localeCompare(b.ct)||a.name.localeCompare(b.name), days:(a,b)=>b.days-a.days, name:(a,b)=>a.name.localeCompare(b.name) }[srt];
@@ -63543,11 +63740,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
     const exp = expectedNext(it.revs);
     const sts = docPickable(data.statuses).filter(s=>docListMatch(s, to)).map(docStatusName);
     let num = it.no;
-    if(it.kind==="req"){
-      const base = docNumberPrefix(data.cats, it.cat)+"-"+it.ct;
-      const used = data.docs.map(d=>String(d.doc_number||"")).filter(n=>n.startsWith(base+"-")).map(n=>parseInt(n.slice(base.length+1),10)||0);
-      num = base+"-"+String(1+Math.max(0,...used)).padStart(3,"0");
-    }
+    if(it.kind==="req"){ num = it.ct; docCnoCheck(); }   // 2026-11-08: your part of the number; prefix, date and time are added on save
     const pref = exp.direction==="Out" && Number(exp.rev)===0 ? /third party/i : exp.direction==="Out" ? /resubmission done/i : null;
     const prevCode = it.last && /code\s*-?\s*2/i.test(it.last.status||"") ? /code\s*-?\s*2/i : it.last && /code\s*-?\s*3/i.test(it.last.status||"") ? /code\s*-?\s*3/i : null;
     const guess = (pref && (sts.find(x=>pref.test(x) && (!prevCode || prevCode.test(x))) || sts.find(x=>pref.test(x)))) || (sts.length===1 ? sts[0] : "");
@@ -63583,13 +63776,12 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
       const at = (mv.date && mv.date!==today) ? mv.date+"T12:00:00" : new Date().toISOString();
       let docId = it.doc && it.doc.id, docNo = it.no;
       if(it.kind==="req"){
-        docNo = String(mv.num||"").trim();
-        if(!docNo){ alert("Give the document a number."); setBusy(false); return; }
-        const { data:taken } = await sb.from("universal_documents_tbl").select("entity_id").ilike("doc_number",docNo.replace(/[%_]/g,"\\$&")).limit(1);
-        if(taken && taken.length){ alert(docNo+" is already used"+(taken[0].entity_id?" on "+taken[0].entity_id:"")+". Pick another number."); setBusy(false); return; }
+        if(!docTypedClean(mv.num)){ alert("Type your part of the document number (e.g. the contract number)."); setBusy(false); return; }
+        docNo = await docMakeFreeNumber(docNumberPrefix(data.cats, it.cat), mv.num);   // 2026-11-08: PREFIX-your number-DDMMYY-HHMMSS
+        const cno = String(mv.cno||"").trim();
         const ins = await insertTolerant("universal_documents_tbl",{ doc_number:docNo, doc_name:String(mv.title||"").trim(), category:it.cat, entity_type:"contract", entity_id:it.ct,
-          is_mandatory:false, is_archived:false, item_sl_no: it.sl??null, for_production: !!(docCategoryRow(data.cats,it.cat)||{}).for_production_default, created_by:user?.username||"unknown", owner: it.owner||null }, ["item_sl_no","for_production","owner"], true);
-        if(ins.error) throw ins.error;
+          is_mandatory:false, is_archived:false, item_sl_no: it.sl??null, for_production: !!(docCategoryRow(data.cats,it.cat)||{}).for_production_default, created_by:user?.username||"unknown", owner: it.owner||null, ...(cno ? { client_doc_no:cno } : {}) }, ["item_sl_no","for_production","owner"], true);
+        if(ins.error){ if(/client_doc_no/.test(ins.error.message||"")) throw new Error("Run "+DOC_CNO_SQL+" first (both companies) \u2014 the client's document number has nowhere to go yet."); throw ins.error; }
         docId = ins.data.id;
         await sb.from("document_requests_tbl").update({ fulfilled_document_id:docId }).eq("id",it.req.id);
       }
@@ -63734,7 +63926,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
       : null,
       o && h("div",{style:{borderTop:"1px dashed "+colors.border,marginTop:6,paddingTop:6,fontSize:11,color:colors.muted,lineHeight:1.6}},
         h("div",null,"Owner ",ownerSel(it,true)),
-        h("div",null,"Doc # ",h("b",{style:{color:colors.text}},it.no||"—"),it.sl!=null?" · Sl "+it.sl:""),
+        h("div",null,"Doc # ",h("b",{style:{color:colors.text}},docItNo(it,true)||"—"),it.sl!=null?" · Sl "+it.sl:""),
         h("div",null,"Category ",it.cat||"—",it.dept?" · "+it.dept:""),
         h("div",null,"Status ",h("b",{style:{color:colors.text}},it.status||"—")),
         h("div",null,it.days+" day"+(it.days===1?"":"s")+" in this list",it.openTask?" · task card: "+taskStageLabel(taskStage(it.openTask,today)):""),
@@ -63757,7 +63949,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   const TCOLS = [["ct","Contract"],["name","Document"],["no","Doc # / Rev"],["cat","Category"],["hold","Hold"],["list","Stage"],["status","Status"],["owner","Owner"],["due","Due / chase"],["days","Days in list"]];
   const tableRows = (key)=>{ const C = key ? columns.find(c=>c.key===key) : null; return vis.filter(C?C.f:()=>true); };
   const tableTitle = (key)=>{ const C = key ? columns.find(c=>c.key===key) : null; return C ? C.label.replace(/^📥 /,"") : "Document Control — whole board"; };
-  const rowVals = (it)=>[ctLabel(it.ct, it.customer), it.name, (it.no||"—")+(it.last?" / Rev "+it.last.rev_number:""), it.cat, holdLabel(it.hold), docItemList(it).short, it.status, it.owner||"Unassigned", it.due?fmtDMY(it.due)+(it.late?" (late)":""):"—", String(it.days)];
+  const rowVals = (it)=>[ctLabel(it.ct, it.customer), it.name, (docItNo(it)||"—")+(it.last?" / Rev "+it.last.rev_number:""), it.cat, holdLabel(it.hold), docItemList(it).short, it.status, it.owner||"Unassigned", it.due?fmtDMY(it.due)+(it.late?" (late)":""):"—", String(it.days)];
   const tableExcel = (key)=>{
     const rows = tableRows(key);
     const ws = XLSX.utils.aoa_to_sheet([TCOLS.map(c=>c[1]), ...rows.map(rowVals)]); ws["!cols"]=TCOLS.map((c,i)=>({wch:[10,34,26,18,14,14,32,16,14,8][i]}));
@@ -63822,7 +64014,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
       h("td",{style:{...td,whiteSpace:"nowrap"}}, h("button",{title:it.revs.length?"Show / hide the revision history":"No revisions yet","data-testid":"doc-rev-toggle",disabled:!it.revs.length,onClick:()=>setTbl(t=>({...t,exp:{...(t.exp||{}),[it.key]:!(t.exp||{})[it.key]}})),
         style:{font:"inherit",fontSize:11,fontWeight:700,border:"1px solid "+colors.border,background:"#fff",color:it.revs.length?"#0f7a5c":colors.mutedLight,borderRadius:5,padding:"1px 7px",cursor:it.revs.length?"pointer":"default"}}, it.revs.length ? (exp[it.key]?"▾ all ":"▸ all ")+it.revs.length : "—")),
       h("td",{style:td},h("b",{style:{color:"#2a6db0"}},it.ct), it.customer ? h("div",{style:{fontSize:10.5,color:colors.muted,lineHeight:1.25,maxWidth:150}},it.customer) : null), h("td",{style:td},h("span",{style:{cursor:"pointer"},onClick:()=>setPanel({kind:"hist",key:it.key,back:{kind:"table",key}})},it.name)),
-      h("td",{style:td},it.no||"—",it.last?" / Rev "+it.last.rev_number:"", " ", latestLink(it)), h("td",{style:td},it.cat), h("td",{style:td}, it.infoOnly ? tag("Info only",{background:"#e6eef6",color:"#2f5f8a"},"io") : tag(holdLabel(it.hold), docHoldTag(it.hold), "h"),
+      h("td",{style:td},docItNo(it)||"—",it.last?" / Rev "+it.last.rev_number:"", " ", latestLink(it)), h("td",{style:td},it.cat), h("td",{style:td}, it.infoOnly ? tag("Info only",{background:"#e6eef6",color:"#2f5f8a"},"io") : tag(holdLabel(it.hold), docHoldTag(it.hold), "h"),
         it.holdOwn && !it.infoOnly ? h("div",{style:{fontSize:9.5,color:"#8a5a00"}},"set on the document") : null, it.infoOwn!==null && it.infoOwn!==undefined && it.infoOwn!==it.infoCat ? h("div",{style:{fontSize:9.5,color:"#2f5f8a"}},(it.infoOnly?"info only":"approval")+" set on the document") : null,
         canHold ? h("button",{style:{...btnSmall,fontSize:10.5,padding:"1px 7px",marginTop:3},onClick:()=>{ setHd({ key:it.key, v: it.holdOwn ? it.holdOwn : (it.hold||DOC_HOLD_NONE), why:"", io: it.infoOnly ? "info" : "appr" }); setPanel({kind:"hold",key:it.key,back:{kind:"table",key}}); }},"✎ Hold / route") : null),
       h("td",{style:td},docItemList(it).short), h("td",{style:td},it.status),
@@ -63970,7 +64162,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
       const body = [];
       docs.forEach(it=>{ const L = hxList(it);
         const now = client ? (it.last ? hxSt({status:it.status}) : "To be submitted") : (L.label||"");
-        body.push([{ content: it.name+(it.no?"   \u00b7   "+it.no:"")+"   \u00b7   Now: "+now+(client ? "" : (it.owner?"   \u00b7   Owner "+it.owner:"")+(it.hold?"   \u00b7   "+holdLabel(it.hold):"")), colSpan:cols.length, styles:{ fontStyle:"bold", fillColor:[234,240,248], textColor:[29,61,110] } }]);
+        body.push([{ content: it.name+(it.no?"   \u00b7   "+docItNo(it,true):"")+"   \u00b7   Now: "+now+(client ? "" : (it.owner?"   \u00b7   Owner "+it.owner:"")+(it.hold?"   \u00b7   "+holdLabel(it.hold):"")), colSpan:cols.length, styles:{ fontStyle:"bold", fillColor:[234,240,248], textColor:[29,61,110] } }]);
         const rs = chx.newest ? [...it.revs].reverse() : it.revs;
         if(!rs.length) body.push([{ content:"No revision yet \u2014 "+(it.kind==="req"?"requested, not yet submitted":"not yet sent"), colSpan:cols.length, styles:{ textColor:[120,120,110], fontStyle:"italic" } }]);
         rs.forEach(r=>{ const row = ["R"+r.rev_number, hxDir(r), r.changed_at?fmtDMY(r.changed_at):"", hxSt(r), hxWhy(r, client)]; if(!client) row.push(r.changed_by||""); body.push(row); }); });
@@ -63995,7 +64187,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   };
   const ctHistModal = (c)=>{
     const ql = String(chx.q||"").trim().toLowerCase();
-    const all = hxDocs(c); const docs = all.filter(it=>!ql || [it.name,it.no,it.cat].some(x=>String(x||"").toLowerCase().includes(ql)));
+    const all = hxDocs(c); const docs = all.filter(it=>!ql || [it.name,it.no,it.cno,it.cat].some(x=>String(x||"").toLowerCase().includes(ql)));
     const n = docs.reduce((a,it)=>a+it.revs.length,0);
     const close = ()=> setPanel(null);
     return modal(1120, [
@@ -64016,7 +64208,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
         return h("div",{key:it.key,"data-testid":"doc-cthist-doc",style:{border:"1px solid "+colors.border,borderRadius:8,marginBottom:10,overflow:"hidden"}},
           h("div",{onClick:()=>setChx(x=>({...x,shut:{...x.shut,[it.key]:!shut}})),style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",padding:"7px 10px",background:"#f6f8fb",cursor:"pointer"}},
             h("span",null,shut?"\u25b8":"\u25be"), h("b",{style:{fontSize:13}},it.name),
-            h("span",{style:{fontFamily:"monospace",fontSize:11.5,color:colors.muted}},it.no||"no number yet"),
+            h("span",{style:{fontFamily:"monospace",fontSize:11.5,color:colors.muted}},docItNo(it,true)||"no number yet"),
             h("span",{style:{fontSize:10.5,fontWeight:700,borderRadius:6,padding:"1px 7px",background:L.bg||"#eef3f8",color:L.color||"#2a6fb0"}},L.label||it.status||""),
             it.last ? h("span",{style:{fontSize:11,color:"#2a6db0",fontWeight:700}},"Rev "+it.last.rev_number) : null,
             h("span",{style:{fontSize:11,color:colors.muted}},"\ud83d\udc64 "+(it.owner||"Unassigned")+" \u00b7 "+it.revs.length+" entr"+(it.revs.length===1?"y":"ies")),
@@ -64034,6 +64226,16 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
       !docs.length ? h("div",{key:"none",style:{color:colors.muted,padding:10}},"No document matches.") : null
     ], close);
   };
+  // 2026-11-08: the client's own number for a document, added or changed later from the card detail
+  const editCno = async(it)=>{
+    if(!(await docCnoCheck())){ alert("Run "+DOC_CNO_SQL+" first (both companies) \u2014 the client's document number has nowhere to go yet."); return; }
+    const v = prompt("Client's document number for "+it.no+" ("+it.name+").\n\nLeave it empty to remove it.", it.cno||""); if(v===null) return;
+    const nv = String(v).trim(); if(nv===String(it.cno||"")) return;
+    const { error } = await sb.from("universal_documents_tbl").update({ client_doc_no: nv||null }).eq("id",it.doc.id);
+    if(error){ alert("Could not save the client's number: "+error.message); return; }
+    await logAudit("UPDATE","universal_documents_tbl",it.ct,it.no+": client doc no "+(it.cno||"\u2014")+" \u2192 "+(nv||"\u2014"),user?.username||"unknown",{client_doc_no:it.cno||null},{client_doc_no:nv||null});
+    await load(true);
+  };
   const histModal = (key, back)=>{
     const it = itemByKey(key); if(!it) return null;
     const bc = (st)=>{ const k = docStatusListKey(data.statuses.find(s=>docStatusName(s)===st), st); const L = docListOf(k); return {background:L.bg,color:L.color}; };
@@ -64043,8 +64245,11 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
     return modal(660, [
       h("div",{key:"h",style:{display:"flex",gap:8,alignItems:"flex-start"}},
         h("div",{style:{flex:1,minWidth:0}}, h("b",{style:{fontSize:14}},"🕘 "+it.name), " ", latestLink(it),
-          h("div",{style:{fontSize:11.5,color:colors.muted}},(it.no||"no number yet")+" · ",h("b",{style:{color:"#2a6db0"}},it.ct)," · "+(it.customer||"")+" · "+it.cat+" ",holdTag(it))),
+          h("div",{style:{fontSize:11.5,color:colors.muted}},(docItNo(it,true)||"no number yet")+" · ",h("b",{style:{color:"#2a6db0"}},it.ct)," · "+(it.customer||"")+" · "+it.cat+" ",holdTag(it))),
         h("button",{style:btnSmall,onClick:close},"Close")),
+      it.doc ? h("div",{key:"cn",style:{fontSize:11.5,color:colors.muted,marginTop:6,display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}},"Client doc no:",h("b",{"data-testid":"hist-cno",style:{color:colors.text}},it.cno||"\u2014"),
+        canTouch(it) ? h("button",{"data-testid":"hist-cno-edit",style:{...btnSmall,padding:"1px 7px",fontSize:11},onClick:()=>editCno(it)},it.cno?"Change":"Add") : null,
+        h("span",null,"\u00b7 ours ",h("span",{style:{fontFamily:"monospace"}},docNoRev(it.no, it.last ? it.last.rev_number : 0)))) : null,   // 2026-11-08
       h("div",{key:"n",style:{margin:"10px 0 4px",display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",fontSize:11.5,color:colors.muted}}, "Now:",
         h("span",{style:{...bc(it.status),fontWeight:700,borderRadius:8,padding:"2px 8px",fontSize:11}},it.status||"—"),
         "Owner "+(it.owner||"Unassigned")+" · "+it.days+" days in this list"+(it.chased?" · chased "+it.chased+"×":"")+(it.due&&it.list!=="done"?" · "+(it.waitingClient?"chase ":"due ")+fmtDMY(it.due):"")),
@@ -64082,7 +64287,8 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
       mv.viaReply ? h("div",{key:"vr",style:{background:"#eef4fb",borderRadius:6,padding:"7px 9px",fontSize:11.5,marginTop:8}},"The client has replied. Pick the code they gave (the status), paste the link to the returned file, and the date it came back. The card moves to the list that status belongs to.") : null,
       mv.viaComplete ? h("div",{key:"vc",style:{background:"#e4f3ed",borderRadius:6,padding:"7px 9px",fontSize:11.5,marginTop:8}},mv.infoOnly ? "Info only: this document goes to the client for information, with no approval. Saving logs Rev "+mv.rev+" Out, moves the card to “All approved” and closes its task card. Nothing comes back, so there is no chase and no code." : mv.info ? "Code 1: the client only wants a copy for information. Saving logs Rev "+mv.rev+" Out, moves the card to “"+L.label+"” and closes its task card. Nothing comes back, so there is no chase." : "This task is done when the document goes to the client. Saving logs Rev "+mv.rev+" Out, moves the card to “"+L.label+"”, closes its task card and starts the "+DOC_CHASE_DAYS+"-day chase from the date below.") : null,
       h("div",{key:"s",style:{fontSize:11.5,color:colors.muted,marginTop:3}},it.name+" · "+it.ct+(it.no?" · "+it.no:"")),
-      it.kind==="req" ? h("div",{key:"rq",style:{display:"flex",gap:8}},h("div",{style:{flex:1}},lab("Document number"),inp("num")),h("div",{style:{flex:1.4}},lab("Title"),inp("title"))) : null,
+      it.kind==="req" ? h("div",{key:"rq"},lab("Document number"),h(DocNumberBox,{ prefix:docNumberPrefix(data.cats, it.cat), typed:mv.num, onTyped:v=>setMv(m=>({...m,num:v})), testid:"mv-typed" }),
+        h("div",{style:{display:"flex",gap:8}},h("div",{style:{flex:1.4}},lab("Title"),inp("title")),h("div",{style:{flex:1}},lab("Client doc no (optional)"),DOC_CNO_OK===false ? h("div",{style:{fontSize:11,color:colors.mutedLight,padding:"6px 0"}},"Run "+DOC_CNO_SQL+" first") : inp("cno","the client's own number")))) : null,
       h("div",{key:"st"},lab("New status"),h("select",{value:mv.status,onChange:e=>setMv(m=>({...m,status:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}},
         h("option",{value:""},"— pick —"), groups.map(([l,s])=>h("optgroup",{key:l.key,label:l.label},s.map(x=>h("option",{key:x,value:x},x)))))),
       h("div",{key:"r",style:{display:"flex",gap:8}},
@@ -64105,7 +64311,14 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   // ---- 183: + Missing document — a gateway on the board, wired back into the contract and forward into the work ----
   const openAddReqs = (data.addReqs||[]).filter(r=>r.status==="Open");
   const boardContracts = Array.from(new Set([...Object.keys(data.soBy||{}), ...contracts])).filter(Boolean).sort();
-  const addCats = Array.from(new Set((data.cats||[]).map(c=>c.value).filter(v=>v && docOnBoard(v)))).sort();
+  const addCats = docOrderCatNames(data.cats).filter(n=>!DOC_ADD_SKIP.test(n) && docOnBoard(n));   // 2026-11-08: the Sale Order checklist's list
+  const adPerSl = (cat)=> !!(docCategoryRow(data.cats, cat)||{}).per_sl_no;
+  const adHave = adEnt && !adEnt.loading ? docEntityHave(adEnt.docs, adEnt.reqs, adEnt.ref) : {};
+  const adSls = adEnt && !adEnt.loading ? adEnt.sls : [];
+  const adItemsOf = (e)=> e ? [...e.docs.map(d=>"d"+d.id), ...e.reqs.map(r=>"r"+r.id)].map(k=>data.items.find(it=>it.key===k)).filter(Boolean) : [];
+  const adStageOf = (e)=>{ const it = adItemsOf(e)[0]; if(it){ const L = docItemList(it); return { text:L.short||L.label, style:{ background:L.bg||"#eee", color:L.color||colors.text } }; }
+    return { text: e && e.docs.length ? "document there" : "requested", style:{ background:"#eceeef", color:"#3d4144" } }; };
+  const adSlDefault = (cat)=>{ if(!adPerSl(cat)) return []; const e = adHave[String(cat).toLowerCase()]; return adSls.map(s=>String(s.item_sl_no)).filter(k=>!(e && (e.whole || e.sls.has(k)))); };
   const addPeople = Array.from(new Set([...people, ...(data.emps||[]).map(e=>e.employee_name)].filter(n=>n && n!=="Unassigned"))).sort();
   const numFor = (c, cat)=>{
     if(!c || !cat) return "";
@@ -64134,15 +64347,17 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
     if(dr && dr.a && Date.now()-(dr.at||0) < 864e5 && confirm("You were adding \u201c"+(dr.a.title||dr.a.cat||"a document")+"\u201d"+(dr.a.ct?" ("+dr.a.ct+")":"")+" and did not save it.\n\nOK = carry on with it\nCancel = start a new one")){ setAd({ ...dr.a, code:"" }); setPanel("add"); return; }
     adForget();
     const c = mode==="one" ? curCt : "";
-    setAd({ rel:c?"contract":"", ct:c, cat:"", title:"", num:"", numTouched:false, start:to||"our", initial:(to||"our")==="our", status:"", rev:"", dir:"", date:today, owner:"", why:DOC_ADD_WHY[0], whyText:"", link:"", code:"" });
+    setAd({ rel:c?"contract":"", ct:c, cat:"", title:"", typed:c||"", typedTouched:false, cno:"", sls:[], another:false, taken:"", start:to||"our", initial:(to||"our")==="our", status:"", rev:"", dir:"", date:today, owner:"", why:DOC_ADD_WHY[0], whyText:"", link:"", code:"" });
     setPanel("add");
   };
   const setAdF = (k, v)=> setAd(a=>{
     const n = { ...a, [k]:v };
     if(k==="rel"){ n.ct = ""; }
-    if((k==="ct" || k==="cat" || k==="rel") && !a.numTouched) n.num = numFor(adRel(n)==="other" ? "GEN" : n.ct, n.cat);
+    if((k==="ct" || k==="rel") && !a.typedTouched) n.typed = adRel(n)==="other" ? "GEN" : String(n.ct||"");   // 2026-11-08: your part of the number
     if(k==="cat" && (!a.title || a.title===a.cat)) n.title = v;
-    if(k==="num") n.numTouched = true;
+    if(k==="cat"){ n.another = false; n.taken = ""; n.sls = adSlDefault(v); }
+    if(k==="ct" || k==="rel"){ n.cat = ""; n.another = false; n.taken = ""; n.sls = []; if(!a.title || a.title===a.cat) n.title = ""; }
+    if(k==="typed") n.typedTouched = true;
     if(k==="start"){ n.dir = ""; n.status = ""; n.rev = ""; n.initial = v==="our"; }
     if(k==="initial"){ n.status = ""; n.dir = ""; n.rev = ""; }
     if(k==="rev" && String(v).trim()==="") n.dir = "";
@@ -64165,7 +64380,19 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
     if(rel==="quote" && adQs && !adQs.some(x=>x[0]===a.ct)) return "Quote# "+a.ct+" is not in the Quote Register. Pick it from the list.";
     if(!a.cat) return "Pick the document category.";
     if(!String(a.title||"").trim()) return "Give the document a title.";
-    if(!String(a.num||"").trim()) return "Give the document a number.";
+    if(a.typed!==undefined ? !docTypedClean(a.typed) : !String(a.num||"").trim()) return "Type your part of the document number (e.g. the contract number).";
+    if(a.typed!==undefined && adEnt && !adEnt.loading && String(adEnt.ref)===String(adRef(a))){   // 2026-11-08: one of each, unless added as another on purpose
+      const e = adHave[String(a.cat).toLowerCase()]; const ps = adPerSl(a.cat) && adSls.length;
+      if(ps && !(a.sls||[]).length) return "Tick the Sl No(s) this "+a.cat+" covers.";
+      if(!a.another){
+        if(e && !ps) return a.cat+" is already on "+adWhat(a)+". Pick it in the list to see how to add another one.";
+        if(e && ps){ const clash = (a.sls||[]).filter(k=>e.whole || e.sls.has(String(k))); if(clash.length) return "Sl "+clash.join(", ")+" already "+(clash.length>1?"have":"has")+" a "+a.cat+". Untick "+(clash.length>1?"them":"it")+", or pick the name again and choose Add another."; }
+      } else {
+        const t = String(a.title||"").trim().toLowerCase();
+        const same = e ? e.docs.find(d=>String(d.doc_name||"").trim().toLowerCase()===t || String(d.category||"").trim().toLowerCase()===t) : null;
+        if(same || t===String(a.cat).trim().toLowerCase()) return "Give this "+a.cat+" a title that says what makes it different from the one already there (e.g. "+a.cat+" \u2013 150NB CF8M).";
+      }
+    }
     if(!adInit(a)){   // 245: not an initial submission — the revision it is at
       if(String(a.rev==null?"":a.rev).trim()==="" || !(Number(a.rev)>=0)) return "Give the revision number it is at (0 for the first issue).";
       if(!a.dir) return "Say whether Rev "+a.rev+" is Out (we sent it to the client) or In (the client returned it).";
@@ -64178,17 +64405,19 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   // Makes the document. Backward: a fulfilled requirement on the contract (the Sale Order's Documents and Report by
   // Contract show it). Forward: the next sync makes the owner's task card; chase and codes follow as for any card.
   const doAdd = async(a, by, via)=>{
-    const docNo = String(a.num).trim();
+    const docNo = a.typed!==undefined ? await docMakeFreeNumber(docNumberPrefix(data.cats, a.cat), a.typed) : String(a.num).trim();   // 2026-11-08
+    const cno = String(a.cno||"").trim(); const sls = (a.sls||[]).map(Number).filter(n=>!isNaN(n));
     const { data:taken } = await sb.from("universal_documents_tbl").select("entity_id").ilike("doc_number",docNo.replace(/[%_]/g,"\\$&")).limit(1);
     if(taken && taken.length) throw new Error(docNo+" is already used"+(taken[0].entity_id?" on "+taken[0].entity_id:"")+". Pick another number.");
     const why = addWhy(a), now = new Date().toISOString(), link = String(a.link).trim();
     const rel = adRel(a) || "contract", ref = adRef(a), etype = rel==="quote" ? "quote" : rel==="other" ? "other" : "contract";   // 245
     const ins = await sb.from("universal_documents_tbl").insert({ doc_number:docNo, doc_name:String(a.title).trim(), category:a.cat, entity_type:etype, entity_id:ref, is_mandatory:false, is_archived:false,
       for_production: !!(docCategoryRow(data.cats,a.cat)||{}).for_production_default, created_by:by, owner:a.owner||null,
+      ...(sls.length ? { item_sl_no:sls[0] } : {}), ...(cno ? { client_doc_no:cno } : {}),
       review_added_by:by, review_added_at:now, review_reason:why, review_link:link, review_via:via }).select().single();
-    if(ins.error){ if(/review_/.test(ins.error.message||"")) throw new Error("Run structure_doc_board_gateway_2026-10-13.sql first (both companies)."); throw ins.error; }
+    if(ins.error){ if(/client_doc_no/.test(ins.error.message||"")) throw new Error("Run "+DOC_CNO_SQL+" first (both companies) \u2014 the client's document number has nowhere to go yet."); if(/review_/.test(ins.error.message||"")) throw new Error("Run structure_doc_board_gateway_2026-10-13.sql first (both companies)."); throw ins.error; }
     const docId = ins.data.id;
-    if(rel!=="other") await sb.from("document_requests_tbl").insert({ entity_type:etype, entity_id:ref, category:a.cat, fulfilled_document_id:docId, requested_by:by, is_mandatory:false, source:"review", owner:a.owner||null });
+    if(rel!=="other") for(const sl of (sls.length ? sls : [null])) await sb.from("document_requests_tbl").insert({ entity_type:etype, entity_id:ref, category:a.cat, fulfilled_document_id:docId, requested_by:by, is_mandatory:false, source:"review", owner:a.owner||null, ...(sl!=null ? { item_sl_no:sl } : {}) });
     if(!adInit(a)){
       const at = (a.date && a.date!==today) ? a.date+"T12:00:00" : now;
       const { error } = await sb.from("universal_document_history_tbl").insert({ document_id:docId, doc_number:docNo, rev_number:Number(a.rev)||0, direction:a.dir, status:a.status,
@@ -64208,7 +64437,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
       if(r.error) console.error("Card for the added document not made", r.error);
       else await taskLog(r.data.id, by, "Created with document "+docNo+" ("+adWhat(a)+") "+(a.owner?"on "+a.owner+"'s board":"in the "+DOC_DEPT+" Unassigned pile"));
     }
-    await logAudit("INSERT","universal_documents_tbl",ref,"Added in review: "+docNo+" "+String(a.title).trim()+" ("+a.cat+", "+adWhat(a)+") in “"+docListOf(a.start).label+"”"+(adInit(a)?"":" at Rev "+(Number(a.rev)||0)+" "+a.dir)+(a.owner?", handed to "+a.owner:"")+" — "+why+" ["+via+"]",user?.username||"unknown",null,null);
+    await logAudit("INSERT","universal_documents_tbl",ref,"Added in review: "+docNo+(cno?" (client no "+cno+")":"")+" "+String(a.title).trim()+" ("+a.cat+(sls.length?", Sl "+sls.join(", "):"")+(a.another?", another of this kind":"")+", "+adWhat(a)+") in “"+docListOf(a.start).label+"”"+(adInit(a)?"":" at Rev "+(Number(a.rev)||0)+" "+a.dir)+(a.owner?", handed to "+a.owner:"")+" — "+why+" ["+via+"]",user?.username||"unknown",null,null);
     if(a.owner && a.owner!==me) await notifyPeople([a.owner], "📄 "+(me||by)+" added "+String(a.title).trim()+" ("+docNo+") to "+adWhat(a)+" in review and handed it to you — "+why+". "+(rel==="contract"?"Order Status → Document Control.":"Your task board."), "doc_review_add");
     return docNo;
   };
@@ -64217,8 +64446,6 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
     const err0 = addCheck({ ...a, link:"https://drive.google.com/x" }); if(err0){ alert(err0); return; }   // 245: everything but the link first
     if(!String(a.link||"").trim()){ setAdHelp(true); return; }
     const err = addCheck(a); if(err){ alert(err); return; }
-    const dup = adRel(a)==="contract" ? data.items.filter(it=>it.ct===a.ct && it.cat===a.cat) : [];
-    if(dup.length && !confirm("Contract "+a.ct+" already has "+dup.map(it=>"“"+it.name+"” ("+(it.no||"requested")+", "+docItemList(it).short+")").join(", ")+" under "+a.cat+".\n\nAdd another one anyway?")) return;
     let via;
     if(isSuper) via = "Super Admin";
     else if(isAdmin) via = "Admin";
@@ -64299,9 +64526,28 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
       fld(rel==="quote" ? "Quote# (Quote Register)" : "Contract",
         rel==="quote" ? h(SearchPick,{value:a.ct,onChange:v=>setAdF("ct",v),width:440,placeholder:adQs?"Type a Quote# or customer — pick from the list":"Loading the Quote Register…",options:adQs||[]})
                       : h(ContractFind,{testid:"add-ct",value:rel==="contract"?a.ct:"",disabled:rel!=="contract",onChange:v=>setAdF("ct",v),width:440,placeholder: rel==="other" ? "— not linked (Others) —" : !rel ? "Pick Offer, Contract or Others first" : "Type a contract number or customer"}),"ct"),
-      fld("Document category", h("div",{"data-testid":"add-cat-box"}, h(LimitToListCombo,{ value:a.cat||"", options:addCats, onChange:v=>setAdF("cat",v), placeholder:"Type to search, e.g. hyd…", style:{...inS,width:"100%"} })),"cat"),   // 2026-11-05 Ramesh: type to narrow the list
-      fld("Title", h("input",{value:a.title||"",onChange:e=>setAdF("title",e.target.value),style:inS,"data-testid":"add-title"}),"ti"),
-      fld("Doc number", h("input",{value:a.num||"",onChange:e=>setAdF("num",e.target.value),style:inS,"data-testid":"add-num"}),"nu"),
+      fld("Document category", h("div",{"data-testid":"add-cat-box"}, h(DocCatPick,{ names:addCats, have:adHave, perSl:adPerSl, sls:adSls, value:a.cat||"", stageOf:adStageOf,
+        onPick:v=>setAdF("cat",v), onTaken:n=>setAd(x=>({ ...x, cat:"", taken:n, another:false, sls:[] })) }),
+        adEnt && adEnt.loading ? h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:2}},"Reading what "+adWhat(a)+" already has\u2026") : null),"cat"),   // 2026-11-08: one list, names already there greyed
+      a.taken ? (()=>{ const e = adHave[a.taken.toLowerCase()]; const its = adItemsOf(e); const rows = e ? [...e.docs, ...e.reqs] : [];
+        return h("div",{key:"tk","data-testid":"add-taken",style:{background:"#fff4d6",border:"1px solid #e9c46a",borderRadius:8,padding:"9px 11px",marginTop:8,fontSize:12,lineHeight:1.45}},
+          h("b",null,a.taken+" is already on "+adWhat(a)),
+          h("div",{style:{color:colors.muted,margin:"2px 0 6px"}}, rows.map((r,i)=>h("div",{key:i},"\u2022 "+docRowLabel(r)+(r.doc_name?" \u2014 "+r.doc_name:"")+(r.item_sl_no!=null?" \u00b7 Sl "+r.item_sl_no:" \u00b7 whole order")+(its[i]?" \u00b7 "+(docItemList(its[i]).short||""):"")))),
+          h("div",null,"What are you adding?"),
+          h("ol",{style:{margin:"4px 0 8px 18px",padding:0}},
+            h("li",null,h("b",null,"A new revision of that same document"),": don't add it here. Open its card and press ",h("b",null,"Send resubmission \u25b8")," (or log the client's return on it); the revision goes into the card's history."),
+            h("li",null,h("b",null,"A separate document of the same kind"),adPerSl(a.taken)?" (for example a separate drawing for some of the Sl Nos)":" (for example a second one for another material)",": press ",h("b",null,"Add another")," and give it a title that says what makes it different. It gets its own number.")),
+          h("div",{style:{display:"flex",gap:6,flexWrap:"wrap"}},
+            its.length ? h("button",{"data-testid":"add-taken-open",style:btnSmall,onClick:()=>{ adForget(); setPanel({ kind:"hist", key:its[0].key }); }},"Open the existing card \u25b8") : null,
+            h("button",{"data-testid":"add-taken-another",style:{...btnSmall,background:"#0f7a5c",color:"#fff",borderColor:"#0f7a5c",fontWeight:700},onClick:()=>setAd(x=>({ ...x, cat:x.taken, taken:"", another:true, title:"", sls:[] }))},"Add another "+a.taken),
+            h("button",{"data-testid":"add-taken-other",style:btnSmall,onClick:()=>setAd(x=>({ ...x, taken:"" }))},"Pick a different name"))); })() : null,
+      a.another && a.cat ? h("div",{key:"an","data-testid":"add-another-note",style:{background:"#e6f1fb",borderRadius:6,padding:"6px 9px",marginTop:6,fontSize:11.5}},"Adding another "+a.cat+" to "+adWhat(a)+". Give it a title that says what makes it different from the one already there.") : null,
+      a.cat && adPerSl(a.cat) && adSls.length ? fld(h("span",null,"Covers Sl No ",h("b",{style:{color:"#a3312a"}},"(tick one or more)")), h(DocSlTicks,{ sls:adSls, have:adHave[a.cat.toLowerCase()], value:a.sls||[], onChange:v=>setAd(x=>({ ...x, sls:v })) }),"sl") : null,
+      fld("Title", h("input",{value:a.title||"",onChange:e=>setAdF("title",e.target.value),placeholder:a.another?"What makes it different, e.g. "+a.cat+" \u2013 150NB CF8M":"",style:inS,"data-testid":"add-title"}),"ti"),
+      a.typed!==undefined ? fld("Doc number", h(DocNumberBox,{ prefix:a.cat ? docNumberPrefix(data.cats, a.cat) : "", typed:a.typed, onTyped:v=>setAdF("typed",v), testid:"add-typed" }),"nu")
+        : fld("Doc number", h("input",{value:a.num||"",onChange:e=>setAdF("num",e.target.value),style:inS,"data-testid":"add-num"}),"nu"),
+      fld("Client doc no", h("div",null, h("input",{value:a.cno||"",disabled:DOC_CNO_OK===false,onChange:e=>setAdF("cno",e.target.value),placeholder:DOC_CNO_OK===false?"Run "+DOC_CNO_SQL+" first":"the client's own number, if they gave one (optional)",style:inS,"data-testid":"add-cno"}),
+        h("div",{style:{fontSize:10.5,color:colors.mutedLight,marginTop:2}},"When filled, it is shown first wherever this document appears; ours follows in brackets.")),"cn"),
       fld("Stage", h("select",{value:a.start,onChange:e=>setAdF("start",e.target.value),style:inS,"data-testid":"add-start"}, startLists.map(l=>h("option",{key:l.key,value:l.key},l.label+(docCustomOf(l.key)?" (added list)":"")))),"st"),
       a.start==="our" ? fld("Initial submission?", h("div",{style:{display:"flex",gap:6,flexWrap:"wrap"}}, yn("initial",true,"Yes — nothing sent yet"), yn("initial",false,"No — a revision exists")),"ini") : null,
       !adInit(a) ? h("div",{key:"rv",style:{background:"#f6f6f2",borderRadius:6,padding:"4px 8px 8px",marginTop:6}},
@@ -64397,7 +64643,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
         h("thead",null,h("tr",null,["Added","By","How","Contract","Document","Why","Now in","Owner","OneDrive"].map(x=>h("th",{key:x,style:th},x)))),
         h("tbody",null, rows.map(it=>h("tr",{key:it.key},
           h("td",{style:td},fmtDMY(String(it.doc.review_added_at).slice(0,10))), h("td",{style:td},it.doc.review_added_by||"—"), h("td",{style:td},it.doc.review_via||"—"),
-          h("td",{style:td},ctOptLabel(it.ct,it.customer)), h("td",{style:td},h("b",null,it.name),h("div",{style:{fontSize:11,color:colors.muted}},it.no)),
+          h("td",{style:td},ctOptLabel(it.ct,it.customer)), h("td",{style:td},h("b",null,it.name),h("div",{style:{fontSize:11,color:colors.muted}},docItNo(it,true))),
           h("td",{style:td},it.doc.review_reason||"—"), h("td",{style:td},docItemList(it).short), h("td",{style:td},it.owner||"Unassigned"),
           h("td",{style:td},it.doc.review_link?h("a",{href:it.doc.review_link,target:"_blank",rel:"noopener noreferrer"},"🔗 open"):"—")))))),
       h("div",{key:"x",style:{display:"flex",justifyContent:"flex-end",marginTop:12}}, h("button",{style:btnSmall,onClick:()=>setPanel(null)},"Close"))
@@ -64559,7 +64805,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
     const emailText = ()=>{
       const t = ["Sub: "+DOC_LETTER_LEVELS[sel.level||1]+" — documents pending your review / approval — our contract "+sel.contract_number+(so.basis_number?" / your PO "+so.basis_number:""),"",
         c&&c.name?"Kind attn: "+c.name+(c.designation?", "+c.designation:""):"","",opening,"",
-        ...rows.map((it,i)=>(i+1)+". "+it.name+" — "+(it.no||"")+" Rev "+(it.last?it.last.rev_number:"0")+" — submitted "+(outOf(it)?fmtDMY(outOf(it).changed_at):"—")+" — "+it.days+" days pending"+(it.hold==="Full Hold"?" (Full Hold)":"")),
+        ...rows.map((it,i)=>(i+1)+". "+it.name+" — "+(docItNo(it)||"")+" Rev "+(it.last?it.last.rev_number:"0")+" — submitted "+(outOf(it)?fmtDMY(outOf(it).changed_at):"—")+" — "+it.days+" days pending"+(it.hold==="Full Hold"?" (Full Hold)":"")),
         "", closing||"", "", "Thanking you,", "For "+((company&&company.company_name)||COMPANY_NAME), signer||"", "Document Controller", "Ref: "+sel.letter_no].filter(x=>x!==null).join("\n");
       const done = ()=>alert("Copied. Paste it into the email to the client.");
       if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(done).catch(()=>prompt("Copy the text:", t)); else prompt("Copy the text:", t);
@@ -64588,7 +64834,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
             ed ? h("textarea",{value:ed.opening,onChange:e=>setLt(x=>({...x,edit:{...x.edit,opening:e.target.value}})),rows:4,style:{...inputStyle,fontSize:12}}) : h("div",{style:{whiteSpace:"pre-wrap"}},opening),
             h("div",{style:{overflowX:"auto",margin:"10px 0"}},h("table",{style:{borderCollapse:"collapse",width:"100%",minWidth:540}},
               h("thead",null,h("tr",null,["Sl","Document","Doc # / Rev","Submitted on","Days pending"].map((x,i)=>h("th",{key:x,style:{...th,...(i===0||i===4?{textAlign:"right"}:{})}},x)))),
-              h("tbody",null,rows.map((it,i)=>h("tr",{key:it.key},h("td",{style:tdn},i+1),h("td",{style:td},it.name," ",holdTag(it)),h("td",{style:td},(it.no||"—")+" / Rev "+(it.last?it.last.rev_number:"0")),h("td",{style:td},outOf(it)?fmtDMY(outOf(it).changed_at):"—"),h("td",{style:{...tdn,...(it.late?{color:"#a3312a",fontWeight:700}:{})}},it.days)))))),
+              h("tbody",null,rows.map((it,i)=>h("tr",{key:it.key},h("td",{style:tdn},i+1),h("td",{style:td},it.name," ",holdTag(it)),h("td",{style:td},(docItNo(it)||"—")+" / Rev "+(it.last?it.last.rev_number:"0")),h("td",{style:td},outOf(it)?fmtDMY(outOf(it).changed_at):"—"),h("td",{style:{...tdn,...(it.late?{color:"#a3312a",fontWeight:700}:{})}},it.days)))))),
             ed ? h("textarea",{value:ed.closing,onChange:e=>setLt(x=>({...x,edit:{...x.edit,closing:e.target.value}})),rows:3,placeholder:"(no closing paragraph)",style:{...inputStyle,fontSize:12}}) : (closing ? h("div",{style:{whiteSpace:"pre-wrap"}},closing) : null),
             h("div",{style:{marginTop:12}},"Thanking you,",h("br"),"For "+((company&&company.company_name)||COMPANY_NAME),h("br"),h("br"),h("b",null,signer||""),h("br"),"Document Controller")),
           h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginTop:10,alignItems:"center"}},
@@ -64618,7 +64864,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
       const cols = ext ? ["Sl","Document","Doc # / Rev","Status","Submitted (Out)","Returned (In)","With"] : ["Sl","Document","Doc # / Rev","Hold","Stage","Status","Out","In","Days in stage","Owner","Chased"];
       if(hsum) cols.push("Revision history");   // 233
       const row0 = (it,i)=>{ const o=outOf(it), inn=inOf(it); const st = it.kind==="req" ? (ext?"To be submitted":"Requested — no document yet") : String(it.status||"").replace(/-Awarded|-Proceed/g,"");
-        const rv = (it.no||"—")+" / "+(it.last?"Rev "+it.last.rev_number:"—");
+        const rv = (docItNo(it)||"—")+" / "+(it.last?"Rev "+it.last.rev_number:"—");
         return ext ? h("tr",{key:it.key},h("td",{style:tdn},i+1),h("td",{style:td},it.name),h("td",{style:td},rv),h("td",{style:td},h("span",{style:{display:"inline-block",width:8,height:8,borderRadius:"50%",marginRight:6,background:DOC_RSTG_TONE[docRStageOf(docRStage(it)).tone][2]}}),st),h("td",{style:td},o?fmtDMY(o.changed_at):"—"),h("td",{style:td},inn?fmtDMY(inn.changed_at):"—"),h("td",{style:td},it.list==="our"?((company&&company.company_name)||"Us"):it.list==="done"?"—":"Client"))
           : h("tr",{key:it.key},h("td",{style:tdn},i+1),h("td",{style:td},it.name),h("td",{style:td},rv," ",latestLink(it)),h("td",{style:td},holdTag(it)),h("td",{style:td},docRStageOf(docRStage(it)).short),h("td",{style:td},h("span",{style:{display:"inline-block",width:8,height:8,borderRadius:"50%",marginRight:6,background:DOC_RSTG_TONE[docRStageOf(docRStage(it)).tone][2]}}),st),h("td",{style:td},o?fmtDMY(o.changed_at):"—"),h("td",{style:td},inn?fmtDMY(inn.changed_at):"—"),h("td",{style:{...tdn,...(it.late?{color:"#a3312a",fontWeight:700}:{})}},it.days),h("td",{style:td},it.owner||h("span",{style:{color:"#a06a00"}},"Unassigned")),h("td",{style:tdn},it.chased||"·")); };
       const row = (it,i)=>{ const el = row0(it,i); const kids = [].concat(el.props.children);   // 233: history column / lines, double-click = detail
@@ -64643,8 +64889,8 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
       const head = ext ? ["Contract","Customer","Group","Document","Doc #","Rev","Status","Submitted (Out)","Returned (In)","With"] : ["Contract","Customer","Stage","Document","Doc #","Rev","Hold","Status","Out","In","Days in stage","Owner","Chased"];
       const rowsOut = [head];
       cts.forEach(c=>{ const so=data.soBy[c]||{}; const xsE = data.items.filter(it=>it.ct===c && (!stg || docRStage(it)===stg)); const ordE = k=>DOC_RSTG.findIndex(x=>x.key===k); xsE.sort((a,b)=>ordE(docRStage(a))-ordE(docRStage(b))); xsE.forEach(it=>{ const o=outOf(it), inn=inOf(it); const st = it.kind==="req"?(ext?"To be submitted":"Requested — no document yet"):it.status;
-        rowsOut.push(ext ? [c, so.customer_name||"", docRStageCw(docRStage(it), company), it.name, it.no, it.last?it.last.rev_number:"", st, o?fmtDMY(o.changed_at):"", inn?fmtDMY(inn.changed_at):"", it.list==="our"?"Us":it.list==="done"?"":"Client"]
-          : [c, so.customer_name||"", docRStageOf(docRStage(it)).short, it.name, it.no, it.last?it.last.rev_number:"", holdLabel(it.hold), st, o?fmtDMY(o.changed_at):"", inn?fmtDMY(inn.changed_at):"", it.days, it.owner||"Unassigned", it.chased||""]); }); });
+        rowsOut.push(ext ? [c, so.customer_name||"", docRStageCw(docRStage(it), company), it.name, docItNo(it), it.last?it.last.rev_number:"", st, o?fmtDMY(o.changed_at):"", inn?fmtDMY(inn.changed_at):"", it.list==="our"?"Us":it.list==="done"?"":"Client"]
+          : [c, so.customer_name||"", docRStageOf(docRStage(it)).short, it.name, docItNo(it), it.last?it.last.rev_number:"", holdLabel(it.hold), st, o?fmtDMY(o.changed_at):"", inn?fmtDMY(inn.changed_at):"", it.days, it.owner||"Unassigned", it.chased||""]); }); });
       XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rowsOut), "Documents");
       XLSX.writeFile(wb, ("Document_Status_"+(cts.length===1?cts[0]:(woF?woF:"all"))+(stg?"_"+stg:"")+(ext?"_client":"")+"_"+today).replace(/[^A-Za-z0-9_-]+/g,"_")+".xlsx");
     };
@@ -64758,7 +65004,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   const listExcel = ()=>{
     const gs = listRows();
     const hd = ["Contract","Client","Document","Number","Stage","Hold","Owner","Due / chase","Overdue","Days in this list"];
-    const body = []; gs.forEach(g=>g.items.forEach(it=>body.push([it.ct, g.customer, it.name, it.no||"", stageName(it), holdLabel(it.hold||""), it.owner||"Unassigned", dueWords(it), it.late?"Yes":"", it.days])));
+    const body = []; gs.forEach(g=>g.items.forEach(it=>body.push([it.ct, g.customer, it.name, docItNo(it)||"", stageName(it), holdLabel(it.hold||""), it.owner||"Unassigned", dueWords(it), it.late?"Yes":"", it.days])));
     const ws = XLSX.utils.aoa_to_sheet([[listTitle()+" — "+fmtDMY(today)], [], hd, ...body]);
     ws["!cols"] = [10,24,34,18,26,24,16,20,9,10].map(w=>({wch:w}));
     const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "Documents");
@@ -64776,7 +65022,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
     gs.forEach(g=>{
       const fh = fullHoldOpen(data.items.filter(it=>it.ct===g.ct)), up = g.items.filter(it=>dueOpen(it) && it.due && it.due<=today).length;
       if(mode==="all") body.push([{ content:g.ct+" – "+g.customer+"   ·   "+g.items.length+" document"+(g.items.length===1?"":"s")+(fh?"   ·   "+fh+" Full Hold open":"")+(up?"   ·   "+up+" due up to today":""), colSpan:7, styles:{ fillColor:[244,242,234], fontStyle:"bold", textColor:[12,68,124] } }]);
-      g.items.forEach(it=>body.push([ it.name+(it.no?"\n"+it.no:""), stageName(it), holdLabel(it.hold||""), it.owner||"Unassigned",
+      g.items.forEach(it=>body.push([ it.name+(it.no?"\n"+docItNo(it,true):""), stageName(it), holdLabel(it.hold||""), it.owner||"Unassigned",
         { content:dueWords(it), styles: it.late ? { textColor:[163,49,42], fontStyle:"bold" } : {} }, String(it.days), it.chased ? "Chased "+it.chased+"×" : "" ]));
     });
     doc.autoTable({ startY:27, head:[["Document","Stage","Hold","Owner","Due / chase","Days in list","Note"]], body, theme:"grid",
@@ -64811,7 +65057,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
                 up ? h("span",{style:{fontSize:10.5,fontWeight:700,borderRadius:9,padding:"1px 8px",marginLeft:6,background:"#fdeaea",color:"#8a2d2d"}},up+" due up to today") : null, h("span",{style:{marginLeft:6}}, woTagEl(g.ct, true)))) : null;
             const lines = f ? [] : g.items.map(it=>{ const lst = docItemList(it);
               return h("tr",{key:it.key, ...docLongPress(()=>setPanel({kind:"hist",key:it.key}))},
-                h("td",{style:td}, h("div",{style:{display:"flex",gap:6,alignItems:"flex-start"}}, h("span",{style:{fontWeight:600}},it.name), latestLink(it)), it.no ? h("div",{style:{fontSize:10.5,color:colors.muted}},it.no) : null),
+                h("td",{style:td}, h("div",{style:{display:"flex",gap:6,alignItems:"flex-start"}}, h("span",{style:{fontWeight:600}},it.name), latestLink(it)), it.no ? h("div",{style:{fontSize:10.5,color:colors.muted}},docItNo(it,true)) : null),
                 h("td",{style:td}, tag(lst.short||lst.label,{background:lst.bg,color:lst.color},"l")),
                 h("td",{style:td}, holdTag(it)),
                 h("td",{style:td,onClick:e=>e.stopPropagation()}, ownerSel(it,true)),
@@ -75370,10 +75616,203 @@ async function invPdf(inv, lines){
   pdfShow(doc, ((DI?"Direct_Invoice_":PI?"Proforma_":"Invoice_")+inv.invoice_no+"_"+(inv.contract_number||"")).replace(/[^A-Za-z0-9_-]+/g,"_")+".pdf");
 }
 // ---- the invoice editor ----------------------------------------------------------------------------
+// ===== 2026-11-08 IRP build: e-invoice and e-way bill — two gateways =====
+// Manual gateway: generate on the government portal, enter the numbers here (checked). Automatic gateway: the app sends the
+// invoice through Clear (GST Suvidha Provider) by the Supabase function gst-gateway; the Clear key lives only in Supabase.
+// Switch per company (Setup › Despatch Settings & LUT): Off / Sandbox (tests only, nothing saved) / Live. Super Admins set it.
+const GST_SQL = "structure_gst_gateway_2026-11-08.sql";
+const GST_FN = "gst-gateway";
+let GST_CFG = null;
+async function gstCfg(force){
+  if(GST_CFG && !force) return GST_CFG;
+  try{ const { data, error } = await sb.from("gst_gateway_tbl").select("*").eq("id",1).maybeSingle(); GST_CFG = error ? { mode:"off", _missing:true, _err:error.message } : (data || { mode:"off" }); }
+  catch(e){ GST_CFG = { mode:"off", _missing:true, _err:String(e&&e.message||e) }; }
+  return GST_CFG;
+}
+const gstMode = (c)=> (c && (c.mode==="sandbox" || c.mode==="live")) ? c.mode : "off";
+function gstIsFD(me){ try{ return !!me && postHolders("finance_director").includes(me); }catch(e){ return false; } }
+function gstFree(user, me){ return !!user && (user.role==="super_admin" || gstIsFD(me)); }   // the Finance Director and Super Admins need no code
+function gstCanEinv(user, me, P){ return despCan("acc",user,me,P) || gstIsFD(me); }
+function gstCanEwb(user, me, P){ return gstCanEinv(user,me,P) || !!(P && (P.fm||[]).includes(me)); }
+async function gstApprovers(){ try{ await loadPostPeople(true); }catch(e){} let sa = []; try{ sa = await superAdminNames(); }catch(e){}
+  return Array.from(new Set([...(postHolders("finance_director")||[]), ...(sa||[])])).filter(Boolean); }
+const gstWho = (names)=> (names && names.length) ? names.join(" or ") : "the Finance Director or a Super Admin";
+// what the portal's numbers look like
+const GST_IRN_RE = /^[0-9a-f]{64}$/, GST_ACK_RE = /^\d{15}$/, GST_EWB_RE = /^\d{12}$/;
+function gstAckProblem(irn, ackNo, ackDate, inv){
+  const a = String(ackNo||"").trim(), i = String(irn||"").trim().toLowerCase();
+  if(!GST_ACK_RE.test(a)) return "The Ack No is 15 digits (numbers only), e.g. 112620123456789. Copy it from the IRP — it is printed next to the IRN.";
+  if(i && a.toLowerCase()===i) return "That is the IRN, not the Ack No. The Ack No is the 15-digit number next to it.";
+  if(!ackDate) return "Enter the Ack date and time from the IRP.";
+  const d = new Date(ackDate); if(isNaN(d.getTime())) return "The Ack date is not readable.";
+  if(inv && inv.invoice_date && toISODate(d) < String(inv.invoice_date).slice(0,10)) return "The Ack date ("+fmtDMYTime(d)+") is before the invoice date ("+fmtDMY(inv.invoice_date)+"). Copy the Ack date and time exactly as the IRP shows it.";
+  if(d.getTime() > Date.now()+10*60*1000) return "The Ack date is in the future. Copy it exactly as the IRP shows it.";
+  return "";
+}
+// "2026-11-05 10:26:00" (India time, as Clear / the IRP send it) -> ISO
+function gstIstToIso(s){ const m = String(s||"").match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/); if(m) return new Date(Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+(m[6]||0)) - 330*60000).toISOString();
+  const m2 = String(s||"").match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i); if(m2){ let hh = +m2[4]; if(m2[7]){ if(/PM/i.test(m2[7]) && hh<12) hh+=12; if(/AM/i.test(m2[7]) && hh===12) hh=0; }
+    return new Date(Date.UTC(+m2[3],+m2[2]-1,+m2[1],hh,+m2[5],+(m2[6]||0)) - 330*60000).toISOString(); }
+  const d = new Date(s); return isNaN(d.getTime()) ? null : d.toISOString(); }
+// the one call to the server function; it always answers { ok, ... }
+async function gstCall(action, body, user){
+  let r;
+  try{ r = await sb.functions.invoke(GST_FN, { body:{ action, sess:sessId(), username:user?.username||"", ...(body||{}) } }); }
+  catch(e){ return { ok:false, missing:true, error:"The automatic gateway could not be reached: "+(e&&e.message||e) }; }
+  if(r && r.error){ const m = String(r.error.message||r.error); const missing = /not found|404|failed to send|relay|fetch/i.test(m);
+    return { ok:false, missing, error: missing ? "The automatic gateway is not set up on this server (Supabase function “"+GST_FN+"” missing or not reachable). Use the manual way meanwhile." : m }; }
+  return (r && r.data) || { ok:false, error:"No reply from the automatic gateway." };
+}
+// ---- codes for this build: Edit code (manual entry / correction), E-invoice cancel code, E-way bill cancel code ----
+async function gstMakeCode(kind, inv, user, me, note){
+  const code = String(Math.floor(100000+Math.random()*900000)); const expires_at = new Date(Date.now()+24*3600*1000).toISOString();
+  const { error } = await sb.from("authorization_codes").insert({ code, code_type:kind, generated_by:user?.username||"unknown", expires_at, reference_number:"INV:"+inv.id, note:(note||codeName(kind))+" — invoice "+inv.invoice_no, used:false });
+  if(error) throw new Error("Could not make "+aCode(kind)+": "+error.message);
+  await logAudit("INSERT","authorization_codes","INV:"+inv.id,"Made "+aCode(kind)+" for invoice "+inv.invoice_no+(note?" ("+note+")":""),user?.username||"unknown",null,null);
+  try{ const { data: hs } = await sb.from("dc_history_tbl").select("*").eq("invoice_id",inv.id).eq("action","Asked for "+codeName(kind)).order("at",{ascending:false}).limit(1);
+    const ask = (hs||[])[0]; if(ask && ask.note) await notifyPeople([ask.note], "🔑 "+codeName(kind)+" for invoice "+inv.invoice_no+": "+code+" (one use, this invoice only, 24 h) — from "+(me||user?.username)+".", "gst_code"); }catch(e){}
+  return code;
+}
+async function gstAskCode(kind, inv, user, me, why){
+  const names = await gstApprovers();
+  await invHist(inv.id, inv.dc_id, "Asked for "+codeName(kind), user?.username, me||user?.username);
+  await notifyPeople(names, "🔑 "+(me||user?.username)+" asks for "+aCode(kind)+" for invoice "+inv.invoice_no+(why?" — "+why:"")+". Open the invoice (Accounts › Billing › Tax Invoices) and press Make a code.", "gst_code");
+  return names;
+}
+async function gstTakeCode(kind, code, inv, user){
+  const c = String(code||"").trim(); if(!c) return { err:"Enter "+aCode(kind)+"." };
+  const { data } = await sb.from("authorization_codes").select("*").eq("code",c).eq("code_type",kind).eq("used",false).limit(1);
+  const row = (data||[])[0];
+  if(!row) return { err:"That isn't an unused "+codeName(kind)+"." };
+  if(row.reference_number && row.reference_number!=="INV:"+inv.id) return { err:"That "+codeName(kind)+" is for another invoice." };
+  if(row.expires_at && new Date(row.expires_at) < new Date()) return { err:"That "+codeName(kind)+" has expired. Ask for a new one." };
+  await sb.from("authorization_codes").update({ used:true, used_by:user?.username||"unknown", used_at:new Date().toISOString() }).eq("id",row.id);
+  return { by:row.generated_by };
+}
+// ---- the e-invoice in the government format (schema 1.1), built from the invoice ----
+const GST_UQC = { NOS:"NOS",NO:"NOS",NUMBER:"NOS",NUMBERS:"NOS",EA:"NOS",EACH:"NOS",UNIT:"UNT",UNITS:"UNT",UNT:"UNT",PCS:"PCS",PC:"PCS",PIECE:"PCS",PIECES:"PCS",SET:"SET",SETS:"SET",KG:"KGS",KGS:"KGS",
+  MTR:"MTR",MTRS:"MTR",M:"MTR",METER:"MTR",METRE:"MTR",METERS:"MTR",PAIR:"PRS",PAIRS:"PRS",PRS:"PRS",LTR:"LTR",L:"LTR",LITRE:"LTR",BOX:"BOX",ROLL:"ROL",ROL:"ROL",TON:"TON",MT:"MTS",LOT:"OTH",JOB:"OTH",LS:"OTH" };
+const GST_UQC_LIST = ["NOS","PCS","SET","UNT","KGS","MTR","PRS","LTR","BOX","ROL","TON","MTS","OTH"];
+const gstUqc = (u)=> GST_UQC[String(u||"").trim().toUpperCase().replace(/[.\s]/g,"")] || "OTH";
+const GST_CNT = { "UNITED ARAB EMIRATES":"AE",UAE:"AE","U.A.E":"AE","SAUDI ARABIA":"SA",KSA:"SA",OMAN:"OM",QATAR:"QA",KUWAIT:"KW",BAHRAIN:"BH",SINGAPORE:"SG","UNITED STATES":"US",USA:"US","UNITED KINGDOM":"GB",UK:"GB",
+  IRELAND:"IE",GERMANY:"DE",MALAYSIA:"MY",INDONESIA:"ID",TURKMENISTAN:"TM",EGYPT:"EG",NIGERIA:"NG",KENYA:"KE","SOUTH AFRICA":"ZA","SRI LANKA":"LK",BANGLADESH:"BD",NEPAL:"NP",AUSTRALIA:"AU",CANADA:"CA",
+  FRANCE:"FR",ITALY:"IT",NETHERLANDS:"NL",IRAQ:"IQ",IRAN:"IR",JORDAN:"JO",THAILAND:"TH",VIETNAM:"VN",JAPAN:"JP","SOUTH KOREA":"KR",KOREA:"KR",CHINA:"CN",TURKEY:"TR",SPAIN:"ES",BELGIUM:"BE",PHILIPPINES:"PH" };
+const gstCnt = (s)=>{ const k = String(s||"").trim().toUpperCase(); return GST_CNT[k] || (/^[A-Z]{2}$/.test(k) ? k : ""); };
+function gstPin(t){ const m = String(t||"").match(/\b[1-9]\d{5}\b/g); return m ? m[m.length-1] : ""; }
+function gstAddr(text, nameFallback){
+  const ls = String(text||"").split(/\n/).map(s=>s.trim()).filter(Boolean);
+  const name = ls[0] || nameFallback || ""; const rest = ls.slice(1); const pin = gstPin(text);
+  const pinLine = rest.find(l=>pin && l.includes(pin)) || rest[rest.length-1] || "";
+  const loc = String(pinLine).replace(pin,"").replace(/[-–,:\s]+$/,"").replace(/^[-–,:\s]+/,"").split(",").map(s=>s.trim()).filter(Boolean).pop() || "";
+  const addr = rest.filter(l=>l!==pinLine || rest.length===1).join(", ").replace(/\s+/g," ").trim();
+  return { LglNm:name.slice(0,100), Addr1:(addr||loc||name).slice(0,100), Addr2:addr.length>100 ? addr.slice(100,200) : "", Loc:loc.slice(0,50), Pin:pin };
+}
+function gstDmy(d){ const s = String(d||"").slice(0,10); const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/); return m ? m[3]+"/"+m[2]+"/"+m[1] : s; }
+// the starting values the preview shows (the person can correct them before sending)
+function gstDefaults(inv, lines, co){
+  const exp = !!inv.is_export;
+  const b = gstAddr(inv.bill_to, inv.customer_name);
+  const stB = exp ? "96" : String(inv.buyer_gstin||"").slice(0,2) || String(inv.pos_code||"");
+  return { buyer:{ LglNm:b.LglNm||inv.customer_name||"", Addr1:b.Addr1, Addr2:b.Addr2, Loc:b.Loc, Pin: exp ? "999999" : b.Pin, Stcd:stB, Pos: exp ? "96" : String(inv.pos_code||"") },
+    uqc: Object.fromEntries((lines||[]).map(l=>[String(l.id), gstUqc(l.uom||l.unit)])), cnt: exp ? gstCnt(inv.buyer_state) : "", port:"",
+    seller:{ LglNm:(co&&co.company_name)||"", Addr1:[co&&co.street].filter(Boolean).join(", ")||"", Loc:(co&&co.city)||"", Pin:String((co&&co.pin)||"").replace(/\D/g,"").slice(0,6) } };
+}
+function gstBuildEinv(inv, lines, gstSnap, kindIn, ov){
+  const exp = !!inv.is_export; const kind = exp ? "export" : (kindIn || inv.gst_kind || null);
+  const fx = exp ? (Number(inv.fx_rate)||0) : 1; const cur = String(inv.currency||"INR").toUpperCase();
+  const inr = (v)=> r2((Number(v)||0)*fx);
+  const wop = exp || kind==="sez";
+  const supTyp = exp ? "EXPWOP" : kind==="sez" ? "SEZWOP" : "B2B";
+  const intra = !wop && String(inv.pos_code||"")===String(inv.snap_state_code||"");
+  const basic = (lines||[]).reduce((n,l)=>n+(Number(l.amount)||0),0);
+  const charges = (Number(inv.pf_amount)||0)+(Number(inv.freight_amount)||0)+(Number(inv.insurance_amount)||0);
+  const rateOf = (l)=> wop ? (l.gst_rate!=null && l.gst_rate!=="" && !isNaN(Number(l.gst_rate)) ? Number(l.gst_rate) : (invSnapRate(gstSnap)||18)) : invLineRate(l, kind, gstSnap);
+  const items = []; const groups = new Map(); const problems = [];
+  const tax = (ass, rt)=> wop ? { IgstAmt:0, CgstAmt:0, SgstAmt:0 } : intra ? { IgstAmt:0, CgstAmt:r2(ass*rt/200), SgstAmt:r2(ass*rt/200) } : { IgstAmt:r2(ass*rt/100), CgstAmt:0, SgstAmt:0 };
+  const push = (o)=>{ const t = tax(o.AssAmt, o.GstRt); items.push({ SlNo:String(items.length+1), ...o, ...t, TotItemVal:r2(o.AssAmt+t.IgstAmt+t.CgstAmt+t.SgstAmt) }); };
+  (lines||[]).forEach(l=>{
+    const hsn = String(l.hsn||"").replace(/\D/g,""); const rt = rateOf(l); const qty = Number(l.qty)||0;
+    if(![4,6,8].includes(hsn.length)) problems.push("Sl No "+l.item_sl_no+": the HSN must be 4, 6 or 8 digits (now “"+(l.hsn||"")+"”).");
+    const isServ = /^99/.test(hsn) ? "Y" : "N";
+    const tot = inr(Number(l.amount)||0);
+    push({ PrdDesc:String(l.description||l.item||("Sl No "+l.item_sl_no)).replace(/\s+/g," ").slice(0,300), IsServc:isServ, HsnCd:hsn, Qty:qty, Unit: isServ==="Y" ? undefined : ((ov&&ov.uqc&&ov.uqc[String(l.id)]) || gstUqc(l.uom||l.unit)),
+      UnitPrice: qty ? Math.round((tot/qty)*1000)/1000 : tot, TotAmt:tot, AssAmt:tot, GstRt:rt });
+    const k = hsn+"|"+rt; groups.set(k, (groups.get(k)||0)+(Number(l.amount)||0));
+  });
+  if(charges>0 && basic>0){ groups.forEach((amt,k)=>{ const [hsn, rs] = k.split("|"); const sh = inr(charges*amt/basic); if(sh>0) push({ PrdDesc:"Packing, freight and insurance charges", IsServc:"N", HsnCd:hsn, Qty:1, Unit:"OTH", UnitPrice:sh, TotAmt:sh, AssAmt:sh, GstRt:Number(rs) }); }); }
+  items.forEach(it=>{ if(it.Unit===undefined) delete it.Unit; });
+  const sum = (k)=> r2(items.reduce((n,it)=>n+(Number(it[k])||0),0));
+  const AssVal = sum("AssAmt"), IgstVal = sum("IgstAmt"), CgstVal = sum("CgstAmt"), SgstVal = sum("SgstAmt");
+  const TotInvVal = inr(inv.grand_total); const RndOffAmt = r2(TotInvVal - (AssVal+IgstVal+CgstVal+SgstVal));
+  if(Math.abs(RndOffAmt) > 99.99) problems.push("The items and taxes ("+invMoney(AssVal+IgstVal+CgstVal+SgstVal,"INR")+") don't add up to the invoice total ("+invMoney(TotInvVal,"INR")+"). Check the invoice before sending.");
+  const B = (ov && ov.buyer) || {};
+  const S = (ov && ov.seller) || {};
+  const no = String(inv.invoice_no||"");
+  if(!/^[A-Za-z1-9][A-Za-z0-9/-]{0,15}$/.test(no)) problems.push("The invoice number “"+no+"” can't go to the IRP: up to 16 letters, digits, / and -, not starting with 0, / or -.");
+  if(!exp && !/^[0-9]{2}[A-Z0-9]{13}$/.test(String(inv.buyer_gstin||"").toUpperCase())) problems.push("The buyer GSTIN is missing or not 15 characters — an e-invoice is only for registered buyers (B2B), SEZ and exports.");
+  if(!/^[1-9]\d{5}$/.test(String(B.Pin||""))) problems.push("Buyer PIN code: 6 digits, e.g. 600058.");
+  if(String(B.Loc||"").trim().length<3) problems.push("Buyer place (city / town): at least 3 letters.");
+  if(String(B.Addr1||"").trim().length<1) problems.push("Buyer address line is empty.");
+  if(String(B.LglNm||"").trim().length<3) problems.push("Buyer legal name: at least 3 letters.");
+  if(!/^[1-9]\d{5}$/.test(String(S.Pin||""))) problems.push("Our PIN code (Company Master) is missing.");
+  if(String(S.Loc||"").trim().length<3) problems.push("Our city (Company Master) is missing.");
+  if(exp && !/^[A-Z]{2}$/.test(String((ov&&ov.cnt)||""))) problems.push("Export: the buyer's country code (2 letters, e.g. AE for UAE).");
+  const body = {
+    Version:"1.1",
+    TranDtls:{ TaxSch:"GST", SupTyp:supTyp, RegRev: inv.reverse_charge ? "Y" : "N", IgstOnIntra:"N" },
+    DocDtls:{ Typ:"INV", No:no, Dt:gstDmy(inv.invoice_date) },
+    SellerDtls:{ Gstin:String(inv.snap_gstin||"").toUpperCase(), LglNm:String(S.LglNm||"").slice(0,100), Addr1:String(S.Addr1||S.Loc||"").slice(0,100), Loc:String(S.Loc||"").slice(0,50), Pin:Number(S.Pin)||0, Stcd:String(inv.snap_state_code||String(inv.snap_gstin||"").slice(0,2)) },
+    BuyerDtls:{ Gstin: exp ? "URP" : String(inv.buyer_gstin||"").toUpperCase(), LglNm:String(B.LglNm||"").slice(0,100), Pos: exp ? "96" : String(B.Pos||inv.pos_code||""), Addr1:String(B.Addr1||"").slice(0,100), ...(String(B.Addr2||"").trim().length>=3 ? { Addr2:String(B.Addr2).slice(0,100) } : {}),
+      Loc:String(B.Loc||"").slice(0,100), Pin: exp ? 999999 : (Number(B.Pin)||0), Stcd: exp ? "96" : String(B.Stcd||"") },
+    ItemList:items,
+    ValDtls:{ AssVal, CgstVal, SgstVal, IgstVal, CesVal:0, StCesVal:0, Discount:0, OthChrg:0, RndOffAmt, TotInvVal, ...(exp ? { TotInvValFc:r2(Number(inv.grand_total)||0) } : {}) },
+    ...(exp ? { ExpDtls:{ ForCur:cur, CntCode:String((ov&&ov.cnt)||""), ...(inv.shipping_bill_no ? { ShipBNo:String(inv.shipping_bill_no).slice(0,20) } : {}), ...(inv.shipping_bill_date ? { ShipBDt:gstDmy(inv.shipping_bill_date) } : {}), ...((ov&&ov.port) ? { Port:String(ov.port).toUpperCase() } : {}) } } : {})
+  };
+  return { body, problems, totals:{ AssVal, IgstVal, CgstVal, SgstVal, RndOffAmt, TotInvVal } };
+}
+// the switch and the server check, on Setup › Despatch Settings & LUT
+function GstGatewayCard({ user }){
+  const [c,setC] = useState(null); const [f,setF] = useState(null); const [busy,setBusy] = useState(false); const [msg,setMsg] = useState(""); const [ping,setPing] = useState(null);
+  const sa = user && user.role==="super_admin";
+  const load = async()=>{ const x = await gstCfg(true); setC(x); setF({ mode:gstMode(x), sandbox_gstin:x.sandbox_gstin||"" }); };
+  useEffect(()=>{ load(); },[]);
+  if(!c || !f) return null;
+  const box = { background:"#fff", border:"1px solid "+colors.border, borderRadius:8, padding:"10px 14px", marginBottom:12 };
+  if(c._missing) return h("div",{style:box}, h("b",null,"E-invoice & e-way bill gateway"), h("div",{style:{fontSize:12,color:colors.danger,marginTop:4}},"Run "+GST_SQL+" first (both companies). Until then only the manual way works."));
+  const save = async()=>{
+    if(!sa) return; const mode = f.mode; const sg = String(f.sandbox_gstin||"").trim().toUpperCase();
+    if(mode==="sandbox" && sg && !/^[0-9]{2}[A-Z0-9]{13}$/.test(sg)){ setMsg("The sandbox GSTIN is 15 characters (Clear gives it with the test key)."); return; }
+    if(mode==="live" && !(await despAsk("Switch the automatic gateway to Live?","From now on Generate e-invoice and Generate e-way bill send real documents to the government portal through Clear. The manual way stays, with a reason (and an Edit code for everyone but the Finance Director and Super Admins).",[{key:"no",label:"Go back"},{key:"yes",label:"Switch to Live",primary:true}]))==="yes") return;
+    setBusy(true); setMsg("");
+    const row = { id:1, mode, sandbox_gstin:sg||null, updated_by:user?.username||"unknown", updated_at:new Date().toISOString() };
+    const { error } = await sb.from("gst_gateway_tbl").upsert(row, { onConflict:"id" });
+    setBusy(false); if(error){ setMsg("Could not save: "+error.message); return; }
+    await logAudit("UPDATE","gst_gateway_tbl","1","Automatic e-invoice / e-way bill gateway: "+gstMode(c)+" → "+mode+(sg?" (sandbox GSTIN "+sg+")":""),user?.username||"unknown",{ mode:gstMode(c) },{ mode });
+    try{ await notifySuperAdmins("⚙️ "+(user?.username||"")+" set the automatic e-invoice / e-way bill gateway to "+mode.toUpperCase()+".", null, "gst"); }catch(e){}
+    setMsg("Saved."); load();
+  };
+  const test = async()=>{ setBusy(true); setPing(null); const r = await gstCall("ping", {}, user); setBusy(false); setPing(r); };
+  const modeTxt = { off:"Off — manual way only", sandbox:"Sandbox — Super Admins can send test documents to Clear's test system; nothing is saved on invoices", live:"Live — Generate e-invoice / e-way bill send real documents" };
+  return h("div",{style:box,"data-testid":"gst-card"},
+    h("b",null,"E-invoice & e-way bill gateway"),
+    h("div",{style:{fontSize:11.5,color:colors.muted,margin:"2px 0 8px"}},"Manual way: generate on the government portal and enter the numbers in the invoice. Automatic way: the app sends through Clear. The Clear key is kept only in Supabase (function “"+GST_FN+"”), never in the app."),
+    h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"flex-end"}},
+      h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted}},"Gateway",
+        h("select",{"data-testid":"gst-mode",value:f.mode,disabled:!sa,onChange:e=>setF(x=>({...x,mode:e.target.value})),style:{...inputStyle,width:220,padding:"6px 8px"}}, ["off","sandbox","live"].map(m=>h("option",{key:m,value:m},m==="off"?"Off":m==="sandbox"?"Sandbox (test)":"Live")))),
+      f.mode==="sandbox" ? h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted}},"Sandbox GSTIN (from Clear)", h("input",{value:f.sandbox_gstin,disabled:!sa,onChange:e=>setF(x=>({...x,sandbox_gstin:e.target.value})),style:{...inputStyle,width:200,padding:"6px 8px",fontFamily:"monospace"}})) : null,
+      sa ? h("button",{"data-testid":"gst-save",onClick:save,disabled:busy,style:btnPrimary},"Save") : null,
+      h("button",{onClick:test,disabled:busy,style:btnSecondary},"Check the server function")),
+    h("div",{style:{fontSize:12,marginTop:6}},"Now: ",h("b",null,modeTxt[gstMode(c)]), c.updated_by ? h("span",{style:{color:colors.muted}}," · set by "+c.updated_by+" "+fmtDMYTime(c.updated_at)) : null),
+    !sa ? h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:3}},"Only a Super Admin changes the gateway.") : null,
+    ping ? h("div",{style:{fontSize:12,marginTop:6,color:ping.ok?"#0f6e56":colors.danger}}, ping.ok ? "✓ The server function answers. Clear test key: "+(ping.has_sandbox?"set":"not set")+" · live key: "+(ping.has_live?"set":"not set")+"." : "✗ "+(ping.error||"No answer.")) : null,
+    msg ? h("div",{style:{fontSize:12,marginTop:6}},msg) : null);
+}
+
 function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
   const [inv,setInv] = useState(null); const [lines,setLines] = useState([]); const [orig,setOrig] = useState(null);
   const [gst,setGst] = useState(null); const [gstKind,setGstKind] = useState(null); const [busy,setBusy] = useState(false); const [msg,setMsg] = useState(""); const [hist,setHist] = useState([]);
   const [irnDlg,setIrnDlg] = useState(null); const [cancelDlg,setCancelDlg] = useState(false);
+  const [gc,setGc] = useState(null); const [gstDlg,setGstDlg] = useState(null); const [gstLog,setGstLog] = useState([]); const [co,setCo] = useState(null);   // 2026-11-08 IRP build
   const load = useCallback(async()=>{
     const [{ data: i }, { data: ls }] = await Promise.all([ sb.from("invoice_tbl").select("*").eq("id",invoiceId).maybeSingle(), sb.from("invoice_line_tbl").select("*").eq("invoice_id",invoiceId).order("sort_order") ]);
     if(!i){ setMsg("Invoice not found."); return; }
@@ -75381,6 +75820,8 @@ function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
     setGst(G.snap||[]); setGstKind(i.gst_kind || G.kind || null);
     setInv(i); setLines((ls||[]).map(l=>({ ...l, hsn: l.hsn || (i.status==="Draft" ? HSN_DEFAULT||null : null), unit_price:String(l.unit_price), _orig:Number(l.unit_price) }))); setOrig(JSON.stringify(i));
     const { data: hs } = await sb.from("dc_history_tbl").select("*").eq("invoice_id",invoiceId).order("at"); setHist(hs||[]);
+    gstCfg(true).then(async c=>{ let n = []; try{ n = await gstApprovers(); }catch(e){} setGc({ ...c, _names:n }); });
+    try{ const { data: gl } = await sb.from("gst_api_log_tbl").select("*").eq("ref",i.invoice_no).order("at",{ascending:false}).limit(15); setGstLog(gl||[]); }catch(e){}
   },[invoiceId]);
   useEffect(()=>{ load(); },[load]);
   if(!inv) return h("div",{style:{padding:20,color:colors.muted}}, msg || "Reading the invoice…");
@@ -75444,24 +75885,10 @@ function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
   };
   const backToDraft = async()=>{ setBusy(true); await sb.from("invoice_tbl").update({ status:"Draft", ready_by:null, ready_at:null }).eq("id",inv.id).eq("status","Ready for IRN"); setBusy(false);
     await invHist(inv.id, inv.dc_id, "Back to Draft", user?.username, null); onChanged && onChanged(); load(); };
-  const issue = async(f)=>{
-    const irn = String(f.irn||"").trim().toLowerCase();
-    if(!/^[0-9a-f]{64}$/.test(irn)){ alert("The IRN is 64 characters, letters a–f and digits only. Copy it from the IRP."); return; }
-    if(!String(f.ack_no||"").trim() || !f.ack_date){ alert("Enter the Ack No and Ack date from the IRP."); return; }
-    const { data: dup } = await sb.from("invoice_tbl").select("invoice_no").eq("irn",irn).neq("id",inv.id);
-    if(dup && dup.length){ alert("This IRN is already on invoice "+dup[0].invoice_no+"."); return; }
-    setBusy(true);
-    const now = new Date().toISOString();
-    const { error } = await sb.from("invoice_tbl").update({ status:"Issued", irn, ack_no:String(f.ack_no).trim(), ack_date:new Date(f.ack_date).toISOString(), signed_qr:String(f.signed_qr||"").trim()||null, issued_by:user?.username||"unknown", issued_at:now }).eq("id",inv.id).eq("status","Ready for IRN");
-    if(error){ setBusy(false); alert("Could not save: "+error.message); return; }
-    try{ await sb.from("posting_queue_tbl").insert({ doc_type: inv.is_export ? "Export invoice" : "Tax invoice", doc_id:inv.id, doc_no:inv.invoice_no, doc_date:inv.invoice_date, party:inv.customer_name, amount:inv.grand_total, currency:cur, amount_inr:inv.grand_total_inr, status:"To post" }); }catch(e){ console.error("posting queue", e); }
-    await invHist(inv.id, inv.dc_id, "Issued — IRN entered", user?.username, "Ack "+String(f.ack_no).trim());
-    await logAudit("UPDATE","invoice_tbl",inv.invoice_no,"Issued · IRN "+irn.slice(0,12)+"… · Ack "+String(f.ack_no).trim()+" · "+cur+" "+invMoney(inv.grand_total,cur),user?.username||"unknown",null,null);
-    setBusy(false); setIrnDlg(null); onChanged && onChanged(); load();
-  };
   const saveTransport = async()=>{
+    { const ew = String(inv.eway_no||"").replace(/\s+/g,""); if(ew && !GST_EWB_RE.test(ew)){ setMsg("The e-way bill number is 12 digits."); return; } }   // 2026-11-08
     setBusy(true);
-    const { error } = await sb.from("invoice_tbl").update({ eway_no:inv.eway_no||null, eway_date:inv.eway_date||null, vehicle_no:inv.vehicle_no||null, shipping_bill_no:inv.shipping_bill_no||null, shipping_bill_date:inv.shipping_bill_date||null }).eq("id",inv.id);
+    const { error } = await sb.from("invoice_tbl").update({ eway_no:String(inv.eway_no||"").replace(/\s+/g,"")||null, eway_date:inv.eway_date||null, vehicle_no:inv.vehicle_no||null, shipping_bill_no:inv.shipping_bill_no||null, shipping_bill_date:inv.shipping_bill_date||null }).eq("id",inv.id);
     setBusy(false); if(error){ setMsg("Could not save: "+error.message); return; }
     await invHist(inv.id, inv.dc_id, "Transport details", user?.username, [inv.eway_no&&"e-way "+inv.eway_no, inv.shipping_bill_no&&"shipping bill "+inv.shipping_bill_no, inv.vehicle_no].filter(Boolean).join(" · ")||null);
     setMsg("Saved."); onChanged && onChanged(); load();
@@ -75482,10 +75909,229 @@ function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
     await logAudit("UPDATE","invoice_tbl",inv.invoice_no,"IRN cancelled: "+why,user?.username||"unknown",null,null);
     setCancelDlg(false); onChanged && onChanged(); load();
   };
+  // ---- 2026-11-08 IRP build: the two gateways on this invoice ----
+  const gMode = gstMode(gc); const gLive = gMode==="live";
+  const canE = gstCanEinv(user, me, P), canW = gstCanEwb(user, me, P), gFree = gstFree(user, me), gSA = user && user.role==="super_admin";
+  const gNames = gstWho(gc && gc._names);
+  const within24 = (iso)=> !!iso && (Date.now() - new Date(iso).getTime()) < 24*3600*1000;
+  const gLogAdd = async()=>{ try{ const { data } = await sb.from("gst_api_log_tbl").select("*").eq("ref",inv.invoice_no).order("at",{ascending:false}).limit(15); setGstLog(data||[]); }catch(e){} };
+  const gErrText = (r)=> r.missing ? r.error : ((r.errors||[]).length ? r.errors.map(e=>(e.code?"["+e.code+"] ":"")+e.message).join("\n") : (r.error||"The portal did not accept it."));
+  // the preview: what goes to the IRP; buyer details can be corrected here
+  const openPreview = async(test)=>{
+    const coRow = co || await pdfCompanyFor(null).catch(()=>null); if(!co) setCo(coRow);
+    setGstDlg({ kind:"preview", test, ov:gstDefaults(inv, lines, coRow), msg:"" });
+  };
+  const sendEinv = async()=>{
+    const d = gstDlg; const B = gstBuildEinv(inv, lines.map(l=>({ ...l, unit_price:Number(l.unit_price) })), gst, gstKind, d.ov);
+    if(B.problems.length){ setGstDlg({ ...d, msg:B.problems.join("\n") }); return; }
+    setBusy(true); setGstDlg({ ...d, msg:"Sending to the IRP…" });
+    const r = await gstCall("irn_generate", { test:!!d.test, invoice_id:inv.id, ref:inv.invoice_no, einv:B.body }, user);
+    setBusy(false); gLogAdd();
+    if(!r.ok){ setGstDlg({ ...d, msg:"✗ "+gErrText(r) }); return; }
+    if(d.test){ setGstDlg({ kind:"result", test:true, r }); return; }
+    const ok = await issueSave({ irn:r.irn, ack_no:String(r.ack_no||""), ack_date:gstIstToIso(r.ack_dt), signed_qr:r.signed_qr||"", via:"automatic (Clear)"+(r.dup?" — already registered, details fetched":""),
+      eway: r.ewb_no ? { eway_no:String(r.ewb_no), eway_date:(gstIstToIso(r.ewb_dt)||"").slice(0,10)||null, eway_valid_till:gstIstToIso(r.ewb_valid) } : null }, true);
+    if(ok) setGstDlg({ kind:"result", test:false, r });
+  };
+  // manual entry while the automatic gateway is Live: a reason, and an Edit code unless Finance Director / Super Admin
+  const manualGate = async(f)=>{
+    if(!gLive) return { via:"manual" };
+    const why = String(f.reason||"").trim(); if(why.length<3){ alert("The automatic gateway is Live. Say why you are entering it by hand (e.g. Clear down, portal generated it)."); return null; }
+    if(gFree) return { via:"manual — "+why };
+    const t = await gstTakeCode("edit", f.code, inv, user); if(t.err){ alert(t.err+"\n\nAsk "+gNames+" for an Edit code."); return null; }
+    return { via:"manual — "+why+" (Edit code from "+t.by+")" };
+  };
+  const issueSave = async(f, auto)=>{
+    const irn = String(f.irn||"").trim().toLowerCase();
+    if(!GST_IRN_RE.test(irn)){ alert("The IRN is 64 characters, letters a–f and digits only. Copy it from the IRP."); return false; }
+    if(!auto){ const p = gstAckProblem(irn, f.ack_no, f.ack_date, inv); if(p){ alert(p); return false; } }
+    const { data: dup } = await sb.from("invoice_tbl").select("invoice_no").eq("irn",irn).neq("id",inv.id);
+    if(dup && dup.length){ alert("This IRN is already on invoice "+dup[0].invoice_no+"."); return false; }
+    let via = f.via || "manual";
+    if(!auto){ const g = await manualGate(f); if(!g) return false; via = g.via; }
+    setBusy(true);
+    const now = new Date().toISOString();
+    const patch = { status:"Issued", irn, ack_no:String(f.ack_no).trim(), ack_date:new Date(f.ack_date).toISOString(), signed_qr:String(f.signed_qr||"").trim()||null, issued_by:user?.username||"unknown", issued_at:now, einv_via:via, ...(f.eway||{}) };
+    let { error } = await sb.from("invoice_tbl").update(patch).eq("id",inv.id).eq("status","Ready for IRN");
+    if(error && /einv_via|eway_valid_till|eway_at/.test(error.message||"")){ const p2 = { ...patch }; delete p2.einv_via; delete p2.eway_valid_till; delete p2.eway_at; ({ error } = await sb.from("invoice_tbl").update(p2).eq("id",inv.id).eq("status","Ready for IRN")); }
+    if(error){ setBusy(false); alert("Could not save: "+error.message); return false; }
+    try{ await sb.from("posting_queue_tbl").insert({ doc_type: inv.is_export ? "Export invoice" : "Tax invoice", doc_id:inv.id, doc_no:inv.invoice_no, doc_date:inv.invoice_date, party:inv.customer_name, amount:inv.grand_total, currency:cur, amount_inr:inv.grand_total_inr, status:"To post" }); }catch(e){ console.error("posting queue", e); }
+    await invHist(inv.id, inv.dc_id, "Issued — IRN "+(auto?"from the IRP (automatic)":"entered"), user?.username, "Ack "+String(f.ack_no).trim()+" · "+via+(f.eway&&f.eway.eway_no?" · e-way bill "+f.eway.eway_no:""));
+    await logAudit("UPDATE","invoice_tbl",inv.invoice_no,"Issued · IRN "+irn.slice(0,12)+"… · Ack "+String(f.ack_no).trim()+" · "+via+" · "+cur+" "+invMoney(inv.grand_total,cur),user?.username||"unknown",null,null);
+    if(gLive && !auto){ try{ await notifySuperAdmins("✍️ Invoice "+inv.invoice_no+": IRN entered by hand while the automatic gateway is Live — "+via+" — by "+(me||user?.username)+".", null, "gst"); }catch(e){} }
+    setBusy(false); setIrnDlg(null); onChanged && onChanged(); load(); return true;
+  };
+  const issue = (f)=> issueSave(f, false);
+  // correct the Ack No / date of an issued invoice (and its sales voucher)
+  const saveCorrect = async(d)=>{
+    const p = gstAckProblem(inv.irn, d.ack_no, d.ack_date, inv); if(p){ alert(p); return; }
+    const why = String(d.reason||"").trim(); if(why.length<3){ alert("Say why the Ack No / date is being corrected."); return; }
+    let by = "";
+    if(!gFree){ const t = await gstTakeCode("edit", d.code, inv, user); if(t.err){ alert(t.err+"\n\nAsk "+gNames+" for an Edit code."); return; } by = " (Edit code from "+t.by+")"; }
+    setBusy(true);
+    const old = { ack_no:inv.ack_no, ack_date:inv.ack_date };
+    const nv = { ack_no:String(d.ack_no).trim(), ack_date:new Date(d.ack_date).toISOString() };
+    const { error } = await sb.from("invoice_tbl").update(nv).eq("id",inv.id).eq("status","Issued");
+    if(error){ setBusy(false); alert("Could not save: "+error.message); return; }
+    let vch = 0; try{ const { data: vs } = await sb.from("acc_voucher_tbl").update({ ack_no:nv.ack_no, ack_date:toISODate(new Date(nv.ack_date)) }).eq("src_invoice_id",inv.id).select("id"); vch = (vs||[]).length; }catch(e){}
+    const txt = "Ack No / date corrected: "+(old.ack_no||"—")+" / "+(old.ack_date?fmtDMYTime(old.ack_date):"—")+" → "+nv.ack_no+" / "+fmtDMYTime(nv.ack_date)+" — "+why+by+(vch?" · sales voucher updated":"");
+    await invHist(inv.id, inv.dc_id, "Ack No / date corrected", user?.username, txt);
+    await logAudit("UPDATE","invoice_tbl",inv.invoice_no,txt,user?.username||"unknown",old,nv);
+    try{ await notifySuperAdmins("✍️ Invoice "+inv.invoice_no+": "+txt+" — by "+(me||user?.username)+".", null, "gst"); }catch(e){}
+    setBusy(false); setGstDlg(null); onChanged && onChanged(); load();
+  };
+  // automatic cancel of the IRN (within 24 hours of the Ack)
+  const cancelAuto = async(d)=>{
+    const why = String(d.remark||"").trim(); if(why.length<3){ alert("Write the cancellation remark (it goes to the IRP)."); return; }
+    let by = "";
+    if(!gFree){ const t = await gstTakeCode("irn_cancel", d.code, inv, user); if(t.err){ alert(t.err+"\n\nAsk "+gNames+" for an E-invoice cancel code."); return; } by = " (E-invoice cancel code from "+t.by+")"; }
+    setBusy(true); const r = await gstCall("irn_cancel", { invoice_id:inv.id, ref:inv.invoice_no, irn:inv.irn, reason:d.rsn||"2", remark:why.slice(0,100) }, user); setBusy(false); gLogAdd();
+    if(!r.ok){ alert("The IRP did not cancel it:\n\n"+gErrText(r)); return; }
+    const rs = { "1":"Duplicate", "2":"Data entry mistake", "3":"Order cancelled", "4":"Others" }[d.rsn||"2"];
+    await cancelIssued("Cancelled on the IRP (automatic) "+(r.cancel_dt||"")+" — "+rs+": "+why+by);
+    try{ await notifySuperAdmins("❌ Invoice "+inv.invoice_no+": e-invoice cancelled on the IRP — "+rs+": "+why+" — by "+(me||user?.username)+by+".", null, "gst"); }catch(e){}
+    setGstDlg(null);
+  };
+  // e-way bill through Clear: generate (by IRN), update vehicle (Part B), cancel
+  const ewbGen = async(d)=>{
+    const dist = Number(d.distance); if(!(dist>=1 && dist<=4000)){ alert("Distance in km between our PIN and the delivery PIN (1–4000)."); return; }
+    if(d.mode==="1" && !String(d.veh||"").trim() && !String(d.trans_id||"").trim()){ alert("By road: give the vehicle number, or the transporter's GSTIN (then the transporter adds the vehicle)."); return; }
+    setBusy(true); const r = await gstCall("ewb_by_irn", { test:!!d.test, invoice_id:inv.id, ref:inv.invoice_no, irn:d.test ? d.irn : inv.irn, distance:dist, trans_mode:d.mode||"1", veh_no:String(d.veh||"").replace(/\s+/g,"").toUpperCase(), veh_type:d.vtype||"R",
+      trans_id:String(d.trans_id||"").trim().toUpperCase(), trans_name:String(d.trans_name||"").trim(), trans_doc_no:String(d.doc_no||"").trim(), trans_doc_dt:d.doc_dt?gstDmy(d.doc_dt):"" }, user); setBusy(false); gLogAdd();
+    if(!r.ok){ setGstDlg({ ...d, msg:"✗ "+gErrText(r) }); return; }
+    if(d.test){ setGstDlg({ kind:"result", test:true, r, ewb:true }); return; }
+    const patch = { eway_no:String(r.ewb_no), eway_date:(gstIstToIso(r.ewb_dt)||new Date().toISOString()).slice(0,10), vehicle_no:String(d.veh||"").replace(/\s+/g,"").toUpperCase()||inv.vehicle_no||null, eway_valid_till:gstIstToIso(r.ewb_valid), eway_at:gstIstToIso(r.ewb_dt)||new Date().toISOString() };
+    let { error } = await sb.from("invoice_tbl").update(patch).eq("id",inv.id);
+    if(error && /eway_valid_till|eway_at/.test(error.message||"")){ const p2 = { ...patch }; delete p2.eway_valid_till; delete p2.eway_at; ({ error } = await sb.from("invoice_tbl").update(p2).eq("id",inv.id)); }
+    if(error){ alert("E-way bill "+r.ewb_no+" was generated but could not be saved here: "+error.message+"\n\nWrite it down and enter it by hand."); return; }
+    await invHist(inv.id, inv.dc_id, "E-way bill generated (automatic)", user?.username, "EWB "+r.ewb_no+(r.ewb_valid?" · valid till "+r.ewb_valid:"")+(patch.vehicle_no?" · vehicle "+patch.vehicle_no:""));
+    await logAudit("UPDATE","invoice_tbl",inv.invoice_no,"E-way bill "+r.ewb_no+" generated through Clear",user?.username||"unknown",null,null);
+    setGstDlg({ kind:"result", test:false, r, ewb:true }); onChanged && onChanged(); load();
+  };
+  const ewbPartB = async(d)=>{
+    const veh = String(d.veh||"").replace(/\s+/g,"").toUpperCase(); if(!veh){ alert("Enter the new vehicle number."); return; }
+    if(String(d.from_place||"").trim().length<3){ alert("Where the goods are now (place)."); return; }
+    setBusy(true); const r = await gstCall("ewb_partb", { invoice_id:inv.id, ref:inv.invoice_no, ewb_no:String(inv.eway_no), veh_no:veh, from_place:String(d.from_place).trim(), from_state:String(d.from_state||inv.snap_state_code||"33"), reason:d.reason||"FIRST_TIME", remark:String(d.remark||"Vehicle details").trim().slice(0,50), trans_mode:"ROAD", trans_doc_no:String(d.doc_no||"").trim(), trans_doc_dt:d.doc_dt?gstDmy(d.doc_dt):"" }, user); setBusy(false); gLogAdd();
+    if(!r.ok){ setGstDlg({ ...d, msg:"✗ "+gErrText(r) }); return; }
+    const patch = { vehicle_no:veh, ...(r.valid_upto ? { eway_valid_till:gstIstToIso(r.valid_upto) } : {}) };
+    let { error } = await sb.from("invoice_tbl").update(patch).eq("id",inv.id); if(error && /eway_valid_till/.test(error.message||"")) await sb.from("invoice_tbl").update({ vehicle_no:veh }).eq("id",inv.id);
+    await invHist(inv.id, inv.dc_id, "E-way bill vehicle updated (automatic)", user?.username, "EWB "+inv.eway_no+" · vehicle "+veh+(r.valid_upto?" · valid till "+r.valid_upto:""));
+    setGstDlg(null); onChanged && onChanged(); load();
+  };
+  const ewbCancel = async(d)=>{
+    const why = String(d.remark||"").trim(); if(why.length<3){ alert("Write the cancellation remark."); return; }
+    let by = "";
+    if(!gFree){ const t = await gstTakeCode("ewb_cancel", d.code, inv, user); if(t.err){ alert(t.err+"\n\nAsk "+gNames+" for an E-way bill cancel code."); return; } by = " (E-way bill cancel code from "+t.by+")"; }
+    setBusy(true); const r = await gstCall("ewb_cancel", { invoice_id:inv.id, ref:inv.invoice_no, ewb_no:String(inv.eway_no), reason:d.rsn||"DATA_ENTRY_MISTAKE", remark:why.slice(0,50) }, user); setBusy(false); gLogAdd();
+    if(!r.ok){ alert("The portal did not cancel the e-way bill:\n\n"+gErrText(r)); return; }
+    const old = inv.eway_no;
+    let { error } = await sb.from("invoice_tbl").update({ eway_no:null, eway_date:null, eway_valid_till:null, eway_at:null }).eq("id",inv.id);
+    if(error && /eway_valid_till|eway_at/.test(error.message||"")) await sb.from("invoice_tbl").update({ eway_no:null, eway_date:null }).eq("id",inv.id);
+    await invHist(inv.id, inv.dc_id, "E-way bill cancelled (automatic)", user?.username, "EWB "+old+" — "+why+by);
+    await logAudit("UPDATE","invoice_tbl",inv.invoice_no,"E-way bill "+old+" cancelled through Clear — "+why+by,user?.username||"unknown",null,null);
+    try{ await notifySuperAdmins("❌ Invoice "+inv.invoice_no+": e-way bill "+old+" cancelled — "+why+" — by "+(me||user?.username)+by+".", null, "gst"); }catch(e){}
+    setGstDlg(null); onChanged && onChanged(); load();
+  };
+  // an approver makes a code for this invoice (it also goes to whoever asked)
+  const makeCode = async(kind)=>{ try{ const c = await gstMakeCode(kind, inv, user, me); setGstDlg({ kind:"code", code:c, ck:kind }); }catch(e){ alert(e.message); } };
+  const askCode = async(kind)=>{ const names = await gstAskCode(kind, inv, user, me); alert("Asked "+gstWho(names)+" for "+aCode(kind)+". It comes to your bell."); };
+  // ---- the dialogs ----
+  const gModal = (w, kids, close)=> h("div",{onClick:e=>{ if(e.target===e.currentTarget) close(); },style:{position:"fixed",inset:0,background:"rgba(0,0,0,.45)",zIndex:2600,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"40px 16px",overflowY:"auto"}},
+    h("div",{style:{background:"#fff",borderRadius:10,width:w,maxWidth:"100%",padding:"14px 16px"}},...kids));
+  const gIn = (d, k, label, opt)=> h("label",{key:k,style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,flex:"1 1 "+((opt&&opt.w)||180)+"px"}},label,
+    opt && opt.options ? h("select",{"data-testid":"g-"+k,value:d[k]||"",onChange:e=>{ const v = e.target.value; setGstDlg(x=>({...x,[k]:v})); },style:{...inputStyle,padding:"6px 8px"}}, opt.options.map(([v,t])=>h("option",{key:v,value:v},t)))
+    : h("input",{"data-testid":"g-"+k,type:(opt&&opt.type)||"text",step:opt&&opt.step,value:d[k]||"",onChange:e=>{ const v = e.target.value; setGstDlg(x=>({...x,[k]:v})); },placeholder:(opt&&opt.ph)||"",style:{...inputStyle,padding:"6px 8px",...((opt&&opt.mono)?{fontFamily:"monospace"}:{})}}));
+  const codeRow = (d, kind)=> gFree ? h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:6}},"No code needed — you are "+(gSA?"a Super Admin":"the Finance Director")+". The action is logged and Super Admins are told.")
+    : h("div",{style:{background:"#fff4d6",border:"1px solid #f0d9a8",borderRadius:8,padding:"7px 10px",marginTop:8,fontSize:12}},
+        h("b",null,"This needs "+aCode(kind)+" from "+gNames+"."),
+        h("div",{style:{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginTop:5}},
+          h("button",{"data-testid":"g-ask",onClick:()=>askCode(kind),style:{...btnSmall,background:"#2a6db0",color:"#fff",borderColor:"#2a6db0"}},"Ask for "+aCode(kind)),
+          h("input",{"data-testid":"g-code",value:d.code||"",onChange:e=>{ const v = e.target.value; setGstDlg(x=>({...x,code:v})); },placeholder:codeName(kind),style:{...inputStyle,width:150,padding:"5px 8px",letterSpacing:".12em"}})));
+  const btnRow = (okLabel, onOk, extra)=> h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:12,flexWrap:"wrap"}}, extra||null, h("button",{onClick:()=>setGstDlg(null),style:btnSecondary},"Close"), onOk ? h("button",{"data-testid":"g-ok",onClick:onOk,disabled:busy,style:btnPrimary},busy?"Working…":okLabel) : null);
+  const gMsg = (d)=> d.msg ? h("div",{"data-testid":"g-msg",style:{whiteSpace:"pre-wrap",fontSize:12,marginTop:8,padding:"6px 9px",borderRadius:6,background:/^✗|can't|must|missing|empty|least|don't/.test(d.msg)?"#fdecea":"#eef4fb",color:/^✗|can't|must|missing|empty|least|don't/.test(d.msg)?"#a3312a":colors.text}},d.msg) : null;
+  const gstDialog = ()=>{
+    const d = gstDlg; if(!d) return null;
+    if(d.kind==="preview"){
+      const B = gstBuildEinv(inv, lines.map(l=>({ ...l, unit_price:Number(l.unit_price) })), gst, gstKind, d.ov);
+      const setB = (k,v)=> setGstDlg(x=>({ ...x, ov:{ ...x.ov, buyer:{ ...x.ov.buyer, [k]:v } } }));
+      const bIn = (k,l,w)=> h("label",{key:k,style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,flex:"1 1 "+(w||160)+"px"}},l, h("input",{"data-testid":"gb-"+k,value:d.ov.buyer[k]||"",disabled:inv.is_export && ["Pin","Stcd","Pos"].includes(k),onChange:e=>setB(k,e.target.value),style:{...inputStyle,padding:"5px 8px"}}));
+      return gModal(860, [
+        h("b",{key:"t",style:{fontSize:15}},(d.test?"Test on the sandbox — ":"Generate e-invoice — ")+inv.invoice_no),
+        h("div",{key:"s",style:{fontSize:11.5,color:colors.muted,margin:"2px 0 8px"}}, d.test ? "Goes to Clear's test system with the sandbox GSTIN. Nothing is saved on this invoice." : "Check what goes to the government portal. Correct the buyer's details if they are wrong; the rest comes from the invoice. Once the IRP accepts it the invoice is issued and locked."),
+        h("div",{key:"sl",style:{fontSize:12,marginBottom:6}},h("b",null,"Seller: "),[d.ov.seller.LglNm, inv.snap_gstin, d.ov.seller.Loc, d.ov.seller.Pin].filter(Boolean).join(" · ")),
+        h("div",{key:"b1",style:{display:"flex",gap:8,flexWrap:"wrap"}}, bIn("LglNm","Buyer legal name",260), bIn("Addr1","Address",300), bIn("Addr2","Address line 2",200)),
+        h("div",{key:"b2",style:{display:"flex",gap:8,flexWrap:"wrap",marginTop:6}}, bIn("Loc","Place (city / town)"), bIn("Pin","PIN",90), bIn("Stcd","State code",80), bIn("Pos","Place of supply code",90),
+          inv.is_export ? h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,flex:"0 1 110px"}},"Country code", h("input",{"data-testid":"gb-cnt",value:d.ov.cnt||"",onChange:e=>{ const v = e.target.value.toUpperCase(); setGstDlg(x=>({ ...x, ov:{ ...x.ov, cnt:v } })); },style:{...inputStyle,padding:"5px 8px"}})) : null,
+          inv.is_export ? h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,flex:"0 1 110px"}},"Port code (optional)", h("input",{value:d.ov.port||"",onChange:e=>{ const v = e.target.value.toUpperCase(); setGstDlg(x=>({ ...x, ov:{ ...x.ov, port:v } })); },style:{...inputStyle,padding:"5px 8px"}})) : null),
+        h("div",{key:"it",style:{overflowX:"auto",marginTop:8,border:"1px solid "+colors.border,borderRadius:6}},
+          h("table",{style:{borderCollapse:"collapse",width:"100%",fontSize:11.5}},
+            h("thead",null,h("tr",{style:{background:"#faf9f4"}},["#","Description","HSN","Qty","Unit","Assessable ₹","GST %","Tax ₹","Total ₹"].map(x=>h("th",{key:x,style:{textAlign:"left",padding:"4px 6px",color:colors.muted}},x)))),
+            h("tbody",null, B.body.ItemList.map((it,i)=>{ const ln = lines[i]; return h("tr",{key:i,style:{borderTop:"1px solid #eee"}},
+              h("td",{style:{padding:"4px 6px"}},it.SlNo), h("td",{style:{padding:"4px 6px",maxWidth:260}},it.PrdDesc), h("td",{style:{padding:"4px 6px"}},it.HsnCd), h("td",{style:{padding:"4px 6px"}},it.Qty),
+              h("td",{style:{padding:"4px 6px"}}, ln && it.Unit ? h("select",{value:d.ov.uqc[String(ln.id)]||it.Unit,onChange:e=>{ const v = e.target.value; setGstDlg(x=>({ ...x, ov:{ ...x.ov, uqc:{ ...x.ov.uqc, [String(ln.id)]:v } } })); },style:{fontSize:11}}, GST_UQC_LIST.map(u=>h("option",{key:u,value:u},u))) : (it.Unit||"—")),
+              h("td",{style:{padding:"4px 6px",textAlign:"right"}},invMoney(it.AssAmt,"INR")), h("td",{style:{padding:"4px 6px"}},it.GstRt), h("td",{style:{padding:"4px 6px",textAlign:"right"}},invMoney(it.IgstAmt+it.CgstAmt+it.SgstAmt,"INR")), h("td",{style:{padding:"4px 6px",textAlign:"right"}},invMoney(it.TotItemVal,"INR"))); })))),
+        h("div",{key:"tt",style:{fontSize:12,marginTop:6,textAlign:"right"}},"Assessable ₹"+invMoney(B.totals.AssVal,"INR")+" · IGST "+invMoney(B.totals.IgstVal,"INR")+" · CGST "+invMoney(B.totals.CgstVal,"INR")+" · SGST "+invMoney(B.totals.SgstVal,"INR")+" · round-off "+invMoney(B.totals.RndOffAmt,"INR")+" · ",h("b",null,"Invoice total ₹"+invMoney(B.totals.TotInvVal,"INR"))),
+        B.problems.length ? h("div",{key:"pb","data-testid":"g-problems",style:{whiteSpace:"pre-wrap",fontSize:12,marginTop:8,padding:"6px 9px",borderRadius:6,background:"#fdecea",color:"#a3312a"}},"Fix before sending:\n• "+B.problems.join("\n• ")) : null,
+        gMsg(d),
+        btnRow(d.test ? "Send test to the sandbox" : "Send to the IRP ▸", sendEinv)
+      ], ()=>setGstDlg(null));
+    }
+    if(d.kind==="result"){ const r = d.r || {};
+      return gModal(560, [ h("b",{key:"t",style:{fontSize:15}},(d.test?"Sandbox reply — ":"")+(d.ewb?"E-way bill generated":"E-invoice registered")),
+        h("div",{key:"b","data-testid":"g-result",style:{fontSize:12.5,marginTop:8,lineHeight:1.7}},
+          d.ewb ? [h("div",{key:1},"E-way bill no: ",h("b",null,String(r.ewb_no||""))), h("div",{key:2},"Date: "+(r.ewb_dt||"")), h("div",{key:3},"Valid till: "+(r.ewb_valid||"—"))]
+                : [h("div",{key:1},"IRN: ",h("span",{style:{fontFamily:"monospace",fontSize:11,wordBreak:"break-all"}},r.irn||"")), h("div",{key:2},"Ack No: ",h("b",null,String(r.ack_no||""))), h("div",{key:3},"Ack date: "+(r.ack_dt||"")), r.dup ? h("div",{key:4,style:{color:"#854f0b"}},"It was already registered — the existing details were fetched.") : null, r.ewb_no ? h("div",{key:5},"E-way bill: "+r.ewb_no) : null]),
+        d.test ? h("div",{key:"n",style:{fontSize:11.5,color:colors.muted,marginTop:6}},"Test only — nothing was saved on this invoice.") : null,
+        btnRow(null, null, d.test && !d.ewb && r.irn && !inv.is_export ? h("button",{style:btnSecondary,onClick:()=>setGstDlg({ kind:"ewb", test:true, irn:r.irn, mode:"1", vtype:"R", distance:"" })},"Test an e-way bill with this IRN") : null) ], ()=>setGstDlg(null)); }
+    if(d.kind==="correct") return gModal(520, [ h("b",{key:"t",style:{fontSize:15}},"Correct Ack No / date — "+inv.invoice_no),
+      h("div",{key:"s",style:{fontSize:11.5,color:colors.muted,margin:"2px 0 8px"}},"Only the Ack No and Ack date change; the IRN, values and QR stay. Copy both exactly from the IRP. The sales voucher is corrected too."),
+      h("div",{key:"o",style:{fontSize:12,marginBottom:6}},"Now: Ack "+(inv.ack_no||"—")+" · "+(inv.ack_date?fmtDMYTime(inv.ack_date):"—")),
+      h("div",{key:"f",style:{display:"flex",gap:8,flexWrap:"wrap"}}, gIn(d,"ack_no","Ack No (15 digits)",{mono:true,w:200}), gIn(d,"ack_date","Ack date and time",{type:"datetime-local",step:1,w:220})),
+      h("div",{key:"r",style:{marginTop:6}}, gIn(d,"reason","Why (kept in the history)",{ph:"e.g. IRN was typed in the Ack No box"})),
+      codeRow(d,"edit"), btnRow("Save the correction", ()=>saveCorrect(d)) ], ()=>setGstDlg(null));
+    if(d.kind==="cancel") return gModal(520, [ h("b",{key:"t",style:{fontSize:15}},"Cancel e-invoice on the IRP — "+inv.invoice_no),
+      h("div",{key:"s",style:{fontSize:11.5,color:colors.muted,margin:"2px 0 8px"}},"Allowed only within 24 hours of the Ack, and only if no active e-way bill is linked. The invoice then stays as Cancelled; the goods need a new DC."),
+      h("div",{key:"f",style:{display:"flex",gap:8,flexWrap:"wrap"}}, gIn(d,"rsn","Reason",{options:[["2","Data entry mistake"],["1","Duplicate"],["3","Order cancelled"],["4","Others"]],w:200}), gIn(d,"remark","Remark (goes to the IRP)",{w:260})),
+      codeRow(d,"irn_cancel"), btnRow("Cancel the e-invoice", ()=>cancelAuto(d)) ], ()=>setGstDlg(null));
+    if(d.kind==="ewb") return gModal(620, [ h("b",{key:"t",style:{fontSize:15}},(d.test?"Test e-way bill (sandbox) — ":"Generate e-way bill — ")+inv.invoice_no),
+      h("div",{key:"s",style:{fontSize:11.5,color:colors.muted,margin:"2px 0 8px"}},"Made from the e-invoice (IRN). The goods' details come from the invoice; add how they travel."),
+      h("div",{key:"a",style:{display:"flex",gap:8,flexWrap:"wrap"}}, gIn(d,"distance","Distance (km)",{type:"number",w:110}), gIn(d,"mode","Mode",{options:[["1","Road"],["2","Rail"],["3","Air"],["4","Ship"]],w:110}), gIn(d,"veh","Vehicle no",{ph:"TN01AB1234",w:140}), gIn(d,"vtype","Vehicle type",{options:[["R","Regular"],["O","Over-dimensional"]],w:150})),
+      h("div",{key:"b",style:{display:"flex",gap:8,flexWrap:"wrap",marginTop:6}}, gIn(d,"trans_id","Transporter GSTIN (optional)",{w:180,mono:true}), gIn(d,"trans_name","Transporter name (optional)",{w:200}), gIn(d,"doc_no","LR / doc no (optional)",{w:130}), gIn(d,"doc_dt","LR date",{type:"date",w:140})),
+      gMsg(d), btnRow(d.test?"Send test":"Generate e-way bill ▸", ()=>ewbGen(d)) ], ()=>setGstDlg(null));
+    if(d.kind==="partb") return gModal(600, [ h("b",{key:"t",style:{fontSize:15}},"Update vehicle (Part B) — e-way bill "+inv.eway_no),
+      h("div",{key:"f",style:{display:"flex",gap:8,flexWrap:"wrap",marginTop:6}}, gIn(d,"veh","New vehicle no",{w:150}), gIn(d,"from_place","Goods are now at (place)",{w:180}), gIn(d,"from_state","State code",{w:90}),
+        gIn(d,"reason","Reason",{options:[["FIRST_TIME","First time"],["BREAKDOWN","Breakdown"],["TRANSSHIPMENT","Transshipment"],["OTHERS","Others"]],w:150})),
+      h("div",{key:"g",style:{display:"flex",gap:8,flexWrap:"wrap",marginTop:6}}, gIn(d,"remark","Remark",{w:220}), gIn(d,"doc_no","LR / doc no (optional)",{w:130}), gIn(d,"doc_dt","LR date",{type:"date",w:140})),
+      gMsg(d), btnRow("Update vehicle", ()=>ewbPartB(d)) ], ()=>setGstDlg(null));
+    if(d.kind==="ewbcancel") return gModal(520, [ h("b",{key:"t",style:{fontSize:15}},"Cancel e-way bill "+inv.eway_no),
+      h("div",{key:"s",style:{fontSize:11.5,color:colors.muted,margin:"2px 0 8px"}},"Allowed within 24 hours of generation, before the goods are verified in transit."),
+      h("div",{key:"f",style:{display:"flex",gap:8,flexWrap:"wrap"}}, gIn(d,"rsn","Reason",{options:[["DATA_ENTRY_MISTAKE","Data entry mistake"],["DUPLICATE","Duplicate"],["ORDER_CANCELLED","Order cancelled"],["OTHERS","Others"]],w:200}), gIn(d,"remark","Remark",{w:260})),
+      codeRow(d,"ewb_cancel"), btnRow("Cancel the e-way bill", ()=>ewbCancel(d)) ], ()=>setGstDlg(null));
+    if(d.kind==="ewbmanual") return gModal(520, [ h("b",{key:"t",style:{fontSize:15}},"Enter the e-way bill by hand — "+inv.invoice_no),
+      h("div",{key:"s",style:{fontSize:11.5,color:colors.muted,margin:"2px 0 8px"}},"The automatic gateway is Live, so entering it by hand needs a reason"+(gFree?".":" and an Edit code.")),
+      h("div",{key:"f",style:{display:"flex",gap:8,flexWrap:"wrap"}}, gIn(d,"eway_no","E-way bill no (12 digits)",{mono:true,w:180}), gIn(d,"eway_date","Date",{type:"date",w:150}), gIn(d,"veh","Vehicle no",{w:140})),
+      h("div",{key:"r",style:{marginTop:6}}, gIn(d,"reason","Why by hand",{ph:"e.g. generated on the portal, Clear down"})),
+      codeRow(d,"edit"), btnRow("Save", ()=>saveEwbManual(d)) ], ()=>setGstDlg(null));
+    if(d.kind==="code") return gModal(440, [ h("b",{key:"t",style:{fontSize:15}},codeName(d.ck)+" made"), h("div",{key:"c","data-testid":"g-made-code",style:{fontSize:26,fontWeight:700,letterSpacing:".2em",margin:"10px 0"}},d.code),
+      h("div",{key:"s",style:{fontSize:11.5,color:colors.muted}},"One use, this invoice only, 24 hours. If someone asked for it, it has gone to their bell too."), btnRow(null,null) ], ()=>setGstDlg(null));
+    return null;
+  };
+  // manual e-way bill (checked: 12 digits) — by hand while Live needs a reason and an Edit code
+  const saveEwbManual = async(d)=>{
+    const no = String(d.eway_no||"").replace(/\s+/g,""); if(!GST_EWB_RE.test(no)){ alert("The e-way bill number is 12 digits."); return; }
+    if(!d.eway_date){ alert("Enter the e-way bill date."); return; }
+    const g = await manualGate(d); if(!g) return;
+    setBusy(true);
+    const { error } = await sb.from("invoice_tbl").update({ eway_no:no, eway_date:d.eway_date, vehicle_no:String(d.veh||"").replace(/\s+/g,"").toUpperCase()||inv.vehicle_no||null }).eq("id",inv.id);
+    setBusy(false); if(error){ alert("Could not save: "+error.message); return; }
+    await invHist(inv.id, inv.dc_id, "E-way bill entered by hand", user?.username, "EWB "+no+" · "+g.via);
+    try{ await notifySuperAdmins("✍️ Invoice "+inv.invoice_no+": e-way bill "+no+" entered by hand while the automatic gateway is Live — "+g.via+" — by "+(me||user?.username)+".", null, "gst"); }catch(e){}
+    setGstDlg(null); onChanged && onChanged(); load();
+  };
   // ---- view ----
   const fld = (label, k, opt)=> h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,flex:"1 1 "+((opt&&opt.w)||200)+"px"}}, label,
     (opt&&opt.area) ? h("textarea",{rows:opt.rows||3,value:inv[k]||"",disabled:!(opt&&opt.always?canAcc:editable),onChange:e=>set(k,e.target.value),style:inputStyle})
-    : h("input",{type:(opt&&opt.type)||"text",value:inv[k]==null?"":(opt&&opt.type==="date"?String(inv[k]).slice(0,10):inv[k]),disabled:!(opt&&opt.always?canAcc&&inv.status!=="Cancelled":editable),onChange:e=>set(k,e.target.value),style:inputStyle}));
+    : h("input",{type:(opt&&opt.type)||"text",value:inv[k]==null?"":(opt&&opt.type==="date"?String(inv[k]).slice(0,10):inv[k]),disabled:!(opt&&opt.always?((opt.ewb?canW&&!gLive:canAcc)&&inv.status!=="Cancelled"):editable),onChange:e=>set(k,e.target.value),style:inputStyle}));
   const card = (title, ...kids)=> h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"8px 12px",marginBottom:10}}, h("b",{style:{fontSize:13}},title), h("div",{style:{marginTop:6}},...kids));
   const row = (...kids)=> h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:6}},...kids);
   const th = (t,w,al)=> h("th",{style:{textAlign:al||"left",padding:"5px 7px",fontSize:11,color:colors.muted,borderBottom:"2px solid "+colors.dark,width:w}},t);
@@ -75494,10 +76140,20 @@ function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
   if(editable){ acts.push(h("button",{key:"s",onClick:()=>save(false),disabled:busy,style:btnSecondary},busy?"Saving…":"Save draft"));
     acts.push(h("button",{key:"r",onClick:toReady,disabled:busy,style:btnPrimary},"Ready for IRN"));
     acts.push(h("button",{key:"d",onClick:discard,style:btnDanger},"Discard draft")); }
-  if(inv.status==="Ready for IRN" && canAcc){ acts.push(h("button",{key:"b",onClick:backToDraft,disabled:busy,style:btnSecondary},"Back to draft"));
-    acts.push(h("button",{key:"i",onClick:()=>setIrnDlg({ irn:"", ack_no:"", ack_date:"", signed_qr:"" }),style:btnPrimary},"Enter IRN and issue")); }
-  if(inv.status==="Issued" && canAcc){ acts.push(h("button",{key:"t",onClick:saveTransport,disabled:busy,style:btnSecondary},"Save transport details"));
+  if(inv.status==="Ready for IRN" && (canAcc || canE)){ acts.push(h("button",{key:"b",onClick:backToDraft,disabled:busy,style:btnSecondary},"Back to draft"));
+    if(gLive) acts.push(h("button",{key:"ga","data-testid":"g-gen",onClick:()=>openPreview(false),style:btnPrimary},"Generate e-invoice \u25b8"));   // 2026-11-08: automatic gateway
+    acts.push(h("button",{key:"i","data-testid":"g-manual",onClick:()=>setIrnDlg({ irn:"", ack_no:"", ack_date:"", signed_qr:"", reason:"", code:"" }),style:gLive?btnSecondary:btnPrimary},gLive?"Enter IRN by hand":"Enter IRN and issue")); }
+  if(gMode==="sandbox" && gSA && ["Draft","Ready for IRN","Issued"].includes(inv.status)) acts.push(h("button",{key:"gt","data-testid":"g-test",onClick:()=>openPreview(true),style:btnSecondary},"Test e-invoice on the sandbox"));
+  if(inv.status==="Issued" && canW && !gLive) acts.push(h("button",{key:"t",onClick:saveTransport,disabled:busy,style:btnSecondary},"Save transport details"));
+  if(inv.status==="Issued" && canE){
+    acts.push(h("button",{key:"ca","data-testid":"g-correct",onClick:()=>setGstDlg({ kind:"correct", ack_no:"", ack_date:"", reason:"", code:"" }),style:btnSecondary},"Correct Ack No / date"));
+    if(gLive && inv.irn && within24(inv.ack_date)) acts.push(h("button",{key:"cx","data-testid":"g-cancel",onClick:()=>setGstDlg({ kind:"cancel", rsn:"2", remark:"", code:"" }),style:btnDanger},"Cancel e-invoice \u25b8"));
     acts.push(h("button",{key:"c",onClick:()=>setCancelDlg(true),style:btnDanger},"Record IRN cancellation")); }
+  if(inv.status==="Issued" && canW && !inv.is_export && gLive){
+    if(!inv.eway_no) acts.push(h("button",{key:"ew","data-testid":"g-ewb",onClick:()=>setGstDlg({ kind:"ewb", mode:"1", vtype:"R", distance:"", veh:inv.vehicle_no||"" }),style:btnPrimary},"Generate e-way bill \u25b8"));
+    else { acts.push(h("button",{key:"pb","data-testid":"g-partb",onClick:()=>setGstDlg({ kind:"partb", veh:"", from_place:"", from_state:inv.snap_state_code||"33", reason:"FIRST_TIME", remark:"" }),style:btnSecondary},"Update vehicle (Part B)"));
+      acts.push(h("button",{key:"ec","data-testid":"g-ewbcancel",onClick:()=>setGstDlg({ kind:"ewbcancel", rsn:"DATA_ENTRY_MISTAKE", remark:"", code:"" }),style:btnDanger},"Cancel e-way bill")); }
+    acts.push(h("button",{key:"em","data-testid":"g-ewbmanual",onClick:()=>setGstDlg({ kind:"ewbmanual", eway_no:inv.eway_no||"", eway_date:inv.eway_date?String(inv.eway_date).slice(0,10):"", veh:inv.vehicle_no||"", reason:"", code:"" }),style:btnSecondary},"Enter e-way bill by hand")); }
   if(inv.status==="Issued") acts.push(h(BillSentButton,{ key:"snt", kind:"invoice", row:inv, user, onDone:load }));   // 212
   acts.push(h("button",{key:"p",onClick:()=>billAllowPdf([inv.invoice_no]) && invPdf({ ...inv, ...(editable?calc:{}) }, editable?calcLines:lines.map(l=>({...l,unit_price:Number(l.unit_price)}))).catch(e=>alert("PDF: "+e.message)),style:btnSecondary},"Invoice PDF (3 copies)"));
   return h("div",{style:{padding:"12px 18px",maxWidth:1150}},
@@ -75506,9 +76162,11 @@ function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
       h("h2",{style:{fontSize:18,margin:0}},(inv.is_export?"Export invoice ":"Tax invoice ")+inv.invoice_no), invPill(inv.status),
       h("span",{style:{fontSize:13,color:colors.muted}},"Contract "+inv.contract_number+" · "+(inv.customer_name||"")+" · DC "+inv.invoice_no)),
     h("div",{style:{fontSize:11.5,color:colors.muted,margin:"4px 0 8px"}}, inv.status==="Draft" ? "Draft: check prices, charges and fields, then Ready for IRN. Upload to the IRP outside the app and enter the IRN back here." :
-      inv.status==="Ready for IRN" ? "Upload this invoice to the IRP, then Enter IRN and issue. Values are locked; Back to draft to change them." :
+      inv.status==="Ready for IRN" ? (gLive ? "Press Generate e-invoice: the app registers it on the IRP through Clear and issues it. Enter IRN by hand only with a reason. Values are locked; Back to draft to change them." : "Upload this invoice to the IRP, then Enter IRN and issue. Values are locked; Back to draft to change them.") :
       inv.status==="Issued" ? "Issued "+fmtDMYTime(inv.issued_at)+" by "+(inv.issued_by||"")+" — locked. Corrections only by a credit note. E-way bill and shipping bill details can still be added." : "Cancelled: "+(inv.cancel_reason||"")),
     posWarn && inv.status!=="Issued" ? h("div",{style:{background:"#fff4d6",color:"#854f0b",borderRadius:6,padding:"6px 10px",fontSize:12.5,marginBottom:8}},"⚠ "+posWarn) : null,
+    gFree && ["Ready for IRN","Issued"].includes(inv.status) ? h("div",{style:{fontSize:12,display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",margin:"0 0 8px",color:colors.muted}},"Make a code for this invoice:", ...["edit","irn_cancel","ewb_cancel"].map(k=>h("button",{key:k,"data-testid":"g-make-"+k,onClick:()=>makeCode(k),style:btnSmall},codeName(k)))) : null,   // 2026-11-08
+    gMode!=="off" ? h("div",{style:{fontSize:11.5,color:gLive?"#0f6e56":"#854f0b",margin:"0 0 6px"}},"E-invoice / e-way bill gateway: "+(gLive?"Live (automatic through Clear)":"Sandbox (tests only)")) : null,
     card("Invoice",
       row(fld("Invoice date","invoice_date",{type:"date",w:150}), fld("PO No","po_no",{w:160}), fld("PO date","po_date",{type:"date",w:150}), !inv.is_export ? fld("OA date","oa_date",{type:"date",w:150}) : null, !inv.is_export ? fld("Site contact","site_contact") : null),
       row(fld(inv.is_export?"Buyer (Bill To)":"Customer (Bill To)","bill_to",{area:true,w:300}), fld(inv.is_export?"Consignee / Deliver To":"Deliver To","ship_to",{area:true,w:300}), inv.is_export ? fld("Notifying Party","handoff",{area:true,w:260}) : null),
@@ -75541,7 +76199,7 @@ function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
       row(fld("Packing","packing_term"), fld("Insurance","insurance_term"), fld("Taxes","tax_term")),
       row(fld("Note on the invoice (optional)","remarks",{w:500}))),
     card("Transport and e-invoice",
-      row(!inv.is_export ? fld("E-way bill no","eway_no",{always:true,w:160}) : null, !inv.is_export ? fld("E-way bill date","eway_date",{type:"date",always:true,w:150}) : null, fld("Vehicle no","vehicle_no",{always:true,w:150}),
+      row(!inv.is_export ? fld("E-way bill no","eway_no",{always:true,ewb:true,w:160}) : null, !inv.is_export ? fld("E-way bill date","eway_date",{type:"date",always:true,ewb:true,w:150}) : null, fld("Vehicle no","vehicle_no",{always:true,w:150}),
         inv.is_export ? fld("Shipping bill no","shipping_bill_no",{always:true,w:160}) : null, inv.is_export ? fld("Shipping bill date","shipping_bill_date",{type:"date",always:true,w:150}) : null),
       !inv.is_export && inv.grand_total_inr>50000 && !inv.eway_no ? h("div",{style:{fontSize:11.5,color:"#854f0b"}},"Over ₹50,000 — an e-way bill is needed before the goods move.") : null,
       inv.irn ? h("div",{style:{fontSize:12,marginTop:4}},h("b",null,"IRN "),h("span",{style:{fontFamily:"monospace",fontSize:11.5}},inv.irn)," · Ack ",inv.ack_no," · ",fmtDMYTime(inv.ack_date), inv.signed_qr?" · signed QR on file":" · no signed QR (the PDF prints without the QR)") : null),
@@ -75553,11 +76211,18 @@ function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
       h("div",{style:{background:"#fff",borderRadius:10,width:540,maxWidth:"100%",padding:"14px 16px"}},
         h("b",{style:{fontSize:15}},"Enter the IRN — "+inv.invoice_no),
         h("div",{style:{fontSize:11.5,color:colors.muted,margin:"3px 0 8px"}},"Copy these from the IRP after uploading the invoice. Once saved the invoice is issued and locked."),
-        ...[["IRN (64 characters)","irn"],["Ack No","ack_no"]].map(([l,k])=>h("label",{key:k,style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,marginBottom:6}},l,h("input",{value:irnDlg[k],onChange:e=>{ const v = e.target.value; setIrnDlg(d=>({...d,[k]:v})); },style:{...inputStyle,fontFamily:k==="irn"?"monospace":"inherit"}}))),
-        h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,marginBottom:6}},"Ack date and time",h("input",{type:"datetime-local",value:irnDlg.ack_date,onChange:e=>{ const v = e.target.value; setIrnDlg(d=>({...d,ack_date:v})); },style:inputStyle})),
+        ...[["IRN (64 characters)","irn"],["Ack No (15 digits)","ack_no"]].map(([l,k])=>h("label",{key:k,style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,marginBottom:6}},l,h("input",{value:irnDlg[k],onChange:e=>{ const v = e.target.value; setIrnDlg(d=>({...d,[k]:v})); },style:{...inputStyle,fontFamily:k==="irn"?"monospace":"inherit"}}))),
+        h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,marginBottom:6}},"Ack date and time",h("input",{type:"datetime-local",step:1,value:irnDlg.ack_date,onChange:e=>{ const v = e.target.value; setIrnDlg(d=>({...d,ack_date:v})); },style:inputStyle}), h("span",{style:{fontSize:10.5,color:colors.mutedLight}},"Exactly as the IRP shows it, with the time (hh:mm:ss).")),
+        gLive ? h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,marginBottom:6}},"Why by hand? (the automatic gateway is Live)",h("input",{"data-testid":"irn-reason",value:irnDlg.reason||"",onChange:e=>{ const v = e.target.value; setIrnDlg(d=>({...d,reason:v})); },placeholder:"e.g. Clear down, generated on the portal",style:inputStyle})) : null,
+        gLive && !gFree ? h("div",{style:{background:"#fff4d6",border:"1px solid #f0d9a8",borderRadius:8,padding:"7px 10px",marginBottom:6,fontSize:12}}, h("b",null,"This needs an Edit code from "+gNames+"."),
+          h("div",{style:{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginTop:5}}, h("button",{onClick:()=>askCode("edit"),style:{...btnSmall,background:"#2a6db0",color:"#fff",borderColor:"#2a6db0"}},"Ask for an Edit code"),
+            h("input",{"data-testid":"irn-code",value:irnDlg.code||"",onChange:e=>{ const v = e.target.value; setIrnDlg(d=>({...d,code:v})); },placeholder:"Edit code",style:{...inputStyle,width:140,padding:"5px 8px"}}))) : null,
         h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted}},"Signed QR code text (optional — prints as the QR)",h("textarea",{rows:3,value:irnDlg.signed_qr,onChange:e=>{ const v = e.target.value; setIrnDlg(d=>({...d,signed_qr:v})); },style:{...inputStyle,fontFamily:"monospace",fontSize:11}})),
         h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:12}}, h("button",{onClick:()=>setIrnDlg(null),style:btnSecondary},"Cancel"), h("button",{onClick:()=>issue(irnDlg),disabled:busy,style:btnPrimary},busy?"Saving…":"Issue the invoice")))) : null,
-    cancelDlg ? h(ReasonDialog,{title:"Record IRN cancellation — "+inv.invoice_no, subtitle:"Cancel the IRN on the IRP first (allowed within 24 hours of issue). This invoice and its number stay as Cancelled; the goods need a new DC.", placeholder:"Why was the IRN cancelled?", okLabel:"Record cancellation", okStyle:{background:colors.danger}, onCancel:()=>setCancelDlg(false), onOk:cancelIssued}) : null);
+    cancelDlg ? h(ReasonDialog,{title:"Record IRN cancellation — "+inv.invoice_no, subtitle:"Cancel the IRN on the IRP first (allowed within 24 hours of issue). This invoice and its number stay as Cancelled; the goods need a new DC.", placeholder:"Why was the IRN cancelled?", okLabel:"Record cancellation", okStyle:{background:colors.danger}, onCancel:()=>setCancelDlg(false), onOk:cancelIssued}) : null,
+    gstDialog(),   // 2026-11-08 IRP build
+    gstLog.length && canW ? h("div",{"data-testid":"g-log",style:{marginTop:14}},h("div",{style:{fontSize:12,fontWeight:700,color:colors.muted}},"E-invoice / e-way bill gateway log"),
+      gstLog.map(x=>h("div",{key:x.id,style:{fontSize:11.5,color:x.ok?colors.muted:"#a3312a",padding:"2px 0"}},fmtDMYTime(x.at)+" \u00b7 "+(x.username||"")+" \u00b7 "+x.action+(x.mode==="sandbox"?" (sandbox)":"")+" \u00b7 "+(x.ok?"OK":"refused")+(x.message?" \u2014 "+x.message:"")))) : null);
 }
 // ---- invoice list ----------------------------------------------------------------------------------
 // ===== 212: Invoice & PI Register, legacy FFS invoices / proformas, Mark as sent, advance-PI cards, service invoices =====
@@ -83282,7 +83947,7 @@ function DespatchSettingsScreen({ user }){
   const fld = (k,l,ph,w)=> h("label",{key:k,style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,flex:"1 1 "+(w||220)+"px"}},l,h("input",{value:f[k],disabled:!can,placeholder:ph||"",onChange:e=>setF(x=>({...x,[k]:e.target.value})),style:inputStyle}));
   const box = (kids)=> h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"10px 12px",marginBottom:10}},...kids);
   const inpN = (obj,setter,k,l,type,w)=> h("label",{key:k,style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted,flex:"1 1 "+(w||160)+"px"}},l,h("input",{type:type||"text",value:obj[k]||"",onChange:e=>{ const v = e.target.value; setter(o=>({...o,[k]:v})); },style:inputStyle}));
-  return h("div",{style:{padding:"14px 18px",maxWidth:980}},
+  return h("div",{style:{padding:"14px 18px",maxWidth:980}}, h(GstGatewayCard,{ user }),   // 2026-11-08 IRP build
     h("div",{style:{fontSize:11.5,color:colors.muted}},"Stores → Despatch"),
     h("h2",{style:{fontSize:19,margin:"2px 0 8px"}},"Despatch Settings & LUT"),
     !can ? h("div",{style:{fontSize:12,color:colors.muted,marginBottom:8}},"Only Accounts, admins and the super admin can change these.") : null,
