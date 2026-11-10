@@ -55,7 +55,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-10T14:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-10T15:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -26179,6 +26179,22 @@ async function fetchPaged(build, pageSize){
   }
   return all;
 }
+// 2026-11-10T15:00: fetchPaged keeps going with what it has when a later page fails (fine for showing a list). Anything that MAKES
+// records from "what is missing" must not work from half a list — 6 Nov: pages of task_tbl timed out, the board thought ~3,400 document
+// cards were missing and made them again. fetchPagedStrict throws if any page fails.
+async function fetchPagedStrict(build, pageSize){
+  const size = pageSize||1000; let all = [], from = 0, tie = true;
+  while(true){
+    let { data, error } = await (tie ? build().order("id",{ascending:true}) : build()).range(from, from+size-1);
+    if(error && tie && from===0){ tie = false; continue; }
+    if(error) throw error;
+    all = all.concat(data||[]);
+    if(!data || data.length < size) break;
+    from += size;
+  }
+  return all;
+}
+async function pagedReadStrict(build){ try{ return { data: await fetchPagedStrict(build), error: null }; }catch(e){ return { data: [], error: e }; } }
 // Plain words for a refused save, whatever shape the error came in.
 function saveFailedText(what, err){
   const m = String((err && (err.message||err.details||err.hint)) || err || "unknown reason");
@@ -35894,6 +35910,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"10 Nov 2026 (357)", summary:"Built on 2026-11-10T15:00:00Z. NEEDS SQL: structure_task_cards_once_2026-11-10.sql (BOTH companies). REPEATED TASK CARDS (6 Nov: ~3,400 document cards made again): the app no longer makes cards from half a list — if any page of the existing cards (or of the Order Status data) fails to load, it makes and closes nothing and tries again later. Just before making a card it looks again in the database, and the database itself now refuses a second open card for the same document round, or for the same Order Status step, contract and person. Opening Task Boards runs the document card check at most once every 5 minutes for everyone (it used to run for every person, every time)." },
   { date:"10 Nov 2026 (356)", summary:"Built on 2026-11-10T14:00:00Z. No SQL. CONTRACT REGISTER: the old register's 7-digit legacy contracts (2240004…) are hidden unless \"Show old-series contracts (n)\" is ticked (remembered per user), so newest first starts at the latest 26xxxx contract. A 7-digit number made in the app — 2600002 Zeeco Middle East — is not legacy: it stays and sorts as a year-26 contract (with 260002)." },
   { date:"10 Nov 2026 (355)", summary:"Built on 2026-11-10T13:00:00Z. SQL (data, Flometriq only): fix_duplicate_documents_2026-11-10.sql. DUPLICATE DOCUMENTS: adding a document to a contract (+ Missing document, approving a request to add, the OA Documents box) when the contract already has a live document of the same category (same Sl No) shows the existing one(s) with their status and asks whether this is a NEW, separate document — Cancel adds nothing. STAGE REPORT / BOARD: several GADs or ITPs on one contract now read e.g. \"GAD (2): not submitted · pending on our side | CODE 1 ✓ — 1 of 2 approved\" instead of only the weakest. A required document is no longer shown as not submitted when the contract already holds a live document of that category (legacy-loaded documents never linked the requirement)." },
   { date:"10 Nov 2026 (354)", summary:"Built on 2026-11-10T12:00:00Z. NEEDS SQL: structure_training_links_2026-11-10.sql (BOTH companies). TRAINING: Help → Training now lists the guides — Order to despatch (Document Control, as before) and Stores (PO to gate pass, 14 chapters, English / Tamil). Each guide has Files: Watch video, Read guide (PDF), Slides (PPT) — kept on OneDrive, only the links are in the app (open in a new tab, or 📌 in the side Reference panel). A Super Admin adds or changes the links with ✎ Links." },
@@ -63427,7 +63444,7 @@ async function docBoardLoad(){
     loadDocStatuses(),
     sb.from("doc_category_tbl").select("*"),
     fetchAll("sale_order_tbl","*"),
-    pagedRead(()=>sb.from("task_tbl").select("*").or("doc_id.not.is.null,doc_request_id.not.is.null,chase_letter_id.not.is.null")),
+    pagedReadStrict(()=>sb.from("task_tbl").select("*").or("doc_id.not.is.null,doc_request_id.not.is.null,chase_letter_id.not.is.null")),
     sb.from("doc_chase_letter_tbl").select("*").order("id"),
     sb.from("employee_tbl").select("*").order("employee_name"),
     sb.from("post_holder_tbl").select("employee_name").eq("post_key","doc_controller"),
@@ -63499,7 +63516,7 @@ async function docBoardLoad(){
   const emps = (empsR.data||[]);
   const dcNames = (dcR.data||[]).map(r=>r.employee_name).filter(Boolean);
   return { items, holdHist, docs:liveDocs, reqs:reqs||[], statuses:statuses||[], cats, soBy, tasks:taskArr, letters:lettersArr, lettersMissing:!!letters.error,
-    tasksMissing:!!tasks.error, emps, dcNames, taskTypes:ttR.data||[], today, addReqs, customMissing, liveCts, regClient };
+    tasksMissing:!!tasks.error && /task_tbl|doc_id|doc_request_id|chase_letter_id|schema cache|relation/i.test(String((tasks.error||{}).message||"")), tasksPartial:!!tasks.error, emps, dcNames, taskTypes:ttR.data||[], today, addReqs, customMissing, liveCts, regClient };
 }
 
 // Task Manager cards for documents: one per round of our work; completed once the document leaves our hands.
@@ -63509,7 +63526,7 @@ async function docTasksSync(data, by){
   DOC_SYNC_RUNNING = (async()=>{
     let made = 0, closed = 0;
     try{
-      if(!data || data.tasksMissing) return { made, closed };
+      if(!data || data.tasksMissing || data.tasksPartial) return { made, closed };   // 2026-11-10T15:00: never make cards from half a list
       const now = new Date().toISOString(), today = data.today;
       const typeOf = (n)=> data.taskTypes.find(t=>t.type_name===n)||null;
       for(const it of data.items){
@@ -63529,8 +63546,14 @@ async function docTasksSync(data, by){
             ...(ty?{task_type:tyName}:{}), labels:["Document"], links:lastLink, checklists: ty && taskTypeChecklist(ty).length ? taskTypeChecklist(ty) : [],
             notes: it.last && it.last.direction==="In" ? ("Client returned Rev "+it.last.rev_number+": "+(it.last.status||"")+(it.last.notes?" — "+it.last.notes:"")) : "Requested on contract "+it.ct+(it.req&&it.req.is_mandatory?" (mandatory)":""),
             created_by:"App", doc_id: it.doc ? String(it.doc.id) : null, doc_request_id: it.req ? String(it.req.id) : null, doc_round: it.round, doc_contract: it.ct };
+          // 2026-11-10T15:00: another screen may have made it a moment ago — look again in the database
+          { let qq = sb.from("task_tbl").select("id,status,doc_round,doc_id,doc_request_id,assignee,created_at").neq("status","done").eq("doc_round",String(it.round));
+            qq = it.doc ? qq.eq("doc_id",String(it.doc.id)) : qq.eq("doc_request_id",String(it.req.id));
+            const { data: ex2, error: e2 } = await qq.limit(1);
+            if(e2) continue;                                   // cannot check → do not make it now; next sync tries again
+            if(ex2 && ex2.length){ it.tasks.push(ex2[0]); data.tasks.push(ex2[0]); continue; } }
           const { data:t, error } = await sb.from("task_tbl").insert(row).select().single();
-          if(error){ console.error("Document card not made", error); continue; }
+          if(error){ if(!/duplicate key|task_doc_open_uq/i.test(error.message||"")) console.error("Document card not made", error); continue; }
           it.tasks.push(t); data.tasks.push(t); made++;
           await taskLog(t.id, "App", "Created from document "+(it.no||it.cat)+" (contract "+it.ct+") "+(who?"on "+who+"'s board":"in the "+DOC_DEPT+" Unassigned pile"));
         }
@@ -63624,6 +63647,10 @@ async function docSendFromTask(t, f, username){
 // 130: from the Task board — document cards every time it opens; chase letters once a day per browser.
 async function docTaskBoardSync(){
   try{
+    // 2026-11-10T15:00: every person opening Task Boards used to run the full document sync — now once in 5 minutes for everyone
+    try{ const { data: ls } = await sb.from("order_stage_tbl").select("updated_at").eq("contract_number","__docsync__").maybeSingle();
+      if(ls && ls.updated_at && Date.now()-new Date(ls.updated_at).getTime() < 5*60000) return;
+      await ospStageUpsert("__docsync__", {}); }catch(e){}
     const d = await docBoardLoad();
     await docTasksSync(d,"App");
     const k = "doc_sweep_"+toISODate(new Date()); let due = true;
@@ -72722,16 +72749,16 @@ async function ospMayAct(k, user){
 async function ospLoad(){
   const M = { err:"", reg:new Map(), so:new Map(), plan:new Map(), fac:new Map(), rel:new Set(), po:new Set(), st:new Map(), lots:new Map(), placed:new Set(), missing:false };
   try{ await mtcCacheLoad(); }catch(e){}
-  const safe = async(fn)=>{ try{ return await fn(); }catch(e){ return []; } };
+  const safe = async(fn)=>{ try{ return await fn(); }catch(e){ M.partial = true; return []; } };   // 2026-11-10T15:00: a failed read marks M.partial — ospSync then changes nothing
   const [reg, sos, plans, lines, pos, st, lots, pl] = await Promise.all([
-    safe(()=>fetchPaged(()=>sb.from("contract_register_tbl").select("*").order("contract_number"))),
-    safe(()=>fetchPaged(()=>sb.from("sale_order_tbl").select("contract_number,customer_name,status,go_ahead_state,go_ahead_at,quote_reference_number,basis_number,created_at,prod_bom_link,commercial_approved_by,commercial_approved_at,oa_issued_on").order("contract_number"))),
-    safe(()=>fetchPaged(()=>sb.from("proc_plan_tbl").select("id,contract_number,forms,created_at,prod_bom_approved_at").order("id"))),
-    safe(()=>fetchPaged(()=>sb.from("proc_line_tbl").select("plan_id,line_key,act_date").not("act_date","is",null).order("id"))),
-    safe(()=>fetchPaged(()=>sb.from("po_register").select("contract_ref,stage,status").order("id"))),
-    (async()=>{ try{ const r = await sb.from("order_stage_tbl").select("*"); if(r.error){ M.missing = true; return []; } return r.data||[]; }catch(e){ M.missing = true; return []; } })(),
-    safe(async()=>{ const r = await sb.from("so_lot_tbl").select("contract_number,status").limit(5000); return r.data||[]; }),
-    safe(async()=>{ const r = await sb.from("os_place_tbl").select("contract_number"); return r.data||[]; }) ]);
+    safe(()=>fetchPagedStrict(()=>sb.from("contract_register_tbl").select("*").order("contract_number"))),
+    safe(()=>fetchPagedStrict(()=>sb.from("sale_order_tbl").select("contract_number,customer_name,status,go_ahead_state,go_ahead_at,quote_reference_number,basis_number,created_at,prod_bom_link,commercial_approved_by,commercial_approved_at,oa_issued_on").order("contract_number"))),
+    safe(()=>fetchPagedStrict(()=>sb.from("proc_plan_tbl").select("id,contract_number,forms,created_at,prod_bom_approved_at").order("id"))),
+    safe(()=>fetchPagedStrict(()=>sb.from("proc_line_tbl").select("plan_id,line_key,act_date").not("act_date","is",null).order("id"))),
+    safe(()=>fetchPagedStrict(()=>sb.from("po_register").select("contract_ref,stage,status").order("id"))),
+    (async()=>{ try{ return await fetchPagedStrict(()=>sb.from("order_stage_tbl").select("*")); }catch(e){ if(/order_stage_tbl|relation|schema cache/i.test(String(e&&e.message||""))) M.missing = true; else M.partial = true; return []; } })(),
+    safe(async()=>{ const r = await sb.from("so_lot_tbl").select("contract_number,status").limit(5000); if(r.error && !/so_lot_tbl|relation|schema cache/i.test(r.error.message||"")) throw r.error; return r.data||[]; }),
+    safe(async()=>{ const r = await sb.from("os_place_tbl").select("contract_number"); if(r.error && !/os_place_tbl|relation|schema cache/i.test(r.error.message||"")) throw r.error; return r.data||[]; }) ]);
   (reg||[]).forEach(r=>M.reg.set(String(r.contract_number), r));
   (sos||[]).forEach(s=>M.so.set(String(s.contract_number), s));
   const planById = new Map(); (plans||[]).forEach(p=>{ M.plan.set(String(p.contract_number), p); planById.set(p.id, p); });
@@ -72826,8 +72853,12 @@ async function ospTaskCards(cn, client, names, postOf, title, due, note){
   for(const n of Array.from(new Set((names||[]).filter(Boolean)))){
     try{ let dept = null; try{ const { data: e } = await sb.from("employee_tbl").select("department").eq("employee_name",n).limit(1).maybeSingle(); dept = (e && e.department)||null; }catch(x){}
       const row = { title, assignee:n, department:dept, labels:["Order Status"], links:[], ref:String(cn), customer:client||null, created_by:"App", status:"open", checklists:[], due_date:due||null, notes:note||"Made by the app from the Order Status board. It closes itself when the step is done.", post_key:postOf(n)||null };
+      // 2026-11-10T15:00: an open card of this step for this person already exists (another screen made it) → use it
+      { const { data: ex2, error: e2 } = await sb.from("task_tbl").select("id").eq("assignee",n).eq("ref",String(cn)).eq("title",title).neq("status","done").limit(1);
+        if(e2) continue; if(ex2 && ex2.length){ ids.push(ex2[0].id); continue; } }
       let { data: t, error } = await sb.from("task_tbl").insert(row).select().single();
       if(error && /post_key/.test(error.message||"")){ delete row.post_key; ({ data: t, error } = await sb.from("task_tbl").insert(row).select().single()); }
+      if(error && /duplicate key|task_app_open_uq/i.test(error.message||"")){ const { data: ex3 } = await sb.from("task_tbl").select("id").eq("assignee",n).eq("ref",String(cn)).eq("title",title).neq("status","done").limit(1); if(ex3 && ex3.length) ids.push(ex3[0].id); continue; }
       if(t){ ids.push(t.id); try{ await taskLog(t.id, "App", "Made by the app: "+title); }catch(x){} }
     }catch(e){ console.warn("stage task", e); }
   }
@@ -72863,7 +72894,7 @@ let OSP_SYNC_BUSY = false, OSP_SYNC_AT = 0;
 async function ospSync(only, by, Min){
   if(OSP_SYNC_BUSY) return; OSP_SYNC_BUSY = true;
   try{
-    const M = Min || await ospLoad(); if(M.missing) return;
+    const M = Min || await ospLoad(); if(M.missing || M.partial) return;   // 2026-11-10T15:00: never open / close cards from half the data
     await loadPostPeople(true);
     const supers = await superAdminNames();
     const postOfName = {}; ["doc_controller","technical_head","vp_projects","stores","purchase_manager","purchase_engineer","production_manager","sales_head","sales_coordinator"].forEach(k=>postHolders(k).forEach(n=>{ if(!postOfName[n]) postOfName[n] = k; }));
@@ -72929,7 +72960,8 @@ async function ospSync(only, by, Min){
           esc.chase = today; dirty = true; }
       }
       if(dirty){ esc.closed = closed; M.st.set(cn, { ...st, tasks, opened, esc });
-        try{ await ospStageUpsert(cn, { tasks, opened, esc }); }catch(e){ console.warn("order stage", e.message); } }
+        try{ await ospStageUpsert(cn, { tasks, opened, esc }); }catch(e){
+          try{ await ospStageUpsert(cn, { tasks, opened, esc }); }catch(e2){ console.warn("order stage not saved — the open cards are found again by title next time", e2.message); } } }
     }
     // 2026-11-06: GRNs cleared without the bill — a list once a week (the first sync from Monday) to the Finance Director and Accounts posts
     if(!only){ try{ const D2 = M.st.get("__daily__") || {}; const d2 = { ...(D2.esc||{}) }; const wk = grnWeekKey();
