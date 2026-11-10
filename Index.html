@@ -55,7 +55,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-10T13:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-10T14:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -35894,6 +35894,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"10 Nov 2026 (356)", summary:"Built on 2026-11-10T14:00:00Z. No SQL. CONTRACT REGISTER: the old register's 7-digit legacy contracts (2240004…) are hidden unless \"Show old-series contracts (n)\" is ticked (remembered per user), so newest first starts at the latest 26xxxx contract. A 7-digit number made in the app — 2600002 Zeeco Middle East — is not legacy: it stays and sorts as a year-26 contract (with 260002)." },
   { date:"10 Nov 2026 (355)", summary:"Built on 2026-11-10T13:00:00Z. SQL (data, Flometriq only): fix_duplicate_documents_2026-11-10.sql. DUPLICATE DOCUMENTS: adding a document to a contract (+ Missing document, approving a request to add, the OA Documents box) when the contract already has a live document of the same category (same Sl No) shows the existing one(s) with their status and asks whether this is a NEW, separate document — Cancel adds nothing. STAGE REPORT / BOARD: several GADs or ITPs on one contract now read e.g. \"GAD (2): not submitted · pending on our side | CODE 1 ✓ — 1 of 2 approved\" instead of only the weakest. A required document is no longer shown as not submitted when the contract already holds a live document of that category (legacy-loaded documents never linked the requirement)." },
   { date:"10 Nov 2026 (354)", summary:"Built on 2026-11-10T12:00:00Z. NEEDS SQL: structure_training_links_2026-11-10.sql (BOTH companies). TRAINING: Help → Training now lists the guides — Order to despatch (Document Control, as before) and Stores (PO to gate pass, 14 chapters, English / Tamil). Each guide has Files: Watch video, Read guide (PDF), Slides (PPT) — kept on OneDrive, only the links are in the app (open in a new tab, or 📌 in the side Reference panel). A Super Admin adds or changes the links with ✎ Links." },
   { date:"10 Nov 2026 (353)", summary:"Built on 2026-11-10T09:00:00Z. NEEDS SQL: structure_approved_rates_2026-11-10.sql (BOTH companies). MATERIAL RATES PART 3 — ESTIMATION BY VENDOR APPROVAL: the quote / OA header asks Buy from approved vendors? (multi-select; filled from the End User Rule when the end user is picked; changeable per quote). BOM lines take an approved vendor's rate — the last PO from an approved vendor, else the latest approved vendor's quoted rate (Vendors sub-form of Material rates). A material with no approved rate keeps the normal rate, its BOM lines get a red badge (non-ADNOC rate), the quote gets an office note (internal notes, never printed) and the Purchase Head is asked: Purchase › Inventory › Approved rates wanted — one row per material and approval, quotes merged, Pending Actions, ticked off by itself when an approved vendor's rate is entered. New Sl Nos added to a quote that asks for approvals are priced the same way. Quotes already made stay as they are until their header approvals are saved again. Also: the header edit no longer drops the End user." },
@@ -85882,6 +85883,8 @@ function ContractRegisterScreen({ user, onOpenQuote, onOpenContract, onGoToTab, 
   const [kind,setKind] = useState("all");
   const [sortDesc,setSortDescS] = useState(()=>{ try{ return localStorage.getItem("cr_sort")==="desc"; }catch(e){ return false; } });   // 171: oldest to newest unless flipped
   const flipSort = ()=> setSortDescS(v=>{ try{ localStorage.setItem("cr_sort", v?"asc":"desc"); }catch(e){} return !v; });
+  const [showOld,setShowOldS] = useState(()=>{ try{ return localStorage.getItem("cr_show_old")==="1"; }catch(e){ return false; } });   // 2026-11-10T14:00
+  const setShowOld = (v)=>{ setShowOldS(v); try{ localStorage.setItem("cr_show_old", v?"1":"0"); }catch(e){} };
   const [loadedAt,setLoadedAt] = useState(null); const [loading,setLoading] = useState(false);
   const rootRef = useRef(null); const [isFull,setIsFull] = useState(false);
   useEffect(()=>{ const f = ()=> setIsFull(!!rootRef.current && document.fullscreenElement===rootRef.current); document.addEventListener("fullscreenchange",f); return ()=>document.removeEventListener("fullscreenchange",f); },[]);
@@ -85969,14 +85972,20 @@ function ContractRegisterScreen({ user, onOpenQuote, onOpenContract, onGoToTab, 
   const fyOk = (c)=> fy==="all" || (fy.startsWith("cy:") ? String(c.cn).slice(0,2)===fy.slice(3) : crFyOf(c.poDate)===Number(fy));
   const qq = q.trim().toLowerCase();
   const kindOk = (c)=> kind==="all" || (kind==="export" ? c.isExport : !c.isExport);
-  const cnKey = (c)=> Number(String(c.cn).replace(/\D/g,""))||0;
-  const base = list.filter(c=> fyOk(c) && kindOk(c) && (!chk || c.checkCcy) && (!qq || hHas([c.cn,c.quote,c.legacyRef,c.client,c.po,c.endUser,...c.lines.map(l=>l.d)].join(" "), qq)) && ctFindOk(cfx, c.cn));
+  // 2026-11-10T14:00: the old register's 7-digit series (2240004…) is hidden unless "Show old-series contracts" is ticked; a 7-digit
+  // number made in the app (2600002 Zeeco Middle East) is NOT legacy — it stays and sorts as a year-26 contract (26 + 00002 = 260002).
+  const cnDig = (c)=> String(c.cn).replace(/\D/g,"");
+  const oldSeries = (c)=> c.source==="legacy" && cnDig(c).length>=7;
+  const cnLen = (c)=> oldSeries(c) ? 5 : cnDig(c).length>=7 ? 6 : cnDig(c).length;   // old series sorts below every 6-digit contract (they are 2023-24 orders)
+  const cnKey = (c)=>{ const d = cnDig(c); if(d.length>=7 && !oldSeries(c)) return Number(d.slice(0,2))*10000 + (Number(d.slice(2))||0); return Number(d)||0; };
+  const nOld = list.filter(oldSeries).length;
+  const base = list.filter(c=> (showOld || !oldSeries(c)) && fyOk(c) && kindOk(c) && (!chk || c.checkCcy) && (!qq || hHas([c.cn,c.quote,c.legacyRef,c.client,c.po,c.endUser,...c.lines.map(l=>l.d)].join(" "), qq)) && ctFindOk(cfx, c.cn));
   const stKey = (c)=>{ const s = crStShow(c.status); if(s!=="Active") return s; const p = P && P[String(c.cn)]; return P ? String(p ? p.stage : 1) : "?"; };
   const hdKey = (c)=>{ const p = P && P[String(c.cn)]; const g = p && p.g; if(!P) return "?"; if(!g || !g.holdDocs) return "none"; const n = HOLD_ORDER.reduce((k,l)=>k+g.open[l].length,0); return n ? (g.level||"Full Hold") : "clear"; };
   const woKey = (c)=>{ const p = P && P[String(c.cn)]; if(!P) return "?"; const so = p && p.g && p.g.so; if(!so) return "noso"; const s2 = so.go_ahead_state||"Hold"; if(woReleased(s2)) return "rel"; if(s2==="Start Engineering") return "eng"; return ["clear","none","Inspection Hold","Final Hold"].includes(hdKey(c)) ? "ready" : "hold"; };   // 236
   const woOk = (c,w)=> w==="All" || (w==="pending" ? (woKey(c)!=="rel" && crStShow(c.status)==="Active" && ["1","2"].includes(stKey(c))) : woKey(c)===w);
   const stOk = (c,s)=> s==="All" || (s==="ready" ? (["1","2"].includes(stKey(c)) && ["clear","Inspection Hold","Final Hold"].includes(hdKey(c))) : stKey(c)===s);   // 214: Build X
-  const shown = base.filter(c=> stOk(c,st) && (hd==="All" || hdKey(c)===hd) && woOk(c,wo)).sort((a,b)=>{ const d = String(a.cn).length-String(b.cn).length || cnKey(a)-cnKey(b); return sortDesc ? -d : d; });
+  const shown = base.filter(c=> stOk(c,st) && (hd==="All" || hdKey(c)===hd) && woOk(c,wo)).sort((a,b)=>{ const d = cnLen(a)-cnLen(b) || cnKey(a)-cnKey(b); return sortDesc ? -d : d; });
   const cnt = (s)=> base.filter(c=>stOk(c,s) && (hd==="All" || hdKey(c)===hd) && woOk(c,wo)).length;
   const cntH = (s)=> base.filter(c=>(s==="All"||hdKey(c)===s) && stOk(c,st) && woOk(c,wo)).length;
   const cntW = (w)=> base.filter(c=>woOk(c,w) && stOk(c,st) && (hd==="All" || hdKey(c)===hd)).length;   // 236
@@ -86113,6 +86122,7 @@ function ContractRegisterScreen({ user, onOpenQuote, onOpenContract, onGoToTab, 
           CR_OPT.map(o=>h("label",{key:o[0],style:{display:"flex",gap:6,alignItems:"center",fontSize:12.5,padding:"2px 0",cursor:"pointer"}},h("input",{type:"checkbox",checked:!!cols[o[0]],onChange:e=>setCol(o[0],e.target.checked)}),o[1])),
           h("button",{onClick:()=>setColsOpen(false),style:{...btnSmall,marginTop:6}},"Done")) : null),
       h("button",{onClick:flipSort,title:"Sort by contract number",style:{...btnSecondary,fontSize:12,padding:"6px 12px"}},"Contract No "+(sortDesc?"▼ newest first":"▲ oldest first")),
+      nOld ? h("label",{"data-testid":"cr-show-old",title:"The old register's 7-digit contract numbers ("+list.filter(oldSeries).slice(0,3).map(c=>c.cn).join(", ")+"…), loaded as Legacy",style:{display:"inline-flex",alignItems:"center",gap:5,fontSize:12,color:colors.muted,cursor:"pointer",whiteSpace:"nowrap"}}, h("input",{type:"checkbox",checked:showOld,onChange:e=>setShowOld(e.target.checked)}), "Show old-series contracts ("+nOld+")") : null,
       h("button",{onClick:()=>crDownloadExcel(shown),style:{...btnSecondary,fontSize:12,padding:"6px 12px"}},"Download Excel"),
       h("button",{onClick:load,disabled:loading,title:loadedAt?"Loaded "+loadedAt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"",style:{...btnSecondary,fontSize:12,padding:"6px 12px"}},loading?"Loading…":"↻ Refresh"+(loadedAt?" · "+loadedAt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"")),
       h("button",{onClick:toggleFull,style:{...btnSecondary,fontSize:12,padding:"6px 12px"}},isFull?"Exit full screen":"⛶ Full screen"),
