@@ -55,7 +55,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-11T05:30:00Z";
+  var APP_BUILD_VERSION = "2026-11-11T07:45:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -708,6 +708,7 @@ async function loadPostPeople(force){
       sb.from("post_holder_tbl").select("post_key,employee_name")
     ]);
     POST_PEOPLE_CACHE = { posts: posts||[], holders: holders||[] };
+    try{ await loadNameAliases(force); }catch(e){}   // 2026-11-11T07:45:00Z
     return POST_PEOPLE_CACHE;
   })();
   return POST_PEOPLE_LOADING;
@@ -720,6 +721,39 @@ function postLabel(postKey){
 function postHolders(postKey){
   return POST_PEOPLE_CACHE.holders.filter(r=>r.post_key===postKey).map(r=>r.employee_name).filter(Boolean);
 }
+// ---- 2026-11-11T07:45:00Z: ONE PERSON, SEVERAL NAMES ----
+// A person's login (app_users.employee_name / username) and their employee record (employee_tbl.employee_name,
+// linked by app_user_id) may carry different spellings, e.g. login "Ramesh" and employee "Ramesh S". Posts, boards
+// and owners were saved under either, so every "is this me?" check matches any name of the same person.
+let NAME_ALIAS = {};            // lower-case name -> every name of that person
+let NAME_ALIAS_LOADING = null;
+function nameKey(n){ return String(n||"").trim().replace(/\s+/g," ").toLowerCase(); }
+async function loadNameAliases(force){
+  if(NAME_ALIAS_LOADING && !force) return NAME_ALIAS_LOADING;
+  NAME_ALIAS_LOADING = (async()=>{
+    try{
+      const [{ data: us }, { data: es }] = await Promise.all([
+        sb.from("app_users").select("id,username,employee_name"),
+        sb.from("employee_tbl").select("employee_name,app_user_id")
+      ]);
+      const map = {};
+      (us||[]).forEach(u=>{
+        const e = (es||[]).find(x=>x.app_user_id && x.app_user_id===u.id);
+        const g = Array.from(new Set([u.employee_name, e && e.employee_name, u.username].filter(Boolean).map(x=>String(x).trim())));
+        if(g.length<2) return;
+        g.forEach(n=>{ const k = nameKey(n); map[k] = Array.from(new Set([...(map[k]||[]), ...g])); });
+      });
+      NAME_ALIAS = map;
+    }catch(e){}
+    return NAME_ALIAS;
+  })();
+  return NAME_ALIAS_LOADING;
+}
+function nameAliases(n){ const k = nameKey(n); return k ? Array.from(new Set([String(n).trim(), ...(NAME_ALIAS[k]||[])])) : []; }
+function sameName(a, b){ const ka = nameKey(a), kb = nameKey(b); if(!ka || !kb) return false; if(ka===kb) return true; return (NAME_ALIAS[ka]||[]).some(x=>nameKey(x)===kb); }
+function nameIn(list, n){ return (list||[]).some(x=>sameName(x, n)); }
+function postHas(postKey, n){ return nameIn(postHolders(postKey), n); }
+loadNameAliases();
 // "Veenai Vimal (Technical Head)" — or, vacant:
 // "the Technical Head post is empty — contact Bala Boopathy".
 function postPersonText(postKey){
@@ -13190,8 +13224,10 @@ async function myPostKeys(user){
     const { data: emp } = await sb.from("employee_tbl").select("employee_name").eq("app_user_id",user?.id||"").limit(1).maybeSingle();
     const me = emp && emp.employee_name;
     if(!me) return { me:"", keys:[] };
-    const { data } = await sb.from("post_holder_tbl").select("post_key").eq("employee_name",me);
-    return { me, keys:(data||[]).map(r=>r.post_key) };
+    await loadNameAliases();   // 2026-11-11T07:45:00Z: the post may be saved under the login name
+    const names = Array.from(new Set([...nameAliases(me), ...nameAliases(user && user.username)]));
+    const { data } = await sb.from("post_holder_tbl").select("post_key").in("employee_name",names);
+    return { me, keys:Array.from(new Set((data||[]).map(r=>r.post_key))) };
   }catch(e){ return { me:"", keys:[] }; }
 }
 function canSetForProduction(user, keys){
@@ -15741,7 +15777,7 @@ function bomFieldDiffs(line, master){ return BOM_CMP.filter(f=>!bomSame(f, line[
 // the same Sub-assembly + Component twice? rows = the whole BOM after the change; returns the clashing key text or ""
 function bomDupOf(rows){ const seen = new Map(); for(const r of (rows||[])){ if(!bomIsPlain(r)) continue; const k = bomKey(r); if(k==="|") continue; if(seen.has(k)) return bomKeyText(r); seen.set(k,1); } return ""; }
 async function bomIsTh(user){
-  try{ await loadPostPeople(true); const me = await despMe(user); return !!me && postHolders("technical_head").includes(me); }catch(e){ return false; }
+  try{ await loadPostPeople(true); const me = await despMe(user); return !!me && postHas("technical_head", me); }catch(e){ return false; }
 }
 // write the ticked differences into the master BOM of one model
 async function bomApplyMaster(model, item, size, picks, srcNote, byUser){
@@ -35913,6 +35949,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"11 Nov 2026", summary:"Built on 2026-11-11T07:45:00Z, on top of 2026-11-11T05:30:00Z. No SQL. ONE PERSON, SEVERAL NAMES: a person's login name (app_users) and employee record (employee_tbl) may be spelt differently (login 'Ramesh', employee 'Ramesh S'), so the Document Controller post saved as 'Ramesh' was not recognised and he could not change any card he did not own. Every 'does this person hold the post / own the card' check now matches any name of the same person (login name, employee name, username) — post checks everywhere, Despatch steps, the Document Control board. DOCUMENT CONTROL BOARD: the Document Controller changes the status of ANY card, whoever owns it (History records who did it; no bell to the owner). A card you cannot change says so: 'View only — status can be changed by <owner> (the card's owner), <name> (Document Controller) or an Admin'; the same names are in the refusal messages." },
   { date:"11 Nov 2026", summary:"Built on 2026-11-11T05:30:00Z, on top of 2026-11-11T03:30:00Z. No SQL. DOCUMENT CONTROL BOARD: (1) FILTER STRIP — when any filter is on (Due chip, Our action / Client to chase, My cards, Owner, Dept, Hold, search) a yellow strip says 'Filtered: showing X of Y cards' with a Show all button. The Due chip is remembered on each computer, which is why the Super Admin and Suresh saw different cards on 260061. (2) OWNER POP-UP — the small owner dropdown on a card is replaced by a 👤 name chip; a click opens a pop-up listing ALL active employees of every department (search by name, department or designation; arrow keys + Enter; recently used; open-card count; employees without a login shown greyed). Optional card due date (later date needs a reason) and a note that goes with the bell. The new owner gets a bell; the change goes into History. The owner can work the card even when not on the Document Control board." },
   { date:"11 Nov 2026", summary:"Built on 2026-11-11T03:30:00Z, on top of 2026-11-10T17:00:00Z. No SQL. LOG FOLLOW-UPS → REVIEW, OWNER BOX FIXED (reported by Kayathri): follow-ups are saved under the login name, but the Owner box listed employee names, so picking a person showed nothing and only Everyone worked. The box now lists each person as Employee name (login), filters by the login (and also matches any old rows saved under the employee name), opens on your own name, and has an Import entry for follow-ups loaded from old records. The day prompt and the late-entry check now also look up follow-ups by login name." },
   { date:"10 Nov 2026 (359)", summary:"Built on 2026-11-10T17:00:00Z. NEEDS SQL (BOTH companies, before deploying): structure_purchase_bom_2026-11-10.sql and structure_document_notes_2026-11-10.sql. PURCHASE BOM: the purchase owner (the buyer on the Procurement card) makes it from the Production BOM — one line per shape · spec · grade · size with the total need; free stock first (at each lot's rate, stock set aside for other contracts left out), the rest to buy with vendor rates (Vendors master only, how each rate came: Email quote / WhatsApp / Phone / Handwritten / Visit; foreign currency with its exchange rate; new rates also go to the line's Vendors sub-form), L1 or another vendor with a reason, Single vendor or Value only with a reason, Enter a vendor's rates fills a whole quote, last PO rate shown, PO description editable, no line goes without a rate. Packing = the contract's packing box. Totals: from stock, to buy, packing, total, % of PO value, the Production BOM estimate. Send for endorsement → the Purchase Manager endorses with a note or sends back → the owner presents it → a Super Admin approves (budget fixed, stock set aside, on to PR release) or sends back with a reason (endorse again). Order Status board: three new lists before PR release — Purchase BOM being made (owner), endorsement pending (Purchase Manager), approval pending (Super Admin), 3 days each then late; the old Purchase approval pending list is gone (contracts in it move to material in pending). Contracts whose Procurement Gantt was made before 10 Nov go straight to PR release unless a Purchase BOM is started for them. Purchase › Purchase BOM › BOM approvals and Budget control (also Stores › Inventory › Budget control): material and packing used (Material Outward) against the approved Purchase BOM, bells at 65 / 80 / 90 % once each to the Production Manager, Stores In Charge and Super Admins. Order Acceptance: four material % (Estimated, Production BOM, Budget, Actual) in INR. Material Outward no longer offers stock set aside for another contract. STORES GUIDE FIXES: gate pass only after Accounts' Despatch Clearance is cleared (held ones listed with the reason); payment-due-before-despatch stays a warning; Stores › Inventory › Stock items (master rates) back on the ribbon; the Technical Head named as the approver of new materials and master rates; Tag Register shows the tags a GRN line went into stock as; picking a PO line on a GRN no longer makes a stock item (made when the line is saved); Pieces & scrap: Scrap… takes a date; auto-made Circle / Ring Circle lines have the Technical Head as owner. Procurement Gantt: the Packing box shows as the contract's packing box, not 'BOM to be corrected'. Document notes (✎ note) save once the notes table SQL is run." },
@@ -44901,7 +44938,7 @@ async function pgTaskChanged(task, before, me){
 // made only by the head of the department (or a Super Admin). Heads by post — never by person.
 const DEPT_HEAD_POST = [[/purchase/i,"purchase_manager"],[/store/i,"stores"],[/production/i,"production_manager"],[/^\s*qc|quality/i,"qc"],[/account|finance/i,"accounts"],[/design|estimation/i,"technical_head"],[/sales/i,"sales_head"],[/document/i,"vp_projects"],[/hr|human|admin/i,"hr_admin"]];
 function deptHeadPost(dept){ const m = DEPT_HEAD_POST.find(([re])=>re.test(String(dept||""))); return m ? m[1] : null; }
-function isDeptHead(user, me, dept){ if(user && user.role==="super_admin") return true; const k = deptHeadPost(dept); return !!(k && me && postHolders(k).includes(me)); }
+function isDeptHead(user, me, dept){ if(user && user.role==="super_admin") return true; const k = deptHeadPost(dept); return !!(k && me && postHas(k, me)); }
 const PGF = "pgf|";   // a Procurement Gantt form kept as a checklist on the Procurement card
 async function pgNotifyPurchase(message, except){
   try{ const { data: emps } = await sb.from("employee_tbl").select("employee_name,department,status");
@@ -45099,7 +45136,7 @@ async function packAlert(cn, by){
     await logAudit("UPDATE","contract_packing_tbl",String(cn),"Packing budget alert "+t+"% ("+Math.round(pct)+"% used)", by||"App", null, null);
   }catch(e){ console.warn("packing alert", e); }
 }
-const packCanEdit = (user)=> !!(user && (user.role==="technical_head" || user.role==="admin" || user.role==="super_admin" || (()=>{ try{ return postHolders("technical_head").includes(user.employee_name||""); }catch(e){ return false; } })()));
+const packCanEdit = (user)=> !!(user && (user.role==="technical_head" || user.role==="admin" || user.role==="super_admin" || (()=>{ try{ return postHas("technical_head", user.employee_name||""); }catch(e){ return false; } })()));
 function PackBoxModal({ cn, user, onClose, onSaved }){
   const [st,setSt] = useState(null); const [f,setF] = useState({ packing:"", budget:"", no:false, reason:"" }); const [busy,setBusy] = useState(false); const [err,setErr] = useState("");
   useEffect(()=>{ (async()=>{ const g = await packGet(cn); const bl = await packBomLines(cn); const iu = await packIssued(cn); const ls = await packLotShares(cn, Number(g.row&&g.row.budget)||0).catch(()=>({ total:0, lots:[] }));
@@ -46145,7 +46182,7 @@ function purCardStage(card){
   const a = card.assignee||""; if(!a || a==="Unassigned") return "pile";
   if(card.post_key==="purchase_engineer") return "eng";
   if(card.post_key==="purchase_manager") return "pile";
-  return postHolders("purchase_manager").includes(a) ? "pile" : "eng";
+  return postHas("purchase_manager", a) ? "pile" : "eng";
 }
 // who can receive a card: the Purchase Engineer post (Purchase department people if nobody holds it)
 async function purEngineers(){
@@ -60799,7 +60836,7 @@ function OrgChartScreen({ user, onOpenTab }){
       help:{ btn:"Go and approve", what:"Approve the organisation chart revision ("+(w==="hr"?"HR":"MD")+")", do:["Read the description and the changes listed.","Check each new or moved person sits under the right role.","Press Approve ("+(w==="hr"?"HR":"MD")+"). If something is wrong, use Send back with a note."] } });
     const orgMsg = "Organisation chart revision waiting for your approval: "+(ed.description||"")+" — HR → Organisation Chart → Revision.";
     await notifyPeople(postHolders(W.hrPost), orgMsg, "info", orgAct("hr"));
-    await notifyPeople(postHolders(W.mdPost).filter(n=>!postHolders(W.hrPost).includes(n)), orgMsg, "info", orgAct("md"));
+    await notifyPeople(postHolders(W.mdPost).filter(n=>!postHas(W.hrPost, n)), orgMsg, "info", orgAct("md"));
     await logAudit("UPDATE","org_chart_rev_tbl",String(ed.id),"Org chart revision sent for approval: "+ed.description+" · "+ch.length+" change(s)", user?.username||"", null, null);
     apprRefresh(); await load(); };
   const approve = async(which)=>{
@@ -64518,10 +64555,12 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
 
   if(!data) return h("div",{style:{padding:30,color:colors.muted}},"Loading the Document Control board…");
   const today = data.today;
-  const isDocCtl = data.dcNames.includes(me);
-  const canAdmin = isAdmin || isDocCtl;
-  const canTouch = (it)=> canAdmin || (!!it.owner && it.owner===me);
-  const canHold = canAdmin || postHolders("technical_head").includes(me);   // 216: Document Controller, Technical Head, admins, super admins
+  const isDocCtl = nameIn(data.dcNames, me);   // 2026-11-11T07:45:00Z: any name of the person (login "Ramesh" = employee "Ramesh S")
+  const canAdmin = isAdmin || isDocCtl;        // the Document Controller works EVERY card, whoever owns it
+  const canTouch = (it)=> canAdmin || (!!it.owner && sameName(it.owner, me));
+  const canHold = canAdmin || postHas("technical_head", me);
+  const whoCanTxt = (it)=>{ const dc = data.dcNames.length ? data.dcNames.join(" / ")+" (Document Controller)" : "the Document Controller";
+    return (it.owner ? it.owner+" (the card's owner), " : "the card's owner, ")+dc+" or an Admin"; };   // 216: Document Controller, Technical Head, admins, super admins
   const contracts = Array.from(new Set(data.items.map(it=>it.ct))).filter(Boolean).sort();
   const curCt = ct || contracts[contracts.length-1] || "";
   const people = Array.from(new Set([
@@ -64533,7 +64572,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   const ql = q.trim().toLowerCase();
   const allTiles = [...DOC_TILES, ...DOC_CUSTOM.filter(c=>c.tile!==false).map(c=>({ key:"c:"+c.key, grp:"Documents", label:c.label, color:c.color, note:c.sub, f:it=>it.sub===c.key }))];   // 183
   const tileDef = allTiles.find(t=>t.key===tile) || null;   // 174
-  const tileItems = data.items.filter(it=> !mine || it.owner===me);
+  const tileItems = data.items.filter(it=> !mine || sameName(it.owner, me));
   // 236: WORK ORDER RELEASE of each contract (the go-ahead on its Order Acceptance)
   const fhOf = (ct)=> data.items.filter(it=>it.ct===ct && it.hold==="Full Hold" && !["code2","info","done"].includes(it.list)).length;
   const woKind = (ct)=>{ const so = data.soBy[ct]; if(!so) return "noso"; const st = so.go_ahead_state||"Hold"; if(woReleased(st)) return "rel"; if(st==="Start Engineering") return "eng"; return fhOf(ct)===0 ? "ready" : "hold"; };
@@ -64567,7 +64606,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   const woCount = (f)=> woPool.filter(ct=>showOk(ct,f)).length;   // 239
   const delBy = {}; (del||[]).forEach(x=>{ delBy[x.ct] = { date:x.date, from:x.from, what:"Contract "+x.ct }; });   // 255: project due date (contract delivery)
   const openCtHist = (c)=>{ setChx({ q:"", shut:{}, newest:true }); setPanel({ kind:"cthist", ct:c }); };
-  const visBase = data.items.filter(it=>(!tileDef || !tileDef.f || tileDef.f(it)) && (!mine || it.owner===me) && (mode==="all" || it.ct===curCt) && (!fHold || (fHold==="info" ? it.infoOnly : fHold==="appr" ? !it.infoOnly : fHold==="none" ? !it.hold && !it.infoOnly : it.hold===fHold))
+  const visBase = data.items.filter(it=>(!tileDef || !tileDef.f || tileDef.f(it)) && (!mine || sameName(it.owner, me)) && (mode==="all" || it.ct===curCt) && (!fHold || (fHold==="info" ? it.infoOnly : fHold==="appr" ? !it.infoOnly : fHold==="none" ? !it.hold && !it.infoOnly : it.hold===fHold))
     && (!fOwner || (fOwner==="__none" ? !it.owner : it.owner===fOwner)) && (!fDept || it.dept===fDept)
     && (!ql || [it.name,it.no,it.cno,it.ct,it.customer,it.cat,it.owner].some(x=>hHas(x||"", ql)))
     && (!fSide || (fSide==="client" ? it.waitingClient : (!it.waitingClient && it.list!=="done" && it.list!=="confirm"))) && woOk(it.ct));   // 236
@@ -64671,7 +64710,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   // ---- move = log the next revision ----
   const expectedNext = docExpectedNext;   // 175: a loaded, never-sent revision goes out at the same Rev
   const startMove = async(it, to, forceStatus, viaComplete, viaReply)=>{
-    if(!canTouch(it)){ alert("Only the Document Controller, an Admin or "+(it.owner?it.owner+" (the card's owner)":"the card's owner")+" can move this card."); return; }
+    if(!canTouch(it)){ alert("Only "+whoCanTxt(it)+" can move this card."); return; }
     if(to==="confirm"){ alert("“Status to confirm” comes only from the legacy load. A card can't be moved back to it."); return; }   // 175
     if(it.list==="confirm"){ startSetStatus(it); return; }   // 175: a loaded card gets its status set, not a new revision
     const cTo = docCustomOf(to), cFrom = it.cx;   // 183
@@ -64688,7 +64727,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   };
   // 175: ✓ Completed on a card = the document goes to the client now.
   const completeCard = (it)=>{
-    if(!canTouch(it)){ alert("Only the Document Controller, an Admin or "+(it.owner?it.owner+" (the card's owner)":"the card's owner")+" can complete this card."); return; }
+    if(!canTouch(it)){ alert("Only "+whoCanTxt(it)+" can complete this card."); return; }
     if(!it.needsUs){ alert("This card is waiting on the client — there is nothing of ours to complete."); return; }
     const exp = expectedNext(it.revs);
     if(exp.direction!=="Out"){ alert("The latest entry on this card is already Out (sent). Log the client's reply first: drag the card to the right list, or use + Add revision in 🕘 History."); return; }
@@ -64698,7 +64737,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   };
   // 178: Log client reply ▸ on a card that is with the client: records the returned file, code and date (Rev In).
   const logReply = (it)=>{
-    if(!canTouch(it)){ alert("Only the Document Controller, an Admin or "+(it.owner?it.owner+" (the card's owner)":"the card's owner")+" can log the client's reply."); return; }
+    if(!canTouch(it)){ alert("Only "+whoCanTxt(it)+" can log the client's reply."); return; }
     const exp = expectedNext(it.revs);
     if(exp.direction!=="In"){ alert("The latest entry on this card is not a submission, so there is no reply to log. Use 🕘 History → + Add revision."); return; }
     startMove(it, it.list, "", false, true);
@@ -64755,7 +64794,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
 
   // ---- 175: Set status on a loaded ("Status to confirm") card — sets the loaded revision, makes no new one ----
   const startSetStatus = (it)=>{
-    if(!canTouch(it)){ alert("Only the Document Controller, an Admin or "+(it.owner?it.owner+" (the card's owner)":"the card's owner")+" can set this status."); return; }
+    if(!canTouch(it)){ alert("Only "+whoCanTxt(it)+" can set this status."); return; }
     if(!it.last){ alert("This card has no loaded revision to set."); return; }
     setMv({ key:it.key, status:"", date: String(it.last.changed_at||"").slice(0,10) || today, what:"", hold:"" });
     setPanel({ kind:"setst", key:it.key });
@@ -64868,6 +64907,8 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
               : h("button",{onClick:e=>{ e.stopPropagation(); completeCard(it); },title:"Send the document to the client for the first time: logs Rev 0 Out and closes the task card",style:{font:"inherit",fontSize:11,fontWeight:700,border:"1px solid #2a6db0",background:"#2a6db0",color:"#fff",borderRadius:6,padding:"2px 9px",cursor:"pointer"}},"Send to client ▸"); })())
       : it.waitingClient && canTouch(it) ? h("div",{onMouseDown:e=>e.stopPropagation(),style:{display:"flex",gap:5,flexWrap:"wrap",borderTop:"1px dashed "+colors.border,marginTop:6,paddingTop:6}},
           h("button",{onClick:e=>{ e.stopPropagation(); logReply(it); },title:"The client has replied: record the returned file, their code and the date",style:{font:"inherit",fontSize:11,fontWeight:700,border:"1px solid #6b4fa0",background:"#f3effa",color:"#4b3480",borderRadius:6,padding:"2px 9px",cursor:"pointer"}},"Log client reply ▸"))
+      : (it.list==="confirm" || it.needsUs || it.waitingClient) ? h("div",{"data-testid":"doc-view-only",title:"You can see this card but not change it",style:{borderTop:"1px dashed "+colors.border,marginTop:6,paddingTop:5,fontSize:10.5,color:colors.muted,lineHeight:1.35}},
+          "View only \u2014 status can be changed by "+whoCanTxt(it)+".")   // 2026-11-11T07:45:00Z
       : null,
       o && h("div",{style:{borderTop:"1px dashed "+colors.border,marginTop:6,paddingTop:6,fontSize:11,color:colors.muted,lineHeight:1.6}},
         h("div",null,"Owner ",ownerSel(it,true)),
@@ -69801,10 +69842,10 @@ async function despPeople(){
 function despCan(step, user, me, P){
   if(!user) return false;
   if(user.role==="admin" || user.role==="super_admin") return true;
-  if(step==="stores") return P.stores.includes(me) || (P.fm||[]).includes(me);   // the Factory Manager has Stores rights
-  if(step==="pm") return P.pm.includes(me);
-  if(step==="qc") return P.qc.includes(me) || user.role==="qc";
-  if(step==="acc") return P.acc.includes(me) || user.role==="accounts_admin";
+  if(step==="stores") return nameIn(P.stores, me) || nameIn((P.fm||[]), me);   // the Factory Manager has Stores rights
+  if(step==="pm") return nameIn(P.pm, me);
+  if(step==="qc") return nameIn(P.qc, me) || user.role==="qc";
+  if(step==="acc") return nameIn(P.acc, me) || user.role==="accounts_admin";
   return false;
 }
 async function despSettings(){
@@ -70014,7 +70055,7 @@ function DespatchDetailsPanel({ contractInfo, user }){
   const [missing,setMissing] = useState(false); const [canEdit,setCanEdit] = useState(false);
   const load = useCallback(async()=>{ if(!cn) return; try{ const c = await despContract(cn); setC(c); setMissing(false); }catch(e){ setMissing(true); } },[cn]);
   useEffect(()=>{ load(); },[load]);
-  useEffect(()=>{ (async()=>{ const me = await despMe(user); const P = await despPeople(); setCanEdit(despCan("acc",user,me,P) || despCan("stores",user,me,P) || postHolders("doc_controller").includes(me)); })(); },[user && user.username]);
+  useEffect(()=>{ (async()=>{ const me = await despMe(user); const P = await despPeople(); setCanEdit(despCan("acc",user,me,P) || despCan("stores",user,me,P) || postHas("doc_controller", me)); })(); },[user && user.username]);
   if(!cn || missing || !C) return null;
   const shipLater = !!(C.so && C.so.ship_tba) && !(C.despatch && String(C.despatch.ship_address||"").trim());   // 2026-11-08
   const dd = C.despatch;
@@ -70484,7 +70525,7 @@ async function qcsrCanGive(user){
   try{
     await loadPostPeople();
     const me = await despMe(user);
-    if(me && postHolders("qc").includes(me)) return true;
+    if(me && postHas("qc", me)) return true;
     if(me){ const { data } = await sb.from("employee_tbl").select("department").eq("employee_name",me).limit(1).maybeSingle(); if(data && /\b(qc|quality)\b/i.test(String(data.department||""))) return true; }
   }catch(e){}
   return false;
@@ -70704,7 +70745,7 @@ function DcSerialTicks({ r, q, RG, rows, setRow, user, C }){
 // Any QC person corrects with a one-time code from the QC Head or a Super Admin (they correct without a code). Every change is kept in the serial's history.
 const QCSRF_HOURS = 24;
 async function qcsrFixApprovers(){ try{ await loadPostPeople(true); }catch(e){} let sa = []; try{ sa = await superAdminNames(); }catch(e){} return Array.from(new Set([...postHolders("qc"), ...(sa||[])])); }
-function qcsrFixCanApprove(user, me){ return !!(user && user.role==="super_admin") || (!!me && postHolders("qc").includes(me)); }
+function qcsrFixCanApprove(user, me){ return !!(user && user.role==="super_admin") || (!!me && postHas("qc", me)); }
 async function qcsrAskSave(cn, val){
   const { data: c, error } = await sb.from("qc_serial_config_tbl").select("fix_asks").eq("id",1).maybeSingle();
   if(error) throw new Error(/fix_asks/.test(error.message||"") ? "Run structure_serial_fix_2026-11-06.sql first." : error.message);
@@ -70993,7 +71034,7 @@ async function qcSkipGive(dc, user, me, label){
   return code; }
 async function qcSkipApprovers(){ try{ await loadPostPeople(true); }catch(e){} let sa = []; try{ sa = await superAdminNames(); }catch(e){}
   return Array.from(new Set([...(IS_LEVAFLOW_SITE ? [] : postHolders("finance_director")), ...(sa||[])])); }
-function qcSkipCanGive(user, me){ if(user && user.role==="super_admin") return true; return !IS_LEVAFLOW_SITE && !!me && postHolders("finance_director").includes(me); }
+function qcSkipCanGive(user, me){ if(user && user.role==="super_admin") return true; return !IS_LEVAFLOW_SITE && !!me && postHas("finance_director", me); }
 async function qcSkipSave(dcId, patch){
   const { data: cur, error: e1 } = await sb.from("dc_tbl").select("qc_skip").eq("id",dcId).maybeSingle();
   if(e1) throw new Error(/qc_skip/.test(e1.message||"") ? "Run "+QCSKIP_SQL+" first (both companies)." : e1.message);
@@ -74887,7 +74928,7 @@ function CrqCapture({ user, presetCn, onClose, onSaved }){
       // task cards to the owners (by post), due by the date asked
       await loadPostPeople(true);
       const names = Array.from(new Set(r0.owners.flatMap(k=>postHolders(k))));
-      const postOf = (n)=> r0.owners.find(k=>postHolders(k).includes(n))||null;
+      const postOf = (n)=> r0.owners.find(k=>postHas(k, n))||null;
       const title = (CRQ_KIND[kind]||CRQ_KIND.other)[0]+" — "+v("cn")+(c.client?" "+c.client:"")+": "+String(v("asked")).slice(0,80);
       const due = v("need") || wdAdd(insToday(), 2);
       const ids = names.length ? await ospTaskCards(v("cn"), c.client||"", names, postOf, title, due, "Customer request "+rq.id+(v("from")?" from "+v("from"):"")+"\n\n"+r0.lines.join("\n")) : [];
@@ -77791,7 +77832,7 @@ async function gstCfg(force){
   return GST_CFG;
 }
 const gstMode = (c)=> (c && (c.mode==="sandbox" || c.mode==="live")) ? c.mode : "off";
-function gstIsFD(me){ try{ return !!me && postHolders("finance_director").includes(me); }catch(e){ return false; } }
+function gstIsFD(me){ try{ return !!me && postHas("finance_director", me); }catch(e){ return false; } }
 function gstFree(user, me){ return !!user && (user.role==="super_admin" || gstIsFD(me)); }   // the Finance Director and Super Admins need no code
 function gstCanEinv(user, me, P){ return despCan("acc",user,me,P) || gstIsFD(me); }
 function gstCanEwb(user, me, P){ return gstCanEinv(user,me,P) || !!(P && (P.fm||[]).includes(me)); }
@@ -79155,7 +79196,7 @@ const DI_OPEN = ["Draft","Waiting","Sent back","Approved"];
 const diHours = (di)=> di && di.sent_at ? Math.floor((Date.now()-new Date(di.sent_at).getTime())/3600000) : 0;
 const diLate = (di)=> di && di.status==="Waiting" && diHours(di)>=24;
 async function diApprovers(){ await loadPostPeople(true); const s = new Set(); DI_APPROVER_POSTS.forEach(k=>(postHolders(k)||[]).forEach(n=>n && s.add(n))); return Array.from(s); }
-async function diApproverPostOf(name){ await loadPostPeople(false); return DI_APPROVER_POSTS.filter(k=>(postHolders(k)||[]).includes(name)).map(k=>postLabel(k)).join(" / "); }
+async function diApproverPostOf(name){ await loadPostPeople(false); return DI_APPROVER_POSTS.filter(k=>postHas(k, name)).map(k=>postLabel(k)).join(" / "); }
 async function diHist(di, action, by, note){ try{ await sb.from("direct_invoice_hist_tbl").insert({ di_id:di.id||null, contract_number:di.contract_number||null, action, by_user:by||"", note:note||null }); }catch(e){} }
 // What is left to invoice on each Sl No: ordered − on tax invoices (not cancelled) − on other open direct invoices.
 async function diAvailable(cn, exceptId){
@@ -80850,7 +80891,7 @@ function AccInvoicePost({ user, A, C, inv, typeBar, onBack, onPosted }){
 }
 // typed sales (No contract): the reasons
 const ACC_NC_REASONS = ["Scrap","Sale of an asset","Other sundry sale","Stock sale (until the stock-sale Order Acceptance is in the app)"];
-const accIsFdOrSuper = (user, me)=> user && (user.role==="super_admin" || (me && (postHolders("finance_director")||[]).includes(me)));
+const accIsFdOrSuper = (user, me)=> user && (user.role==="super_admin" || (me && postHas("finance_director", me)));
 async function accCancelForInvoice(inv, why, user){   // IRN cancelled → the posted sales voucher is cancelled with it
   try{ const [a, b] = await Promise.all([ sb.from("acc_voucher_tbl").select("id,voucher_no,status").eq("src_invoice_id",inv.id),
       sb.from("acc_voucher_tbl").select("id,voucher_no,status").in("voucher_no",[String(inv.invoice_no), "T-"+inv.invoice_no]) ]);
@@ -80867,7 +80908,7 @@ async function accCancelForInvoice(inv, why, user){   // IRN cancelled → the p
 async function accSalesSweep(username){   // once a day, the Accounts posts hear of invoices waiting to be posted (3 days) or for their IRN (24 h)
   try{ const key = "acc_sales_sweep_"+new Date().toISOString().slice(0,10)+"_"+username; if(localStorage.getItem(key)) return; localStorage.setItem(key,"1"); }catch(e){ return; }
   try{ const me = await despMe({ username }); if(!me) return; await loadPostPeople(false);
-    if(!(postHolders("accounts")||[]).includes(me) && !(postHolders("accountant")||[]).includes(me)) return;
+    if(!postHas("accounts", me) && !postHas("accountant", me)) return;
     const { data: inv, error } = await sb.from("invoice_tbl").select("invoice_no,status,issued_at,ready_at,invoice_date,is_test").in("status",["Ready for IRN","Issued"]); if(error) return;
     const live = (inv||[]).filter(i=>!i.is_test); if(!live.length) return;
     const { data: vs } = await sb.from("acc_voucher_tbl").select("voucher_no,ref,status").ilike("vtype","sales%").limit(10000);
@@ -81737,7 +81778,7 @@ function pettyPill(st){ const m = { Submitted:["#fff1d6","#8a5a00"], Reviewed:["
 async function pettySweep(username){   // once a day: the reviewers hear of slips waiting more than a week
   try{ const key = "petty_sweep_"+new Date().toISOString().slice(0,10)+"_"+username; if(localStorage.getItem(key)) return; localStorage.setItem(key,"1"); }catch(e){ return; }
   try{ const me = await despMe({ username }); if(!me) return; await loadPostPeople(false);
-    if(!(postHolders("purchase_manager")||[]).includes(me)) return;
+    if(!postHas("purchase_manager", me)) return;
     const old = new Date(Date.now()-7*86400000).toISOString();
     const { data, error } = await sb.from("petty_slip_tbl").select("id,amount").eq("status","Submitted").lt("created_at",old); if(error || !(data||[]).length) return;
     await notifyPeople([me], (data.length)+" petty-purchase slip"+(data.length===1?"":"s")+" ("+accInr(data.reduce((a,x)=>a+(Number(x.amount)||0),0))+") waiting for your review for more than a week — Stores → Petty cash → Petty Purchases.", "warning");
@@ -86478,7 +86519,7 @@ const crFyOf = (iso)=>{ if(!iso) return null; const d = new Date(String(iso).sli
 async function crCanEdit(user){
   if(!user) return false;
   if(user.role==="admin" || user.role==="super_admin") return true;
-  try{ await loadPostPeople(); const me = await despMe(user); return !!me && (postHolders("doc_controller").includes(me) || postHolders("sales_coordinator").includes(me)); }catch(e){ return false; }
+  try{ await loadPostPeople(); const me = await despMe(user); return !!me && (postHas("doc_controller", me) || postHas("sales_coordinator", me)); }catch(e){ return false; }
 }
 async function crHist(cn, by, what){ try{ await sb.from("contract_register_hist_tbl").insert({ contract_number:cn, by_user:by||"unknown", what }); }catch(e){} }
 // Everything on one list: register rows + Order Acceptances, joined by contract number.
