@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-13T17:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-13T17:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -15535,7 +15535,14 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     outstandingDocs.length>0 && ("Mandatory documents ("+outstandingDocs.map(r=>r.category).join(", ")+")"),
   ].filter(Boolean);
   const billingMissing = !contractInfo.billing_address && !contractInfo.billing_address_overridden;
-  const canApproveAtAll = (otherMissing.length===0 && !billingMissing) || overrideActive;
+  // 2026-11-13T17:30:00Z: the client's PO price on every Sl No is mandatory before the Commercial Terms (or anything) can be
+  // approved — without it the Purchase BOM has no PO value / material % and the invoice falls back to the quote's price.
+  const [poMissSl,setPoMissSl] = useState([]);
+  useEffect(()=>{ const cn = contractInfo && contractInfo.contract_number; if(!cn){ setPoMissSl([]); return; } let dead = false;
+    const load = async()=>{ try{ const { data, error } = await sb.from("estimates").select("item_sl_no,order_qty,po_sales_price,po_price_value,po_price_currency,po_price_fx").eq("reference_number",String(cn));
+      if(!dead && !error) setPoMissSl((data||[]).filter(r=>poPricePaid(r)===null).map(r=>r.item_sl_no).sort((a,b)=>a-b)); }catch(e){} };
+    load(); const f = ()=>load(); window.addEventListener("flo-po-price-saved", f); return ()=>{ dead = true; window.removeEventListener("flo-po-price-saved", f); }; },[contractInfo && contractInfo.contract_number]);
+  const canApproveAtAll = ((otherMissing.length===0 && !billingMissing) || overrideActive) && !poMissSl.length;
 
   const savePoFields = async()=>{
     if(!poNumber.trim() || !poDate){ alert("Enter both P.O. Number and P.O. Date."); return; }
@@ -15578,7 +15585,8 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
   const mayApproveField = (field)=> isSuperAdmin || overrideActive || (field==="technical_approved" ? (isSalesHead || (!!soMe && soFse.includes(soMe))) : (user.role===roleFor[field] || (field==="commercial_approved" && (soKeys.includes("accounts") || soKeys.includes("finance_director")))));
   const soBlockers = async(field)=>{
     const L = []; const N = await soApproverNames();
-    if(!canApproveAtAll){ const miss = [...otherMissing, billingMissing?"Billing Address":null].filter(Boolean);
+    if(poMissSl.length) L.push({ t:"No client PO price on Sl "+poMissSl.join(", ")+" — the PO price is mandatory.", fix:"Open the Cart of this Order Acceptance and type the client's PO price (per unit, as on the PO) for Sl "+poMissSl.join(", ")+" in the PO price column. It saves by itself; then press Approve again." });   // 2026-11-13T17:30:00Z
+    if(!canApproveAtAll && (otherMissing.length || billingMissing) && !overrideActive){ const miss = [...otherMissing, billingMissing?"Billing Address":null].filter(Boolean);
       L.push({ t:"Required Order Acceptance details are missing: "+miss.join(", ")+".", fix:"Open “"+(otherMissing.length+(billingMissing?1:0))+" to fix before approval” on this Order Acceptance and fill them"+(outstandingDocs.length?"; add the mandatory documents in Documents":"")+(billingMissing?"; Billing Address can be overridden and flagged for later":"")+". "+(isSuperAdmin?"Or use Super Admin: enter a Deletion code to override.":"If they can't be filled yet, a Super Admin ("+saNamesTxt()+") can override with a Deletion code.") }); }
     if(field==="technical_approved" || field==="commercial_approved"){ const g = await mtcSoGate(contractInfo.contract_number);   // 301: blocks both approvals
       if(g) L.push({ t:"MTC & AVL is not saved for this contract.", fix:"The Technical Head ("+soList(N.tech)+") opens MTC & AVL on this Order Acceptance, fills the MTC and the vendor of each component and saves."+(/^MTC is 3\.1/.test(g)?" "+g:"") }); }
@@ -18992,6 +19000,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
         val===null?"PO price cleared":("PO price set to "+val+" "+ccy+" per unit (rate "+fx+", = "+(val*fx).toFixed(2)+" INR)"),
         user?.username||"unknown",null,{po_price_value:val,po_price_currency:ccy,po_price_fx:fx});
       await load();
+      try{ window.dispatchEvent(new CustomEvent("flo-po-price-saved",{ detail:{ ref:row.reference_number } })); }catch(e){}   // 2026-11-13T17:30:00Z
       refreshQuoteTotals(row.reference_number);
       refreshReadiness(row.reference_number);
     } catch(e){ alert("Couldn't save the PO sales price: "+e.message); }
@@ -36328,6 +36337,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"13 Nov 2026", summary:"Built on 2026-11-13T17:30:00Z, on top of 2026-11-13T17:00:00Z. No SQL. PO PRICE IS MANDATORY: an Order Acceptance cannot be approved (Commercial Terms, or the technical approval where it is asked) while any Sl No has no client PO price. The button shows \u201cPending \u2014 why?\u201d and the box says \u201cNo client PO price on Sl 1, 2 \u2014 the PO price is mandatory\u201d with where to enter it (Cart \u203a PO price column). The approval button comes back as soon as the last price is saved. The Deletion Code override does not skip it. (260165 reached the Purchase BOM with no PO price on Sl 1 and 2, so its Purchase BOM had no PO value or material %.)" },
   { date:"13 Nov 2026", summary:"Built on 2026-11-13T17:00:00Z, on top of 2026-11-13T16:30:00Z. No SQL. \ud83d\udd14 BELL LIST ON EVERY BOARD: what the bell asks of a person is now also the first list on their board (the bell stays). Do it \u2014 bells with a button to press, cleared by themselves when the job is done; Look at it \u2014 bells that point to a record, cleared with \u2713 Done; For your information \u2014 collapsed at the bottom, cleared with \u2713 Seen. Each has a due date: the app's own rule for that kind (approvals 2 working days), otherwise 3 working days after the bell came; past it the item shows stale in red, on top, like an overdue card. Bells that only open a task card already on the board, and OA approval bells (already in \u2705 My approvals), are not repeated. From before this build only the open Do it bells of the last 30 days are brought in; older Look at it / information bells are left as they are. Others see a person's Bell list on that person's board; only the owner presses its buttons." },
   { date:"13 Nov 2026", summary:"Built on 2026-11-13T16:30:00Z, on top of 2026-11-13T15:30:00Z. No SQL. APPROVALS: Order Acceptances waiting for Commercial Terms are now an approval like any other — in ✅ My approvals on the board of whoever holds the Accounts or Finance Director post (or has the Accounts Admin login), and on a Super Admin’s board under On others’ behalf; the card shows the customer, PO, PO value and the advance, and opens the OA with Approve lit up. NEW ✅ APPROVALS ON THE TOP RIBBON (beside the bell): the count waiting on you (red when one is 2+ days old); the drop-down lists your categories — Accounts, BOM & pricing, Purchase, Despatch, Documents, HR, Tasks — with counts, and their sub-categories when there is more than one kind (a Super Admin sees every category with its subs). Each person sees only what their posts and rights allow. Tasks › ✅ Approvals: the same, as a category tree and a list with Open & approve. SCROLLBARS: every board that scrolls sideways (task boards, Task Assignment Board, department rows, Document Control, Stock orders board, Gaps chase) has a second scrollbar on top that moves with the one at the bottom." },
   { date:"13 Nov 2026", summary:"Built on 2026-11-13T15:30:00Z, on top of 2026-11-13T15:00:00Z. No SQL. ONE CLIENT ORDER, ONE CONTRACT: before an Order Acceptance makes a new contract (from the quote or the Order Acceptance screen), before + New contract on the Contract Register, and when a PO number is typed on a register line or added from PO awaited, the app looks for the same client PO / LOI number on another contract of the same client, and for the quote already on a register line that has no Order Acceptance yet. Found: a yellow box says which contract (\u201cClient PO PO/0103/26-27 is already on contract 260010 \u2014 no Order Acceptance yet\u201d) with Go back, Open the Contract Register (it opens on that contract) and \u201cSeparate order \u2014 carry on\u201d, which needs the tick \u201cI have checked \u2014 this is a different order from the client\u201d and is written to the audit log. Cancelled contracts are not counted. (Levaflow 260012 was made on 11 Nov for the order already on 260010.)" },
