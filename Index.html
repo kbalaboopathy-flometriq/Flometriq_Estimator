@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-16T06:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-16T07:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -2416,14 +2416,32 @@ function generateMultiColumnListPDF({ title, subtitle, items, columnsCount, crea
 }
 
 /* ---- LOGIN ---- */
+// 2026-11-16T07:00:00Z: Save password on this device. After a good sign-in the app asks once; Yes keeps the login and
+// password in this browser (this device only) and fills them in next time. Every sign-in is still checked against the
+// database, so a saved password never lets anyone in on its own. Wrong password or Inactive login → the saved copy is wiped.
+const LOGIN_SAVE_KEY = "flo_saved_login";
+function loginSavedGet(){ try{ const r = localStorage.getItem(LOGIN_SAVE_KEY); if(!r) return null; const o = JSON.parse(decodeURIComponent(escape(atob(r)))); return (o && o.u) ? o : null; }catch(e){ return null; } }
+function loginSavedSet(u,p){ try{ localStorage.setItem(LOGIN_SAVE_KEY, btoa(unescape(encodeURIComponent(JSON.stringify({ u, p, at:new Date().toISOString() }))))); return true; }catch(e){ return false; } }
+function loginSavedClear(onlyUser){ try{ const o = loginSavedGet(); if(!o) return; if(onlyUser && String(o.u).toLowerCase()!==String(onlyUser).toLowerCase()) return; localStorage.removeItem(LOGIN_SAVE_KEY); }catch(e){} }
+async function loginSuperAdminNames(){
+  try{ const { data } = await sb.from("app_users").select("username,employee_name,is_active").eq("role","super_admin");
+    const n = (data||[]).filter(r=>r.is_active!==false).map(r=>r.employee_name||r.username).filter(Boolean);
+    return n.length ? n.join(" or ") : "";
+  }catch(e){ return ""; } }
 function LoginScreen({ onLogin }) {
   const [outMsg] = useState(()=>{ try{ const m = sessionStorage.getItem("flo_signed_out_msg"); sessionStorage.removeItem("flo_signed_out_msg"); return m||""; }catch(e){ return ""; } });   // load build
-  const [username, setUsername] = useState(""); const [password, setPassword] = useState("");
+  const [saved, setSaved] = useState(()=>loginSavedGet());
+  const [username, setUsername] = useState(()=>(loginSavedGet()||{}).u||""); const [password, setPassword] = useState(()=>(loginSavedGet()||{}).p||"");
   const [error, setError] = useState(""); const [loading, setLoading] = useState(false);
+  const [ask, setAsk] = useState(null);   // the signed-in user waiting for the Save password? answer
+  const usingSaved = !!saved && username===saved.u && password===saved.p;
+  const forget = ()=>{ loginSavedClear(); setSaved(null); setPassword(""); setError(""); };
+  const finish = (u)=>{ setAsk(null); onLogin(u); };
   const submit = async(e) => {
     e.preventDefault(); setError(""); setLoading(true);
+    const typedUser = username.trim();
     try {
-      const { data, error:err } = await sb.from("app_users").select("*").eq("username",username.trim()).limit(1);
+      const { data, error:err } = await sb.from("app_users").select("*").eq("username",typedUser).limit(1);
       if(err) throw err;
       const credsOk = data&&data.length>0&&data[0].password===password;
       const isActive = data&&data.length>0 ? data[0].is_active!==false : true;
@@ -2432,15 +2450,30 @@ function LoginScreen({ onLogin }) {
       // logged distinctly from a genuinely wrong password, since those mean
       // very different things when reviewing login history later.
       await sb.from("login_history").insert({
-        username: username.trim()||"unknown",
+        username: typedUser||"unknown",
         user_agent: navigator.userAgent.substring(0,200),
         status: success?"success":(credsOk&&!isActive?"blocked (inactive)":"failed")
       });
-      if(credsOk && !isActive){ setError("This account has been deactivated. Contact your Super Admin."); setLoading(false); return; }
-      if(!success) { setError("Incorrect username or password."); setLoading(false); return; }
-      onLogin({ id:data[0].id, username:data[0].username, role:data[0].role, company_id:data[0].company_id||null });
+      if(credsOk && !isActive){
+        const wasSaved = !!saved && String(saved.u).toLowerCase()===typedUser.toLowerCase();
+        loginSavedClear(typedUser); if(wasSaved){ setSaved(null); setPassword(""); }
+        const who = await loginSuperAdminNames();
+        setError("This login is Inactive — you cannot use the app. Please contact a Super Admin"+(who?": "+who:"")+"."+(wasSaved?" The saved password has been removed from this device.":""));
+        setLoading(false); return; }
+      if(!success) {
+        if(usingSaved){ loginSavedClear(typedUser); setSaved(null); setPassword("");
+          setError("The saved password no longer works — it may have been changed by a Super Admin. The saved copy has been removed. Please type the new password."); }
+        else setError("Incorrect username or password.");
+        setLoading(false); return; }
+      const u = { id:data[0].id, username:data[0].username, role:data[0].role, company_id:data[0].company_id||null };
+      if(saved && saved.u===data[0].username && saved.p===password){ finish(u); return; }   // already saved on this device
+      setLoading(false); setAsk({ u, p:password });
     } catch(e2) { setError("Cannot reach database."); } finally { setLoading(false); }
   };
+  const answer = (yes)=>{ if(!ask) return;
+    if(yes) loginSavedSet(ask.u.username, ask.p);
+    finish(ask.u); };
+  const savedBox = { ...inputStyle, background:"#fffbea", borderColor:"#c9962b" };
   return h("div",{style:{minHeight:"calc(100vh / var(--uiz,1))",display:"flex",alignItems:"center",justifyContent:"center"}},
     h("div",{style:{width:340,maxWidth:"calc(90vw / var(--uiz,1))",padding:"2rem 1.75rem",background:colors.panel,border:"1px solid "+colors.border,borderRadius:10}},
       h("div",{style:{marginBottom:22,textAlign:"center"}},
@@ -2451,15 +2484,25 @@ function LoginScreen({ onLogin }) {
         h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"Authored by K.Bala Boopathy")
       ),
       outMsg ? h("div",{"data-testid":"login-out-msg",style:{background:"#fff4d6",color:"#5c3d06",borderRadius:6,padding:"7px 10px",fontSize:12.5,marginBottom:14}},outMsg) : null,
-      h("form",{onSubmit:submit},
+      h("form",{onSubmit:submit,autoComplete:"off"},
         h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Username"),
-        h("input",{value:username,onChange:e=>setUsername(e.target.value),style:inputStyle,placeholder:"username",autoFocus:true}),
+        h("input",{"data-testid":"login-user",value:username,onChange:e=>setUsername(e.target.value),style:usingSaved?savedBox:inputStyle,placeholder:"username",autoFocus:!usingSaved,autoComplete:"off"}),
         h("label",{style:{display:"block",fontSize:12,color:colors.muted,margin:"14px 0 6px"}},"Password"),
-        h("input",{type:"password",value:password,onChange:e=>setPassword(e.target.value),style:inputStyle,placeholder:"••••••••"}),
-        error&&h("div",{style:{marginTop:10,fontSize:12,color:colors.danger}},error),
-        h("button",{type:"submit",style:{...btnPrimary,width:"100%",marginTop:20},disabled:loading},loading?"Signing in…":"Sign in")
+        h("input",{"data-testid":"login-pass",type:"password",value:password,onChange:e=>setPassword(e.target.value),style:usingSaved?savedBox:inputStyle,placeholder:"••••••••",autoComplete:"new-password"}),
+        saved ? h("div",{"data-testid":"login-saved-tag",style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:8,fontSize:11.5}},
+          h("span",{style:{color:"#8a6410"}},usingSaved?"🔒 Password saved on this device":"🔒 A password is saved on this device for "+saved.u),
+          h("button",{type:"button","data-testid":"login-forget",onClick:forget,style:{background:"none",border:"none",padding:0,color:colors.text,textDecoration:"underline",cursor:"pointer",fontSize:11.5}},"Forget saved password")) : null,
+        error&&h("div",{"data-testid":"login-error",style:{marginTop:10,fontSize:12,color:colors.danger,lineHeight:1.45}},error),
+        h("button",{type:"submit","data-testid":"login-submit",autoFocus:usingSaved,style:{...btnPrimary,width:"100%",marginTop:20},disabled:loading||!!ask},loading?"Signing in…":"Sign in")
       )
-    )
+    ),
+    ask ? h("div",{"data-testid":"login-save-ask",style:{position:"fixed",inset:0,background:"rgba(20,30,45,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999}},
+      h("div",{style:{width:320,maxWidth:"calc(92vw / var(--uiz,1))",background:"#fff",borderRadius:10,padding:"20px 22px",boxShadow:"0 8px 28px rgba(0,0,0,.25)"}},
+        h("div",{style:{fontWeight:700,fontSize:15,color:colors.text,marginBottom:8}},"Save password?"),
+        h("div",{style:{fontSize:13,lineHeight:1.5,marginBottom:16,color:colors.text}},"Do you want to save your password on ",h("b",null,"this device"),"? Next time you will not need to type it."),
+        h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
+          h("button",{type:"button","data-testid":"login-save-no",onClick:()=>answer(false),style:btnSecondary},"No"),
+          h("button",{type:"button","data-testid":"login-save-yes",onClick:()=>answer(true),autoFocus:true,style:btnPrimary},"Yes, save")))) : null
   );
 }
 
@@ -29619,6 +29662,7 @@ const MANUAL_SECTIONS = [
           }
         ]
       },
+      {"key": "save_password", "title": "Save password on this device", "tag": "Getting started", "blocks": [{"type": "p", "text": "After you sign in, the app asks once: Save password? Press Yes, save to keep your login and password on this device only \u2014 next time both boxes are already filled in (yellow) and you just press Sign in. Press No and nothing is kept; you are asked again at the next sign-in."}, {"type": "steps", "items": ["Forget saved password (under the password box) removes it from this device.", "If a Super Admin changes your password, the saved one stops working: it is removed and you type the new one.", "If your login is made Inactive, all rights go at once: sign-in is refused, the saved password is wiped, and if you are signed in the app signs you out within a minute."]}, {"type": "tip", "text": "Save it only on your own or your designated computer, never on a shared one \u2014 someone who knows computers can dig a saved password out of the browser."}]},
       {"key": "approval_login_menus", "title": "Menus for the contract-approval logins", "tag": "Getting started", "blocks": [{"type": "p", "text": "Three logins exist to approve contracts: Technical Head (technical_head), QC (qc) and Accounts Admin (accounts_admin). They see a shorter menu than other users."}, {"type": "bullets", "items": ["All three: Sales (Order Acceptance), Order Status, Stores, Accounts, Tasks and Setup.", "Technical Head also: Engineering Calc, BOM (BOM Entry Form), Purchase and Reports.", "Tasks gives the task boards and dashboards, the Tasks Completed Report and Stale Items, so cards handed to these people, and cards waiting for their approval, can be opened from the menu.", "The approval rights do not change: Technical approval stays with the Technical Head, Testing with QC and Commercial with Accounts Admin."]}]}, {"key": "no_permission", "title": "When you don't have permission", "tag": "Getting started", "blocks": [{"type": "p", "text": "Some buttons are only for certain logins or posts \u2014 for example deleting a quote, removing a customer's contact, or adding a value to a master list. If yours isn't one of them, the button still shows (dimmed) instead of disappearing."}, {"type": "p", "text": "Click it and the app tells you what you tried to do, which login or post can do it, and the names of the people who hold it. Ask one of them to do it, or to give you the access."}, {"type": "tip", "text": "Nothing is ever hidden silently: if a click does nothing and no message appears, use Report an issue from the menu."}]},
       {"key": "pdf_preview", "title": "Every PDF opens a preview first", "tag": "Getting started", "blocks": [{"type": "p", "text": "Every PDF the app makes — quotes, datasheets, estimates, Order Acceptance and procurement reports, POs, GRNs, DCs, packing slips, gate passes, proformas, tax invoices, FFS copies, registers, task and HR reports, the user manual — opens in a preview window first. Nothing downloads until you ask."}, {"type": "bullets", "items": ["From the preview: ⬇ Download saves the file, 🖨 Print prints it, Close (or Esc, or a click outside) shuts the preview without saving.", "The preview is the exact file that will be saved.", "If the preview stays blank on a phone, press Download: the file opens in the phone's PDF viewer.", "Excel and other files download straight away as before."]}]}
     ]
@@ -36669,6 +36713,7 @@ const FAQ_ENTRIES = [
   { q:"Can I read the User Manual in Tamil?", a:"Yes. Open User Manual and press \u0ba4\u0bae\u0bbf\u0bb4\u0bcd at the top of the list; your choice is remembered on that computer. The staff sections (tasks and boards, Pending Actions, Document Control, enquiries, quotes, Quote Register, follow-ups, procurement, stores) are in Tamil; the rest show in English with a note until they are translated. Screen and button names stay in English so they match the screen. If the English page was changed after the Tamil was written, the Tamil page says the English is newer." },
   { q:"Why can't I move my quote's stage? It asks for a Price-check code.", a:"The quote still has a Direct Price (Custom) line whose price an Admin has not validated. Ask an Admin for a Price-check code for this quote (they give it from the banner on the quote, or Order Status \u2192 Pending validation), enter it with a short reason, and the line is marked Validated and the stage moves. An Admin moving the stage just confirms; the lines are validated in their name." },
   { q:"Why does Make New Quote say I have quotes in Draft for more than three days?", a:"One or more quotes you built have sat in Draft for over three days. Send them, move them to Lost or Deferred, or carry on for three more days with a reason (the Sales Head sees it). Only Make New Quote is stopped \u2014 everything else works." },
+  { q:"Can the app remember my password?", a:"Yes, on one device. After you sign in it asks Save password? \u2014 press Yes, save. Next time the boxes are filled in. Forget saved password (under the password box) removes it. A changed password or an Inactive login wipes it by itself." },
   { q:"What is the version under the company name?", a:"It is the version.txt line of the build you are running, the same name as the saved folder. Hover over it for the date and time in India. For the first day a new version is open on your computer it turns yellow and says \u201cnew today\u201d, so you know screens may have changed." },
   { q:"My datasheet won't save \u2014 it says the Sl No was removed.", a:"Someone removed that Sl No (or the cart changed) while the datasheet was open. Close the datasheet and reopen the quote; if the Sl No should exist, add it again first. This stops datasheets being saved for a Sl No that no longer exists." },
   { q:"How do I delete a Quote Register line?", a:"Press \ud83d\uddd1 on the line and give the reason. It works only while no enquiry is logged and no quote exists; the line then stays struck off with the reason, so the number is never used again. With an enquiry, use \u270e Edit instead." },
@@ -36747,6 +36792,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"16 Nov 2026", summary:"Built on 2026-11-16T07:00:00Z, on top of 2026-11-16T06:00:00Z. No SQL. SAVE PASSWORD ON THIS DEVICE (login screen, both companies): after a good sign-in the app asks once \u201cSave password?\u201d. Yes = the login and password are kept on this device only and filled in next time (yellow boxes, \u201cPassword saved on this device\u201d, Forget saved password link). No = nothing kept, asked again next login. Every sign-in is still checked against the database. A login made Inactive is refused at sign-in, the saved password is wiped and the message names the Super Admins; if that user is signed in, the app signs them out within a minute. A saved password that no longer works (changed by a Super Admin) is wiped and the new one asked for." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T06:00:00Z, on top of 2026-11-16T05:00:00Z. SQL: structure_my_day_2026-11-16.sql (both companies). ☀️ MY DAY (Tasks › My Day, for everyone): the list of what you will do today. Suggestions on the right — left from earlier days, overdue, due today, waiting for your approval, from your bell, coming up in 3 days; a card's checklist lines can be added one by one. ＋ puts it on your day; ★ moves it to the top; ✕ takes it off (it stays on your board). Type a task and Enter — it becomes a card on your board (today or tomorrow). Ticking a card sends it for approval as on the board (a card made from My Day is just done); ticking a checklist line ticks it inside its card. It starts empty every morning; what was not done shows under Left from earlier days. Heads of department and Super Admins: 👥 My team's day — planned / done / progress / overdue per person, the list on a click, 🔔 Nudge for those who have not planned. Today for you has a ☀️ Plan my day → button; the task board has ☀️ My Day — plan today." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T05:00:00Z, on top of 2026-11-16T04:00:00Z. SQL: structure_oa_approval_2026-11-16.sql (both companies). APPROVAL (build approval): (1) An approval box on every Order Acceptance, under the Step strip: Commercial Terms with who approves by name (Accounts Admin or a Super Admin), a big Approve button when it is yours and nothing is missing, otherwise the list of what is missing with who fixes each (PO price on a Sl No, OA details, mandatory documents, MTC & AVL), 🔔 Send to the approver / 🔔 Remind those who fix it, and the Super Admin Deletion-code override for missing OA details. Once approved it shrinks to one green line. (2) Ribbon › This Order Acceptance › Approvals (n) — red with the count while pending, green when done; jumps to the box. The approval button in the grey Contract strip is now a status chip that jumps to the box. (3) No documents required: from the box when documents are what is missing. Flometriq — the VP Projects post (and Super Admins) set it directly or give a one-use No-documents code (24 h) to the person asking, who can also press Ask to ring them; Levaflow — no code. Mandatory documents are then waived (the Purchase Order and the PO price still count), the order leaves the review meeting's document groups, who set it and why is shown and logged; take it off (VP Projects / Super Admin). (4) Super Admins checked across the app's approval points (Order Acceptance, Order Status steps, work order release, Purchase BOM, PR, QC serial fix, task approvals) — all already allow a Super Admin; overrides still need their code." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T04:00:00Z, on top of 2026-11-16T03:00:00Z. No SQL. A Delivery Challan is never a mandatory document: it no longer blocks Order Acceptance approvals, and it cannot be made mandatory (it only exists at despatch). Order Acceptance approval button: instead of “Pending — why?” it now says “Can't approve — n missing ▸” (or “Not yours to approve ▸”), red-dashed, with the list on hover; pressing it lists each item with who fixes it, and Super Admins still see the Deletion-code override. “You can't approve” now says which login you are using. The approval guide pop-up no longer says “Press Approve” when the button may say what is missing." },
@@ -60202,6 +60248,16 @@ function App() {
   };
   // 158: the role is read again when the app loads, so a role changed by the Super Admin applies without logging out
   useEffect(()=>{ if(!user || !user.id) return; (async()=>{ try{ const { data } = await sb.from("app_users").select("role").eq("id",user.id).maybeSingle(); if(data && data.role && data.role!==user.role) setUserPersisted({ ...user, role:data.role }); }catch(e){} })(); },[user && user.id]);
+  // 2026-11-16T07:00:00Z: a login made Inactive loses everything within a minute — signed out, saved password wiped
+  useEffect(()=>{ if(!user || !user.id) return; let stop = false;
+    const chk = async()=>{ try{ const { data, error } = await sb.from("app_users").select("is_active").eq("id",user.id).maybeSingle();
+      if(stop || error || !data || data.is_active!==false) return;
+      loginSavedClear(user.username); const who = await loginSuperAdminNames();
+      try{ sessionStorage.setItem("flo_signed_out_msg","This login has been made Inactive — all rights are gone. Please contact a Super Admin"+(who?": "+who:"")+". The saved password has been removed from this device."); sessionStorage.removeItem("flometriq_user"); sessionStorage.removeItem("flometriq_session_company"); }catch(e){}
+      try{ if(window.__unsavedGuard) window.__unsavedGuard.dirty = false; }catch(e){}
+      try{ await sessClose("login made Inactive"); window.__sessUser = null; }catch(e){}
+      location.reload(); }catch(e){} };
+    const t = setInterval(chk, 60000); return ()=>{ stop = true; clearInterval(t); }; },[user && user.id]);
   const setSessionCompanyIdPersisted = (id)=>{
     setSessionCompanyId(id);
     try{ if(id) sessionStorage.setItem("flometriq_session_company",id); else sessionStorage.removeItem("flometriq_session_company"); }catch(e){}
