@@ -2416,32 +2416,14 @@ function generateMultiColumnListPDF({ title, subtitle, items, columnsCount, crea
 }
 
 /* ---- LOGIN ---- */
-// 2026-11-16T07:00:00Z: Save password on this device. After a good sign-in the app asks once; Yes keeps the login and
-// password in this browser (this device only) and fills them in next time. Every sign-in is still checked against the
-// database, so a saved password never lets anyone in on its own. Wrong password or Inactive login → the saved copy is wiped.
-const LOGIN_SAVE_KEY = "flo_saved_login";
-function loginSavedGet(){ try{ const r = localStorage.getItem(LOGIN_SAVE_KEY); if(!r) return null; const o = JSON.parse(decodeURIComponent(escape(atob(r)))); return (o && o.u) ? o : null; }catch(e){ return null; } }
-function loginSavedSet(u,p){ try{ localStorage.setItem(LOGIN_SAVE_KEY, btoa(unescape(encodeURIComponent(JSON.stringify({ u, p, at:new Date().toISOString() }))))); return true; }catch(e){ return false; } }
-function loginSavedClear(onlyUser){ try{ const o = loginSavedGet(); if(!o) return; if(onlyUser && String(o.u).toLowerCase()!==String(onlyUser).toLowerCase()) return; localStorage.removeItem(LOGIN_SAVE_KEY); }catch(e){} }
-async function loginSuperAdminNames(){
-  try{ const { data } = await sb.from("app_users").select("username,employee_name,is_active").eq("role","super_admin");
-    const n = (data||[]).filter(r=>r.is_active!==false).map(r=>r.employee_name||r.username).filter(Boolean);
-    return n.length ? n.join(" or ") : "";
-  }catch(e){ return ""; } }
 function LoginScreen({ onLogin }) {
   const [outMsg] = useState(()=>{ try{ const m = sessionStorage.getItem("flo_signed_out_msg"); sessionStorage.removeItem("flo_signed_out_msg"); return m||""; }catch(e){ return ""; } });   // load build
-  const [saved, setSaved] = useState(()=>loginSavedGet());
-  const [username, setUsername] = useState(()=>(loginSavedGet()||{}).u||""); const [password, setPassword] = useState(()=>(loginSavedGet()||{}).p||"");
+  const [username, setUsername] = useState(""); const [password, setPassword] = useState("");
   const [error, setError] = useState(""); const [loading, setLoading] = useState(false);
-  const [ask, setAsk] = useState(null);   // the signed-in user waiting for the Save password? answer
-  const usingSaved = !!saved && username===saved.u && password===saved.p;
-  const forget = ()=>{ loginSavedClear(); setSaved(null); setPassword(""); setError(""); };
-  const finish = (u)=>{ setAsk(null); onLogin(u); };
   const submit = async(e) => {
     e.preventDefault(); setError(""); setLoading(true);
-    const typedUser = username.trim();
     try {
-      const { data, error:err } = await sb.from("app_users").select("*").eq("username",typedUser).limit(1);
+      const { data, error:err } = await sb.from("app_users").select("*").eq("username",username.trim()).limit(1);
       if(err) throw err;
       const credsOk = data&&data.length>0&&data[0].password===password;
       const isActive = data&&data.length>0 ? data[0].is_active!==false : true;
@@ -2450,30 +2432,15 @@ function LoginScreen({ onLogin }) {
       // logged distinctly from a genuinely wrong password, since those mean
       // very different things when reviewing login history later.
       await sb.from("login_history").insert({
-        username: typedUser||"unknown",
+        username: username.trim()||"unknown",
         user_agent: navigator.userAgent.substring(0,200),
         status: success?"success":(credsOk&&!isActive?"blocked (inactive)":"failed")
       });
-      if(credsOk && !isActive){
-        const wasSaved = !!saved && String(saved.u).toLowerCase()===typedUser.toLowerCase();
-        loginSavedClear(typedUser); if(wasSaved){ setSaved(null); setPassword(""); }
-        const who = await loginSuperAdminNames();
-        setError("This login is Inactive — you cannot use the app. Please contact a Super Admin"+(who?": "+who:"")+"."+(wasSaved?" The saved password has been removed from this device.":""));
-        setLoading(false); return; }
-      if(!success) {
-        if(usingSaved){ loginSavedClear(typedUser); setSaved(null); setPassword("");
-          setError("The saved password no longer works — it may have been changed by a Super Admin. The saved copy has been removed. Please type the new password."); }
-        else setError("Incorrect username or password.");
-        setLoading(false); return; }
-      const u = { id:data[0].id, username:data[0].username, role:data[0].role, company_id:data[0].company_id||null };
-      if(saved && saved.u===data[0].username && saved.p===password){ finish(u); return; }   // already saved on this device
-      setLoading(false); setAsk({ u, p:password });
+      if(credsOk && !isActive){ setError("This account has been deactivated. Contact your Super Admin."); setLoading(false); return; }
+      if(!success) { setError("Incorrect username or password."); setLoading(false); return; }
+      onLogin({ id:data[0].id, username:data[0].username, role:data[0].role, company_id:data[0].company_id||null });
     } catch(e2) { setError("Cannot reach database."); } finally { setLoading(false); }
   };
-  const answer = (yes)=>{ if(!ask) return;
-    if(yes) loginSavedSet(ask.u.username, ask.p);
-    finish(ask.u); };
-  const savedBox = { ...inputStyle, background:"#fffbea", borderColor:"#c9962b" };
   return h("div",{style:{minHeight:"calc(100vh / var(--uiz,1))",display:"flex",alignItems:"center",justifyContent:"center"}},
     h("div",{style:{width:340,maxWidth:"calc(90vw / var(--uiz,1))",padding:"2rem 1.75rem",background:colors.panel,border:"1px solid "+colors.border,borderRadius:10}},
       h("div",{style:{marginBottom:22,textAlign:"center"}},
@@ -2484,25 +2451,15 @@ function LoginScreen({ onLogin }) {
         h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"Authored by K.Bala Boopathy")
       ),
       outMsg ? h("div",{"data-testid":"login-out-msg",style:{background:"#fff4d6",color:"#5c3d06",borderRadius:6,padding:"7px 10px",fontSize:12.5,marginBottom:14}},outMsg) : null,
-      h("form",{onSubmit:submit,autoComplete:"off"},
+      h("form",{onSubmit:submit},
         h("label",{style:{display:"block",fontSize:12,color:colors.muted,marginBottom:6}},"Username"),
-        h("input",{"data-testid":"login-user",value:username,onChange:e=>setUsername(e.target.value),style:usingSaved?savedBox:inputStyle,placeholder:"username",autoFocus:!usingSaved,autoComplete:"off"}),
+        h("input",{value:username,onChange:e=>setUsername(e.target.value),style:inputStyle,placeholder:"username",autoFocus:true}),
         h("label",{style:{display:"block",fontSize:12,color:colors.muted,margin:"14px 0 6px"}},"Password"),
-        h("input",{"data-testid":"login-pass",type:"password",value:password,onChange:e=>setPassword(e.target.value),style:usingSaved?savedBox:inputStyle,placeholder:"••••••••",autoComplete:"new-password"}),
-        saved ? h("div",{"data-testid":"login-saved-tag",style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:8,fontSize:11.5}},
-          h("span",{style:{color:"#8a6410"}},usingSaved?"🔒 Password saved on this device":"🔒 A password is saved on this device for "+saved.u),
-          h("button",{type:"button","data-testid":"login-forget",onClick:forget,style:{background:"none",border:"none",padding:0,color:colors.text,textDecoration:"underline",cursor:"pointer",fontSize:11.5}},"Forget saved password")) : null,
-        error&&h("div",{"data-testid":"login-error",style:{marginTop:10,fontSize:12,color:colors.danger,lineHeight:1.45}},error),
-        h("button",{type:"submit","data-testid":"login-submit",autoFocus:usingSaved,style:{...btnPrimary,width:"100%",marginTop:20},disabled:loading||!!ask},loading?"Signing in…":"Sign in")
+        h("input",{type:"password",value:password,onChange:e=>setPassword(e.target.value),style:inputStyle,placeholder:"••••••••"}),
+        error&&h("div",{style:{marginTop:10,fontSize:12,color:colors.danger}},error),
+        h("button",{type:"submit",style:{...btnPrimary,width:"100%",marginTop:20},disabled:loading},loading?"Signing in…":"Sign in")
       )
-    ),
-    ask ? h("div",{"data-testid":"login-save-ask",style:{position:"fixed",inset:0,background:"rgba(20,30,45,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999}},
-      h("div",{style:{width:320,maxWidth:"calc(92vw / var(--uiz,1))",background:"#fff",borderRadius:10,padding:"20px 22px",boxShadow:"0 8px 28px rgba(0,0,0,.25)"}},
-        h("div",{style:{fontWeight:700,fontSize:15,color:colors.text,marginBottom:8}},"Save password?"),
-        h("div",{style:{fontSize:13,lineHeight:1.5,marginBottom:16,color:colors.text}},"Do you want to save your password on ",h("b",null,"this device"),"? Next time you will not need to type it."),
-        h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
-          h("button",{type:"button","data-testid":"login-save-no",onClick:()=>answer(false),style:btnSecondary},"No"),
-          h("button",{type:"button","data-testid":"login-save-yes",onClick:()=>answer(true),autoFocus:true,style:btnPrimary},"Yes, save")))) : null
+    )
   );
 }
 
@@ -16469,7 +16426,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
   const [quotesCloseBusy,setQuotesCloseBusy]=useState(false);
   const proceedQuotesNav = (kind)=>{
     setOpenRef(null); setOpenLines([]); setRefFilter(""); setRefSearchDisplay(""); setSlNoFilter("");
-    if(kind==="close"){ if(onGoToTab) onGoToTab("home"); }
+    if(kind==="close"){ if(window.__appGoBack) window.__appGoBack(); else if(onGoToTab) onGoToTab("home"); }   // 2026-11-16T07:00:00Z: back where you came from
     else { setShowEntryGate(true); }
   };
   const attemptCloseOrNewQuotes = (kind)=>{
@@ -29662,7 +29619,6 @@ const MANUAL_SECTIONS = [
           }
         ]
       },
-      {"key": "save_password", "title": "Save password on this device", "tag": "Getting started", "blocks": [{"type": "p", "text": "After you sign in, the app asks once: Save password? Press Yes, save to keep your login and password on this device only \u2014 next time both boxes are already filled in (yellow) and you just press Sign in. Press No and nothing is kept; you are asked again at the next sign-in."}, {"type": "steps", "items": ["Forget saved password (under the password box) removes it from this device.", "If a Super Admin changes your password, the saved one stops working: it is removed and you type the new one.", "If your login is made Inactive, all rights go at once: sign-in is refused, the saved password is wiped, and if you are signed in the app signs you out within a minute."]}, {"type": "tip", "text": "Save it only on your own or your designated computer, never on a shared one \u2014 someone who knows computers can dig a saved password out of the browser."}]},
       {"key": "approval_login_menus", "title": "Menus for the contract-approval logins", "tag": "Getting started", "blocks": [{"type": "p", "text": "Three logins exist to approve contracts: Technical Head (technical_head), QC (qc) and Accounts Admin (accounts_admin). They see a shorter menu than other users."}, {"type": "bullets", "items": ["All three: Sales (Order Acceptance), Order Status, Stores, Accounts, Tasks and Setup.", "Technical Head also: Engineering Calc, BOM (BOM Entry Form), Purchase and Reports.", "Tasks gives the task boards and dashboards, the Tasks Completed Report and Stale Items, so cards handed to these people, and cards waiting for their approval, can be opened from the menu.", "The approval rights do not change: Technical approval stays with the Technical Head, Testing with QC and Commercial with Accounts Admin."]}]}, {"key": "no_permission", "title": "When you don't have permission", "tag": "Getting started", "blocks": [{"type": "p", "text": "Some buttons are only for certain logins or posts \u2014 for example deleting a quote, removing a customer's contact, or adding a value to a master list. If yours isn't one of them, the button still shows (dimmed) instead of disappearing."}, {"type": "p", "text": "Click it and the app tells you what you tried to do, which login or post can do it, and the names of the people who hold it. Ask one of them to do it, or to give you the access."}, {"type": "tip", "text": "Nothing is ever hidden silently: if a click does nothing and no message appears, use Report an issue from the menu."}]},
       {"key": "pdf_preview", "title": "Every PDF opens a preview first", "tag": "Getting started", "blocks": [{"type": "p", "text": "Every PDF the app makes — quotes, datasheets, estimates, Order Acceptance and procurement reports, POs, GRNs, DCs, packing slips, gate passes, proformas, tax invoices, FFS copies, registers, task and HR reports, the user manual — opens in a preview window first. Nothing downloads until you ask."}, {"type": "bullets", "items": ["From the preview: ⬇ Download saves the file, 🖨 Print prints it, Close (or Esc, or a click outside) shuts the preview without saving.", "The preview is the exact file that will be saved.", "If the preview stays blank on a phone, press Download: the file opens in the phone's PDF viewer.", "Excel and other files download straight away as before."]}]}
     ]
@@ -36713,7 +36669,6 @@ const FAQ_ENTRIES = [
   { q:"Can I read the User Manual in Tamil?", a:"Yes. Open User Manual and press \u0ba4\u0bae\u0bbf\u0bb4\u0bcd at the top of the list; your choice is remembered on that computer. The staff sections (tasks and boards, Pending Actions, Document Control, enquiries, quotes, Quote Register, follow-ups, procurement, stores) are in Tamil; the rest show in English with a note until they are translated. Screen and button names stay in English so they match the screen. If the English page was changed after the Tamil was written, the Tamil page says the English is newer." },
   { q:"Why can't I move my quote's stage? It asks for a Price-check code.", a:"The quote still has a Direct Price (Custom) line whose price an Admin has not validated. Ask an Admin for a Price-check code for this quote (they give it from the banner on the quote, or Order Status \u2192 Pending validation), enter it with a short reason, and the line is marked Validated and the stage moves. An Admin moving the stage just confirms; the lines are validated in their name." },
   { q:"Why does Make New Quote say I have quotes in Draft for more than three days?", a:"One or more quotes you built have sat in Draft for over three days. Send them, move them to Lost or Deferred, or carry on for three more days with a reason (the Sales Head sees it). Only Make New Quote is stopped \u2014 everything else works." },
-  { q:"Can the app remember my password?", a:"Yes, on one device. After you sign in it asks Save password? \u2014 press Yes, save. Next time the boxes are filled in. Forget saved password (under the password box) removes it. A changed password or an Inactive login wipes it by itself." },
   { q:"What is the version under the company name?", a:"It is the version.txt line of the build you are running, the same name as the saved folder. Hover over it for the date and time in India. For the first day a new version is open on your computer it turns yellow and says \u201cnew today\u201d, so you know screens may have changed." },
   { q:"My datasheet won't save \u2014 it says the Sl No was removed.", a:"Someone removed that Sl No (or the cart changed) while the datasheet was open. Close the datasheet and reopen the quote; if the Sl No should exist, add it again first. This stops datasheets being saved for a Sl No that no longer exists." },
   { q:"How do I delete a Quote Register line?", a:"Press \ud83d\uddd1 on the line and give the reason. It works only while no enquiry is logged and no quote exists; the line then stays struck off with the reason, so the number is never used again. With an enquiry, use \u270e Edit instead." },
@@ -36792,7 +36747,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
-  { date:"16 Nov 2026", summary:"Built on 2026-11-16T07:00:00Z, on top of 2026-11-16T06:00:00Z. No SQL. SAVE PASSWORD ON THIS DEVICE (login screen, both companies): after a good sign-in the app asks once \u201cSave password?\u201d. Yes = the login and password are kept on this device only and filled in next time (yellow boxes, \u201cPassword saved on this device\u201d, Forget saved password link). No = nothing kept, asked again next login. Every sign-in is still checked against the database. A login made Inactive is refused at sign-in, the saved password is wiped and the message names the Super Admins; if that user is signed in, the app signs them out within a minute. A saved password that no longer works (changed by a Super Admin) is wiped and the new one asked for." },
+  { date:"16 Nov 2026", summary:"Built on 2026-11-16T07:00:00Z, on top of 2026-11-16T06:00:00Z. No SQL. (1) APPROVALS: a To (approves) column — the people who hold the approving post today and the post, e.g. Nevil Edwin → Aragan Keerthi (Purchase Manager); the old “on behalf” note is gone. Approvals about a contract show contract · quote · client under What. (2) CARDS: a card about a contract shows the contract number, its quote number and the client as chips (click the contract or quote to open it); a card about a customer without a contract shows the client. On the board columns the quote joins the contract · client tag. (3) BACK: goes to the exact screen you came from — another Order Acceptance or quote on the same screen is now a step of its own, the trail survives Reload app, screens that closed to Home (Quotes Close, Log Follow-ups) go back instead, and the Task Boards (person, view) and Document Control (one contract, view) reopen as you left them." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T06:00:00Z, on top of 2026-11-16T05:00:00Z. SQL: structure_my_day_2026-11-16.sql (both companies). ☀️ MY DAY (Tasks › My Day, for everyone): the list of what you will do today. Suggestions on the right — left from earlier days, overdue, due today, waiting for your approval, from your bell, coming up in 3 days; a card's checklist lines can be added one by one. ＋ puts it on your day; ★ moves it to the top; ✕ takes it off (it stays on your board). Type a task and Enter — it becomes a card on your board (today or tomorrow). Ticking a card sends it for approval as on the board (a card made from My Day is just done); ticking a checklist line ticks it inside its card. It starts empty every morning; what was not done shows under Left from earlier days. Heads of department and Super Admins: 👥 My team's day — planned / done / progress / overdue per person, the list on a click, 🔔 Nudge for those who have not planned. Today for you has a ☀️ Plan my day → button; the task board has ☀️ My Day — plan today." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T05:00:00Z, on top of 2026-11-16T04:00:00Z. SQL: structure_oa_approval_2026-11-16.sql (both companies). APPROVAL (build approval): (1) An approval box on every Order Acceptance, under the Step strip: Commercial Terms with who approves by name (Accounts Admin or a Super Admin), a big Approve button when it is yours and nothing is missing, otherwise the list of what is missing with who fixes each (PO price on a Sl No, OA details, mandatory documents, MTC & AVL), 🔔 Send to the approver / 🔔 Remind those who fix it, and the Super Admin Deletion-code override for missing OA details. Once approved it shrinks to one green line. (2) Ribbon › This Order Acceptance › Approvals (n) — red with the count while pending, green when done; jumps to the box. The approval button in the grey Contract strip is now a status chip that jumps to the box. (3) No documents required: from the box when documents are what is missing. Flometriq — the VP Projects post (and Super Admins) set it directly or give a one-use No-documents code (24 h) to the person asking, who can also press Ask to ring them; Levaflow — no code. Mandatory documents are then waived (the Purchase Order and the PO price still count), the order leaves the review meeting's document groups, who set it and why is shown and logged; take it off (VP Projects / Super Admin). (4) Super Admins checked across the app's approval points (Order Acceptance, Order Status steps, work order release, Purchase BOM, PR, QC serial fix, task approvals) — all already allow a Super Admin; overrides still need their code." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T04:00:00Z, on top of 2026-11-16T03:00:00Z. No SQL. A Delivery Challan is never a mandatory document: it no longer blocks Order Acceptance approvals, and it cannot be made mandatory (it only exists at despatch). Order Acceptance approval button: instead of “Pending — why?” it now says “Can't approve — n missing ▸” (or “Not yours to approve ▸”), red-dashed, with the list on hover; pressing it lists each item with who fixes it, and Super Admins still see the Deletion-code override. “You can't approve” now says which login you are using. The approval guide pop-up no longer says “Press Approve” when the button may say what is missing." },
@@ -60213,8 +60168,11 @@ function App() {
   // 📌 Reference window (any screen, any login)
   const [refOpen,setRefOpen] = useState(false);
   useEffect(()=>{ window.__refShow = ()=>setRefOpen(true); refHoverInstall(); return ()=>{ window.__refShow = null; }; },[]);
-  // 2026-10-28T09:00:00Z: Back / Home — the screens visited this session (memory only; a reload starts at Home)
-  const navStack = useRef([]); const navGoingBack = useRef(false); const [navN,setNavN] = useState(0);
+  // 2026-10-28T09:00:00Z: Back / Home — the screens visited this session
+  // 2026-11-16T07:00:00Z: kept through Reload app (this tab), a different Order Acceptance / quote on the same screen is a step too
+  const navLoad = ()=>{ try{ return (JSON.parse(sessionStorage.getItem("flo_nav_stack")||"[]")||[]).map(e=>({ tab:e.tab, cn:e.cn||null, q:e.q||null })); }catch(e){ return []; } };
+  const navSave = (st)=>{ try{ sessionStorage.setItem("flo_nav_stack", JSON.stringify(st.slice(-40).map(e=>({ tab:e.tab, cn:(e.so && e.so.contract_number) || e.cn || null, q:e.q||null })))); }catch(e){} };
+  const navStack = useRef(navLoad()); const navGoingBack = useRef(false); const [navN,setNavN] = useState(0);
   const navPrevTab = useRef("home"); const navSnap = useRef({ tab:"home" });
   const [accTick,setAccTick2] = useState(0); useEffect(()=>{ const f = ()=>setAccTick2(t=>t+1); window.addEventListener("flo-access", f); return ()=>window.removeEventListener("flo-access", f); },[]);
   useEffect(()=>{ const f = (e)=>{ const t = e && e.detail && e.detail.tab; if(t) setTab(t); }; window.addEventListener("flo-open-tab", f); return ()=>window.removeEventListener("flo-open-tab", f); },[]);   // 209: open a screen from anywhere (stale items, PDF block)
@@ -60230,7 +60188,7 @@ function App() {
       if(d.contract){ try{ const { data } = await sb.from("sale_order_tbl").select("*").eq("contract_number",d.contract).maybeSingle(); if(data){ finishOpenContract(data); return; } }catch(x){} appToast("Order Acceptance "+d.contract+" was not found."); } };
     window.addEventListener("flo-goto", f); return ()=>window.removeEventListener("flo-goto", f); },[]);
   useEffect(()=>{ const f = (e)=>{ const d = (e && e.detail)||{};   // 2026-10-31T06:00:00Z: "← Back to the Order Status board" (or any screen) after a jump
-      setNavBack({ label:d.label||"\u2190 Back", go:()=>{ if(d.oslot) window.__osOpenLot = d.oslot; setTab(d.tab||"home"); setTimeout(()=>{ try{ window.dispatchEvent(new CustomEvent("flo-open-tab",{ detail:{ tab:d.tab } })); }catch(x){} },30); } }); };
+      setNavBack({ label:d.label||"\u2190 Back", go:()=>{ if(d.oslot) window.__osOpenLot = d.oslot; if(!d.tab){ goBackOrHome(); return; } setTab(d.tab); setTimeout(()=>{ try{ window.dispatchEvent(new CustomEvent("flo-open-tab",{ detail:{ tab:d.tab } })); }catch(x){} },30); } }); };
     window.addEventListener("flo-navback", f); return ()=>window.removeEventListener("flo-navback", f); },[]);
   const [socPos,setSocPos] = useState(false);   // 2026-10-31T10:00:00Z: POs of cancelled orders
   useEffect(()=>{ const f = ()=>setSocPos(true); window.addEventListener("flo-socancel-pos", f); return ()=>window.removeEventListener("flo-socancel-pos", f); },[]);
@@ -60248,16 +60206,6 @@ function App() {
   };
   // 158: the role is read again when the app loads, so a role changed by the Super Admin applies without logging out
   useEffect(()=>{ if(!user || !user.id) return; (async()=>{ try{ const { data } = await sb.from("app_users").select("role").eq("id",user.id).maybeSingle(); if(data && data.role && data.role!==user.role) setUserPersisted({ ...user, role:data.role }); }catch(e){} })(); },[user && user.id]);
-  // 2026-11-16T07:00:00Z: a login made Inactive loses everything within a minute — signed out, saved password wiped
-  useEffect(()=>{ if(!user || !user.id) return; let stop = false;
-    const chk = async()=>{ try{ const { data, error } = await sb.from("app_users").select("is_active").eq("id",user.id).maybeSingle();
-      if(stop || error || !data || data.is_active!==false) return;
-      loginSavedClear(user.username); const who = await loginSuperAdminNames();
-      try{ sessionStorage.setItem("flo_signed_out_msg","This login has been made Inactive — all rights are gone. Please contact a Super Admin"+(who?": "+who:"")+". The saved password has been removed from this device."); sessionStorage.removeItem("flometriq_user"); sessionStorage.removeItem("flometriq_session_company"); }catch(e){}
-      try{ if(window.__unsavedGuard) window.__unsavedGuard.dirty = false; }catch(e){}
-      try{ await sessClose("login made Inactive"); window.__sessUser = null; }catch(e){}
-      location.reload(); }catch(e){} };
-    const t = setInterval(chk, 60000); return ()=>{ stop = true; clearInterval(t); }; },[user && user.id]);
   const setSessionCompanyIdPersisted = (id)=>{
     setSessionCompanyId(id);
     try{ if(id) sessionStorage.setItem("flometriq_session_company",id); else sessionStorage.removeItem("flometriq_session_company"); }catch(e){}
@@ -60309,19 +60257,30 @@ function App() {
   const navCurSnap = { tab, so: tab==="sale_order" ? saleOrderContractInfo : null, q: tab==="saved" ? (window.__curQuoteRef||null) : null };
   window.__soOpenCn = tab==="sale_order" && saleOrderContractInfo ? String(saleOrderContractInfo.contract_number||"") : null;   // 2026-10-30T12:00:00Z: its own PDFs pass the O.A block
   useEffect(()=>{
-    if(navPrevTab.current!==tab){
-      if(!navGoingBack.current && navSnap.current && navSnap.current.tab){ navStack.current.push(navSnap.current); if(navStack.current.length>40) navStack.current.shift(); }
+    const cnNow = tab==="sale_order" && saleOrderContractInfo ? String(saleOrderContractInfo.contract_number||"") : "";
+    const prevCn = navSnap.current && navSnap.current.so ? String(navSnap.current.so.contract_number||"") : "";
+    const sameTabNewOa = navPrevTab.current===tab && tab==="sale_order" && prevCn && cnNow && prevCn!==cnNow;   // another OA on the same screen
+    if(navPrevTab.current!==tab || sameTabNewOa){
+      if(!navGoingBack.current && navSnap.current && navSnap.current.tab && navSnap.current.tab!=="__start"){ navStack.current.push(navSnap.current); if(navStack.current.length>40) navStack.current.shift(); navSave(navStack.current); }
       navGoingBack.current = false; navPrevTab.current = tab; setNavN(n=>n+1);
     }
     navSnap.current = { tab, so: tab==="sale_order" ? saleOrderContractInfo : null, q: tab==="saved" ? (window.__curQuoteRef||null) : null };
   });
-  useEffect(()=>{ const f = ()=>{ if(navPrevTab.current==="saved") navSnap.current = { tab:"saved", so:null, q: window.__curQuoteRef||null }; setNavN(n=>n+1); }; window.addEventListener("flo-curquote", f); return ()=>window.removeEventListener("flo-curquote", f); },[]);
-  const goBack = ()=>{ const e = navStack.current[navStack.current.length-1]; if(!e) return; if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false);
-    navStack.current.pop(); setNavN(n=>n+1);
-    navGoingBack.current = e.tab!==tab;
+  useEffect(()=>{ const f = ()=>{ if(navPrevTab.current==="saved"){ const q = window.__curQuoteRef||null; const old = navSnap.current;   // another quote on the same screen is a step too
+        if(navGoingBack.current && old && old.q!==q) navGoingBack.current = false;
+        else if(old && old.tab==="saved" && old.q && q && old.q!==q){ navStack.current.push(old); if(navStack.current.length>40) navStack.current.shift(); navSave(navStack.current); }
+        navSnap.current = { tab:"saved", so:null, q }; } setNavN(n=>n+1); }; window.addEventListener("flo-curquote", f); return ()=>window.removeEventListener("flo-curquote", f); },[]);
+  const goBack = async()=>{ const e = navStack.current[navStack.current.length-1]; if(!e) return; if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false);
+    navStack.current.pop(); navSave(navStack.current); setNavN(n=>n+1);
+    navGoingBack.current = true;
     if(e.so){ setSaleOrderContractInfo(e.so); setSaleOrderTarget({ reference_number:e.so.contract_number, item_sl_no:1 }); setTab("sale_order"); return; }
+    if(e.cn){ try{ const { data } = await sb.from("sale_order_tbl").select("*").eq("contract_number",e.cn).maybeSingle(); if(data){ setSaleOrderContractInfo(data); setSaleOrderTarget({ reference_number:data.contract_number, item_sl_no:1 }); setTab("sale_order"); return; } }catch(x){} }
     if(e.q){ setQuoteToOpen({ reference_number:e.q, item_sl_no:1 }); }
+    if(e.tab===tab && !e.q){ navGoingBack.current = false; setNavN(n=>n+1); }
     setTab(e.tab); };
+  // 2026-11-16T07:00:00Z: screens that used to "close to Home" go back where you came from (Home only if there is nothing to go back to)
+  const goBackOrHome = ()=>{ if(navStack.current.length) goBack(); else { setTab("home"); } };
+  useEffect(()=>{ window.__appGoBack = goBackOrHome; });
   const goHome = ()=>{ if(tab==="home") return; if(!confirmLeaveIfDirty()) return; setUnsavedGuard(false); setTab("home"); };
   const openContract = (contractRow)=>{
     if(!contractRow.billing_address && !contractRow.shipping_address && !contractRow.drawings_required){
@@ -60748,7 +60707,7 @@ function App() {
     tab==="followup_log"?h(FollowupLogScreen,{user:uTab}):   // 2026-11-13T14:00:00Z
     tab==="order_review"?h(OrderReviewScreen,{user:uTab}):   // 2026-11-13T15:00:00Z
     tab==="approvals"?h(ApprovalsScreen,{user:uTab}):   // 2026-11-13T16:30:00Z
-    tab==="followup_entry"?h(ContinuousFollowupEntry,{user:uTab,sessionCompany,prefill:followupPrefill,onBackToOverdue:handleBackToOverdue,onClose:()=>setTab("home")}):
+    tab==="followup_entry"?h(ContinuousFollowupEntry,{user:uTab,sessionCompany,prefill:followupPrefill,onBackToOverdue:handleBackToOverdue,onClose:()=>goBackOrHome()}):
     tab==="reports_won_by_owner"?h(WonByOwnerReport,null):
     tab==="reports_overdue_calls"?h(OverdueCallsReport,null):
     tab==="reports_overdue_followups"?h(SalesOverdueCallsScreen,{user:uTab,onGoLog:(prefillData)=>handleGoLogFromOverdue(prefillData,"admin")}):
@@ -62248,6 +62207,13 @@ function apprSplit(items, who, user, isSelf, extraMine){
   return { mine, behalf, nBehalf: others.length };
 }
 const apprPbPct = (i)=> i && i.pb && i.pb.pct!=null ? Number(i.pb.pct) : null;
+// 2026-11-16T07:00:00Z: who an approval goes To — the posts' holders today (by post), else the Super Admins / the login role
+function apprToOf(i){ const names = Array.from(new Set((i.posts||[]).filter(Boolean).flatMap(k=>postHolders(k)||[])));
+  const posts = (i.posts||[]).filter(Boolean).map(k=>postLabel(k)).filter(Boolean);
+  if(!names.length && (i.roles||[]).includes("super_admin")) return { names:(SA_NAMES_LAST||[]).slice(), posts:["Super Admin"] };
+  if(!names.length && (i.loginRoles||[]).length) return { names:[], posts:(i.loginRoles||[]).map(r=>String(r).replace(/_/g," ")) };
+  return { names, posts }; }
+function apprCtOf(i){ const c = String(i.ct||"").trim(); if(/^\d{6}$/.test(c)) return c; const r = String(i.ref||"").trim(); return /^\d{6}$/.test(r) ? r : ""; }
 // 250 (24 Oct): a "to send" step (PO / PI / invoice to be sent) lives in its own list, not among the task cards.
 // The step's card carries a checklist "step" whose item id is "step|sent"; a PI waiting for the DC (pi_wait_dc) keeps its own list.
 function taskIsSendStep(t){ return !!t && t.status!=="done" && t.task_type!=="pi_wait_dc" && (t.checklists||[]).some(c=>c && c.id==="step" && (c.items||[]).some(i=>i && i.id==="step|sent")); }
@@ -62395,6 +62361,7 @@ function ApprovalsTopBtn({ user }){
 }
 
 function ApprovalsScreen({ user }){
+  useEffect(()=>{ (async()=>{ try{ await loadPostPeople(); await superAdminNames(); await ctClientLoad(); }catch(e){} })(); },[]);   // 2026-11-16T07:00:00Z: To and client
   const [V,setV] = useState(null); const [cur,setCur] = useState(()=>{ const p = window.__apprPre || null; window.__apprPre = null; return p; });
   const [poOpen,setPoOpen] = useState(null); const [pbOpen,setPbOpen] = useState(null); const [tick,setTick] = useState(0);
   useEffect(()=>{ let dead = false; apprVisible(user, true).then(v=>{ if(!dead) setV(v); }).catch(()=>{ if(!dead) setV({ mine:[], behalf:[], me:"" }); }); return ()=>{ dead = true; }; },[tick]);
@@ -62425,15 +62392,15 @@ function ApprovalsScreen({ user }){
       h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:10,minWidth:0}},
         h("div",{style:{fontWeight:700,marginBottom:6}}, C ? C.c+(cur.s ? " › "+cur.s : "") : "All approvals"),
         shown.length ? h("div",{style:{overflowX:"auto"}}, h("table",{"data-testid":"appr-table",style:{borderCollapse:"collapse",width:"100%",minWidth:760}},
-          h("thead",null,h("tr",null,["Kind","Ref","What","From","Waiting","",""].map((x,k)=>h("th",{key:k,style:th},x)))),
+          h("thead",null,h("tr",null,["Kind","Ref","What","From","To (approves)","Waiting",""].map((x,k)=>h("th",{key:k,style:th},x)))),
           h("tbody",null, shown.slice().sort((a,b)=>(b.days||0)-(a.days||0)).map(i=>{ const T = APPR_TYPES[i.type]||APPR_TYPES.task; const late = (i.days||0)>=APPR_RED_DAYS;
             return h("tr",{key:i.key,"data-testid":"appr-row"},
               h("td",{style:td}, h("span",{style:{fontSize:10.5,fontWeight:700,borderRadius:9,padding:"1px 8px",background:T.bg,color:T.c,whiteSpace:"nowrap"}},T.t)),
               h("td",{style:{...td,fontWeight:700,whiteSpace:"nowrap"}}, i.ref),
-              h("td",{style:td}, i.what||"—", i.pb ? h("div",{style:{fontSize:11.5,color:apprPbPct(i)>PB_MAT_LIMIT?"#a3312a":"#0b5a40",fontWeight:700}},"Order ₹"+Math.round(i.pb.ov||0).toLocaleString("en-IN")+" · est. ₹"+Math.round(i.pb.est||0).toLocaleString("en-IN")+" · "+(apprPbPct(i)!=null?apprPbPct(i)+"%":"—")) : null),
+              h("td",{style:td}, i.what||"—", apprCtOf(i) ? h("div",{style:{marginTop:3}}, h(CtCtx,{ ct:apprCtOf(i), stop:true })) : null, i.pb ? h("div",{style:{fontSize:11.5,color:apprPbPct(i)>PB_MAT_LIMIT?"#a3312a":"#0b5a40",fontWeight:700}},"Order ₹"+Math.round(i.pb.ov||0).toLocaleString("en-IN")+" · est. ₹"+Math.round(i.pb.est||0).toLocaleString("en-IN")+" · "+(apprPbPct(i)!=null?apprPbPct(i)+"%":"—")) : null),
               h("td",{style:td}, i.by||"—"),
+              h("td",{"data-testid":"appr-to",style:td}, (()=>{ const T2 = apprToOf(i); return [h("b",{key:"n",style:{color:"#0c467e"}}, T2.names.join(", ")||"—"), T2.posts.length ? h("div",{key:"p",style:{fontSize:11,color:colors.muted}}, T2.posts.join(" / ")+(i._mine?" · you":"")) : null]; })()),
               h("td",{style:{...td,whiteSpace:"nowrap"}}, h("span",{style:{fontSize:11,fontWeight:700,borderRadius:9,padding:"1px 8px",background:late?"#fdecea":i.days?"#fff4d6":"#e3f1ea",color:late?"#a3312a":i.days?"#854f0b":"#0f6a4c"}}, i.days ? i.days+" day"+(i.days>1?"s":"") : "today")),
-              h("td",{style:{...td,fontSize:11.5,color:colors.muted}}, i._mine ? "" : "on behalf"+(i.behalfDept?" · "+i.behalfDept:"")),
               h("td",{style:td}, h("button",{"data-testid":"appr-open",onClick:()=>apprOpenItem(i, setPoOpen, setPbOpen),style:{...btnSmall,background:"#0f7a5c",borderColor:"#0f7a5c",color:"#fff",fontSize:12,whiteSpace:"nowrap"}},"Open & approve ▸"))); })))) :
           h("div",{style:{fontSize:12.5,color:colors.muted,padding:8}},"Nothing waiting here."))),
     pbOpen ? h(PbModal,{ cn:pbOpen, user, onClose:()=>{ setPbOpen(null); apprRefresh(); setTick(x=>x+1); } }) : null,
@@ -66077,6 +66044,18 @@ function crProgressCells(c, P){
     ["last","Last movement", p && p.lastMove ? p.lastMove[1]+" · "+fmtDMY(p.lastMove[0]) : "—", ""] ];
 }
 const ctDaysBetween = (a,b)=> Math.max(0, Math.round((new Date(String(b).slice(0,10)+"T12:00:00") - new Date(String(a).slice(0,10)+"T12:00:00"))/86400000));
+// 2026-11-16T07:00:00Z: contract · quote · client together wherever a card or an approval is about a customer
+function CtCtx({ ct, client, quote, stop }){
+  useCtData();
+  const c = String(ct||"").trim(); const q = String(quote || (c ? ctQ(c) : "") || "").trim(); const nm = client || (c ? ctClientOf(c) : "");
+  if(!c && !q && !nm) return null;
+  const st = (e)=>{ if(e) e.stopPropagation(); };
+  const chip = (txt, bg, col, onClick, title, tid)=> h("span",{"data-testid":tid,title,onClick:onClick?(e)=>{ st(e); onClick(); }:undefined,style:{fontSize:11,fontWeight:700,borderRadius:5,padding:"0 7px",background:bg,color:col,whiteSpace:"nowrap",cursor:onClick?"pointer":"default",lineHeight:"17px"}},txt);
+  return h("span",{"data-testid":"ct-ctx",onClick:stop?st:undefined,style:{display:"inline-flex",gap:5,flexWrap:"wrap",alignItems:"center"}},
+    c ? chip(c,"#1f4e78","#fff",()=>window.dispatchEvent(new CustomEvent("flo-goto",{ detail:{ contract:c } })),"Open Order Acceptance "+c,"ctx-cn") : null,
+    q ? chip(q,"#e7eef8","#0c467e",()=>window.dispatchEvent(new CustomEvent("flo-goto",{ detail:{ quote:q } })),"Open quote "+q,"ctx-q") : null,
+    nm ? chip(nm,"#f4efe2","#6b4e12",null,nm,"ctx-cl") : null);
+}
 function ctClientTag(ct, name, color){   // 19 Oct: Contract – Client with the hold tag on hover
   return h(CtRef,{ ct, name, color:color||"#2a6db0", compact:true });
 }
@@ -66503,9 +66482,9 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   const [data,setData] = useState(null);
   const [busy,setBusy] = useState(false);
   const [me,setMe] = useState("");
-  const [mode,setMode] = useState("all");        // all | one
-  const [ct,setCt] = useState("");
-  const [view,setView] = useState("stage");      // stage | person
+  const [mode,setMode] = useNavState("dc_mode","all");        // all | one   (2026-11-16T07:00:00Z: kept for Back)
+  const [ct,setCt] = useNavState("dc_ct","");
+  const [view,setView] = useNavState("dc_view","stage");      // stage | person
   const [fHold,setFHold] = useState("");
   const [fOwner,setFOwner] = useState("");
   const [fDept,setFDept] = useState("");
@@ -69210,9 +69189,9 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
   const today = toISODate(new Date());
   const [emps,setEmps] = useState([]);
   const [me,setMe] = useState("");
-  const [mode,setMode] = useState("emp");          // assign | emp | dash
-  const [who,setWho] = useState("");
-  const [dept,setDept] = useState("");
+  const [mode,setMode] = useNavState("tb_mode","emp");          // assign | emp | dash   (2026-11-16T07:00:00Z: kept for Back)
+  const [who,setWho] = useNavState("tb_who","");
+  const [dept,setDept] = useNavState("tb_dept","");
   const [cameFromAssign,setCameFromAssign] = useState(false);
   const [tasks,setTasks] = useState([]);
   const [labels,setLabels] = useState([]);
@@ -69916,7 +69895,7 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
     const edge = od ? "4px solid "+colors.danger : prog ? "4px solid #c99a06" : "1px solid "+colors.border;
     const tCt = e ? "" : taskContractOf(t);   // 178: contract + client on the card
     const top = e ? [h("b",{key:"c",style:{flex:1,minWidth:0,fontSize:12.5}},(st==="done"?"✓ ":"")+(e.company_name||t.customer||"—")), quoteOf(t) ? h("b",{key:"q",style:{color:"#2a6db0",fontSize:12,whiteSpace:"nowrap"}},quoteOf(t),copyBtn(quoteOf(t))) : null]
-                  : [h("b",{key:"c",style:{flex:1,minWidth:0,fontSize:12.5}},(st==="done"?"✓ ":"")+t.title), tCt ? h("span",{key:"ct",style:{fontSize:11,whiteSpace:"nowrap",color:colors.muted}},ctClientTag(tCt, ctClientOf(tCt)||t.customer)) : null];   // 178
+                  : [h("b",{key:"c",style:{flex:1,minWidth:0,fontSize:12.5}},(st==="done"?"✓ ":"")+t.title), tCt ? h("span",{key:"ct",style:{fontSize:11,whiteSpace:"nowrap",color:colors.muted}},ctClientTag(tCt, ctClientOf(tCt)||t.customer), ctQ(tCt) ? h("span",{style:{marginLeft:4,fontWeight:700,color:"#0c467e",background:"#e7eef8",borderRadius:5,padding:"0 6px"}},ctQ(tCt)) : null) : null];   // 178 · 2026-11-16T07:00:00Z: + quote
     const line2 = e ? (e.enquiry_number+" · "+fmtDMY(e.enquiry_date)) : [t.task_type, tCt?null:t.customer, t.ref].filter(Boolean).join(" · ") || (t.created_at?"created "+fmtDMY(t.created_at):"");
     const dueTxt = (st!=="done" && t.start_date ? "starts "+fmtDMY(t.start_date)+" · " : "")+(st==="done" ? "✓ completed "+(t.approved_at?fmtDMY(t.approved_at):"") : t.due_date ? "Task due "+fmtDMY(t.due_date)+(od?" · "+over+" day"+(over===1?"":"s")+" over":"") : "No task due date");   // 139: start date
     return h("div",{key:t.id, "data-savedkey":"task:"+t.id, draggable:true, onDragStart:ev=>ev.dataTransfer.setData("text/plain",String(t.id)), onClick:()=>setOpenId(t.id),
@@ -70086,7 +70065,10 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
         h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginTop:3,fontSize:12,color:colors.muted,alignItems:"center"}},
           done ? h("span",null,"✓ completed"+(t.approved_at?" "+fmtDMY(t.approved_at):"")) : t.due_date ? h("span",{style:{color:od?colors.danger:undefined,fontWeight:od?600:400}},"📅 "+fmtDMY(t.due_date)+(od?" · "+over+" day"+(over===1?"":"s")+" over":"")) : h("span",null,"No due date"),
           t.status==="approval" ? h("span",{style:{fontSize:10.5,fontWeight:700,borderRadius:8,padding:"0 7px",background:"#fff4d6",color:"#854f0b"}},"Under approval") : null,
-          num ? h("span",null,num,copyBtn(num)) : null,
+          (()=>{ const cn = e ? "" : taskContractOf(t);   // 2026-11-16T07:00:00Z: contract · quote · client
+            if(cn) return h("span",{style:{display:"inline-flex",gap:4,alignItems:"center"}}, h(CtCtx,{ ct:cn, client:ctClientOf(cn)||t.customer, stop:true }), copyBtn(cn));
+            return num ? h("span",{style:{display:"inline-flex",gap:4,alignItems:"center"}}, num, copyBtn(num), !e && t.customer ? h(CtCtx,{ client:t.customer, stop:true }) : null)
+              : (!e && t.customer ? h(CtCtx,{ client:t.customer, stop:true }) : null); })(),
           e ? h("span",null,e.enquiry_number,copyBtn(e.enquiry_number)) : null,
           e && t.status!=="done" ? quoteStatePill(e, quoteMade) : null,   // 242
           e ? regretBadge(e) : null,
