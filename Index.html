@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-16T01:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-16T02:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -36631,6 +36631,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"16 Nov 2026", summary:"Built on 2026-11-16T02:00:00Z, on top of 2026-11-16T01:00:00Z. No SQL. ORDER PROCESSING REVIEW: two clear columns on every item — New owner (pick the person, Give) and Change due date (date, reason, ✓) — for Super Admins and the Document Controller / VP Projects posts, or anyone with a Review edit code (others see —). The status (late / due today / paused) is now a badge under the customer; the PO and Status columns are gone (PO date missing still shows under the due date). ⚑ Mark urgent and Notes · history are buttons under the item. The item's owner can now fill their own committed date and reason (as well as the chair, VP Projects and the Document Controller). When the meeting is not set up, the banner says the committed boxes stay closed until it is." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T01:00:00Z, on top of 2026-11-16T00:00:00Z. NEEDS SQL: structure_order_review_edit_2026-11-16.sql (both companies). ORDER PROCESSING REVIEW: click an item's owner to give it to someone else, click its due date to change it (reason needed); a badge shows who had it before and how many times the date moved (and the first date). ⚑ Mark urgent: the item goes into an Urgent group at the top of the next sitting (even if not yet due) until the mark is taken off. Notes · history on every item (owner changes, date changes, urgent, notes — with who and when). Owner / due / urgent changes: Super Admins and the Document Controller and VP Projects posts straight away; anyone else with a Review edit code from them (one use, today's meeting; blank = ask them by bell). Meeting history: today's changes (also into the minutes at Close) and earlier sittings with their minutes. Code 3 and Code 2 resubmissions are now groups 7 and 8 with deadlines (3 and 5 working days from the client's comments, set in ⚙ Set up), owner = the document's owner." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T00:00:00Z, on top of 2026-11-15T23:00:00Z. No SQL. USER MANUAL: new Production group, English and Tamil — Route cards (picker, tiles, one card), Marking (marks, who, long-press, undo), Catch-up and adding rows, Job work, Serials, Route templates and Models → route, Production progress, Finished goods, Traded items. The Download (PDF) manual picks them up. VERSION HISTORY: entries added for the builds 16:00 to 23:00 on 15 Nov." },
   { date:"15 Nov 2026", summary:"Built on 2026-11-15T23:00:00Z, on top of 2026-11-15T22:00:00Z. NEEDS SQL: structure_trade_route_2026-11-15.sql (both companies). TRADE route template (draft, 22 steps) for traded items; AR-SL, MSEP, AV-CS go to TRADE; Technical Head's Traded (buy & sell) button on Sl No tiles with no card. Finished goods screen: group rows fixed." },
@@ -80073,6 +80074,7 @@ function OrderReviewScreen({ user }){
   const [gave,setGave] = useState(""); const [codeIn,setCodeIn] = useState(""); const [codeMsg,setCodeMsg] = useState("");
   const [past,setPast] = useState(null);     // earlier sittings
   const [emps,setEmps] = useState([]);
+  const [rf,setRf] = useState({});           // 2026-11-16T02:00:00Z: per-row New owner / Change due date inputs { key: { owner, due, why, oerr, derr } }
   const me = (user && (user.employee_name||user.username)) || "";
   useEffect(()=>{ let dead = false; (async()=>{
     try{ setErr(""); setA(null);
@@ -80092,6 +80094,7 @@ function OrderReviewScreen({ user }){
   if(!R || !A) return h("div",{style:{padding:20,color:colors.muted}},"Building today's agenda… (reads the Order Status board and every contract's documents)");
   const cfg = R.cfg; const times = rvwTimes(cfg, A); const closed = !!(sess && sess.closed_at);
   const edit = canRun && !closed && !R.missing && !!R.row;
+  const editRec = (it)=> edit || (!closed && !R.missing && !!R.row && !!sess && (it.owners||[]).some(n=>sameName(n, me) || (user && sameName(n, user.username))));   // 2026-11-16T02:00:00Z: owners fill their own committed date
   const att = (sess && sess.attendance) || {};
   const people = Array.from(new Set([...rvwHolders([cfg.chair]), ...rvwHolders(cfg.co), ...rvwNeeded(cfg, A)]));
   const saveRec = async(it, patch)=>{
@@ -80145,6 +80148,18 @@ function OrderReviewScreen({ user }){
   const doNote = async(it)=>{ const t = String(form.note||"").trim(); if(!t){ setForm(f=>({ ...f, err:"Type the note first." })); return; }
     const notes = [ ...((EM.map.get(it.key)||{}).notes||[]), { at:new Date().toISOString(), by:me, text:t } ];
     if(await saveEdit(it, { notes }, "note: "+t)) setForm({}); };
+  const rfSet = (k, patch)=> setRf(m=>({ ...m, [k]:{ ...(m[k]||{}), ...patch } }));
+  const doOwnerRow = async(it)=>{ const f = rf[it.key]||{}; const to = String(f.owner||"").trim(); const was = (it.owners||[]).join(", ");
+    if(!to){ rfSet(it.key,{ oerr:"Pick who it goes to." }); return; } if(to===was){ rfSet(it.key,{ oerr:"Already with "+to+"." }); return; }
+    const hist = [ ...((EM.map.get(it.key)||{}).owner_hist||[]), { from:was, to, by:me, at:new Date().toISOString(), why:null } ];
+    if(await saveEdit(it, { owner:to, owner_hist:hist }, "owner "+was+" → "+to,
+      { to:[to], msg:"📋 "+cfg.title+": "+it.cn+(it.client?" "+it.client:"")+" — "+it.title+" is now with you (was "+was+"), due "+fmtDMY(it.due)+". Given by "+me+"." })){ rfSet(it.key,{ owner:"", oerr:"" }); appToast("✓ Given to "+to); } };
+  const doDueRow = async(it)=>{ const f = rf[it.key]||{}; const d = String(f.due||"").slice(0,10); const why = String(f.why||"").trim();
+    if(!d){ rfSet(it.key,{ derr:"Pick the new date." }); return; } if(!why){ rfSet(it.key,{ derr:"Write the reason." }); return; }
+    if(d===it.due){ rfSet(it.key,{ derr:"That is the due date already." }); return; }
+    const hist = [ ...((EM.map.get(it.key)||{}).due_hist||[]), { from:it.due, to:d, by:me, at:new Date().toISOString(), why } ];
+    if(await saveEdit(it, { due:d, due_hist:hist }, "due "+fmtDMY(it.due)+" → "+fmtDMY(d)+" ("+why+")",
+      { to:(it.owners||[]).filter(n=>n!==me), msg:"📅 "+cfg.title+": "+it.cn+" — "+it.title+" now due "+fmtDMY(d)+" (was "+fmtDMY(it.due)+"): "+why+". Changed by "+me+"." })) rfSet(it.key,{ due:"", why:"", derr:"" }); };
   const giveCode = async()=>{ setCodeMsg("");
     const code = String(Math.floor(100000+Math.random()*900000));
     const { error } = await sb.from("authorization_codes").insert({ code, code_type:"review_edit", generated_by:(user&&user.username)||me, expires_at:new Date(Date.now()+12*3600e3).toISOString(), reference_number:"RVW:"+A.today, note:cfg.title+" "+fmtDMY(A.today), used:false });
@@ -80203,6 +80218,7 @@ function OrderReviewScreen({ user }){
     return out.sort((a,b)=>String(b.at).localeCompare(String(a.at))); };
   const panel = (it)=>{ if(!open || open.key!==it.key) return null; const w = open.what; const err = form.err ? h("div",{key:"err",style:{color:colors.danger,fontSize:12,marginTop:4}},form.err) : null;
     const box = (kids)=> h("tr",{key:it.key+"|p"}, h("td",{colSpan:8,style:{...td,background:"#f8f7f2"}}, kids));
+    if(w!=="notes") return null;   // 2026-11-16T02:00:00Z: owner and due date have their own columns
     if(w==="owner") return box([ h("span",{key:"a",style:{fontSize:12.5}},"Give to "),
       h("select",{key:"s","data-testid":"rvw-owner-sel",value:form.owner||"",onChange:e=>setForm(f=>({ ...f, owner:e.target.value, err:"" })),style:inp},
         h("option",{value:""},"— pick —"), Array.from(new Set([...emps, ...people])).sort().map(n=>h("option",{key:n,value:n},n))),
@@ -80226,34 +80242,47 @@ function OrderReviewScreen({ user }){
     if(!b.items.length) return h("div",{key:b.k,"data-testid":"rvw-block-"+b.k,style:{border:"1px solid "+colors.border,borderRadius:9,marginBottom:10,overflow:"hidden",opacity:.8}}, head);
     return h("div",{key:b.k,"data-testid":"rvw-block-"+b.k,style:{border:"1px solid "+(U?"#e8a39b":colors.border),borderRadius:9,marginBottom:10,overflow:"hidden"}}, head,
       h("div",{style:{overflowX:"auto"}}, h("table",{style:{borderCollapse:"collapse",width:"100%",minWidth:900}},
-        h("thead",null,h("tr",null,["Contract","Customer","Item","PO","Due","Status","Owner","Committed date & reason"].map(x=>h("th",{key:x,style:th},x)))),
+        h("thead",null,h("tr",null,["Contract","Customer","Item","Due","Owner","New owner","Change due date","Committed date & reason"].map(x=>h("th",{key:x,style:{...th, ...(x==="New owner"||x==="Change due date" ? { background:"#e7eef8", color:"#0c467e" } : null)}},x)))),
         h("tbody",null,b.items.map(it0=>{ const r = recs[it0.key]||{}; const prevMiss = (r.misses||0);
           const it = (it0.state==="late" && rvwIsClient(r.reason)) ? { ...it0, state:"paused", pausedWhy:r.reason } : it0;   // paused in this sitting: shows at once
           const oh = it.ownerHist||[], dh = it.dueHist||[]; const wasOwners = Array.from(new Set(oh.map(x=>x.from).filter(Boolean)));
+          const f = rf[it.key]||{}; const er = editRec(it);
+          const chg = { ...td, background:"#f4f8fd", whiteSpace:"nowrap" };
+          const errTxt = (t)=> t ? h("div",{style:{color:colors.danger,fontSize:11,marginTop:2,whiteSpace:"normal"}},t) : null;
           return [h("tr",{key:it.key,"data-testid":"rvw-item",style: it.state==="paused" ? {color:colors.muted} : null},
             h("td",{style:td}, h("span",{style:{color:"#0c447c",cursor:"pointer",textDecoration:"underline"},onClick:()=>window.dispatchEvent(new CustomEvent("flo-goto",{ detail:{ contract:it.cn } }))},it.cn)),
-            h("td",{style:td},it.client||"—"), h("td",{style:td},
+            h("td",{style:td}, it.client||"—", h("div",{"data-testid":"rvw-status",style:{marginTop:3}}, status(it))),
+            h("td",{style:td},
               it.urgent ? h("span",{style:{marginRight:6}}, pill("⚑ URGENT","#b2342a","#fff")) : null,
               it.title, U && it.blk ? h("span",{style:{marginLeft:6}}, pill((rvwBlockDef(it.blk)||{}).label||it.blk,"#eceee9","#5f655e")) : null,
               prevMiss ? h("span",{style:{marginLeft:6}}, pill("missed "+prevMiss+"×","#fbe7e4","#b2342a")) : null,
-              h("div",{style:{display:"flex",gap:10,marginTop:3,fontSize:11.5}},
-                canChange ? h("span",{"data-testid":"rvw-urgent",style:lnk(true),onClick:()=>doUrgent(it)}, it.urgent ? "Take off urgent" : "⚑ Mark urgent") : null,
-                h("span",{"data-testid":"rvw-notes",style:lnk(true),onClick:()=>{ setForm({}); setOpen(open && open.key===it.key && open.what==="notes" ? null : { key:it.key, what:"notes" }); }},"Notes"+(it.notesN?" ("+it.notesN+")":"")+" · history"))),
-            h("td",{style:{...td,whiteSpace:"nowrap"}}, fmtDMY(it.po), it.poReal ? null : h("div",{style:{fontSize:10.5,color:"#b2342a"}},"PO date missing — counted from entry")),
-            h("td",{style:{...td,whiteSpace:"nowrap"}},
-              h("span",{"data-testid":"rvw-due",style:lnk(canChange),onClick:()=>{ if(!canChange) return; setForm({ due:it.due }); setOpen({ key:it.key, what:"due" }); }},fmtDMY(it.due)),
-              dh.length ? h("div",{"data-testid":"rvw-due-badge",style:{marginTop:2}}, pill("moved "+dh.length+"× · was "+fmtDMY(dh[0].from),"#fbf0d6","#9a6a08")) : null),
-            h("td",{style:td},status(it)),
-            h("td",{style:td},
-              h("span",{"data-testid":"rvw-owner",style:lnk(canChange),onClick:()=>{ if(!canChange) return; setForm({ owner:(it.owners||[])[0]||"" }); setOpen({ key:it.key, what:"owner" }); }},(it.owners||[]).join(", ")||"—"),
-              wasOwners.length ? h("div",{"data-testid":"rvw-was",style:{marginTop:2}}, pill("was "+wasOwners.join(", "),"#e7eef8","#0c467e")) : null),
+              h("div",{style:{display:"flex",gap:8,marginTop:4,flexWrap:"wrap"}},
+                canChange ? h("button",{"data-testid":"rvw-urgent",onClick:()=>doUrgent(it),style:{...btnSmall,padding:"2px 8px",fontSize:11.5,color:"#b2342a",borderColor:"#e8a39b",background:"#fff"}}, it.urgent ? "Take off urgent" : "⚑ Mark urgent") : null,
+                h("button",{"data-testid":"rvw-notes",onClick:()=>{ setForm({}); setOpen(open && open.key===it.key && open.what==="notes" ? null : { key:it.key, what:"notes" }); },style:{...btnSmall,padding:"2px 8px",fontSize:11.5,background:"#fff"}},"Notes"+(it.notesN?" ("+it.notesN+")":"")+" · history"))),
+            h("td",{style:{...td,whiteSpace:"nowrap"}}, h("span",{"data-testid":"rvw-due"},fmtDMY(it.due)),
+              dh.length ? h("div",{"data-testid":"rvw-due-badge",style:{marginTop:3}}, pill("moved "+dh.length+"× · was "+fmtDMY(dh[0].from),"#fbf0d6","#9a6a08")) : null,
+              it.poReal ? null : h("div",{style:{fontSize:10.5,color:"#b2342a",marginTop:2}},"PO date missing")),
+            h("td",{style:td}, h("span",{"data-testid":"rvw-owner"},(it.owners||[]).join(", ")||"—"),
+              wasOwners.length ? h("div",{"data-testid":"rvw-was",style:{marginTop:3}}, pill("was "+wasOwners.join(", "),"#e7eef8","#0c467e")) : null),
+            h("td",{style:chg}, canChange ? h(React.Fragment,null,
+                h("span",{style:{display:"inline-flex",gap:4}},
+                  h("select",{"data-testid":"rvw-owner-sel",value:f.owner||"",onChange:e=>rfSet(it.key,{ owner:e.target.value, oerr:"" }),style:{...inp,maxWidth:150}},
+                    h("option",{value:""},"— pick —"), Array.from(new Set([...emps, ...people])).filter(n=>!(it.owners||[]).includes(n)).sort().map(n=>h("option",{key:n,value:n},n))),
+                  h("button",{"data-testid":"rvw-owner-save",onClick:()=>doOwnerRow(it),style:{...btnSmall,padding:"2px 10px"}},"Give")), errTxt(f.oerr))
+              : h("span",{style:{color:colors.muted}},"—")),
+            h("td",{style:chg}, canChange ? h(React.Fragment,null,
+                h("span",{style:{display:"inline-flex",gap:4}},
+                  h("input",{"data-testid":"rvw-due-in",type:"date",value:f.due||"",onChange:e=>rfSet(it.key,{ due:e.target.value, derr:"" }),style:{...inp,width:132}}),
+                  h("input",{"data-testid":"rvw-due-why",value:f.why||"",onChange:e=>rfSet(it.key,{ why:e.target.value, derr:"" }),placeholder:"Reason",style:{...inp,width:120}}),
+                  h("button",{"data-testid":"rvw-due-save",title:"Change the due date",onClick:()=>doDueRow(it),style:{...btnSmall,padding:"2px 10px"}},"✓")), errTxt(f.derr))
+              : h("span",{style:{color:colors.muted}},"—")),
             h("td",{style:{...td,whiteSpace:"nowrap"}},
               it.state==="paused" ? h("span",null, (it.pausedWhy||"Client")+" · Sales chases ", edit ? h("button",{onClick:()=>resume(it),style:{...btnSecondary,padding:"2px 8px",fontSize:11.5}},"Resume the clock") : null)
               : it.state==="today" ? h("span",{style:{fontSize:12,color:colors.muted}},"Owner confirms it goes today")
               : it.state==="ahead" ? h("span",{style:{fontSize:12,color:colors.muted}},"Not due yet — urgent")
               : h("span",{style:{display:"inline-flex",gap:6}},
-                  h("input",{type:"date","data-testid":"rvw-commit",disabled:!edit,value:r.committed_date?String(r.committed_date).slice(0,10):"",min:A.today,onChange:e=>saveRec(it,{ committed_date:e.target.value||null }),style:inp}),
-                  h("select",{"data-testid":"rvw-reason",disabled:!edit,value:r.reason||"",onChange:e=>saveRec(it,{ reason:e.target.value||null }),style:inp},
+                  h("input",{type:"date","data-testid":"rvw-commit",disabled:!er,value:r.committed_date?String(r.committed_date).slice(0,10):"",min:A.today,onChange:e=>saveRec(it,{ committed_date:e.target.value||null }),style:inp}),
+                  h("select",{"data-testid":"rvw-reason",disabled:!er,value:r.reason||"",onChange:e=>saveRec(it,{ reason:e.target.value||null }),style:inp},
                     h("option",{value:""},"— reason —"), RVW_REASONS.map(o=>h("option",{key:o,value:o},o)))))), panel(it)];
         })))),
       U ? null : h("div",{style:{fontSize:12,color:colors.muted,padding:"6px 10px"}}, b.ontime+" on time — not discussed"));
@@ -80285,7 +80314,7 @@ function OrderReviewScreen({ user }){
           h("button",{"data-testid":"rvw-code-use",onClick:useCode,style:btnSmall},codeIn.trim() ? "Use the code" : "Ask for one")),
       codeMsg ? h("span",{"data-testid":"rvw-code-msg",style:{color:/^✗/.test(codeMsg)?colors.danger:"#085041"}},codeMsg) : null) : null,
     R.missing ? h("div",{style:{background:"#fdecea",color:"#a3312a",padding:"8px 12px",borderRadius:6,margin:"10px 0",fontSize:12.5}},"Run "+RVW_SQL+" (both companies). Until then the agenda shows but nothing can be saved and the meeting is not on the calendar.") : null,
-    !R.missing && !R.row ? h("div",{"data-testid":"rvw-not-set",style:{background:"#fbf0d6",color:"#7a5406",padding:"8px 12px",borderRadius:6,margin:"10px 0",fontSize:12.5}},"The meeting is not set up yet. "+(canSet ? "Press ⚙ Set up and Save — it then goes on everyone's calendar, rings each person needed every working day and keeps the minutes." : "The "+postLabel(cfg.chair)+" or a Super Admin sets it up (⚙ Set up).")) : null,
+    !R.missing && !R.row ? h("div",{"data-testid":"rvw-not-set",style:{background:"#fbf0d6",color:"#7a5406",padding:"8px 12px",borderRadius:6,margin:"10px 0",fontSize:12.5}},"The meeting is not set up yet — the committed date and reason boxes stay closed until it is. "+(canSet ? "Press ⚙ Set up and Save — it then goes on everyone's calendar, rings each person needed every working day and keeps the minutes." : "The "+postLabel(cfg.chair)+" or a Super Admin sets it up (⚙ Set up).")) : null,
     A.newOrders.length ? h("div",{"data-testid":"rvw-new",style:{fontSize:12.5,margin:"10px 0",padding:"6px 10px",background:"#e7eef8",borderRadius:6,color:"#0c467e"}},"New orders since the last working day: "+A.newOrders.map(o=>o.cn+(o.client?" "+o.client:"")+" (PO "+fmtDMY(o.po)+")").join(" · ")) : null,
     h("div",{style:{display:"flex",flexWrap:"wrap",gap:6,margin:"10px 0"},"aria-label":"Attendance"},
       h("span",{style:{fontSize:12,color:colors.muted,alignSelf:"center"}}, edit ? "Present (tap):" : "Present:"),
