@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-17T01:30:00Z";
+  var APP_BUILD_VERSION = "2026-11-17T02:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -13697,12 +13697,14 @@ function DocumentsBox({ mode, entityRef, user, isAdminOrAbove, withMandatoryAuth
     setStatuses(st||[]);
     setQuoteStatus(((sl||[]).find(x=>x.quote_status)||{}).quote_status || "Draft");
     const seen = new Set(); setSlNos((sl||[]).filter(x=>{ const k=String(x.item_sl_no); if(seen.has(k)) return false; seen.add(k); return true; }));
-    setReqs(r||[]);
+    // 2026-11-17T02:00:00Z: on a quote, a PO requirement raised for an Order Acceptance is not shown
+    const rQ = isContract ? (r||[]) : (r||[]).filter(q=>!(isPoDocRequirement(q) && q.source==="Order Acceptance" && !q.fulfilled_document_id));
+    setReqs(rQ);
     setDocs((d||[]).filter(x=>!x.is_archived));
     setPostKeys(pk.keys||[]);
     setLoading(false);
     if(!keepSel){
-      const open = (r||[]).filter(q=>!q.fulfilled_document_id);
+      const open = rQ.filter(q=>!q.fulfilled_document_id);
       const firstMand = open.find(q=>q.is_mandatory);
       const firstDoc = (d||[]).filter(x=>!x.is_archived)[0];
       setSel(firstMand ? "r"+firstMand.id : firstDoc ? "d"+firstDoc.id : open[0] ? "r"+open[0].id : "+");
@@ -16622,7 +16624,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
     const savedMode=termsRow && termsRow.price_summary_mode==="proforma" ? "proforma" : "basic";
     // 1 Oct (107) — enclosures (quotes only): merged unless "Offer only" is picked.
     const encl = mode==="contract" ? [] : await fetchOfferEnclosures(quoteExportRef);
-    return new Promise(resolve=>{ psResolveRef.current=resolve; setPsAsk({mode:savedMode, gstKey, why, opts, currency, hasPf:!!(termsRow&&(termsRow.packing_forwarding_basis||termsRow.packing_forwarding)), encl, enclOn:true}); });
+    return new Promise(resolve=>{ psResolveRef.current=resolve; setPsAsk({mode:savedMode, gstKey, why, opts, currency, hasPf:!!(termsRow&&(pfNormTerms(termsRow).packing_forwarding_basis||termsRow.packing_forwarding)), encl, enclOn:true}); });
   };
   const [draftConfirm,setDraftConfirm]=useState(null); // {missing, incompleteBomDetails}
   const draftConfirmResolveRef = useRef(null);
@@ -17191,7 +17193,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
       let newEstRows = [];
       if(estRows?.length){ const { data: ne, error: neErr } = await sb.from("estimates").insert(estRows.map(r=>({...stripId(r), reference_number:newRef, quote_status:"Draft", created_at:new Date().toISOString()}))).select(); if(neErr) throw neErr; newEstRows = ne||[]; }
       if(lineRows?.length){ const { error: lnErr } = await sb.from("estimate_lines").insert(remapEstimateIds(onlyLiveSl(lineRows, estRows), estRows, newEstRows).map(r=>({...stripId(r), reference_number:newRef}))); if(lnErr) throw lnErr; }
-      if(termsRows?.length) await sb.from("quote_commercial_terms").insert(termsRows.map(r=>({...stripId(r), reference_number:newRef})));
+      if(termsRows?.length) await sb.from("quote_commercial_terms").insert(termsRows.map(r=>({...stripId(pfNormTerms(r)), reference_number:newRef})));
       if(noteRows?.length) await sb.from("quote_notes").insert(noteRows.map(r=>({...stripId(r), reference_number:newRef})));
       if(onlyLiveSl(dsRows, estRows).length) await sb.from("datasheets").insert(onlyLiveSl(dsRows, estRows).map(r=>({...stripId(r), reference_number:newRef})));   // 156
       // Extra Price lines clone forward like everything else, but the
@@ -18109,7 +18111,8 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
     // so contracts opened from the Order Acceptance screen never got one. Safe
     // to call every time: it does nothing if the requirement exists.
     if(mode==="contract") await ensurePoDocumentRequirement(ref, user?.username);
-    setDocumentRequests(await fetchDocumentRequirements(ref));
+    { const rq = await fetchDocumentRequirements(ref);   // 2026-11-17T02:00:00Z: a quote ignores an Order-Acceptance PO requirement
+      setDocumentRequests(mode==="contract" ? rq : rq.filter(q=>!(isPoDocRequirement(q) && q.source==="Order Acceptance" && !q.fulfilled_document_id))); }
   },[mode, user?.username]);
   useEffect(()=>{ if(quoteExportRef) loadDocumentRequests(quoteExportRef); },[quoteExportRef,loadDocumentRequests]);
   // Runs now for an Admin/Super Admin, otherwise behind the code.
@@ -18969,7 +18972,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
     const missing = [];
     let termsDone = true, validationDone = true;
     let dsDoneCount=0, descDoneCount=0, slCount=0;
-    const {data:terms} = await sb.from("quote_commercial_terms").select("*").eq("reference_number",refNumber).maybeSingle();
+    const {data:terms} = await sb.from("quote_commercial_terms").select("*").eq("reference_number",refNumber).maybeSingle(); pfNormTerms(terms);   // 2026-11-17T02:00:00Z
     if(!terms){ missing.push({section:"Commercial Terms", items:["Not created yet"]}); termsDone=false; }
     else {
       // 12 Oct (180): an Order Acceptance has no Validity — that belongs to the offer only.
@@ -20737,7 +20740,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
       estimatesRows.forEach(est=>{
         const lines = linesRows.filter(l=>l.item_sl_no===est.item_sl_no);
         const dpLine = lines.find(l=>l.is_direct_price===true);
-        const itemName = dpLine ? (dpLine.item||"Custom") : (modelItemMap.get(est.model) || "");
+        const itemName = dpLine ? (dpLine.item||"Custom") : (modelItemMap.get(est.model) || ((lines.find(l=>l.item)||{}).item) || "");
         const rows=[];
         rows.push(["BOM WITH ESTIMATE"]);
         rows.push([]);
@@ -20883,7 +20886,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
         if(idx>0) doc.addPage();
         ensureLetterhead();
         const dpLineForItem = linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.is_direct_price===true);
-        const itemName = dpLineForItem ? (dpLineForItem.item||"Custom") : (modelItemMap.get(est.model) || "");
+        const itemName = dpLineForItem ? (dpLineForItem.item||"Custom") : (modelItemMap.get(est.model) || ((linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.item)||{}).item) || "");
         let y = drawDocHeaderBlock(doc,"BOM WITH ESTIMATE",{slNo:est.item_sl_no,client:customer,quoteDate:est.quote_date,item:itemName,quoteNo:est.reference_number,model:est.model,qtyByOrder:est.order_qty||1});
         doc.setFont(undefined,"italic"); doc.setFontSize(7); doc.setTextColor(120,120,120);
         doc.text("(Qty By Order x Reqd Qty)", 14, y);
@@ -20965,7 +20968,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
       // typed Item FIRST, same source DatasheetModal/CustomDatasheetCapture
       // already use to open/save the datasheet in the first place.
       const dpLineForTemplate = linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.is_direct_price===true);
-      const itemNameForTemplate = (dpLineForTemplate && dpLineForTemplate.item) || modelItemMap.get(est.model) || est.model || "Unknown item";
+      const itemNameForTemplate = (dpLineForTemplate && dpLineForTemplate.item) || modelItemMap.get(est.model) || ((linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.item)||{}).item) || est.model || "Unknown item"; // 02:30: model not in the catalogue -> the Sl No's own BOM line Item (same as the Datasheet screen)
       // 181: a datasheet taken from the OA prints as is — its own sections, labels and values.
       const oaDs = datasheetsRows.find(d=>d.item_sl_no===est.item_sl_no && d.source==="OA" && Array.isArray(d.custom_free_fields) && d.custom_free_fields.length);
       if(oaDs){
@@ -21284,7 +21287,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
       const {estimatesRows, linesRows, datasheetsRows} = await fetchQuoteBundle(quoteExportRef);
       if(!estimatesRows.length){ alert("No Sl Nos found under "+quoteExportRef+"."); return; }
       const {data:termsRow} = await sb.from("quote_commercial_terms").select("*").eq("reference_number",quoteExportRef).maybeSingle();
-      const terms = termsRow || {};
+      const terms = pfNormTerms(termsRow || {});   // 2026-11-17T02:00:00Z
       const forceMaj = terms.force_majeure || CT_DEFAULTS.force_majeure;
       const cancelCharges = terms.order_cancellation_charges || CT_DEFAULTS.order_cancellation_charges;
       const {data:notesRows} = await sb.from("quote_notes").select("*").eq("reference_number",quoteExportRef).order("sl_no",{ascending:true});
@@ -21471,7 +21474,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
         const qty = est.order_qty||1; const slExact = poUnitPriceIn(est, quoteCurrency)!==null;
         const { unit, total } = priceUnitTotal(slNoFoldedTotalDisp(est), qty, slExact, quoteCurrency);
         const dp = linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.is_direct_price===true);
-        const it = dp ? (dp.item||"Custom") : (modelItemMap.get(est.model)||est.model||"—");
+        const it = dp ? (dp.item||"Custom") : (modelItemMap.get(est.model)||((linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.item)||{}).item)||est.model||"—");
         return { sl:est.item_sl_no, item:it, desc:est.description||"—", hsn:hsnByItem.get(normalizeItemName(it))||HSN_DEFAULT||"", unit, qty, total, exact:slExact };
       });
       const psOptions = (extraPriceForPdf||[]).map(l=>({ label:l.label||"—", amt:moneyVal(psToDisp(l.price)) }));
@@ -21998,7 +22001,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
         // by the user — est.model is "Custom" (or a typed model label),
         // never the Item. Real BOM Sl Nos are unaffected (no dpLine found).
         const dpLine = linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.is_direct_price===true);
-        const itemDisplay = dpLine ? (dpLine.item||"Custom") : (modelItemMap.get(est.model)||est.model||"—");
+        const itemDisplay = dpLine ? (dpLine.item||"Custom") : (modelItemMap.get(est.model)||((linesRows.find(l=>l.item_sl_no===est.item_sl_no && l.item)||{}).item)||est.model||"—");
         return [est.item_sl_no, itemDisplay, est.description||"—",
           slExact ? fmt(unit) : fmt0(unit), qty, slExact ? fmt(total) : fmt0(total)];
       });
@@ -26189,6 +26192,11 @@ async function applyOutcomeStatus(referenceNumber, newStatus, changedBy, source,
 // it would stop a lorry. Adding a document is never blocked either, at any
 // stage, by anything.
 const PO_DOC_CATEGORY = "Purchase Order";
+// 2026-11-17T02:00:00Z: USER WINS, also on quotes nobody has re-saved — a P&F figure with no basis is
+// a percentage (that is what the Commercial Terms form shows for it), so every PDF and
+// invoice reads it that way. Without this a 5% typed on a quote loaded by SQL printed
+// nothing until someone opened and saved the terms again.
+function pfNormTerms(t){ if(t && typeof t==="object" && !t.packing_forwarding_basis && String(t.packing_forwarding_value??"").trim()!=="") t.packing_forwarding_basis = "Percentage"; return t; }
 
 // ---- PRODUCTION GO-AHEAD + WORK ORDERS (20 Sep) ----------------------
 // Order status (commercial progress) and the production go-ahead are
@@ -26386,6 +26394,11 @@ async function ensurePoDocumentRequirement(contractNumber, username){
 }
 async function _ensurePoDocumentRequirement(contractNumber, username){
   try{
+    // 2026-11-17T02:00:00Z: only an Order Acceptance gets the PO requirement. A quote screen that was
+    // briefly in contract mode raised one on quote FXAD260007-R02 ("Purchase Order —
+    // Mandatory" on a quote). No sale order row = not a contract = nothing to raise.
+    const { data: soRow } = await sb.from("sale_order_tbl").select("id").eq("contract_number",contractNumber).limit(1);
+    if(!(soRow||[]).length) return;
     const { data: existing } = await sb.from("document_requests_tbl").select("id,category").eq("entity_id",contractNumber);
     if((existing||[]).some(isPoDocRequirement)) return;
     await sb.from("document_requests_tbl").insert({
@@ -26971,7 +26984,7 @@ async function cloneQuoteIntoContract(quoteRef, contractNumber, customerName, us
   let newEstRows = [];
   if(estRows?.length){ const { data: ne, error: neErr } = await sb.from("estimates").insert(estRows.map(r=>({...stripId(r), reference_number:contractNumber}))).select(); if(neErr) throw neErr; newEstRows = ne||[]; }
   if(lineRows?.length){ const { error: lnErr } = await sb.from("estimate_lines").insert(remapEstimateIds(onlyLiveSl(lineRows, estRows), estRows, newEstRows).map(r=>({...stripId(r), reference_number:contractNumber}))); if(lnErr) throw lnErr; }
-  if(termsRows?.length) await sb.from("quote_commercial_terms").insert(termsRows.map(r=>({...stripId(r), reference_number:contractNumber, validity:null})));   // 180: no Validity on an Order Acceptance
+  if(termsRows?.length) await sb.from("quote_commercial_terms").insert(termsRows.map(r=>({...stripId(pfNormTerms(r)), reference_number:contractNumber, validity:null})));   // 180: no Validity on an Order Acceptance
   if(noteRows?.length) await sb.from("quote_notes").insert(noteRows.map(r=>({...stripId(r), reference_number:contractNumber})));
   if(onlyLiveSl(dsRows, estRows).length) await sb.from("datasheets").insert(onlyLiveSl(dsRows, estRows).map(r=>({...stripId(r), reference_number:contractNumber})));   // 156
   if(epRows?.length) await sb.from("quote_extra_price_tbl").insert(epRows.map(r=>({...stripId(r), reference_number:contractNumber})));
@@ -36783,6 +36796,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Nov 2026", summary:"Built on 2026-11-17T02:30:00Z, on top of 2026-11-17T02:00:00Z. No SQL. \ud83d\udcc4 DATASHEET IN THE QUOTE PDF: a Sl No whose Model is not in the catalogue (a one-off model typed on the quote, e.g. ISWB-1440-CUNI) now takes its Item from its own BOM lines \u2014 the same way the Datasheet screen opens it \u2014 so its saved datasheet prints in Annexure III instead of being skipped. The same Item now shows in the price summary, the HSN lookup, the BOM with estimate and the Excel price list for such Sl Nos (they showed the Model before). Catalogue models and Direct Price lines are unchanged." },
+  { date:"17 Nov 2026", summary:"Built on 2026-11-17T02:00:00Z, on top of 2026-11-17T01:30:00Z. No SQL in the build (a one-time data fix for FXAD260007-R02 comes with it). (1) P&F ON QUOTES NOBODY HAS RE-SAVED: a P&F figure with no basis is read as a percentage everywhere it is used \u2014 quote PDF (cover, Annexure I, price summary), copies to a revision or an Order Acceptance, proforma, delivery challan and invoices. It is what the Commercial Terms form shows for it, so a 5% typed on a quote loaded from outside the app now prints without re-saving. (2) PURCHASE ORDER ON A QUOTE: the mandatory Purchase Order requirement is raised only for an Order Acceptance (a sale order must exist). A quote no longer shows a PO requirement raised for an Order Acceptance, in the Documents box or the quote readiness." },
   { date:"17 Nov 2026", summary:"Built on 2026-11-17T01:30:00Z, on top of 2026-11-16T12:00:00Z. No SQL. \u270b THE USER ALWAYS WINS: whatever is loaded into a quote from outside the app (SQL, legacy loads) is only a starting point, and a change made in the app always takes effect. COMMERCIAL TERMS \u203a PACKING & FORWARDING: (1) The dropdown shows Percentage when nothing is stored; the form now holds Percentage too, so Save stores the basis with the value (before, a typed 5% was saved with no basis and the PDF ignored it \u2014 FXAD260007-R02). (2) Once a % or a lumpsum is typed, older P&F text the form does not show is cleared on Save: the old free-text P&F, and on a quote the P&F note (an Order Acceptance still edits its notes). (3) The form says so in a yellow note under P&F before you save. An old quote with only P&F text and no value keeps printing its text until someone types a % or lumpsum. The quote PDF already prints a basis and value first and the text only when no basis is set \u2014 unchanged." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T12:00:00Z, on top of 2026-11-16T10:00:00Z. No SQL. 🧾 GRN VALUES: (1) The expected bill on a GRN now uses the PO line each GRN line is linked to (it showed ₹ 0 when the PO lines had only a description). (2) Every GRN line shows its PO line, PO rate, value, GST % / GST and total, with a total row at PO rates and the PO's charges (P&F etc.) noted. (3) ⬇ Fill lines from PO adds one row per PO line still pending, already linked — Stores corrects the quantity, picks the stock item and gives Rack / Bin; only the Purchase Manager post or a Super Admin can change a line's PO line. (4) A PO line with no rate: the Purchase Manager post (or a Super Admin) enters the rate on the GRN line with a reason (audit log). (5) Clear GRN when the bill does not match the PO rates (or lines have no rate): allowed after a warning, and a card goes to the Purchase Manager, Finance Director and Accounts posts and the Super Admins. (6) The older PO line editor needs a rate above 0. (7) MANDATORY FIELDS: every label ending in * shows a red asterisk across the app; PO Vendor, PO date, Purchased for, line Qty and Rate now carry it." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T10:00:00Z, on top of 2026-11-16T09:00:00Z. No SQL. 🚚 SHIP-TO AWAITED: its own list (Tasks › 🚚 Ship-to awaited, and a summary with Open the list on the Accounts post's board) of every Order Acceptance saved with ship-to “to be advised” — from the day the OA is saved. Stale only once the order is in Production in progress on the Order Status board (red, days stale, first in the list; then it also shows in Stale / Pending Actions and the Sales Head and the order's FSE get one bell). Before that it is Waiting (amber when a letter is due) and counts nowhere as stale. Each order: contract · quote · client, stage with a bar, letters sent and the next one, Make letter (PDF), Mark sent, Enter ship-to, and 💬 WhatsApp to the FSE when stale. Letters unchanged (No. 1 from the Final Hold documents stage). No PDF block for Accounts." },
@@ -74370,7 +74385,7 @@ function OsLotPanel({ lotId, user, me, P, so, onClose, onChanged, sessionCompany
     let d = null; if(l.dc_id){ const { data } = await sb.from("dc_tbl").select("*").eq("id",l.dc_id).maybeSingle(); d = data||null; } if(d){ try{ await osInvLoad([d]); }catch(e){} } setDc(d);   // 344
     let iv = null; if(d){ const { data } = await sb.from("invoice_tbl").select("id,invoice_no,invoice_date,grand_total,status,currency").eq("dc_id",d.id).maybeSingle(); iv = data||null; } setInv(iv);
     let g = null; if(d && d.gate_pass_id){ try{ const { data } = await sb.from("gate_pass_tbl").select("*").eq("id",d.gate_pass_id).maybeSingle(); g = data||null; }catch(e){} } setGp(g);
-    let t = null; try{ const { data } = await sb.from("quote_commercial_terms").select("*").eq("reference_number",l.contract_number).limit(1); t = (data||[])[0]||null; }catch(e){} setTerms(t);
+    let t = null; try{ const { data } = await sb.from("quote_commercial_terms").select("*").eq("reference_number",l.contract_number).limit(1); t = pfNormTerms((data||[])[0]||null); }catch(e){} setTerms(t);
     try{ const { data } = await sb.from("proforma_tbl").select("id,pi_no,rev,status,issued_at,sent_at").eq("contract_number",l.contract_number); setPis(data||[]); }catch(e){ setPis([]); }
     const credit = (()=>{ const pt = String((t && (t.payment_term||t.payment_terms))||""); const m = pt.match(/(\d{1,3})\s*days?/i); if(m) return Number(m[1]); if(/advance|against (pi|proforma|delivery)/i.test(pt)) return 0; return 30; })();
     const base = (iv && iv.invoice_date) ? String(iv.invoice_date).slice(0,10) : toISODate(new Date());
@@ -84764,6 +84779,7 @@ async function invMakeFromDc(dcId, user){
     sb.from("quote_commercial_terms").select("*").eq("reference_number",dc.contract_number).maybeSingle(),
     sb.from("estimates").select("*").eq("reference_number",dc.contract_number)]);
   const head = (ests||[])[0]||{};
+  pfNormTerms(terms);   // 2026-11-17T02:00:00Z
   const currency = dc.is_export ? String(C.currency||"USD").toUpperCase() : "INR";
   const fx = dc.is_export ? (Number(head.conversion_rate)||0) : 1;
   const today = toISODate(new Date());
@@ -85059,7 +85075,7 @@ async function invDclFor(dcId){
 async function invOaNow(inv){
   const x = await despLoadDc(inv.dc_id); const dc = x.dc; if(!dc) throw new Error("The DC of this invoice was not found.");
   const C = await despContract(inv.contract_number, dc.id);
-  const { data: terms } = await sb.from("quote_commercial_terms").select("*").eq("reference_number",inv.contract_number).maybeSingle();
+  const { data: terms } = await sb.from("quote_commercial_terms").select("*").eq("reference_number",inv.contract_number).maybeSingle(); pfNormTerms(terms);   // 2026-11-17T02:00:00Z
   const buyerCode = invStateCodeFromGstin(C.buyerGstin) || invStateCodeFromName(C.company && (C.company.billing_state||C.company.state));
   const dd = C.despatch||{};
   const ship = [dd.ship_contact||dc.ship_contact, dd.ship_address||dc.ship_address||C.oaShip, dd.ship_phone||dc.ship_phone].filter(Boolean).join("\n")||null;
@@ -86384,6 +86400,7 @@ async function invMakeService(ct, picks, user){
     sb.from("quote_commercial_terms").select("*").eq("reference_number",ct).maybeSingle(),
     sb.from("estimates").select("*").eq("reference_number",ct)]);
   const head = (ests||[])[0]||{};
+  pfNormTerms(terms);   // 2026-11-17T02:00:00Z
   const isExport = String(C.currency||"INR").toUpperCase()!=="INR";
   const currency = isExport ? String(C.currency||"USD").toUpperCase() : "INR";
   const fx = isExport ? (Number(head.conversion_rate)||0) : 1;
@@ -86711,7 +86728,7 @@ async function diMakeFromContract(cn, why, user){
   if(!C.ests.length) throw new Error("Contract "+cn+" has no Sl Nos.");
   const av = await diAvailable(cn, null);
   if(![...av.values()].some(o=>o.left>0)) throw new Error("Nothing is left to invoice on contract "+cn+": every Sl No is on a tax invoice or another open direct invoice.");
-  const { data: terms } = await sb.from("quote_commercial_terms").select("*").eq("reference_number",cn).maybeSingle();
+  const { data: terms } = await sb.from("quote_commercial_terms").select("*").eq("reference_number",cn).maybeSingle(); pfNormTerms(terms);   // 2026-11-17T02:00:00Z
   const ests = C.ests; const head = ests[0]||{};
   const isExp = !!C.isExport;
   const currency = isExp ? String(C.currency||"USD").toUpperCase() : "INR";
@@ -87114,7 +87131,7 @@ async function piMakeFromContract(cn, user){
   const C = await despContract(cn);
   if(!C.so && !C.ests.length) throw new Error("No contract "+cn+".");
   if(!C.ests.length) throw new Error("Contract "+cn+" has no Sl Nos.");
-  const { data: terms } = await sb.from("quote_commercial_terms").select("*").eq("reference_number",cn).maybeSingle();
+  const { data: terms } = await sb.from("quote_commercial_terms").select("*").eq("reference_number",cn).maybeSingle(); pfNormTerms(terms);   // 2026-11-17T02:00:00Z
   const ests = C.ests; const head = ests[0]||{};
   const isExp = !!C.isExport;
   const currency = isExp ? String(C.currency||"USD").toUpperCase() : "INR";
