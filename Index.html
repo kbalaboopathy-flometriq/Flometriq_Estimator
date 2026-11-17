@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-17T05:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-17T12:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -3676,7 +3676,7 @@ function MenuTabs({ user, active, onChange, onRefresh }) {
     { label:"Inventory", tabs:[{key:"imt_outward",label:"Material Outward"},{key:"imt_stock",label:"Stock on hand"},{key:"imt_ledger",label:"Material ledger"},{key:"imt_pieces",label:"Pieces & scrap"},{key:"material_rates",label:"Material rates"},{key:"imt_master",label:"Stock items (master rates)"},{key:"imt_opening",label:"Opening stock"},{key:"pb_budget_st",label:"Budget control"},{key:"sp_report_st",label:"Spend report"},{key:"pr_list_st",label:"Purchase Requisitions"},...(ovAccess?[{key:"imt_overrun",label:"Issue overrun codes"}]:[])] },   // 348 / 349 · 2026-11-17: stock items back on the ribbon — Pending Actions sends Stores there for master rates
   ]};
   const accountsGroup = { label:"Accounts", subgroups:[
-    { label:"Billing", tabs:[{key:"bill_register",label:"Invoice & PI Register"},{key:"proforma_invoices",label:"Proforma Invoices"},{key:"tax_invoices",label:"Tax Invoices"},{key:"direct_invoices",label:"Direct Invoices (Accounts)"},{key:"legacy_proforma",label:"Legacy Proforma (load)"}] },   // 166, 185k proforma
+    { label:"Billing", tabs:[{key:"bill_register",label:"Invoice & PI Register"},{key:"proforma_invoices",label:"Proforma Invoices"},{key:"tax_invoices",label:"Tax Invoices"},{key:"einv_inbox",label:"E-invoice inbox (portal JSON)"},{key:"einv_report",label:"Invoices vs e-invoice"},{key:"direct_invoices",label:"Direct Invoices (Accounts)"},{key:"legacy_proforma",label:"Legacy Proforma (load)"}] },   // 166, 185k proforma
     { label:"Vouchers & Books", tabs:[{key:"acc_voucher_new",label:"Vouchers"},{key:"acc_vouchers",label:"Voucher Register"},{key:"acc_daybook",label:"Day Book"},{key:"acc_ledger",label:"Ledger"},{key:"acc_po_link",label:"Bills ↔ POs"},{key:"grn_bill_pending",label:"Bill Not Recd — GRN raised"},...(poAccess?[{key:"purchase_owners",label:"Purchase Owners"}]:[])] },   // 188 accounts, 213 bills ↔ POs
     { label:"Statements", tabs:[{key:"acc_dash",label:"Dashboard"},{key:"acc_reports",label:"Reports"},{key:"acc_bank",label:"Bank Stock Statement"},{key:"acc_tb",label:"Trial Balance"},{key:"acc_pl",label:"Profit & Loss"},{key:"acc_bs",label:"Balance Sheet"},{key:"acc_cf",label:"Cash Flow"},{key:"acc_cashbook",label:"Cash Book"},{key:"acc_bankbook",label:"Bank Book & Reconciliation"},{key:"acc_debtors",label:"Debtors"},{key:"acc_creditors",label:"Creditors"},{key:"acc_gst",label:"GST Statements"},{key:"acc_tds",label:"TDS Register"},{key:"acc_registers",label:"Sales & Purchase Registers"},{key:"acc_assets",label:"Fixed Asset Register"},{key:"acc_contracts",label:"Contract Profitability"}] },
     { label:"Close & Masters", tabs:[{key:"acc_period",label:"Period Close"},{key:"acc_stock_types",label:"Stock types"},{key:"acc_coa",label:"Chart of Accounts"},{key:"acc_ledgers",label:"Ledgers"},{key:"acc_import",label:"FFS Import"},{key:"acc_discrep",label:"Discrepancies"},{key:"acc_export",label:"Export for Auditor"}] } ] };
@@ -15141,6 +15141,115 @@ function paymentTermSmellsOfAdvance(term){
   return /\d{1,3}\s*%[^.;]{0,30}\b(order|po|p\.o|pi|p\.i)\b/.test(t);
 }
 
+
+// ---- 2026-11-17T05:30:00Z: STAGE · ORDER STATUS · DOCUMENTS on the Order Acceptance (tiles like the quote's Stage panel) ----
+let OAF_M = null, OAF_AT = 0;
+async function oafM(force){ if(!force && OAF_M && Date.now()-OAF_AT < 120000) return OAF_M; const M = await ospLoad(); OAF_M = M; OAF_AT = Date.now(); return M; }
+const OAF_ORDER = ["so","doc","ph","wo","bom","pbm","pbe","pba","pr","pur","prod"];
+const OAF_SHORT = { so:"OA", doc:"Documents", ph:"Production hold", wo:"W/O release", bom:"BOM summary", pbm:"Purchase BOM — made", pbe:"Purchase BOM — endorsed", pba:"Purchase BOM — approved", pr:"PR release", pur:"Material in", prod:"Production" };
+// this contract's documents, sorted into the Document Control board's lists (same rules as the board)
+async function oafDocCounts(cn){
+  const out = { init:0, c3:0, c2in:0, client:0, c2out:0, done:0, confirm:0, parked:0 };
+  try{
+    if(!DOC_CUSTOM.length){ try{ const r = await sb.from("doc_board_list_tbl").select("*").order("id"); if(!r.error) DOC_CUSTOM = (r.data||[]).filter(c=>c.active!==false).map(docCustomNorm); }catch(e){} }
+    const [dR, rR, statuses, cR] = await Promise.all([
+      sb.from("universal_documents_tbl").select("*").eq("entity_type","contract").eq("entity_id",String(cn)),
+      sb.from("document_requests_tbl").select("*").eq("entity_type","contract").eq("entity_id",String(cn)),
+      loadDocStatuses(), sb.from("doc_category_tbl").select("*") ]);
+    const docs = (dR.data||[]).filter(d=>!d.is_archived && docOnBoard(d.category)); const reqs = rR.data||[]; const cats = cR.data||[];
+    const stBy = {}; (statuses||[]).forEach(x=>{ stBy[docStatusName(x)] = x; });
+    let hist = []; if(docs.length){ const hR = await sb.from("universal_document_history_tbl").select("*").in("document_id",docs.map(d=>d.id)); hist = hR.data||[]; }
+    const ids = new Set(docs.map(d=>String(d.id)));
+    docs.forEach(d=>{
+      const revs = hist.filter(r=>String(r.document_id)===String(d.id)).sort((x,y)=>(Number(x.rev_number)||0)-(Number(y.rev_number)||0) || String(x.changed_at||"").localeCompare(String(y.changed_at||"")) || (Number(x.id)||0)-(Number(y.id)||0));
+      const last = revs[revs.length-1]||null; const status = last ? (last.status||"") : ""; const st = stBy[status];
+      if(last && docSkips(st)){ out.confirm++; return; }
+      const req0 = reqs.find(r=>String(r.fulfilled_document_id)===String(d.id))||null;
+      if(docInfoOnly(d, cats, req0) && last && last.direction==="Out" && !last.legacy_unsent){ out.done++; return; }
+      const list = last ? docStatusListKey(st, status) : "our"; const bucket = last ? docStatusBucketOf(st, status) : "our_action";
+      const it = { list, bucket, revs, sub: docStatusSubKey(st) };
+      if(docParked(it)){ out.parked++; return; }
+      if(list==="our") { if(docSentBefore(it)) out.c3++; else out.init++; }
+      else if(list==="code2" || list==="phold"){ if(docIsOut(it)) out.c2out++; else out.c2in++; }
+      else if(list==="client") out.client++;
+      else if(list==="done" || list==="info") out.done++;
+      else if(list==="confirm") out.confirm++;
+    });
+    reqs.filter(r=>docOnBoard(r.category) && (!r.fulfilled_document_id || !ids.has(String(r.fulfilled_document_id)))).forEach(()=>out.init++);
+  }catch(e){ console.warn("OA documents count", e); out.err = true; }
+  return out;
+}
+function oafGoDocs(cn, tile){ try{ window.__navMem.dc_mode = "one"; window.__navMem.dc_ct = String(cn); if(tile) window.__navMem.dc_tile = tile; else delete window.__navMem.dc_tile; }catch(e){}
+  try{ window.dispatchEvent(new CustomEvent("flo-open-tab",{ detail:{ tab:"doc_board" } })); }catch(e){} }
+function oafGoBoard(cn){ try{ window.__navMem.os_one = String(cn); }catch(e){} try{ window.dispatchEvent(new CustomEvent("flo-open-tab",{ detail:{ tab:"order_board" } })); }catch(e){} }
+function OaFunnelPanel({ contractInfo, statusOptions, changeStatus }){
+  const cn = String(contractInfo.contract_number||"");
+  const [open,setOpen] = useState(()=>{ try{ return localStorage.getItem("oaf_open")==="1"; }catch(e){ return false; } });
+  const [x,setX] = useState(null); const [dc,setDc] = useState(null); const [at,setAt] = useState("");
+  const load = async(force)=>{ try{ const M = await oafM(force); setX(ospStage(cn, M)); }catch(e){ setX({ err:true }); }
+    setDc(await oafDocCounts(cn)); setAt(new Date().toLocaleTimeString("en-GB",{ hour:"2-digit", minute:"2-digit" })); };
+  useEffect(()=>{ setX(null); setDc(null); load(false); },[cn, contractInfo.status, contractInfo.go_ahead_state]);
+  const tog = ()=>{ const n = !open; setOpen(n); try{ localStorage.setItem("oaf_open", n?"1":"0"); }catch(e){} };
+  const st = contractInfo.status||"Draft"; const locked = !soAllApproved(contractInfo);
+  const opts = (statusOptions||[]).length ? statusOptions : [st];
+  const main = opts.filter(o=>!/cancel|closed/i.test(o)), ends = opts.filter(o=>/cancel|closed/i.test(o));
+  const curIx = main.indexOf(st);
+  const p = (t,bg,fg,k)=> h("span",{key:k,style:{fontSize:11.5,fontWeight:700,borderRadius:9,padding:"2px 9px",background:bg,color:fg,whiteSpace:"nowrap"}},t);
+  const ended = /cancel|closed/i.test(st);
+  const stage = x && !x.err ? x.stage : null; const tone = stage ? ospStageTone(stage) : ["#eceee9","#5f655e"];
+  const withUs = dc ? dc.init+dc.c3+dc.c2in : 0, withCl = dc ? dc.client+dc.c2out : 0;
+  const tile = (key, label, sub, kind, onClick, extra)=> h("div",{key,"data-testid":"oaf-tile","data-k":key,onClick,title:onClick?undefined:"",style:{flex:"1 1 92px",minHeight:44,borderRadius:7,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",textAlign:"center",padding:"5px 6px",fontSize:12.5,position:"relative",cursor:onClick?"pointer":"default",
+      ...(kind==="cur" ? { background:(extra&&extra.bg)||"#0f6e56", color:"#fff", fontWeight:700, border:"1px solid "+((extra&&extra.bg)||"#0f6e56") } : kind==="done" ? { background:"#e9f6f0", color:"#1c3b30", border:"1px solid #bfe3d4" } : { background:"#f2f1ec", color:"#8a8e84", border:"1px solid #dedbd1" })}},
+    label, sub ? h("small",{style:{fontSize:10.5,opacity:.85,marginTop:2}},sub) : null,
+    extra && extra.mark ? h("span",{style:{position:"absolute",top:-7,right:-4,fontSize:9.5,fontWeight:700,borderRadius:8,padding:"0 6px",background:extra.markRed?"#fdecea":"#efe9fb",color:extra.markRed?"#8a2a22":"#5b3fa3",border:"1px solid "+(extra.markRed?"#f0b8b2":"#d9cdf3")}},extra.mark) : null);
+  const box = { background:"#faf9f4", border:"1px solid "+colors.border, borderRadius:10, padding:"10px 12px", marginTop:8 };
+  const headRow = (title, cur, hint, right)=> h("div",{style:{display:"flex",alignItems:"baseline",gap:10,marginBottom:7,flexWrap:"wrap"}}, h("b",{style:{fontSize:14}},title), h("span",{style:{color:"#3f4a42"}},cur), hint ? h("span",{style:{color:colors.muted,fontSize:12}},hint) : null, right ? h("span",{style:{marginLeft:"auto",color:colors.mutedLight,fontSize:11.5}},right) : null);
+  // folded line
+  const fold = h("div",{"data-testid":"oaf-fold",onClick:tog,style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:10,padding:"7px 12px",marginTop:8,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",cursor:"pointer"}},
+    h("b",null,"Stage"), p((locked?"🔒 ":"")+st, ended?"#eceee9":"#0f6e56", ended?"#5f655e":"#fff","s"),
+    h("b",{style:{marginLeft:6}},"Order"), x==null ? h("span",{style:{color:colors.muted,fontSize:12}},"…") : p(stage ? ospLabelOf(stage) : ended ? st : "—", tone[0], tone[1], "o"), x && x.hold ? p("On hold","#fbe7e4","#b2342a","h") : null,
+    h("b",{style:{marginLeft:6}},"Documents"), dc==null ? h("span",{style:{color:colors.muted,fontSize:12}},"…") : [p(withUs+" with us", withUs?"#fdecea":"#eceee9", withUs?"#a3312a":"#5f655e","u"), p(withCl+" with client", withCl?"#fff4d6":"#eceee9", withCl?"#8a6400":"#5f655e","c"), p(dc.done+" approved","#e4f3ed","#0f7a5c","d")],
+    h("span",{style:{marginLeft:"auto",color:"#2a6fb0",fontSize:12}}, open ? "▾ Hide" : "▸ Show"));
+  if(!open) return fold;
+  // 1 · Stage
+  const stagePanel = h("div",{"data-testid":"oaf-stage",style:box},
+    headRow("Stage", st, locked ? "🔒 Locked until the Commercial Terms are approved" : "Click a tile to move the Stage", at ? "checked "+at : ""),
+    h("div",{style:{display:"flex",gap:6,flexWrap:"wrap"}}, main.map((o,i)=>{ const kind = o===st ? "cur" : (curIx>=0 && i<curIx) ? "done" : "next";
+      return tile("s"+i, o, null, kind, (locked || o===st) ? null : ()=>{ if(!confirm("Change the Stage of "+cn+" from “"+st+"” to “"+o+"”?")) return; changeStatus(o); }); })),
+    ends.length ? h("div",{style:{marginTop:8,fontSize:12,color:colors.muted,display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}, "Or close it:",
+      ends.map(o=>h("button",{key:o,disabled:locked||o===st,onClick:()=>{ if(/cancel/i.test(o)){ changeStatus(o); return; } if(!confirm("Set "+cn+" to “"+o+"”?")) return; changeStatus(o); },style:{...btnSmall,fontSize:12,padding:"3px 12px",background:o===st?"#5f655e":"#fff",color:o===st?"#fff":colors.text}},o)),
+      h("span",{style:{fontSize:11.5}},"· Amend and Cancel order… stay beside the approvals above")) : null);
+  // 2 · Order status
+  let orderPanel;
+  if(x==null) orderPanel = h("div",{style:box}, headRow("Order status","…"));
+  else if(x.err) orderPanel = h("div",{style:box}, headRow("Order status","could not be read — press Refresh"));
+  else { const ci = OAF_ORDER.indexOf(stage); const steps = OAF_ORDER.filter(k=> k!=="ph" || stage==="ph");
+    const behind = ospBehind(x);
+    orderPanel = h("div",{"data-testid":"oaf-order",style:box},
+      headRow("Order status", stage ? ospLabelOf(stage) : ended ? st : "not on the board", "Shows where the order stands — it moves at each step's own gateway. Click to open the Order Status board."),
+      h("div",{style:{display:"flex",gap:6,flexWrap:"wrap"}}, steps.map(k=>{ const i = OAF_ORDER.indexOf(k); const kind = k===stage ? "cur" : (ci>=0 && i<ci) ? "done" : "next";
+        const ex = k===stage ? { bg:tone[1], mark: behind ? "placed by hand ⚠" : x.ov ? "placed by hand" : x.hold ? "On hold" : "", markRed:behind } : null;
+        const sub = k===stage && x.ov && behind ? "data: "+(OAF_SHORT[x.dataStage]||x.dataStage) : (k==="doc" && x.dataStage==null && kind==="done" ? "✓" : null);
+        return tile("o"+k, OAF_SHORT[k], sub, kind, ()=>oafGoBoard(cn), ex); })),
+      (()=>{ try{ const t = ospDocs(cn, OAF_M).gateTxt; return t ? h("div",{style:{marginTop:7,fontSize:12,color:colors.muted}},t) : null; }catch(e){ return null; } })());
+  }
+  // 3 · Documents
+  const dTile = (key, n, label, bg, fg, tileKey)=> h("div",{key,"data-testid":"oaf-doc","data-k":key,onClick:()=>oafGoDocs(cn, tileKey),style:{flex:"1 1 110px",borderRadius:8,padding:"6px 8px",textAlign:"center",cursor:"pointer",background:bg,color:fg,opacity:n?1:.45}},
+    h("div",{style:{fontSize:19,fontWeight:800}},n), h("div",{style:{fontSize:11.5}},label));
+  const docPanel = h("div",{"data-testid":"oaf-docs",style:box},
+    headRow("Documents", dc==null ? "…" : (withUs+" with us · "+withCl+" with the client · "+dc.done+" approved"), "This contract on the Document Control board — click to open it there"),
+    dc==null ? null : h("div",{style:{display:"flex",gap:6,flexWrap:"wrap"}},
+      dTile("init", dc.init, "Initial pending", "#fdecea", "#a3312a", "init"),
+      dTile("c3", dc.c3, "Code 3 — In", "#fbe8ef", "#c2406d", "resub"),
+      dTile("c2in", dc.c2in, "Code 2 — In", "#fbe8f1", "#b03a78", "resub"),
+      dTile("client", dc.client, "Out — awaiting code", "#fff4d6", "#8a6400", "client"),
+      dTile("c2out", dc.c2out, "Code 2 — Out", "#fff7d9", "#b58d00", null),
+      dTile("done", dc.done, "Code 1 — approved", "#e4f3ed", "#0f7a5c", null),
+      dc.confirm ? dTile("confirm", dc.confirm, "Status to confirm", "#eceee9", "#6f7377", "confirm") : null,
+      dc.parked ? dTile("parked", dc.parked, "Non Critical", "#eef3f8", "#2a6fb0", null) : null));
+  return h("div",{"data-testid":"oaf"}, fold, stagePanel, orderPanel, docPanel,
+    h("div",{style:{textAlign:"right",marginTop:4}}, h("button",{onClick:()=>{ setX(null); setDc(null); load(true); },style:{...btnSmall,fontSize:11}},"↻ Refresh")));
+}
 function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, onEditDetails, onPoFieldsSaved }){
   const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
   const isSuperAdmin = user.role==="super_admin";
@@ -16107,20 +16216,10 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
       h("div",{style:{display:"flex",alignItems:"center",gap:5,marginLeft:"auto"}},
         h(SoAmendChip,{contractInfo,user,onChanged}),   // 2026-10-31T16:00:00Z: the amendment gateway
         h(SoCancelChip,{contractInfo,user,onChanged}),   // 2026-10-31T10:00:00Z: the cancellation gateway
-        h("span",{style:{fontSize:11,color:colors.muted}},"Stage:"),
-        // Locked until all three sections are approved (27-28 Aug) —
-        // approval is a GATE on whether Stage can move at all, never a
-        // trigger for what it moves to. Once unlocked, it's fully
-        // manual — nothing advances it automatically, including
-        // generating the PDF (that only offers to, via a separate
-        // prompt, never forces it).
-        soAllApproved(contractInfo)
-          ? h("select",{value:contractInfo.status||"Draft",onChange:e=>changeStatus(e.target.value),style:{...inputStyle,padding:"3px 6px",fontSize:11}},
-              statusOptions.map(s=>h("option",{key:s,value:s},s))
-            )
-          : h("span",{style:{fontSize:11,fontWeight:600,color:colors.mutedLight},title:"Locked until Accounts approves the Commercial Terms"},"🔒 "+(contractInfo.status||"Draft"))
+        // 2026-11-17T05:30:00Z: the Stage dropdown became tiles in the Stage · Order status · Documents panel below (same lock, same changeStatus)
       )
-    )
+    ),
+    h(OaFunnelPanel,{ key:"oaf"+contractInfo.contract_number, contractInfo, statusOptions, changeStatus })
   );
 }
 
@@ -36806,6 +36905,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Nov 2026", summary:"Built on 2026-11-17T12:00:00Z, on top of 2026-11-17T05:30:00Z. NEEDS SQL: structure_einvoice_json_2026-11-17.sql (BOTH companies; the last line switches e-invoicing on — Flometriq only). E-INVOICE FROM THE PORTAL JSON: on a Ready-for-IRN invoice, ⬆ Upload e-invoice JSON reads the file the portal gives (Download JSON), checks invoice no, date, both GSTINs, taxable value, GST and the total before round-off against the app's invoice (refused with a field-by-field table and what to do if any differs; HSN and round-off are warnings), then saves IRN, Ack, signed QR, the file and the portal's round-off (the app follows the portal), issues the invoice and marks it sent in the same step (FSE and Sales Head told). Backup OneDrive link optional at that moment — a card gives 3 days, then stale. JSON more than 1 working day after the portal's Ack: noted on the invoice and Super Admins told. Goods over ₹50,000 without the e-way bill: the IRN goes in and the invoice waits for it, as before. Invoices whose IRN was entered by hand can attach the JSON (adds the QR). Accounts › Billing: E-invoice inbox (several files at once, matched by invoice number) and the Invoices vs e-invoice report (date range, customer, domestic/export, status totals, Excel). Settings › gateway card: E-invoicing in use (off = buttons greyed)." },
+  { date:"17 Nov 2026", summary:"Built on 2026-11-17T05:30:00Z, on top of 2026-11-17T05:00:00Z. No SQL. ORDER ACCEPTANCE: a Stage · Order status · Documents panel like the quote's Stage panel. Folded to one line by default (remembered per browser). Stage: the Stage dropdown is now tiles (same lock until the Commercial Terms are approved, asks before changing; Closed / Cancelled under “Or close it:”). Order status: OA → Documents → W/O release → BOM summary → Purchase BOM (made / endorsed / approved) → PR → Material in → Production, from the Order Status board, with placed-by-hand and On hold marks and the W/O gate line; click opens the board on the contract. Documents: the contract's cards per Document Control list (Initial pending, Code 3 In, Code 2 In, Out awaiting code, Code 2 Out, Code 1); click opens Document Control on the contract (and on the matching tile)." },
   { date:"17 Nov 2026", summary:"Built on 2026-11-17T05:00:00Z, on top of 2026-11-17T04:30:00Z. No SQL. ORDER PROCESSING REVIEW: (1) the OA block follows the OA's own data — Not made / Waiting approval / Not marked sent; a card placed by hand on the Order Status board no longer brings a sent OA into the meeting. (2) Every row shows the contract's Order Status column as a badge under the customer (board colours), with On hold and placed-by-hand marks. ORDER STATUS BOARD: a card placed by hand in a column behind where its own data puts it shows a red badge “Placed here by hand on … by … — its data says …”; a Super Admin or the Document Controller post can press Follow the data to clear the hand placement (logged)." },
   { date:"17 Nov 2026", summary:"Built on 2026-11-17T04:30:00Z, on top of 2026-11-17T03:00:00Z. No SQL. ORDER PROCESSING REVIEW now takes its documents from the Document Control board itself, so the two always agree: Initial submission pending → Initial GAD / ITP / procedures, and a new block Other initial submissions for the rest; Code 3 — In, resubmit → Code 3; Code 2 clear / hold — In, resubmit → Code 2. Every card is listed (on time ones too, marked Not due yet), with the board's owner (or Unassigned) and due date. Cards the board leaves out (Status to confirm, Non Critical) stay out. Resubmissions need no committed date to close the meeting. OA, W/O release, BOM summary and PR blocks are unchanged." },
   { date:"17 Nov 2026", summary:"Built on 2026-11-17T03:00:00Z, on top of 2026-11-17T02:30:00Z. No SQL. QUOTE / OA HEADER: (1) On the Quote screen the Find box lists quotes only — Order Acceptance numbers no longer appear in it (the OA screen already listed OAs only). (2) Quote header: 'Enquiry number' is now 'Quote number' and shows the quote's own number (read-only); Enquiry date is no longer shown or edited (the stored date is kept for the Enquiry Register). (3) Order Acceptance header: Enquiry number and Enquiry date are gone; 'From quote: <quote no>' shows the quote the OA came from as a link that opens it. The same applies to the line above each Sl No (Quote# / From quote, no Enquiry date)." },
@@ -60829,6 +60930,8 @@ function App() {
     tab==="despatch_settings"?h(DespatchSettingsScreen,{user:uTab}):
     String(tab||"").startsWith("acc_")?h(AccountsScreen,{user:uTab,route:tab,onGo:setTab}):   // 188
     tab==="tax_invoices"?h(InvoicesScreen,{user:uTab}):
+    tab==="einv_inbox"?h(EinvInboxScreen,{user:uTab}):   // 2026-11-17T12:00:00Z
+    tab==="einv_report"?h(EinvReportScreen,{user:uTab}):
     tab==="direct_invoices"?h(DirectInvoicesScreen,{user:uTab}):
     tab==="petty_purchases"?h(PettyPurchasesScreen,{user:uTab}):   // 248
     tab==="purchase_rules"?h(PurchaseRulesScreen,{user:uTab}):   // 247
@@ -66753,7 +66856,7 @@ function DocControlScreen({ user, company, initialPanel, onOpenContract, onOpenT
   const [lt,setLt] = useState({ sel:null, edit:null, sentOn:"" });
   const [rep,setRep] = useState({ ct:"all", ext:false });
   const [contactCache,setContactCache] = useState({});
-  const [tile,setTile] = useState(null);     // 174: picked count tile
+  const [tile,setTile] = useState(()=>{ let t = null; try{ t = window.__navMem.dc_tile || null; delete window.__navMem.dc_tile; }catch(e){} return t; });     // 174: picked count tile (2026-11-17T05:30:00Z: the OA's Documents tiles open it on a tile)
   const [mine,setMine] = useState(false);    // 174: count / show only my cards
   const [del,setDel] = useState(null);       // 174: open contracts with a delivery date
   const [ad,setAd] = useState({});
@@ -85344,7 +85447,264 @@ function osInvClock(dc){
   return { c, days, lim, stale, since, owner:(st && st.owner)||null, iv };
 }
 // open the invoice of a lot from the board (the step that does the work)
-let INV_OPEN_TARGET = null;   // { id } or { dcId } — the Tax Invoices screen opens it when it mounts / hears flo-inv-open
+let INV_OPEN_TARGET = null;
+// ---- 2026-11-17T12:00:00Z: E-INVOICE JSON FROM THE GOVERNMENT PORTAL (download from the IRP, upload here) ----
+// The portal's file: { AckNo, AckDt, Irn, SignedInvoice (JWT), SignedQRCode (JWT), Status, EwbNo, EwbDt, EwbValidTill }.
+// The signed parts carry the invoice itself; the app reads them and checks them against its own invoice before saving anything.
+let INV_JSON_PENDING = null;   // { invoiceId, E, name } — the E-invoice inbox opens the invoice with the file ready
+function einvB64(s){ s = String(s||"").replace(/-/g,"+").replace(/_/g,"/"); while(s.length%4) s += "=";
+  const bin = atob(s); try{ return decodeURIComponent(Array.prototype.map.call(bin,c=>"%"+("00"+c.charCodeAt(0).toString(16)).slice(-2)).join("")); }catch(e){ return bin; } }
+function einvJwtData(t){ try{ const p = JSON.parse(einvB64(String(t||"").split(".")[1]||"")); const d = p && p.data; return typeof d==="string" ? JSON.parse(d) : (d || null); }catch(e){ return null; } }
+function einvDmyIso(s){ const m = String(s||"").match(/^(\d{2})\/(\d{2})\/(\d{4})/); return m ? m[3]+"-"+m[2]+"-"+m[1] : (String(s||"").match(/^\d{4}-\d{2}-\d{2}/) ? String(s).slice(0,10) : null); }
+const einvNo = (s)=> String(s||"").toUpperCase().replace(/\s+/g,"");
+const einvGstin = (s)=> String(s||"").toUpperCase().replace(/\s+/g,"");
+// one file → a list of e-invoices (the portal gives one; a bulk download may give several)
+function einvParse(text, name){
+  let o; try{ o = JSON.parse(String(text||"").replace(/^﻿/,"")); }catch(e){ return [{ name, err:"This is not a JSON file the app can read." }]; }
+  const arr = Array.isArray(o) ? o : (o && Array.isArray(o.data) ? o.data : (o && o.data && typeof o.data==="object" && !o.Irn ? [o.data] : [o]));
+  return arr.map(x=>{
+    if(!x || !x.Irn) return { name, err:"There is no IRN in this file. Use the JSON the portal gives after the e-invoice is generated (Download JSON)." };
+    const I = einvJwtData(x.SignedInvoice) || {}, Q = einvJwtData(x.SignedQRCode) || {};
+    const V = I.ValDtls || {}, D = I.DocDtls || {};
+    const n = (v)=> v==null || v==="" ? null : Number(v);
+    const tax = ["CgstVal","SgstVal","IgstVal","CesVal","StCesVal"].reduce((a,k)=>a+(Number(V[k])||0),0);
+    return { name, raw:x, irn:String(x.Irn).trim().toLowerCase(), ack_no:String(x.AckNo||"").trim(), ack_dt:String(x.AckDt||""), qr:String(x.SignedQRCode||"").trim()||null,
+      status:String(x.Status||"ACT").toUpperCase(), ewb_no:x.EwbNo ? String(x.EwbNo) : null, ewb_dt:x.EwbDt||null, ewb_valid:x.EwbValidTill||null,
+      no:D.No || Q.DocNo || null, typ:D.Typ || Q.DocTyp || null, dt:einvDmyIso(D.Dt || Q.DocDt), seller:I.SellerDtls ? I.SellerDtls.Gstin : (Q.SellerGstin||null),
+      buyer:I.BuyerDtls ? I.BuyerDtls.Gstin : (Q.BuyerGstin||null), buyerName:I.BuyerDtls ? (I.BuyerDtls.LglNm||I.BuyerDtls.TrdNm||"") : "",
+      ass:n(V.AssVal), tax: I.ValDtls ? Math.round(tax*100)/100 : null, rnd:Number(V.RndOffAmt)||0, tot:n(V.TotInvVal!=null ? V.TotInvVal : Q.TotInvVal),
+      hsn:(I.ItemList||[]).map(i=>String(i.HsnCd||"")).filter(Boolean).concat(Q.MainHsnCode?[String(Q.MainHsnCode)]:[]), signedOk: !!(I.DocDtls || Q.DocNo) };
+  });
+}
+const EINV_TOL = 1.00;   // rupees
+// the check: every row must be ✓ or nothing is saved
+function einvCheck(inv, lines, E){
+  const rows = [], warns = [], stops = [];
+  const r2_ = (v)=> Math.round((Number(v)||0)*100)/100;
+  const add = (field, j, a, ok, note)=> rows.push({ field, json:j, app:a, ok:!!ok, note:note||"" });
+  if(E.err){ stops.push(E.err); return { ok:false, rows, warns, stops }; }
+  if(!E.signedOk) stops.push("The signed part of the file could not be read, so the app cannot check it against the invoice. Download the JSON again from the portal (do not open and save it in another program).");
+  if(E.status && E.status!=="ACT") stops.push("The portal says this IRN is "+(E.status==="CNL"?"CANCELLED":E.status)+". A cancelled IRN cannot go on the invoice — generate a new one on the portal.");
+  if(E.typ && E.typ!=="INV") stops.push("This e-invoice is a "+E.typ+" (not a tax invoice). Load it against the right document.");
+  if(inv.irn && String(inv.irn).toLowerCase()!==E.irn) stops.push("This invoice already has another IRN ("+String(inv.irn).slice(0,12)+"…). This file belongs to a different e-invoice.");
+  add("Invoice no", E.no||"—", inv.invoice_no, einvNo(E.no)===einvNo(inv.invoice_no));
+  add("Invoice date", E.dt?fmtDMY(E.dt):"—", inv.invoice_date?fmtDMY(inv.invoice_date):"—", E.dt && E.dt===String(inv.invoice_date||"").slice(0,10));
+  add("Our GSTIN", E.seller||"—", inv.snap_gstin||"—", einvGstin(E.seller)===einvGstin(inv.snap_gstin));
+  const bOk = inv.is_export ? (einvGstin(E.buyer)==="URP" || einvGstin(E.buyer)===einvGstin(inv.buyer_gstin)) : einvGstin(E.buyer)===einvGstin(inv.buyer_gstin);
+  add("Buyer GSTIN", (E.buyer||"—")+(E.buyerName?" · "+E.buyerName:""), (inv.buyer_gstin||(inv.is_export?"URP (export)":"—"))+(inv.customer_name?" · "+inv.customer_name:""), bOk);
+  const cur = String(inv.currency||"INR").toUpperCase();
+  if(cur==="INR"){
+    const appTax = r2_(inv.tax_total), appTaxable = r2_(inv.taxable_total), appBefore = r2_((Number(inv.grand_total)||0)-(Number(inv.round_off)||0));
+    if(E.ass!=null) add("Taxable value", "₹ "+invMoney(E.ass,"INR"), "₹ "+invMoney(appTaxable,"INR"), Math.abs(E.ass-appTaxable)<=EINV_TOL, Math.abs(E.ass-appTaxable)>0.004 ? "differs by ₹ "+invMoney(E.ass-appTaxable,"INR") : "");
+    if(E.tax!=null) add("GST (CGST+SGST+IGST)", "₹ "+invMoney(E.tax,"INR"), "₹ "+invMoney(appTax,"INR"), Math.abs(E.tax-appTax)<=EINV_TOL, Math.abs(E.tax-appTax)>0.004 ? "differs by ₹ "+invMoney(E.tax-appTax,"INR") : "");
+    if(E.tot!=null){ const jb = r2_(E.tot-E.rnd); add("Total before round-off", "₹ "+invMoney(jb,"INR"), "₹ "+invMoney(appBefore,"INR"), Math.abs(jb-appBefore)<=EINV_TOL, Math.abs(jb-appBefore)>0.004 ? "differs by ₹ "+invMoney(jb-appBefore,"INR") : ""); }
+    if(E.tot!=null && Math.abs(E.rnd-(Number(inv.round_off)||0))>0.004) warns.push("Round-off: portal "+invMoney(E.rnd,"INR")+", app "+invMoney(Number(inv.round_off)||0,"INR")+". The app follows the portal — the invoice total becomes ₹ "+invMoney(E.tot,"INR")+".");
+  } else {
+    if(E.tot!=null && inv.grand_total_inr!=null) add("Total in ₹", "₹ "+invMoney(E.tot,"INR"), "₹ "+invMoney(inv.grand_total_inr,"INR"), Math.abs(E.tot-Number(inv.grand_total_inr))<=Math.max(EINV_TOL, Number(inv.grand_total_inr)*0.0005));
+    else warns.push("Export in "+cur+": the app has no rupee total to compare with the portal's ₹ "+invMoney(E.tot||0,"INR")+". Check the exchange rate by eye.");
+  }
+  const appHsn = new Set((lines||[]).map(l=>String(l.hsn||"").trim()).filter(Boolean));
+  if(E.hsn.length && appHsn.size && !E.hsn.some(x=>appHsn.has(x))) warns.push("HSN: portal "+E.hsn[0]+", app "+[...appHsn].join(", ")+" — check it (not a reason to refuse).");
+  if(E.ewb_no) warns.push("E-way bill "+E.ewb_no+" is in the file — it goes on the invoice.");
+  return { ok: !stops.length && rows.every(x=>x.ok), rows, warns, stops };
+}
+function einvWhatToDo(inv){
+  return ["If the portal invoice was keyed wrong: cancel that IRN on the portal (allowed within 24 hours of the Ack time), generate it again exactly as the app's invoice, download the new JSON and upload it.",
+    "If the app's invoice is wrong: "+(inv && inv.irn ? "it is frozen (IRN in) — ask a Super Admin." : "press Edit (open until an IRN is in), correct it, then cancel and re-generate on the portal as above."),
+    "Wrong file? Pick the JSON of invoice "+(inv?inv.invoice_no:"")+"."];
+}
+// working days from the portal's Ack to now
+function einvLateWd(ackIso){ try{ const a = toISODate(new Date(ackIso)); const due = wdAdd(a, 1); const t = toISODate(new Date()); if(t<=due) return 0; let n = 0, d = due; while(d < t && n < 60){ d = wdAdd(d,1); n++; } return n; }catch(e){ return 0; } }
+async function einvOn(){ try{ const c = await gstCfg(); return !!(c && c.einv_json_on); }catch(e){ return false; } }
+// the dialog: read → check → (send details) → issue
+function EinvJsonDlg({ inv, lines, user, me, ewbNeed, preset, onClose, onDone }){
+  const [E,setE] = useState(preset ? preset.E : null); const [name,setName] = useState(preset ? preset.name : ""); const [err,setErr] = useState(""); const [busy,setBusy] = useState(false);
+  const [f,setF] = useState({ on:toISODate(new Date()), via:"Email", to:"", link:"", note:"", eway_no:"", eway_date:"" });
+  const cur = String(inv.currency||"INR").toUpperCase();
+  const attach = !!(inv.irn && E && !E.err && String(inv.irn).toLowerCase()===E.irn);
+  const C = E ? einvCheck(inv, lines, E) : null;
+  const pick = (file)=>{ if(!file) return; setErr(""); const rd = new FileReader();
+    rd.onload = ()=>{ const xs = einvParse(rd.result, file.name); if(xs.length>1){ const mine = xs.find(x=>einvNo(x.no)===einvNo(inv.invoice_no)); setE(mine || xs[0]); } else setE(xs[0]); setName(file.name); };
+    rd.onerror = ()=>setErr("Could not read the file."); rd.readAsText(file); };
+  const ew0 = E && E.ewb_no ? { eway_no:String(E.ewb_no), eway_date:(gstIstToIso(E.ewb_dt)||"").slice(0,10)||null, eway_valid_till:gstIstToIso(E.ewb_valid) } : null;
+  const go = async()=>{
+    setErr(""); if(!C || !C.ok) return;
+    const by = user?.username||"unknown", now = new Date().toISOString(), ackIso = gstIstToIso(E.ack_dt);
+    if(!GST_IRN_RE.test(E.irn)){ setErr("The IRN in the file is not 64 characters."); return; }
+    if(!GST_ACK_RE.test(E.ack_no)){ setErr("The Ack No in the file is not 15 digits."); return; }
+    setBusy(true);
+    const { data: dup } = await sb.from("invoice_tbl").select("invoice_no").eq("irn",E.irn).neq("id",inv.id);
+    if(dup && dup.length){ setBusy(false); setErr("This IRN is already on invoice "+dup[0].invoice_no+"."); return; }
+    const jx = { einv_json:E.raw, einv_json_by:by, einv_json_at:now };
+    const strip = (p)=>{ const q = { ...p }; ["einv_json","einv_json_by","einv_json_at","einv_via","irn_by","irn_at","eway_valid_till"].forEach(k=>delete q[k]); return q; };
+    const upd = async(p, q)=>{ let r = await q(p); if(r.error && /einv_json|einv_via|irn_by|irn_at|eway_valid_till/.test(r.error.message||"")) r = await q(strip(p)); return r; };
+    if(attach){   // the IRN is already in (entered by hand): keep the file and the QR
+      const p = { ...jx, ...(inv.signed_qr ? {} : { signed_qr:E.qr }), ...(inv.ack_no ? {} : { ack_no:E.ack_no }), ...(inv.ack_date ? {} : { ack_date:ackIso }) };
+      const r = await upd(p, (pp)=>sb.from("invoice_tbl").update(pp).eq("id",inv.id));
+      if(r.error){ setBusy(false); setErr("Could not save: "+r.error.message); return; }
+      await invHist(inv.id, inv.dc_id, "Portal JSON attached", by, "IRN already in"+(inv.signed_qr?"":" · signed QR added")+" · "+name);
+      await logAudit("UPDATE","invoice_tbl",inv.invoice_no,"Portal e-invoice JSON attached (IRN already in)"+(inv.signed_qr?"":" · QR added"),by,null,null);
+      setBusy(false); appToast("JSON kept with "+inv.invoice_no); onDone && onDone(); return;
+    }
+    // new: IRN, Ack, QR, the portal's round-off, the e-way bill if any
+    let ew = ew0;
+    if(!ew && String(f.eway_no||"").trim()){ const no = String(f.eway_no).replace(/\s+/g,""); if(!GST_EWB_RE.test(no)){ setBusy(false); setErr("The e-way bill number is 12 digits."); return; } if(!f.eway_date){ setBusy(false); setErr("Enter the e-way bill date."); return; } ew = { eway_no:no, eway_date:f.eway_date }; }
+    const waitEwb = ewbNeed && !ew;
+    const willSend = !waitEwb;
+    if(willSend){ if(!f.on){ setBusy(false); setErr("Enter the date it was sent."); return; } if(!String(f.to).trim()){ setBusy(false); setErr("Enter who it was sent to."); return; }
+      if(String(f.link).trim()){ const c = checkDocumentLink(f.link); if(c.block){ setBusy(false); setErr(c.message); return; } if(!driveLinkOk(f.link)){ setBusy(false); setErr("The link must be the Google Drive or OneDrive copy of the e-invoice PDF (or leave it empty — 3 days to add it)."); return; } } }
+    const rnd = cur==="INR" && E.tot!=null && Math.abs(E.rnd-(Number(inv.round_off)||0))>0.004 ? { round_off:E.rnd, grand_total:E.tot, amount_words:invAmountWords(E.tot,"INR"), ...(inv.grand_total_inr!=null ? { grand_total_inr:E.tot } : {}) } : {};
+    const base = { irn:E.irn, ack_no:E.ack_no, ack_date:ackIso, signed_qr:E.qr, einv_via:"portal JSON", irn_by:by, irn_at:now, ...jx, ...rnd };
+    const patch = waitEwb ? base : { ...base, status:"Issued", issued_by:by, issued_at:now, ...(ew||{}) };
+    const r = await upd(patch, (pp)=>sb.from("invoice_tbl").update(pp).eq("id",inv.id).eq("status","Ready for IRN"));
+    if(r.error){ setBusy(false); setErr("Could not save: "+r.error.message); return; }
+    const total = rnd.grand_total!=null ? rnd.grand_total : inv.grand_total;
+    try{ await stepDone("invoice_irn", inv.invoice_no, "irn", by, "IRN in (portal JSON)"); }catch(e){}
+    await invHist(inv.id, inv.dc_id, waitEwb ? "IRN in from the portal JSON — e-way bill to follow" : "Issued — IRN from the portal JSON", by, "Ack "+E.ack_no+" · "+fmtDMYTime(ackIso)+(ew?" · e-way bill "+ew.eway_no:"")+(rnd.round_off!=null?" · round-off "+invMoney(rnd.round_off,"INR")+" (as the portal) → total ₹ "+invMoney(total,"INR"):"")+" · "+name);
+    await logAudit("UPDATE","invoice_tbl",inv.invoice_no,(waitEwb?"IRN in (e-way bill to follow)":"Issued")+" · IRN "+E.irn.slice(0,12)+"… · Ack "+E.ack_no+" · portal JSON"+(rnd.round_off!=null?" · round-off as portal":"")+" · "+cur+" "+invMoney(total,cur),by,null,null);
+    if(!waitEwb){ try{ await sb.from("posting_queue_tbl").insert({ doc_type: inv.is_export ? "Export invoice" : "Tax invoice", doc_id:inv.id, doc_no:inv.invoice_no, doc_date:inv.invoice_date, party:inv.customer_name, amount:total, currency:cur, amount_inr: rnd.grand_total_inr!=null ? rnd.grand_total_inr : inv.grand_total_inr, status:"To post" }); }catch(e){} }
+    const late = einvLateWd(ackIso);
+    if(late>0){ await invHist(inv.id, inv.dc_id, "JSON uploaded late", by, late+" working day(s) after the 1 working day from the Ack ("+fmtDMYTime(ackIso)+")");
+      try{ await notifySuperAdmins("⏰ E-invoice "+inv.invoice_no+": the portal JSON came in "+late+" working day(s) late (Ack "+fmtDMYTime(ackIso)+") — by "+(me||by)+".", null, "gst"); }catch(e){} }
+    if(waitEwb){ try{ await invStepSendOpen(inv, user); }catch(e){} }
+    else {   // issued = sent (one step); the backup link may follow within 3 days
+      const link = String(f.link||"").trim();
+      const sp = { sent_at:new Date(f.on+"T12:00:00").toISOString(), sent_by:by, sent_via:f.via, sent_to:String(f.to).trim(), sent_link:link||null, sent_note:String(f.note||"").trim()||null };
+      const r2 = await sb.from("invoice_tbl").update(sp).eq("id",inv.id);
+      if(!r2.error){
+        const note = "Sent "+fmtDMY(f.on)+" by "+f.via+" to "+sp.sent_to+" (with the portal JSON)";
+        await invHist(inv.id, inv.dc_id, "Marked as sent", by, note+(link?"":" · backup link due by "+fmtDMY(purAddDays(pgToday(),3))));
+        try{ await stepDone("invoice", inv.invoice_no, "sent", by, note); }catch(e){}
+        await logAudit("UPDATE","invoice_tbl",inv.invoice_no,"Marked as sent: "+note+(link?" · "+link:" · backup link to follow"),by,null,null);
+        try{ const who = await billChasers(inv.customer_name); await notifyPeople(who, "Tax invoice "+inv.invoice_no+" sent to "+(inv.customer_name||"")+" on "+fmtDMY(f.on)+" (contract "+(inv.contract_number||"")+"). Please follow up the payment: "+cur+" "+invMoney(total,cur)+".", "info"); }catch(e){}
+        if(!link){ try{ await loadPostPeople(true).catch(()=>{}); const owner = await billEmpOfUser(by) || postHolders("accounts")[0] || null;
+          await stepOpen({ module:"accounts", doc_type:"invoice_link", doc_ref:inv.invoice_no, step:"link", owner, manager_post:"accounts", link_tab:"tax_invoices", escalate:BILL_ESCALATE,
+            title:"Backup link — e-invoice "+inv.invoice_no+" — "+(inv.contract_number||"")+" "+(inv.customer_name||""), cardText:"Put the e-invoice PDF in OneDrive and paste the link on the invoice (✓ Sent → Add backup link) — "+STALE_DAYS+" days", labels:["Backup link"] }, by); }catch(e){ console.warn("backup link step", e); } }
+      } else setErr("Issued, but “sent” could not be saved: "+r2.error.message+" — use Mark as sent.");
+      try{ stepRefresh(user); }catch(e){}
+    }
+    setBusy(false); appToast(inv.invoice_no+(waitEwb?": IRN in — e-way bill to follow":": e-invoiced and sent")); onDone && onDone();
+  };
+  const lab = (l,c)=> h("label",{style:{display:"grid",gridTemplateColumns:"130px 1fr",gap:8,alignItems:"center",fontSize:12.5,marginBottom:6}}, h("span",{style:{color:colors.muted}},l), c);
+  const ewbAsk = E && !attach && C && C.ok && ewbNeed && !ew0;
+  const sendAsk = E && !attach && C && C.ok && !(ewbNeed && !ew0 && !String(f.eway_no||"").trim());
+  return h("div",{onClick:e=>{ if(e.target===e.currentTarget && !busy) onClose(); },style:{position:"fixed",inset:0,background:"rgba(0,0,0,.45)",zIndex:2600,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"50px 16px",overflow:"auto"}},
+    h("div",{"data-testid":"einv-dlg",style:{background:"#fff",borderRadius:10,width:640,maxWidth:"100%",padding:"14px 16px"}},
+      h("b",{style:{fontSize:15}},"Upload e-invoice JSON — "+inv.invoice_no),
+      h("div",{style:{fontSize:11.5,color:colors.muted,margin:"3px 0 8px",lineHeight:1.5}},"On the portal: generate the e-invoice, then Download JSON. Pick that file here. The app checks it against this invoice; nothing is saved unless every line is ✓."),
+      h("label",{"data-testid":"einv-drop",onDragOver:e=>e.preventDefault(),onDrop:e=>{ e.preventDefault(); pick(e.dataTransfer.files && e.dataTransfer.files[0]); },style:{display:"block",border:"2px dashed #9fd3bf",borderRadius:10,padding:"14px",textAlign:"center",color:"#3f6b5c",background:"#f3faf6",cursor:"pointer",marginBottom:10}},
+        h("input",{type:"file",accept:".json,application/json",style:{display:"none"},"data-testid":"einv-file",onChange:e=>pick(e.target.files && e.target.files[0])}),
+        name ? "📄 "+name+" — pick another" : "⬆ Drop the portal JSON here, or click to pick it"),
+      E && C ? h("div",null,
+        C.stops.map((s,i)=>h("div",{key:"s"+i,style:{background:"#fdecea",border:"1px solid #f0b8b2",borderRadius:8,padding:"8px 10px",marginBottom:6,color:"#7a1f18",fontSize:12.5}},"✕ "+s)),
+        C.rows.length ? h("table",{"data-testid":"einv-rows",style:{width:"100%",borderCollapse:"collapse",fontSize:12.5,marginBottom:6}},
+          h("thead",null,h("tr",null,["Field","In the JSON (portal)","In the app",""].map((t,i)=>h("th",{key:i,style:{textAlign:"left",padding:"5px 6px",fontSize:11,color:colors.muted,borderBottom:"2px solid "+colors.dark}},t)))),
+          h("tbody",null,C.rows.map((x,i)=>h("tr",{key:i,style:{background:x.ok?null:"#fdecea",fontWeight:x.ok?400:700}},
+            h("td",{style:{padding:"5px 6px",borderBottom:"1px solid "+colors.border}},x.field), h("td",{style:{padding:"5px 6px",borderBottom:"1px solid "+colors.border}},x.json), h("td",{style:{padding:"5px 6px",borderBottom:"1px solid "+colors.border}},x.app),
+            h("td",{style:{padding:"5px 6px",borderBottom:"1px solid "+colors.border,color:x.ok?"#0f6e56":"#a3312a"}}, x.ok ? "✓" : "✕ "+(x.note||"differs")))))) : null,
+        !C.ok ? h("div",{"data-testid":"einv-refused",style:{background:"#fdecea",border:"1px solid #f0b8b2",borderRadius:8,padding:"8px 10px",margin:"4px 0 8px",color:"#7a1f18",fontSize:12.5,lineHeight:1.55}},
+          h("b",null,"Refused — nothing was saved."), h("div",{style:{marginTop:4}},"What to do:"), ...einvWhatToDo(inv).map((t,i)=>h("div",{key:i},"• "+t))) : null,
+        C.warns.map((w,i)=>h("div",{key:"w"+i,style:{background:"#fff4d6",border:"1px solid #f0d27a",borderRadius:8,padding:"6px 10px",marginBottom:6,fontSize:12,color:"#6b5200"}},"⚠ "+w)),
+        C.ok ? h("div",{style:{background:"#e4f3ed",border:"1px solid #bfe3d4",borderRadius:8,padding:"7px 10px",margin:"4px 0 8px",fontSize:12.5,color:"#0f5c46"}},
+          "✓ Matches. IRN "+E.irn.slice(0,16)+"… · Ack "+E.ack_no+" · "+fmtDMYTime(gstIstToIso(E.ack_dt))+(E.qr?" · signed QR":" · (no QR in the file)"),
+          attach ? h("div",{style:{marginTop:3}},"The IRN is already on this invoice — the file and the QR are kept with it; nothing else changes.") : null) : null,
+        ewbAsk ? h("div",{style:{background:"#f4f7fb",border:"1px solid #d6e2f0",borderRadius:8,padding:"7px 10px",marginBottom:8,fontSize:12}},
+          h("b",null,"E-way bill (goods over ₹50,000)"), h("div",{style:{fontSize:11,color:colors.muted,margin:"2px 0 5px"}},"From the Factory Manager. Leave blank if it is not made yet: the IRN goes in, and the invoice is issued and sent once the e-way bill is entered."),
+          h("div",{style:{display:"flex",gap:6,flexWrap:"wrap"}}, h("input",{value:f.eway_no,onChange:e=>setF({...f,eway_no:e.target.value}),placeholder:"E-way bill no (12 digits)",style:{...inputStyle,flex:"1 1 200px"}}), h("input",{type:"date",value:f.eway_date,onChange:e=>setF({...f,eway_date:e.target.value}),style:{...inputStyle,width:160}}))) : null,
+        sendAsk ? h("div",{"data-testid":"einv-send",style:{border:"1px solid "+colors.border,borderRadius:8,padding:"8px 10px",marginBottom:8}},
+          h("b",{style:{fontSize:13}},"Sent to the customer"), h("div",{style:{fontSize:11,color:colors.muted,margin:"2px 0 6px"}},"Uploading the JSON issues the invoice and marks it sent. The region's FSE and the Sales Head are told to chase the payment."),
+          lab("Sent on *", h("input",{type:"date",value:f.on,onChange:e=>setF({...f,on:e.target.value}),style:inputStyle})),
+          lab("How *", h("select",{value:f.via,onChange:e=>setF({...f,via:e.target.value}),style:inputStyle}, BILL_VIA.map(v=>h("option",{key:v,value:v},v)))),
+          lab("Sent to *", h("input",{"data-testid":"einv-to",value:f.to,onChange:e=>setF({...f,to:e.target.value}),placeholder:"Name (email)",style:inputStyle})),
+          lab("Backup link", h("input",{value:f.link,onChange:e=>setF({...f,link:e.target.value}),placeholder:"OneDrive link to the e-invoice PDF — or add it within "+STALE_DAYS+" days",style:inputStyle})),
+          lab("Note", h("input",{value:f.note,onChange:e=>setF({...f,note:e.target.value}),style:inputStyle}))) : null) : null,
+      err ? h("div",{style:{color:colors.danger,fontSize:12.5,margin:"4px 0 8px"}},err) : null,
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:6}},
+        h("button",{onClick:onClose,disabled:busy,style:btnSecondary},"Close"),
+        E && C && C.ok ? h("button",{"data-testid":"einv-go",onClick:go,disabled:busy,style:btnPrimary}, busy ? "Saving…" : attach ? "Keep the JSON and QR" : (ewbNeed && !ew0 && !String(f.eway_no||"").trim()) ? "Save the IRN (e-way bill to follow)" : "Issue and mark as sent") : null)));
+}
+// Accounts › E-invoice inbox: several portal files at once, each matched to its invoice by number
+function EinvInboxScreen({ user }){
+  const [on,setOn] = useState(null); const [rows,setRows] = useState([]); const [busy,setBusy] = useState(false);
+  useEffect(()=>{ einvOn().then(setOn); },[]);
+  if(on===null) return h("div",{style:{padding:20,color:colors.muted}},"Reading…");
+  if(!on) return h("div",{style:{padding:20}}, h("b",null,"E-invoice inbox"), h("div",{style:{marginTop:6,color:colors.muted}},"E-invoicing is off for this company — a Super Admin can switch it on in Settings › E-invoice & e-way bill gateway (E-invoicing in use)."));
+  const take = async(files)=>{
+    setBusy(true); const out = [];
+    for(const file of Array.from(files||[])){
+      const text = await file.text().catch(()=>null); const xs = text==null ? [{ name:file.name, err:"Could not read the file." }] : einvParse(text, file.name);
+      for(const E of xs){
+        if(E.err){ out.push({ E, res:"err", msg:E.err }); continue; }
+        let inv = null, lines = [];
+        try{ const { data } = await sb.from("invoice_tbl").select("*").eq("invoice_no",E.no).limit(2); inv = (data||[])[0]||null;
+          if(!inv){ const { data: d2 } = await sb.from("invoice_tbl").select("*").ilike("invoice_no","%"+String(E.no||"").replace(/[^0-9]/g,"").replace(/^0+/,"").slice(0,6)+"%").limit(50); inv = (d2||[]).find(x=>einvNo(x.invoice_no)===einvNo(E.no))||null; }
+          if(inv){ const { data: ls } = await sb.from("invoice_line_tbl").select("*").eq("invoice_id",inv.id); lines = ls||[]; } }catch(e){}
+        if(!inv){ out.push({ E, res:"none", msg:"No invoice "+(E.no||"?")+" in the app." }); continue; }
+        if(inv.irn && String(inv.irn).toLowerCase()===E.irn && inv.einv_json){ out.push({ E, inv, res:"done", msg:"Already e-invoiced"+(inv.ack_date?" "+fmtDMY(inv.ack_date):"")+" — skipped." }); continue; }
+        const C = einvCheck(inv, lines, E);
+        out.push({ E, inv, C, res: C.ok ? "ok" : "bad", msg: C.ok ? (inv.irn ? "IRN already in — open to keep the JSON / QR" : "Matches — open to issue and send") : "Refused — "+(C.stops[0] || C.rows.filter(x=>!x.ok).map(x=>x.field).join(", ")+" differ") });
+      }
+    }
+    setRows(r=>[...out, ...r]); setBusy(false);
+  };
+  const open = (x)=>{ INV_JSON_PENDING = { invoiceId:x.inv.id, E:x.E, name:x.E.name }; INV_OPEN_TARGET = { id:x.inv.id }; appOpenTab("tax_invoices"); setTimeout(()=>{ try{ window.dispatchEvent(new CustomEvent("flo-inv-open")); }catch(e){} }, 300); };
+  const pill = (t,bg,fg)=> h("span",{style:{fontSize:11.5,fontWeight:700,borderRadius:9,padding:"2px 9px",background:bg,color:fg}},t);
+  const tone = { ok:["#e4f3ed","#0f7a5c"], bad:["#fdecea","#8a2a22"], none:["#fff4d6","#8a6400"], done:["#eceee9","#5f655e"], err:["#fdecea","#8a2a22"] };
+  return h("div",{style:{padding:"12px 16px",maxWidth:1100}},
+    h("h3",{style:{margin:"0 0 4px"}},"E-invoice inbox"),
+    h("div",{style:{fontSize:12,color:colors.muted,marginBottom:10}},"Drop the JSON files downloaded from the e-invoice portal. Each is read and checked against its invoice; open a matched one to issue it and mark it sent."),
+    h("label",{"data-testid":"einv-inbox-drop",onDragOver:e=>e.preventDefault(),onDrop:e=>{ e.preventDefault(); take(e.dataTransfer.files); },style:{display:"block",border:"2px dashed #9fd3bf",borderRadius:10,padding:"18px",textAlign:"center",color:"#3f6b5c",background:"#f3faf6",cursor:"pointer",marginBottom:10}},
+      h("input",{type:"file",multiple:true,accept:".json,application/json",style:{display:"none"},onChange:e=>take(e.target.files)}), busy ? "Reading…" : "⬆ Drop the portal JSON files here, or click to pick them"),
+    rows.length ? h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12.5,background:"#fff"}},
+      h("thead",null,h("tr",null,["File","Invoice","Contract · customer","Total (portal / app)","Result",""].map((t,i)=>h("th",{key:i,style:{textAlign:"left",padding:"6px 7px",fontSize:11,color:colors.muted,borderBottom:"2px solid "+colors.dark}},t)))),
+      h("tbody",null,rows.map((x,i)=>h("tr",{key:i},
+        h("td",{style:{padding:"6px 7px",borderBottom:"1px solid "+colors.border}},x.E.name||""), h("td",{style:{padding:"6px 7px",borderBottom:"1px solid "+colors.border}},x.E.no||"?"),
+        h("td",{style:{padding:"6px 7px",borderBottom:"1px solid "+colors.border}},x.inv ? (x.inv.contract_number||"")+" · "+(x.inv.customer_name||"") : (x.E.buyerName||"—")),
+        h("td",{style:{padding:"6px 7px",borderBottom:"1px solid "+colors.border}},(x.E.tot!=null?invMoney(x.E.tot,"INR"):"—")+" / "+(x.inv?invMoney(x.inv.grand_total,x.inv.currency):"—")),
+        h("td",{style:{padding:"6px 7px",borderBottom:"1px solid "+colors.border}}, pill(x.msg, tone[x.res][0], tone[x.res][1])),
+        h("td",{style:{padding:"6px 7px",borderBottom:"1px solid "+colors.border}}, x.inv && (x.res==="ok"||x.res==="bad") ? h("button",{onClick:()=>open(x),style:btnSmall},x.res==="ok"?"Open and issue":"Open — see why") : null))))) : null);
+}
+// Accounts › Invoices vs e-invoice (report)
+function EinvReportScreen({ user }){
+  const t = toISODate(new Date());
+  const [fr,setFr] = useState(t.slice(0,8)+"01"); const [to,setTo] = useState(t); const [kind,setKind] = useState("all"); const [cust,setCust] = useState(""); const [st,setSt] = useState("");
+  const [list,setList] = useState(null); const [on,setOn] = useState(true);
+  const load = async()=>{ setList(null); setOn(await einvOn());
+    const { data, error } = await sb.from("invoice_tbl").select("*").gte("invoice_date",fr).lte("invoice_date",to).order("invoice_date",{ascending:false}).limit(3000);
+    setList(error ? [] : (data||[]).filter(i=>i.status!=="Draft" || i.irn)); };
+  useEffect(()=>{ load(); },[fr,to]);
+  const stOf = (i)=> i.status==="Cancelled" ? (i.irn ? "IRN cancelled" : "Cancelled") : i.einv_na_reason ? "Not applicable" : !i.irn ? "Not e-invoiced" : !i.sent_at ? "E-invoiced, not sent" : !i.sent_link ? "Sent — backup link due" : "Sent";
+  const TONE = { "Not e-invoiced":["#fdecea","#8a2a22"], "E-invoiced, not sent":["#fff4d6","#7a5a00"], "Sent — backup link due":["#fff4d6","#7a5a00"], "Sent":["#e4f3ed","#0f5c46"], "Not applicable":["#eceee9","#5f655e"], "IRN cancelled":["#f3ecfb","#5b3fa3"], "Cancelled":["#eceee9","#5f655e"] };
+  const days = (i)=>{ const s = stOf(i); const from = s==="Not e-invoiced" ? i.invoice_date : s==="E-invoiced, not sent" ? i.ack_date : s==="Sent — backup link due" ? i.sent_at : null; if(!from) return ""; return Math.max(0, Math.round((Date.now()-new Date(String(from).slice(0,10)+"T00:00:00").getTime())/864e5)); };
+  const shown = (list||[]).filter(i=> (kind==="all" || (kind==="exp" ? i.is_export : !i.is_export)) && (!cust || String(i.customer_name||"").toLowerCase().includes(cust.toLowerCase())) && (!st || stOf(i)===st));
+  const groups = Object.keys(TONE).map(k=>({ k, n:shown.filter(i=>stOf(i)===k).length, v:shown.filter(i=>stOf(i)===k).reduce((a,i)=>a+(Number(i.grand_total_inr!=null?i.grand_total_inr:(String(i.currency||"INR").toUpperCase()==="INR"?i.grand_total:0))||0),0) })).filter(g=>g.n);
+  const xls = ()=>{ try{ const aoa = [["Invoice","Date","Contract","Customer","Currency","Value","E-invoice","Ack date","Via","Sent on","Sent to","Backup link","Days pending"]].concat(shown.map(i=>[i.invoice_no, i.invoice_date, i.contract_number||"", i.customer_name||"", i.currency||"INR", Number(i.grand_total)||0, stOf(i), i.ack_date?fmtDMYTime(i.ack_date):"", i.einv_via||"", i.sent_at?fmtDMY(i.sent_at):"", i.sent_to||"", i.sent_link||"", days(i)]));
+      const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), "Invoices vs e-invoice"); XLSX.writeFile(wb, "invoices_vs_einvoice_"+fr+"_"+to+".xlsx"); }catch(e){ alert("Could not make the Excel: "+(e.message||e)); } };
+  const openInv = (i)=>{ INV_OPEN_TARGET = { id:i.id }; appOpenTab("tax_invoices"); setTimeout(()=>{ try{ window.dispatchEvent(new CustomEvent("flo-inv-open")); }catch(e){} }, 300); };
+  const th = (x,i)=> h("th",{key:i,style:{textAlign:"left",padding:"6px 7px",fontSize:11,color:colors.muted,borderBottom:"2px solid "+colors.dark,background:"#f7f6f1"}},x);
+  const td = (x,s)=> h("td",{style:{padding:"6px 7px",borderBottom:"1px solid "+colors.border,...(s||{})}},x);
+  return h("div",{style:{padding:"12px 16px"}},
+    h("h3",{style:{margin:"0 0 6px"}},"Invoices vs e-invoice"),
+    !on ? h("div",{style:{fontSize:12,color:colors.muted,marginBottom:8}},"E-invoicing is off for this company (Settings) — the list is shown for information.") : null,
+    h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginBottom:10,fontSize:12.5}},
+      "From", h("input",{type:"date",value:fr,onChange:e=>setFr(e.target.value),style:{...inputStyle,width:150}}), "To", h("input",{type:"date",value:to,onChange:e=>setTo(e.target.value),style:{...inputStyle,width:150}}),
+      h("select",{value:kind,onChange:e=>setKind(e.target.value),style:{...inputStyle,width:170}}, [["all","Domestic + export"],["dom","Domestic"],["exp","Export"]].map(([v,l])=>h("option",{key:v,value:v},l))),
+      h("input",{value:cust,onChange:e=>setCust(e.target.value),placeholder:"Customer…",style:{...inputStyle,width:200}}),
+      h("select",{value:st,onChange:e=>setSt(e.target.value),style:{...inputStyle,width:200}}, h("option",{value:""},"Every e-invoice status"), Object.keys(TONE).map(k=>h("option",{key:k,value:k},k))),
+      h("button",{onClick:xls,style:btnSecondary},"⬇ Excel"), h("button",{onClick:load,style:btnSmall},"↻")),
+    list==null ? h("div",{style:{color:colors.muted}},"Reading…") : h(React.Fragment,null,
+      h("div",{"data-testid":"einv-rep-tot",style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}, groups.map(g=>h("div",{key:g.k,onClick:()=>setSt(st===g.k?"":g.k),style:{flex:"1 1 150px",borderRadius:8,padding:"7px 10px",cursor:"pointer",background:TONE[g.k][0],color:TONE[g.k][1],outline:st===g.k?"2px solid "+TONE[g.k][1]:"none"}}, h("b",{style:{fontSize:17,display:"block"}},g.n), g.k+(g.v?" · ₹ "+invMoney(g.v,"INR"):"")))),
+      h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12.5,background:"#fff"}},
+        h("thead",null,h("tr",null,["Invoice","Date","Contract","Customer","Value","E-invoice","Ack date","Via","Sent","Backup","Days"].map(th))),
+        h("tbody",null, shown.map(i=>{ const s = stOf(i); return h("tr",{key:i.id,onClick:()=>openInv(i),style:{cursor:"pointer"}},
+          td(i.invoice_no), td(fmtDMY(i.invoice_date)), td(i.contract_number||""), td(i.customer_name||""), td((i.currency&&i.currency!=="INR"?i.currency+" ":"")+invMoney(i.grand_total,i.currency),{textAlign:"right"}),
+          td(h("span",{style:{fontSize:11.5,fontWeight:700,borderRadius:9,padding:"2px 8px",background:TONE[s][0],color:TONE[s][1]}},s)), td(i.ack_date?fmtDMYTime(i.ack_date):""), td(i.einv_via||""),
+          td(i.sent_at?fmtDMY(i.sent_at):""), td(i.sent_link?"✓":(i.sent_at?"due":"")), td(days(i),{color:"#8a2a22"})); }))),
+      shown.length ? null : h("div",{style:{padding:12,color:colors.muted}},"No invoices in these dates.")));
+}
+
+// (end of the e-invoice JSON block)
+   // { id } or { dcId } — the Tax Invoices screen opens it when it mounts / hears flo-inv-open
 function invOpenFromBoard(dc, intent){
   INV_OPEN_TARGET = dc && dc._inv ? { id:dc._inv.id, intent } : { dcId:dc && dc.id, intent };
   appOpenTab("tax_invoices");
@@ -85537,7 +85897,7 @@ function gstBuildEinv(inv, lines, gstSnap, kindIn, ov){
 function GstGatewayCard({ user }){
   const [c,setC] = useState(null); const [f,setF] = useState(null); const [busy,setBusy] = useState(false); const [msg,setMsg] = useState(""); const [ping,setPing] = useState(null);
   const sa = user && user.role==="super_admin";
-  const load = async()=>{ const x = await gstCfg(true); setC(x); setF({ mode:gstMode(x), sandbox_gstin:x.sandbox_gstin||"" }); };
+  const load = async()=>{ const x = await gstCfg(true); setC(x); setF({ mode:gstMode(x), sandbox_gstin:x.sandbox_gstin||"", einv_json_on:!!x.einv_json_on }); };
   useEffect(()=>{ load(); },[]);
   if(!c || !f) return null;
   const box = { background:"#fff", border:"1px solid "+colors.border, borderRadius:8, padding:"10px 14px", marginBottom:12 };
@@ -85547,8 +85907,9 @@ function GstGatewayCard({ user }){
     if(mode==="sandbox" && sg && !/^[0-9]{2}[A-Z0-9]{13}$/.test(sg)){ setMsg("The sandbox GSTIN is 15 characters (Clear gives it with the test key)."); return; }
     if(mode==="live" && !(await despAsk("Switch the automatic gateway to Live?","From now on Generate e-invoice and Generate e-way bill send real documents to the government portal through Clear. The manual way stays, with a reason (and an Edit code for everyone but the Finance Director and Super Admins).",[{key:"no",label:"Go back"},{key:"yes",label:"Switch to Live",primary:true}]))==="yes") return;
     setBusy(true); setMsg("");
-    const row = { id:1, mode, sandbox_gstin:sg||null, updated_by:user?.username||"unknown", updated_at:new Date().toISOString() };
-    const { error } = await sb.from("gst_gateway_tbl").upsert(row, { onConflict:"id" });
+    const row = { id:1, mode, sandbox_gstin:sg||null, einv_json_on:!!f.einv_json_on, updated_by:user?.username||"unknown", updated_at:new Date().toISOString() };   // 2026-11-17T12:00:00Z: + E-invoicing in use
+    let { error } = await sb.from("gst_gateway_tbl").upsert(row, { onConflict:"id" });
+    if(error && /einv_json_on/.test(error.message||"")){ setBusy(false); setMsg("Run structure_einvoice_json_2026-11-17.sql first (both companies)."); return; }
     setBusy(false); if(error){ setMsg("Could not save: "+error.message); return; }
     await logAudit("UPDATE","gst_gateway_tbl","1","Automatic e-invoice / e-way bill gateway: "+gstMode(c)+" → "+mode+(sg?" (sandbox GSTIN "+sg+")":""),user?.username||"unknown",{ mode:gstMode(c) },{ mode });
     try{ await notifySuperAdmins("⚙️ "+(user?.username||"")+" set the automatic e-invoice / e-way bill gateway to "+mode.toUpperCase()+".", null, "gst"); }catch(e){}
@@ -85563,6 +85924,7 @@ function GstGatewayCard({ user }){
       h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted}},"Gateway",
         h("select",{"data-testid":"gst-mode",value:f.mode,disabled:!sa,onChange:e=>setF(x=>({...x,mode:e.target.value})),style:{...inputStyle,width:220,padding:"6px 8px"}}, ["off","sandbox","live"].map(m=>h("option",{key:m,value:m},m==="off"?"Off":m==="sandbox"?"Sandbox (test)":"Live")))),
       f.mode==="sandbox" ? h("label",{style:{display:"flex",flexDirection:"column",gap:3,fontSize:11.5,color:colors.muted}},"Sandbox GSTIN (from Clear)", h("input",{value:f.sandbox_gstin,disabled:!sa,onChange:e=>setF(x=>({...x,sandbox_gstin:e.target.value})),style:{...inputStyle,width:200,padding:"6px 8px",fontFamily:"monospace"}})) : null,
+      h("label",{"data-testid":"einv-on",style:{display:"flex",gap:6,alignItems:"center",fontSize:12.5,padding:"6px 0"}}, h("input",{type:"checkbox",checked:!!f.einv_json_on,disabled:!sa,onChange:e=>setF(x=>({...x,einv_json_on:e.target.checked}))}), "E-invoicing in use (upload of the portal JSON, inbox, report)"),
       sa ? h("button",{"data-testid":"gst-save",onClick:save,disabled:busy,style:btnPrimary},"Save") : null,
       h("button",{onClick:test,disabled:busy,style:btnSecondary},"Check the server function")),
     h("div",{style:{fontSize:12,marginTop:6}},"Now: ",h("b",null,modeTxt[gstMode(c)]), c.updated_by ? h("span",{style:{color:colors.muted}}," · set by "+c.updated_by+" "+fmtDMYTime(c.updated_at)) : null),
@@ -85574,7 +85936,7 @@ function GstGatewayCard({ user }){
 function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
   const [inv,setInv] = useState(null); const [lines,setLines] = useState([]); const [orig,setOrig] = useState(null);
   const [gst,setGst] = useState(null); const [gstKind,setGstKind] = useState(null); const [busy,setBusy] = useState(false); const [msg,setMsg] = useState(""); const [hist,setHist] = useState([]);
-  const [irnDlg,setIrnDlg] = useState(null); const [cancelDlg,setCancelDlg] = useState(false);
+  const [irnDlg,setIrnDlg] = useState(null); const [cancelDlg,setCancelDlg] = useState(false); const [jDlg,setJDlg] = useState(null);   // 2026-11-17T12:00:00Z: portal JSON
   const [gc,setGc] = useState(null); const [gstDlg,setGstDlg] = useState(null); const [gstLog,setGstLog] = useState([]); const [co,setCo] = useState(null);   // 2026-11-08 IRP build
   const [gp,setGp] = useState(null);   // 345
   const [cmp,setCmp] = useState(null); const [dcl,setDcl] = useState(null); const [ovr,setOvr] = useState([]); const [steps,setSteps] = useState([]); const autoCmp = useRef(false);   // 344
@@ -85595,6 +85957,7 @@ function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
     try{ const { data: gl } = await sb.from("gst_api_log_tbl").select("*").eq("ref",i.invoice_no).order("at",{ascending:false}).limit(15); setGstLog(gl||[]); }catch(e){}
   },[invoiceId]);
   useEffect(()=>{ load(); },[load]);
+  useEffect(()=>{ if(inv && INV_JSON_PENDING && String(INV_JSON_PENDING.invoiceId)===String(inv.id)){ const pj = INV_JSON_PENDING; INV_JSON_PENDING = null; setJDlg({ preset:{ E:pj.E, name:pj.name } }); } },[inv && inv.id]);   // 2026-11-17T12:00:00Z: from the E-invoice inbox
   // 344: the pop-up opens by itself the first time a draft is opened
   useEffect(()=>{ if(inv && inv.status==="Draft" && !inv.irn && !inv.completed_at && !autoCmp.current){ autoCmp.current = true; setCmp({}); } },[inv && inv.id, inv && inv.status]);
   if(!inv) return h("div",{style:{padding:20,color:colors.muted}}, msg || "Reading the invoice…");
@@ -86014,6 +86377,9 @@ function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
     acts.push(h("button",{key:"s",onClick:()=>save(false),disabled:busy,style:btnSecondary},busy?"Saving…":"Save draft"));
     acts.push(h("button",{key:"r",onClick:toReady,disabled:busy,style:btnPrimary},"Ready for IRN"));
     acts.push(h("button",{key:"d",onClick:discard,style:btnDanger},"Discard draft")); }
+  const einvJsonOn = !!(gc && gc.einv_json_on);   // 2026-11-17T12:00:00Z: Settings › E-invoicing in use
+  if(inv.status==="Ready for IRN" && !inv.irn && (canAcc || canE)) acts.push(h("button",{key:"ej","data-testid":"einv-up",disabled:!einvJsonOn,title:einvJsonOn?"The JSON from the e-invoice portal":"E-invoicing is off for this company — a Super Admin can switch it on in Settings",onClick:()=>setJDlg({}),style:{...btnPrimary,background:"#0f6e56",borderColor:"#0f6e56",opacity:einvJsonOn?1:.45}},"⬆ Upload e-invoice JSON"));
+  if(inv.irn && !inv.einv_json && inv.status!=="Cancelled" && (canAcc || canE) && einvJsonOn) acts.push(h("button",{key:"ej2","data-testid":"einv-attach",onClick:()=>setJDlg({}),style:btnSecondary},inv.signed_qr?"Attach the portal JSON":"Attach the portal JSON (adds the QR)"));
   if(inv.status==="Ready for IRN" && !inv.irn && (canAcc || canE)){ acts.push(h("button",{key:"b","data-testid":"inv-edit",onClick:backToDraft,disabled:busy,style:btnSecondary},"Edit"));   // 344: Edit until the IRN
     if(gLive) acts.push(h("button",{key:"ga","data-testid":"g-gen",onClick:()=>openPreview(false),style:btnPrimary},"Generate e-invoice \u25b8"));   // 2026-11-08: automatic gateway
     acts.push(h("button",{key:"i","data-testid":"g-manual",onClick:()=>setIrnDlg({ irn:"", ack_no:"", ack_date:"", signed_qr:"", reason:"", code:"", eway_no:"", eway_date:"" }),style:gLive?btnSecondary:btnPrimary},gLive?"Enter IRN by hand":(ewbNeed?"Enter IRN, Ack and e-way bill":"Enter IRN and issue"))); }
@@ -86092,6 +86458,7 @@ function InvoiceEditor({ user, me, P, invoiceId, onClose, onChanged }){
     h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginTop:6}}, acts),
     hist.length ? h("div",{style:{marginTop:14}},h("div",{style:{fontSize:12,fontWeight:700,color:colors.muted}},"History"),
       hist.map(x=>h("div",{key:x.id,style:{fontSize:11.5,color:colors.muted,padding:"2px 0"}},fmtDMYTime(x.at)+" · "+(x.by_user||"")+" · "+x.action+(x.note?" — "+x.note:"")))) : null,
+    jDlg ? h(EinvJsonDlg,{ inv, lines, user, me, ewbNeed, preset:jDlg.preset||null, onClose:()=>setJDlg(null), onDone:()=>{ setJDlg(null); onChanged && onChanged(); load(); } }) : null,
     irnDlg ? h("div",{onClick:e=>{ if(e.target===e.currentTarget) setIrnDlg(null); },style:{position:"fixed",inset:0,background:"rgba(0,0,0,.45)",zIndex:2600,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"60px 16px"}},
       h("div",{style:{background:"#fff",borderRadius:10,width:540,maxWidth:"100%",padding:"14px 16px"}},
         h("b",{style:{fontSize:15}},"Enter the IRN — "+inv.invoice_no),
@@ -86365,6 +86732,14 @@ function BillSentButton({ kind, row, user, onDone }){
     return h("span",{style:{display:"inline-flex",gap:6,alignItems:"center",flexWrap:"wrap"}},
       h("span",{style:{fontSize:11.5,fontWeight:700,background:"#dff3ea",color:"#0f5b45",borderRadius:10,padding:"3px 10px"}},"✓ Sent "+fmtDMY(row.sent_at)+" · "+(row.sent_via||"")+(row.sent_to?" · "+row.sent_to:"")),
       row.sent_link ? h("a",{href:row.sent_link,target:"_blank",rel:"noopener",style:{fontSize:12}},"OneDrive copy") : null,
+      !row.sent_link && kind!=="proforma" ? h("button",{"data-testid":"bill-add-link",onClick:async()=>{   // 2026-11-17T12:00:00Z: the backup link after a JSON send
+          const l = prompt("OneDrive (or Google Drive) link to the e-invoice PDF of "+no+":"); if(!l) return;
+          const c = checkDocumentLink(l); if(c.block){ alert(c.message); return; } if(!driveLinkOk(l)){ alert("The link must be the Google Drive or OneDrive copy of the e-invoice PDF."); return; }
+          const { error } = await sb.from("invoice_tbl").update({ sent_link:String(l).trim() }).eq("id",row.id); if(error){ alert("Could not save: "+error.message); return; }
+          try{ await stepDone("invoice_link", no, "link", user?.username, "Backup link in"); }catch(e){}
+          await invHist(row.id, row.dc_id, "Backup link added", user?.username, String(l).trim());
+          await logAudit("UPDATE","invoice_tbl",no,"Backup link (e-invoice PDF) added: "+String(l).trim(),user?.username||"unknown",null,null);
+          try{ stepRefresh(user); }catch(e){} appToast("Backup link saved"); onDone && onDone(); },style:{...btnSmall,fontSize:11,background:"#fff4d6",borderColor:"#f0d27a",color:"#7a5a00"}},"⚠ Add backup link") : null,
       h("button",{onClick:undo,style:{...btnSmall,fontSize:11}},"Undo sent"));
   }
   const save = async()=>{
@@ -87921,7 +88296,7 @@ const ACC_GATEWAY = [
   ["Transactions", [["acc_voucher_new","Vouchers"],["acc_vouchers","Voucher Register"],["acc_daybook","Day Book"],["acc_po_link","Bills ↔ POs"]]],
   ["Reports", [["acc_dash","Dashboard"],["acc_reports","Reports & Health"],["acc_bank","Bank Stock Statement"],["acc_bs","Balance Sheet"],["acc_pl","Profit & Loss A/c"],["acc_tb","Trial Balance"],["acc_cf","Cash Flow"],["acc_ledger","Ledger"]]],
   ["Statements", [["acc_cashbook","Cash Book"],["acc_bankbook","Bank Book & Reconciliation"],["acc_debtors","Debtors"],["acc_creditors","Creditors"],["acc_gst","GST Statements"],["acc_tds","TDS Register"],["acc_registers","Sales & Purchase Registers"],["acc_assets","Fixed Asset Register"],["acc_contracts","Contract Profitability"]]],
-  ["Utilities", [["acc_period","Period Close"],["acc_discrep","Discrepancies"],["acc_export","Export for Auditor"],["bill_register","Invoice & PI Register"],["tax_invoices","Tax Invoices"],["direct_invoices","Direct Invoices (Accounts)"],["petty_purchases","Petty Purchases"],["proforma_invoices","Proforma Invoices"],["legacy_proforma","Legacy Proforma (load)"]]] ];
+  ["Utilities", [["acc_period","Period Close"],["acc_discrep","Discrepancies"],["acc_export","Export for Auditor"],["bill_register","Invoice & PI Register"],["tax_invoices","Tax Invoices"],["einv_inbox","E-invoice inbox"],["einv_report","Invoices vs e-invoice"],["direct_invoices","Direct Invoices (Accounts)"],["petty_purchases","Petty Purchases"],["proforma_invoices","Proforma Invoices"],["legacy_proforma","Legacy Proforma (load)"]]] ];
 function AccShell({ user, route, onGo, title, children, A, C, onReload, onYear }){
   const [view,setView] = useState(()=>{ try{ return localStorage.getItem("acc_view")||"erp"; }catch(e){ return "erp"; } });
   const setV = v=>{ setView(v); try{ localStorage.setItem("acc_view",v); }catch(e){} };
