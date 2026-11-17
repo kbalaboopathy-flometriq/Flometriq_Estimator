@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-17T02:30:00Z";
+  var APP_BUILD_VERSION = "2026-11-17T03:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -16465,7 +16465,12 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
   // typing a number that doesn't exist offers to create it as a new quote.
   const [refSearchDisplay,setRefSearchDisplay]=useState("");
   const baseRefOf = (ref)=> (ref||"").replace(/-Rev-\d+$/,"");
-  const refOptionsList = useMemo(()=>{
+  // 2026-11-17T03:00:00Z: the Quote screen lists quotes only — Order Acceptance numbers are left out (refOptionsAll keeps every number for the "already exists" check)
+  const [soNumSet,setSoNumSet] = useState(null);
+  useEffect(()=>{ if(mode==="contract") return; let off = false;
+    (async()=>{ try{ const rows = await fetchPaged(()=>sb.from("sale_order_tbl").select("contract_number")); if(!off) setSoNumSet(new Set((rows||[]).map(r=>String(r.contract_number)))); }catch(e){ if(!off) setSoNumSet(new Set()); } })();
+    return ()=>{ off = true; }; },[mode]);
+  const refOptionsAll = useMemo(()=>{
     const seen=new Set(); const out=[];
     refs.forEach(r=>{
       const base = baseRefOf(r.reference_number);
@@ -16473,6 +16478,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
     });
     return out.sort((a,b)=>a.rn.localeCompare(b.rn));
   },[refs]);
+  const refOptionsList = useMemo(()=> mode==="contract" ? refOptionsAll : refOptionsAll.filter(o=>!(soNumSet && soNumSet.has(String(o.rn))) && !/^\d{5,7}$/.test(String(o.rn))), [refOptionsAll, soNumSet, mode]);
   const latestRefForBase = (base)=>{
     const sameFamily = refs.filter(r=>baseRefOf(r.reference_number)===base);
     let best = base, bestNum = 0;
@@ -17696,7 +17702,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
   const confirmAddNew = async()=>{
     const val = addNewInput.trim();
     if(!val){ setAddNewMsg({type:"invalid",text:"Enter a quote number."}); return; }
-    const hit = refOptionsList.find(o=>o.rn===val);
+    const hit = refOptionsAll.find(o=>o.rn===val);   // 2026-11-17T03:00:00Z: every number, OAs included
     if(hit){ setAddNewMsg({type:"exists", rn:hit.rn, label:hit.label}); return; }
     // 137: a new Quote# must already be a Quote Register line (once the register is in use)
     const rc = await regCheckQuoteNo(val);
@@ -23214,8 +23220,12 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
         ),
         !headerEditOpen
           ? h("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"4px 20px",fontSize:12}},
-              h("div",null,h("span",{style:{color:colors.muted}},"Enquiry number: "),h("span",{style:!quoteHeaderRow.enquiry_number?{color:colors.danger}:{}},quoteHeaderRow.enquiry_number||"— not set")),
-              h("div",null,h("span",{style:{color:colors.muted}},"Enquiry date: "),(fmtDMY(quoteHeaderRow.enquiry_date)||"—")),
+              // 2026-11-17T03:00:00Z: Quote number on a quote; on an OA, the quote it came from (a link). Enquiry date is no longer shown.
+              mode==="contract"
+                ? (()=>{ const q = (contractInfo && contractInfo.quote_reference_number) || quoteHeaderRow.enquiry_number || "";
+                    return h("div",{style:{gridColumn:"span 2"}},h("span",{style:{color:colors.muted}},"From quote: "),
+                      q ? h("a",{href:"#","data-testid":"oa-from-quote",title:"Open quote "+q,onClick:e=>{ e.preventDefault(); try{ window.dispatchEvent(new CustomEvent("flo-goto",{ detail:{ quote:q } })); }catch(x){} },style:{color:"#0c447c",fontWeight:600,textDecoration:"underline"}}, q) : "—"); })()
+                : h("div",{style:{gridColumn:"span 2"}},h("span",{style:{color:colors.muted}},"Quote number: "),h("span",{"data-testid":"hdr-quote-no",style:{fontWeight:600}},refFilter||quoteHeaderRow.enquiry_number||"—")),
               h("div",null,h("span",{style:{color:colors.muted}},"Quote date: "),(fmtDMY(quoteHeaderRow.quote_date)||"—")),
               h("div",null,h("span",{style:{color:colors.muted}},"Currency: "),quoteHeaderRow.currency||"INR"),
               h("div",null,h("span",{style:{color:colors.muted}},"Conversion rate: "),quoteHeaderRow.conversion_rate||1),
@@ -23251,7 +23261,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
                 "Amending "+refFilter+" — leave a field blank to keep its current value. Only fill in what's actually changing."
               ),
               [
-                ["enquiry_number","Enquiry number","text"],["enquiry_date","Enquiry date","date"],["quote_date","Quote date","date"],
+                ["quote_date","Quote date","date"],   /* 2026-11-17T03:00:00Z: Enquiry number / date no longer amended here */
                 ["contact_name","Attention — Contact","text"],["contact_designation","Attention — Designation","text"],
                 ["signatory_name","Signatory","text"],["signatory_designation","Signatory Designation","text"]
               ].map(([field,label,type])=>
@@ -23297,8 +23307,8 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
             ),
         headerEditOpen && !isRevisionRef && h("div",null,
               h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}},
-                h("div",{style:{width:150}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Enquiry number"),h("input",{value:headerDraft.enquiry_number,onChange:e=>setHeaderDraft(d=>({...d,enquiry_number:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
-                h("div",{style:{width:130}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Enquiry date"),h("input",{type:"date",value:headerDraft.enquiry_date,onChange:e=>setHeaderDraft(d=>({...d,enquiry_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
+                /* 2026-11-17T03:00:00Z: field removed */
+                /* 2026-11-17T03:00:00Z: field removed */
                 h("div",{style:{width:130}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Quote date"),h("input",{type:"date",value:headerDraft.quote_date,onChange:e=>setHeaderDraft(d=>({...d,quote_date:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12}})),
                 h("div",{style:{width:90}},h("label",{style:{display:"block",fontSize:10,color:colors.muted,marginBottom:3}},"Currency"),
                   h("select",{value:headerDraft.currency,onChange:e=>{ const v=e.target.value; setHeaderDraft(d=>({...d,currency:v,conversion_rate:v==="INR"?"1":d.conversion_rate})); },style:{...inputStyle,padding:"6px 8px",fontSize:12}},
@@ -23662,8 +23672,8 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
                   )
                 ),
                 h("div",{style:{display:"flex",flexWrap:"wrap",gap:12,marginTop:4}},
-                  h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry#: "+(openRef.enquiry_number||"—")),
-                  h("span",{style:{fontSize:12,color:colors.muted}},"Enquiry date: "+(openRef.enquiry_date||"—")),
+                  // 2026-11-17T03:00:00Z: Quote# on a quote, From quote on an OA; Enquiry date no longer shown
+                  h("span",{style:{fontSize:12,color:colors.muted}}, mode==="contract" ? "From quote: "+((contractInfo && contractInfo.quote_reference_number) || openRef.enquiry_number || "—") : "Quote#: "+(openRef.reference_number || refFilter || "—")),
                   h("span",{style:{fontSize:12,color:colors.muted}},"Quote date: "+(openRef.quote_date||"—")),
                   linkedPackageInfo && h("span",{style:{fontSize:12,fontWeight:600,padding:"2px 9px",borderRadius:20,background:"#eaf9f4",color:"#085041"}},"Major Project: "+linkedPackageInfo.projectName+" · "+linkedPackageInfo.packageName+" · "+linkedPackageInfo.companyName),
                   !linkedPackageInfo && linkedProjectTag && h("span",{style:{fontSize:12,fontWeight:600,padding:"2px 9px",borderRadius:20,background:"#f0efe8",color:colors.muted}},"Major Project: "+linkedProjectTag+" (not linked to a specific package)"),
@@ -36796,6 +36806,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Nov 2026", summary:"Built on 2026-11-17T03:00:00Z, on top of 2026-11-17T02:30:00Z. No SQL. QUOTE / OA HEADER: (1) On the Quote screen the Find box lists quotes only — Order Acceptance numbers no longer appear in it (the OA screen already listed OAs only). (2) Quote header: 'Enquiry number' is now 'Quote number' and shows the quote's own number (read-only); Enquiry date is no longer shown or edited (the stored date is kept for the Enquiry Register). (3) Order Acceptance header: Enquiry number and Enquiry date are gone; 'From quote: <quote no>' shows the quote the OA came from as a link that opens it. The same applies to the line above each Sl No (Quote# / From quote, no Enquiry date)." },
   { date:"17 Nov 2026", summary:"Built on 2026-11-17T02:30:00Z, on top of 2026-11-17T02:00:00Z. No SQL. \ud83d\udcc4 DATASHEET IN THE QUOTE PDF: a Sl No whose Model is not in the catalogue (a one-off model typed on the quote, e.g. ISWB-1440-CUNI) now takes its Item from its own BOM lines \u2014 the same way the Datasheet screen opens it \u2014 so its saved datasheet prints in Annexure III instead of being skipped. The same Item now shows in the price summary, the HSN lookup, the BOM with estimate and the Excel price list for such Sl Nos (they showed the Model before). Catalogue models and Direct Price lines are unchanged." },
   { date:"17 Nov 2026", summary:"Built on 2026-11-17T02:00:00Z, on top of 2026-11-17T01:30:00Z. No SQL in the build (a one-time data fix for FXAD260007-R02 comes with it). (1) P&F ON QUOTES NOBODY HAS RE-SAVED: a P&F figure with no basis is read as a percentage everywhere it is used \u2014 quote PDF (cover, Annexure I, price summary), copies to a revision or an Order Acceptance, proforma, delivery challan and invoices. It is what the Commercial Terms form shows for it, so a 5% typed on a quote loaded from outside the app now prints without re-saving. (2) PURCHASE ORDER ON A QUOTE: the mandatory Purchase Order requirement is raised only for an Order Acceptance (a sale order must exist). A quote no longer shows a PO requirement raised for an Order Acceptance, in the Documents box or the quote readiness." },
   { date:"17 Nov 2026", summary:"Built on 2026-11-17T01:30:00Z, on top of 2026-11-16T12:00:00Z. No SQL. \u270b THE USER ALWAYS WINS: whatever is loaded into a quote from outside the app (SQL, legacy loads) is only a starting point, and a change made in the app always takes effect. COMMERCIAL TERMS \u203a PACKING & FORWARDING: (1) The dropdown shows Percentage when nothing is stored; the form now holds Percentage too, so Save stores the basis with the value (before, a typed 5% was saved with no basis and the PDF ignored it \u2014 FXAD260007-R02). (2) Once a % or a lumpsum is typed, older P&F text the form does not show is cleared on Save: the old free-text P&F, and on a quote the P&F note (an Order Acceptance still edits its notes). (3) The form says so in a yellow note under P&F before you save. An old quote with only P&F text and no value keeps printing its text until someone types a % or lumpsum. The quote PDF already prints a basis and value first and the text only when no basis is set \u2014 unchanged." },
