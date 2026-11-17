@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-16T12:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-17T01:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -18820,6 +18820,13 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
     try {
       const{data}=await sb.from("quote_commercial_terms").select("*").eq("reference_number",quoteExportRef).maybeSingle();
       const loaded = data||{reference_number:quoteExportRef,validity:"",payment_term:"",delivery_term:"",packing_forwarding:"",packing_forwarding_basis:"Percentage",packing_forwarding_value:"",insurance:"",price_basis:"",guarantee:"",dispatch_through:"",incoterms:"",freight:"",tax:"",warranty_coverage:"",jurisdiction:CT_DEFAULTS.jurisdiction,force_majeure:CT_DEFAULTS.force_majeure,order_cancellation_charges:CT_DEFAULTS.order_cancellation_charges};
+      // 2026-11-17T01:30:00Z: USER WINS — the P&F dropdown SHOWS "Percentage" when no basis is
+      // stored, so hold that in the form too, or Save stores a value with no basis
+      // and the PDF ignores it (FXAD260007-R02: a 5% typed by the user never printed
+      // because the quote was loaded by SQL with P&F as text). Left empty only for an
+      // old quote that has P&F text and no value — that text keeps printing until a
+      // % or lumpsum is typed (the form says so).
+      if(data && !data.packing_forwarding_basis && (String(data.packing_forwarding_value??"").trim()!=="" || !String(data.packing_forwarding||"").trim())) loaded.packing_forwarding_basis = "Percentage";
       setCtData(loaded);
       setCtOriginalData(loaded);
       // Packing & Forwarding (24 Aug) — Basis+Value replaces the old free
@@ -18872,6 +18879,15 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
     try {
       const payload={...ctData,reference_number:quoteExportRef,updated_by:user?.username||"unknown",updated_at:new Date().toISOString()};
       delete payload.id;
+      // 2026-11-17T01:30:00Z: USER WINS — once a % or a lumpsum is typed, that is the P&F. The basis the
+      // dropdown shows is stored with it, and older P&F text the form does not show
+      // (the old free-text P&F; on a quote, the P&F note, which only an Order Acceptance
+      // edits) is cleared so it cannot print instead of, or beside, what the user set.
+      if(String(payload.packing_forwarding_value??"").trim()!==""){
+        payload.packing_forwarding_basis = payload.packing_forwarding_basis || "Percentage";
+        payload.packing_forwarding = null;
+        if(mode!=="contract") payload.packing_forwarding_notes = null;
+      }
       let { error } = await sb.from("quote_commercial_terms").upsert(payload,{onConflict:"reference_number"});
       if(error && /gst_kind|packing_forwarding_notes/.test(error.message||"")){ delete payload.gst_kind; delete payload.packing_forwarding_notes; ({ error } = await sb.from("quote_commercial_terms").upsert(payload,{onConflict:"reference_number"})); }
       if(error) throw error;
@@ -25174,7 +25190,15 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
                   const money = (x)=> mode==="contract" ? fmt(r2(x)) : fmtR(x, quoteCcy);   // an Order Acceptance PDF only prints once every Sl No has its PO price
                   return "Computed: "+quoteCcy+" "+money(amt)+" ("+v+"% of "+quoteCcy+" "+money(basicDisp)+" basic)";
                 })()
-              )
+              ),
+              // 2026-11-17T01:30:00Z: say plainly when older P&F text is on this quote, and what Save does with it
+              (()=>{ const oldTxt = String(ctData.packing_forwarding||"").trim(), oldNote = String(ctData.packing_forwarding_notes||"").trim();
+                const typed = String(ctData.packing_forwarding_value??"").trim()!=="";
+                const msgs = [];
+                if(oldTxt && !typed) msgs.push("This quote has older P&F text: \u201c"+oldTxt+"\u201d. It prints as it is until you type a % or a lumpsum here.");
+                if(oldTxt && typed) msgs.push("Older P&F text \u201c"+oldTxt+"\u201d will be removed when you save \u2014 what you typed here is what prints.");
+                if(mode!=="contract" && oldNote && typed) msgs.push("Older P&F note \u201c"+oldNote+"\u201d will be removed when you save.");
+                return msgs.length ? h("div",{style:{fontSize:10.5,color:"#854f0b",background:"#fff4d6",border:"1px solid #e0c48a",borderRadius:5,padding:"4px 8px",marginTop:5,maxWidth:300}}, msgs.join(" ")) : null; })()
             )),
             fld("Insurance",null,ctTermField("insurance","insurance_terms_tbl","Insurance"))
           ),
@@ -30747,6 +30771,10 @@ const MANUAL_SECTIONS = [
         "title": "Packing and forwarding \u2014 which currency",
         "tag": "Sales",
         "blocks": [
+          {
+            "type": "tip",
+            "text": "What you type here is what prints (17 November 2026). Pick Percentage or Lumpsum and type the figure: Save stores both, and any older P&F text on the quote (for example from a quote loaded into the app from outside) is removed, with a yellow note telling you before you save. A quote that has only old P&F text and no figure keeps printing that text until you type a figure."
+          },
           {
             "type": "p",
             "text": "A Packing and Forwarding LUMPSUM is entered in the quote's own currency. The currency is shown as a badge inside the amount box, so there is nothing to remember and nothing to work out."
@@ -36755,6 +36783,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"17 Nov 2026", summary:"Built on 2026-11-17T01:30:00Z, on top of 2026-11-16T12:00:00Z. No SQL. \u270b THE USER ALWAYS WINS: whatever is loaded into a quote from outside the app (SQL, legacy loads) is only a starting point, and a change made in the app always takes effect. COMMERCIAL TERMS \u203a PACKING & FORWARDING: (1) The dropdown shows Percentage when nothing is stored; the form now holds Percentage too, so Save stores the basis with the value (before, a typed 5% was saved with no basis and the PDF ignored it \u2014 FXAD260007-R02). (2) Once a % or a lumpsum is typed, older P&F text the form does not show is cleared on Save: the old free-text P&F, and on a quote the P&F note (an Order Acceptance still edits its notes). (3) The form says so in a yellow note under P&F before you save. An old quote with only P&F text and no value keeps printing its text until someone types a % or lumpsum. The quote PDF already prints a basis and value first and the text only when no basis is set \u2014 unchanged." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T12:00:00Z, on top of 2026-11-16T10:00:00Z. No SQL. 🧾 GRN VALUES: (1) The expected bill on a GRN now uses the PO line each GRN line is linked to (it showed ₹ 0 when the PO lines had only a description). (2) Every GRN line shows its PO line, PO rate, value, GST % / GST and total, with a total row at PO rates and the PO's charges (P&F etc.) noted. (3) ⬇ Fill lines from PO adds one row per PO line still pending, already linked — Stores corrects the quantity, picks the stock item and gives Rack / Bin; only the Purchase Manager post or a Super Admin can change a line's PO line. (4) A PO line with no rate: the Purchase Manager post (or a Super Admin) enters the rate on the GRN line with a reason (audit log). (5) Clear GRN when the bill does not match the PO rates (or lines have no rate): allowed after a warning, and a card goes to the Purchase Manager, Finance Director and Accounts posts and the Super Admins. (6) The older PO line editor needs a rate above 0. (7) MANDATORY FIELDS: every label ending in * shows a red asterisk across the app; PO Vendor, PO date, Purchased for, line Qty and Rate now carry it." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T10:00:00Z, on top of 2026-11-16T09:00:00Z. No SQL. 🚚 SHIP-TO AWAITED: its own list (Tasks › 🚚 Ship-to awaited, and a summary with Open the list on the Accounts post's board) of every Order Acceptance saved with ship-to “to be advised” — from the day the OA is saved. Stale only once the order is in Production in progress on the Order Status board (red, days stale, first in the list; then it also shows in Stale / Pending Actions and the Sales Head and the order's FSE get one bell). Before that it is Waiting (amber when a letter is due) and counts nowhere as stale. Each order: contract · quote · client, stage with a bar, letters sent and the next one, Make letter (PDF), Mark sent, Enter ship-to, and 💬 WhatsApp to the FSE when stale. Letters unchanged (No. 1 from the Final Hold documents stage). No PDF block for Accounts." },
   { date:"16 Nov 2026", summary:"Built on 2026-11-16T09:00:00Z, on top of 2026-11-16T08:00:00Z. No SQL. 💬 WHATSAPP NOTES… FOR MANY PEOPLE on every board — Approvals, Task boards, Document Control, Order Status board and the Order Processing Review: tick people (with their counts), add a whole department, or Everyone; Make notes gives each person their own note with only their items (longest waiting first, contract · quote · client). Copy or Open WhatsApp per person, or Copy all. 📵 marks people with no mobile number in Employees. The review also has 💬 WhatsApp minutes after Close. Every note is logged." },
