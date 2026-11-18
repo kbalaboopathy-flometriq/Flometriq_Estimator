@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-18T07:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-18T13:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -3875,6 +3875,7 @@ function MenuTabs({ user, active, onChange, onRefresh }) {
       visibleGroups[gi] = { ...g, subgroups:sgs }; };
     const myNm = user.employee_name || user.username || ""; const holds = (k)=> user.role==="super_admin" || (postHolders(k)||[]).some(n=>sameName(n, myNm));
     addSub("Order Status", "Flow", { key:"order_flow", label:"⟶ Order flow" });
+    addSub("Order Status", "Kick-off", { key:"kickoff", label:"🤝 Kick-off meetings" });   // 2026-11-18T13:00:00Z
     addSub("Accounts", "Billing", { key:"order_flow_acc", label:"⟶ Order flow" });
     if(holds("purchase_manager")) addSub("Purchase", "Procurement", { key:"order_flow_pur", label:"⟶ Order flow" });
     if(holds("production_manager")) addSub("Production", "Progress", { key:"order_flow_pm", label:"⟶ Order flow" }); }
@@ -15948,6 +15949,7 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     ...(!overrideActive ? otherMissing.filter(x=>!/^Mandatory documents/.test(x)).map(x=>({ t:x+" not filled", fix:"Fill it in “to fix before approval” on this Order Acceptance"+(contractInfo.created_by?" (made by "+contractInfo.created_by+")":"")+".", who:contractInfo.created_by?[contractInfo.created_by]:[] })) : []),
     ...(!overrideActive && billingMissing ? [{ t:"Billing Address not filled", fix:"Fill it, or override it for later (anyone can).", who:contractInfo.created_by?[contractInfo.created_by]:[] }] : []),
     ...(!overrideActive && outstandingDocs.length && !contractInfo.no_docs_at ? [{ t:"Mandatory documents not on file: "+outstandingDocs.map(r=>r.category).join(", "), fix:"The Document Controller ("+apList(apN.dc)+") adds them in Documents — or, if this order needs none, use “No documents required” below.", who:apN.dc, docs:true }] : []),
+    ...(oaFinishMissing(contractInfo) ? [{ t:"Finish document not given (painting / pickling & passivation …)", fix:"Add it in Finish on this Order Acceptance — number, revision, title and link.", who:contractInfo.created_by?[contractInfo.created_by]:[] }] : []),   // 2026-11-18T13:00:00Z
     ...(apMtc ? [{ t:"MTC & AVL is not saved", fix:"The Technical Head ("+apList(apN.tech)+") fills the MTC and the vendor of each component and saves.", who:apN.tech }] : []) ];
   const apWho = (f)=> f==="technical_approved" ? "FSE of the order ("+apList(soFse)+") · or Sales Head ("+apList(apN.sales)+") · or a Super Admin ("+apSA+")"
     : "Accounts Admin ("+apList(apN.accounts)+") · or a Super Admin ("+apSA+")";
@@ -16027,7 +16029,8 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
         h("b",null,"✓ Order Acceptance approved"), " — "+apFields.map(f=>(f==="commercial_approved"?"Commercial Terms":"Everything else")+" by "+String(contractInfo[f+"_by"]||"")+(contractInfo[f+"_at"]?" "+fmtDMY(String(contractInfo[f+"_at"]).slice(0,10)):"")).join(" · "),
         contractInfo.no_docs_at ? " · No documents required" : "");
   return h("div",{style:{marginTop:10}},
-    h(CtfFlag,{ key:"ctf"+contractInfo.contract_number, cn:contractInfo.contract_number }),   // 2026-11-02T08:00:00Z
+    h(CtfFlag,{ key:"ctf"+contractInfo.contract_number, cn:contractInfo.contract_number }),
+    h(OaFinishBox,{ key:"fin"+contractInfo.contract_number, contractInfo, user, onChanged:()=>{ onChanged && onChanged(); } }),   // 2026-11-18T13:00:00Z   // 2026-11-02T08:00:00Z
     apBox,
     h(PurOwnerTag,{ key:"pot"+contractInfo.contract_number, cn:contractInfo.contract_number }),   // 2026-11-03T07:00:00Z
     oaPanel,
@@ -26458,6 +26461,11 @@ async function woReleaseRun({ ct, toState, expectFrom, username, reason, bom, cl
       if(free.length){ const created = await createWorkOrder(ct, free, username, "Raised automatically on production release"+(via?" ("+via+")":""));
         if(created.error) out.warn = (out.warn?out.warn+"\n":"")+"Work order release saved, but the work order was not raised: "+created.error; else out.wo = created.workOrder; }
     }catch(e){ out.warn = (out.warn?out.warn+"\n":"")+"Work order not raised: "+e.message; }
+  }
+  if(prod){   // 2026-11-18T13:00:00Z: the app gives the serials, and opens the Production Release Pack + kick-off
+    let ser = null;
+    try{ ser = await qcsrAutoSync(ct, username||"App", "W/O release", false); if(ser.err) out.warn = (out.warn?out.warn+"\n":"")+"Serials not given: "+ser.err; else if(ser.n) out.serials = ser; }catch(e){ out.warn = (out.warn?out.warn+"\n":"")+"Serials not given: "+e.message; }
+    try{ await rpOpen(ct, username||"App", toState, ser); }catch(e){ out.warn = (out.warn?out.warn+"\n":"")+"Production Release Pack not opened: "+e.message; }
   }
   return out;
 }
@@ -36915,6 +36923,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"18 Nov 2026", summary:"Built on 2026-11-18T13:00:00Z, on top of 2026-11-18T07:00:00Z. NEEDS SQL: structure_release_pack_2026-11-18.sql (BOTH companies). SERIALS: given by the app when the W/O is released (one per unit, every Sl No); a raised OA quantity gets more, a lowered one marks spare serials (not on a DC) unused with the reason; QC's + New entry is gone; Super Admins get a one-time Catch-up for orders already in production. PRODUCTION RELEASE PACK: a live PDF per contract made at W/O release — Critical, what each head must chase, order summary & serials, testing, Finish, other requirements, document index with links, kick-off, who has read it, History. It updates itself until the OA is closed (payment received) or cancelled; critical changes ask every head to read again, routine ones come in a daily digest. Read by Super Admins and the Finance Director, Accounts, Purchase Manager, QC, VP Projects, Production Manager, Stores, Factory Manager, Sales Head, Technical Head and Document Controller posts. KICK-OFF MEETINGS (Order Status › Kick-off meetings): every released W/O waits here; red and a daily reminder after 2 days; started and closed by the VP Projects and Technical Head posts; attendance, actions (owner* due*) that go on the owner's card as checklist lines, minutes; once held it moves to history. FINISH ON THE OA: Order Acceptances made from now need a finish document (painting / pickling & passivation / galvanising …: number, revision, title, link) — they save as Draft with a red badge but can't be approved until it is given." },
   { date:"18 Nov 2026", summary:"Built on 2026-11-18T07:00:00Z, on top of 2026-11-18T06:00:00Z. No SQL. COMPLETE THE INVOICE: nothing is mandatory while the invoice is a draft — no red boxes, no asterisks, no 'to fill' count; Save with whatever is known. When Ready for IRN is pressed, the same pop-up opens with every missing field red and mandatory (freight, insurance, LR no and date or No LR, mode, transporter GSTIN / ID, e-way distance, exchange rate and ports for exports) and Ready for IRN stays blocked until they are filled." },
   { date:"18 Nov 2026", summary:"Built on 2026-11-18T06:00:00Z, on top of 2026-11-18T03:00:00Z. No SQL. FLOW — BADGES: Order Status › Flow, all contracts, now shows each step as a badge instead of a dot — done steps with their date, the current step with who holds it and its days (red when late); the IRN steps sit under With Accounts. New filters: Waiting on (department) and Only late. ⟶ ORDER FLOW BUTTONS: Order Status › Flow (after Pending Orders – By value); Accounts › Billing (opens on Accounts); Purchase › Procurement for the Purchase Manager post; Production › Progress for the Production Manager post. ORDER PROCESSING REVIEW — ✓ COMPLETED on every line (Super Admins, Document Controller post, VP Projects post, or the line's owner; New owner stays as it was): document lines = the task card's Send to client (date, link*, what changed — revision Out, card closes, chase starts, no assignee); OA = OA sent (date*, to*); W/O = release + mandatory pick of the next stage's person (Technical / Design & Estimation people + department heads) and due date — the BOM summary card goes on that person's board; PR (last stage) asks 'close this card?' then releases the PR; BOM summary is approved in Production BOM as before. Review refreshes after each press; ↩ Undo for 10 minutes. New last block UNASSIGNED ON DOCUMENT CONTROL: documents with no owner — 👤 Give an owner (that department's people + department heads, due date*) or ✓ Completed straight away." },
   { date:"18 Nov 2026", summary:"Built on 2026-11-18T03:00:00Z, on top of 2026-11-17T13:30:00Z. No SQL. ORDER STATUS — FLOW VIEW: a third view next to Board and Table (all who open Order Status). All contracts: one dotted line per open contract — the order's stages, then each lot; red = a late step. One contract: boxes for OA made → Docs approved → W/O → BOM summary → Purchase BOM made / endorsed / approved → PR → Material in → Production, then one line per lot: Ready – DC & packing slip → With QC → With Accounts → Clearance – gate pass → Despatched → Payment received, with Accounts' GST steps (Invoice · ready for IRN, IRN in · to send) hanging below With Accounts. Each box: done date and by whom, who pushed it there and when, working days taken against the days allowed (late days in red); the box it is in now: with whom, for how many days. Purchase: PO made % and material in %. Production: each Sl No's route card — % done and the step it is at, with NCR / pause / job work / witness flags. Click a box for the detail. SALES › MY ORDERS — WHERE THEY ARE: the same flow for the FSE's own customers (account owner); the Sales Head and Super Admins pick any owner. DC OF A LOT: stage strip DC made › With QC › With Accounts › Cleared for despatch, and a banner with who has it now and since when (red when QC is over 3 days). Once the DC is with QC, Done – send to QC becomes Remind QC: a bell to the QC post and a line in the DC history, no new card (Done also checks the lot again before sending, so a second press never sends twice). A closed or cancelled order has no Done button and shows a red banner. ORDER STATUS BOARD: a lot With QC for more than 3 days turns red with the days shown." },
@@ -60905,7 +60914,8 @@ function App() {
     tab==="qc_serials"?h(QcSerialRegister,{user}):   // 2026-10-30T16:30:00Z
     tab==="order_board"?h(OrderStatusBoard,{user:uTab,sessionCompany}):
     tab==="my_orders_flow"?h(MyOrdersFlow,{user:uTab}):   // 2026-11-18T03:00:00Z
-    tab==="order_flow"?h(OrderFlowScreen,{user:uTab,dept:""}):   // 2026-11-18T06:00:00Z
+    tab==="order_flow"?h(OrderFlowScreen,{user:uTab,dept:""}):
+    tab==="kickoff"?h(KickoffScreen,{user:uTab}):   // 2026-11-18T13:00:00Z   // 2026-11-18T06:00:00Z
     tab==="order_flow_acc"?h(OrderFlowScreen,{user:uTab,dept:"acc"}):
     tab==="order_flow_pur"?h(OrderFlowScreen,{user:uTab,dept:"pur"}):
     tab==="order_flow_pm"?h(OrderFlowScreen,{user:uTab,dept:"pm"}):
@@ -61431,7 +61441,8 @@ async function stepLoadMine(user, force){
   try{ setTimeout(()=>oaMorningCheck(user), 6000); setTimeout(()=>oaScoreSweep(), 30000); }catch(e){}   // 2026-11-04T04:00:00Z
   try{ await socLoadMine(user); }catch(e){}   // 2026-10-31T10:00:00Z
   try{ await osStaleLoadMine(user, name); setTimeout(()=>osStaleSweepSoon((user&&user.username)||"App"), 40000); }catch(e){}   // 2026-11-13T00:00 (Build 4): stale order steps
-  try{ ospSyncSoon(user); }catch(e){}   // 2026-11-01T06:00:00Z: the order stages (tasks, escalations, PO chase), at most every 30 min
+  try{ ospSyncSoon(user); }catch(e){}
+  try{ rpSyncSoon(user); }catch(e){}   // 2026-11-18T13:00:00Z: Production Release Packs — history, re-reads, daily digest, kick-off reminders   // 2026-11-01T06:00:00Z: the order stages (tasks, escalations, PO chase), at most every 30 min
   try{ pgaSweepSoon(user); }catch(e){}
   try{ setTimeout(()=>pgMandSweep((user&&user.username)||"App"), 15000); }catch(e){}   // Label
   try{ setTimeout(()=>calSweep(), 25000); }catch(e){}
@@ -73122,7 +73133,7 @@ function QcSerialRegister({ user }){
       "Given on":r.given_on||"", "Given by":r.given_by||"", Kind:(QCSR_KIND[r.kind]||[r.kind])[0]+(r.void_at?" — unused: "+(r.void_reason||""):""), DC:dcOf.get(String(r.serial))||"", "Excel row":r.xl_row??"", "Client in Excel":r.xl_client||"", Note:r.match_note||"" }));
     const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(out), "Serials"); XLSX.writeFile(wb, "serial_number_register.xlsx");
   };
-  if(view==="new") return h(QcSerialNew,{ user, rows, nextNo, onBack:()=>setView("list"), onDone:()=>{ load(); } });
+  if(view==="catchup") return h(QcSerialCatchup,{ user, nextNo, onBack:()=>setView("list"), onDone:()=>{ load(); } });   // 2026-11-18T13:00:00Z
   if(view==="check") return h(QcSerialCheck,{ user, rows, dcOf, onBack:()=>setView("list"), onDone:()=>load() });   // 2026-11-06
   const th = (x,w)=> h("th",{style:{textAlign:"left",padding:"5px 7px",fontSize:10.5,letterSpacing:".04em",textTransform:"uppercase",color:colors.muted,borderBottom:"2px solid "+colors.dark,whiteSpace:"nowrap",width:w}},x);
   const td = (c,s)=> h("td",{style:{padding:"5px 7px",borderBottom:"1px solid "+colors.border,verticalAlign:"top",fontSize:12.5,...(s||{})}},c);
@@ -73142,8 +73153,8 @@ function QcSerialRegister({ user }){
         h("select",{value:kind,onChange:e=>{ setKind(e.target.value); setShow(200); },style:{...inputStyle,width:"auto"}},
           [["all","All"],["new","Given in the app"],["semi_legacy","Semi-legacy"],["legacy","Legacy"],["free","Not on a DC yet"]].map(([v,l])=>h("option",{key:v,value:v},l)))),
       canGive ? h("button",{"data-testid":"qcsr-check-btn",onClick:()=>setView("check"),style:{...btnSecondary,padding:"7px 14px",borderColor:"#c9302c",color:"#a3312a",fontWeight:600}},"Register check") : null,
-      canGive ? h("button",{"data-testid":"qcsr-new",onClick:()=>setView("new"),style:{...btnPrimary,padding:"7px 14px"}},"+ New entry")
-        : h("span",{style:{fontSize:11.5,color:colors.muted,maxWidth:260}},"Only QC and Super Admins give serials."),
+      h("span",{"data-testid":"qcsr-auto-note",style:{fontSize:12,color:colors.muted}},"Serials are given by the app when the W/O is released."),   // 2026-11-18T13:00:00Z: + New entry removed
+      user.role==="super_admin" ? h("button",{"data-testid":"qcsr-catchup-btn",onClick:()=>setView("catchup"),style:{...btnSecondary,padding:"7px 14px"}},"Catch-up — orders in production") : null,
       h("button",{onClick:toExcel,style:btn},"Excel")),
     h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:10,padding:"8px 10px",overflowX:"auto"}},
       h("table",{style:{borderCollapse:"collapse",width:"100%",minWidth:1240}},
@@ -73464,6 +73475,8 @@ function QcSerialNew({ user, rows, nextNo, onBack, onDone }){
 
 // 2026-11-01T17:00:00Z: the DC asks QC for serials — one task card per contract and Sl No to the QC post; closes itself when QC gives them
 async function dcAskQcSerials(user, cn, client, sl, qty, item, hint){
+  try{ const g = await qcsrAutoSync(cn, (await despMe(user))||user?.username||"App", "asked from the DC", false);   // 2026-11-18T13:00:00Z: the app gives them now
+    if(g && g.n){ alert("Given by the app: "+g.n+" serial"+(g.n>1?"s":"")+" ("+qcsrRange(g)+") for "+cn+". Open the DC again — the drop-downs fill."); return; } }catch(e){}
   try{ await loadPostPeople(); const names = postHolders("qc"); if(!names.length){ alert("The QC post is empty — "+postPersonText("qc")); return; }
     const title = "Give serials — "+cn+" Sl No "+sl+" ("+qty+" Nos)";
     const { data: open } = await sb.from("task_tbl").select("id").like("title","Give serials — "+cn+" Sl No "+sl+" %").neq("status","done");
@@ -75266,6 +75279,500 @@ function OsFlowView({ D, M, one, q, filterCns, title, dept }){
     pick ? h(OsfDetail,{ n:pick.n, lotName:pick.lotName, cn }) : h("div",{style:{fontSize:12,color:colors.muted,marginTop:8}},"Click a box for who pushed it, when, how long it took, and who has it now."));
 }
 // 2026-11-18T06:00:00Z: Order Status › Flow, Accounts › Billing, Purchase, Production — the same Flow, opened on the department's waiting orders
+
+// ==================================================================================================================
+// 2026-11-18T13:00:00Z: SERIALS AT W/O RELEASE · PRODUCTION RELEASE PACK · KICK-OFF MEETING · FINISH ON THE OA
+// Serials: the app gives them when the W/O is released (Start Production) — one per unit, every Sl No, no skipping —
+// and keeps them in step with the OA: a quantity raised gets more; a quantity lowered marks the spare ones (not on a
+// DC) unused with the reason. QC no longer gives them by hand; a one-time catch-up gives them to orders already in
+// production. The Production Release Pack is a live PDF per contract, made at W/O release and kept up to date until
+// the OA is closed (every lot paid) or cancelled — no revisions, a History chapter instead. Heads of every department
+// read it; a critical change (Code 3, hold, quantity / test / delivery change) asks them to read it again at once,
+// routine changes come in one daily digest. The kick-off meeting is a gateway like the Order Processing Review,
+// started and closed by the VP Projects and Technical Head posts, within 2 days of the release.
+// ==================================================================================================================
+const RP_SQL = "structure_release_pack_2026-11-18.sql";
+const RP_READ_POSTS = ["finance_director","accounts","purchase_manager","qc","vp_projects","production_manager","stores","factory_manager","sales_head","technical_head","doc_controller"];
+const KO_POSTS = ["vp_projects","technical_head"];
+const KO_DAYS = 2;
+const OA_FINISH_FROM = "2026-11-18T13:00:00Z";   // the finish rule is for Order Acceptances made from this build on
+const OA_FINISH_KINDS = ["Painting","Pickling & passivation","Galvanising","Electropolishing","Plating","Other finish"];
+const RP_DEPTS = [
+  ["sales","Sales",/sales|marketing|crm/i,["sales_head","sales_coordinator","oa"]],
+  ["doc","Document Control",/document/i,["doc_controller","vp_projects"]],
+  ["tech","Technical",/design|estimation|technical|engineering/i,["technical_head","estimation_head"]],
+  ["pur","Purchase",/purchase|procure/i,["purchase_manager","purchase_engineer"]],
+  ["prod","Production",/production|factory|shop|machin|fabric|weld/i,["production_manager","factory_manager"]],
+  ["qc","QC",/^\s*qc|quality|inspect/i,["qc"]],
+  ["stores","Stores",/store/i,["stores"]],
+  ["acc","Accounts",/account|finance/i,["accounts","finance_director","accountant"]],
+];
+function rpDeptOf(t){ const pk = String(t.post_key||""); for(const d of RP_DEPTS){ if(pk && d[3].includes(pk)) return d[0]; } const s = String(t.department||""); for(const d of RP_DEPTS){ if(d[2].test(s)) return d[0]; } return "other"; }
+const rpToday = ()=> toISODate(new Date());
+const rpDays = (a)=> a ? Math.max(0, Math.floor((Date.now()-new Date(a).getTime())/864e5)) : 0;
+const rpErr = (e)=> /release_pack|kickoff_meeting|finish_docs/i.test(String((e&&e.message)||e||"")) ? "Run "+RP_SQL+" in Supabase first (both companies)." : String((e&&e.message)||e||"");
+
+// ---------------------------------------------------------------- SERIALS
+// Gives what each Sl No still lacks (order qty less the live serials); with allowVoid, marks spare ones unused.
+async function qcsrAutoSync(cn, by, why, allowVoid){
+  cn = String(cn||"").trim(); const out = { n:0, from:null, to:null, voided:0, err:"" };
+  if(!cn) return out;
+  try{
+    const C = await despContract(cn); if(!C || !(C.lines||[]).length) return out;
+    const { data: regs, error: rErr } = await sb.from("qc_serial_register_tbl").select("id,serial,item_sl_no,void_at").eq("contract_number",cn);
+    if(rErr){ out.err = rErr.message; return out; }
+    const live = (regs||[]).filter(r=>!r.void_at && r.item_sl_no!=null);
+    const giveLines = [], spare = [];
+    C.lines.forEach(l=>{ const mine = live.filter(r=>String(r.item_sl_no)===String(l.item_sl_no)); const want = Math.max(0, Number(l.ordered)||0);
+      if(want > mine.length) giveLines.push({ sl:l.item_sl_no, qty:want-mine.length, item:l.item||"", size:qcsrSize(l.description), description:l.description||"" });
+      else if(allowVoid && mine.length > want) spare.push({ sl:l.item_sl_no, want, rows:mine.sort((a,b)=>b.serial-a.serial), n:mine.length-want }); });
+    // Sl Nos no longer on the OA at all
+    if(allowVoid){ const sls = new Set(C.lines.map(l=>String(l.item_sl_no))); const gone = live.filter(r=>!sls.has(String(r.item_sl_no))); if(gone.length) spare.push({ sl:"(removed)", want:0, rows:gone, n:gone.length }); }
+    if(giveLines.length){
+      const { data, error } = await sb.rpc("qc_serial_give",{ p_contract:cn, p_client:C.customer||"", p_lines:giveLines, p_by:by||"App" });
+      if(error){ out.err = error.message||String(error); }
+      else { const ss = (data||[]).map(r=>Number(r.serial)).filter(n=>!isNaN(n)).sort((a,b)=>a-b); out.n = ss.length; out.from = ss[0]??null; out.to = ss[ss.length-1]??null;
+        try{ await sb.from("qc_serial_register_tbl").update({ given_by:"App" }).in("serial",ss).eq("contract_number",cn); }catch(e){}
+        try{ await dcAskQcClose(cn, "App"); }catch(e){}
+        try{ await logAudit("INSERT","qc_serial_register_tbl",cn,"Serials given by the app ("+(why||"W/O release")+"): "+ss.length+(ss.length?" — "+ss[0]+(ss.length>1?" to "+ss[ss.length-1]:""):""),by||"App",null,null); }catch(e){} }
+    }
+    if(spare.length){
+      const ids = spare.flatMap(s=>s.rows.map(r=>r.id)); let onDc = new Set();
+      try{ const { data: ds } = await sb.from("dc_serial_tbl").select("serial").in("serial",spare.flatMap(s=>s.rows.map(r=>r.serial))); onDc = new Set((ds||[]).map(d=>String(d.serial))); }catch(e){}
+      const now = new Date().toISOString(); const kill = [];
+      spare.forEach(s=>{ let left = s.n; for(const r of s.rows){ if(!left) break; if(onDc.has(String(r.serial))) continue; kill.push({ id:r.id, serial:r.serial, why:"Quantity on the OA for Sl No "+s.sl+" is now "+s.want+(why?" ("+why+")":"") }); left--; } });
+      for(const k of kill){ const { error } = await sb.from("qc_serial_register_tbl").update({ void_at:now, void_by:by||"App", void_reason:k.why }).eq("id",k.id); if(!error) out.voided++; }
+      if(out.voided) try{ await logAudit("UPDATE","qc_serial_register_tbl",cn,out.voided+" serial(s) marked unused — the OA quantity went down",by||"App",null,null); }catch(e){}
+    }
+  }catch(e){ out.err = String(e.message||e); }
+  return out;
+}
+const qcsrRange = (s)=> !s || !s.n ? "" : (s.from===s.to ? String(s.from) : s.from+" – "+s.to);
+
+// One-time catch-up: every contract at Start Production whose Sl Nos have fewer live serials than the order qty
+async function qcsrCatchupList(){
+  const { data: sos } = await sb.from("sale_order_tbl").select("contract_number,customer_name,go_ahead_state,go_ahead_at,status").like("go_ahead_state","Start Production%");
+  const live = (sos||[]).filter(s=>!/cancel|closed/i.test(s.status||""));
+  const cns = live.map(s=>String(s.contract_number));
+  const regs = cns.length ? await fetchPaged(()=>sb.from("qc_serial_register_tbl").select("contract_number,item_sl_no,void_at").in("contract_number",cns), 1000) : [];
+  const out = [];
+  for(const s of live){
+    let C = null; try{ C = await despContract(s.contract_number); }catch(e){} if(!C || !(C.lines||[]).length) continue;
+    const mine = regs.filter(r=>String(r.contract_number)===String(s.contract_number) && !r.void_at);
+    let units = 0, sls = 0; C.lines.forEach(l=>{ const g = mine.filter(r=>String(r.item_sl_no)===String(l.item_sl_no)).length; const need = Math.max(0,(Number(l.ordered)||0)-g); if(need){ units += need; sls++; } });
+    if(units) out.push({ cn:String(s.contract_number), client:s.customer_name||C.customer||"", at:s.go_ahead_at, sls, units });
+  }
+  return out.sort((a,b)=>String(a.cn).localeCompare(String(b.cn)));
+}
+function QcSerialCatchup({ user, nextNo, onBack, onDone }){
+  const [rows,setRows] = useState(null); const [pick,setPick] = useState({}); const [busy,setBusy] = useState(false); const [msg,setMsg] = useState("");
+  useEffect(()=>{ qcsrCatchupList().then(r=>{ setRows(r); const p = {}; r.forEach(x=>p[x.cn] = true); setPick(p); }).catch(e=>{ setRows([]); setMsg(String(e.message||e)); }); },[]);
+  const sel = (rows||[]).filter(r=>pick[r.cn]); const total = sel.reduce((s,r)=>s+r.units,0);
+  let n = nextNo;
+  const apply = async()=>{
+    if(!sel.length || busy) return; if(!confirm("Give "+total+" serial numbers to "+sel.length+" contract(s)? They go into the register as given by the app.")) return;
+    setBusy(true); setMsg(""); const me = (await despMe(user)) || user.username; let given = 0; const bad = [];
+    for(const r of sel){ const s = await qcsrAutoSync(r.cn, me, "catch-up for orders already in production", false); given += s.n; if(s.err) bad.push(r.cn+": "+s.err); }
+    setBusy(false); setMsg("✓ Given "+given+" serial(s)."+(bad.length?" Not given — "+bad.join(" · "):"")); onDone && onDone();
+    qcsrCatchupList().then(setRows).catch(()=>{});
+  };
+  const th = (x)=> h("th",{style:{textAlign:"left",padding:"5px 7px",fontSize:10.5,textTransform:"uppercase",color:colors.muted,borderBottom:"2px solid "+colors.dark}},x);
+  const td = (c,s)=> h("td",{style:{padding:"5px 7px",borderBottom:"1px solid "+colors.border,fontSize:12.5,...(s||{})}},c);
+  const mono = { fontFamily:"'IBM Plex Mono',Consolas,monospace", whiteSpace:"nowrap" };
+  return h("div",{"data-testid":"qcsr-catchup",style:{padding:"16px 20px",maxWidth:1000}},
+    h("button",{onClick:onBack,style:{...btnSecondary,padding:"4px 10px",fontSize:12,marginBottom:8}},"← Register"),
+    h("h2",{style:{fontSize:17,margin:"0 0 3px"}},"Catch-up — orders already in production with no serials"),
+    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:10}},"Every contract released to Start Production whose Sl Nos have fewer serials than the order quantity. Nothing is written until you press Apply."),
+    msg ? h("div",{style:{background:/^✓/.test(msg)?"#e4f3ed":"#fdecea",color:/^✓/.test(msg)?"#0f6b4f":"#a3312a",borderRadius:8,padding:"8px 12px",fontSize:12.5,marginBottom:8}},msg) : null,
+    !rows ? h("div",{style:{color:colors.muted}},"Looking…") : !rows.length ? h("div",{style:{color:"#0f6b4f",fontWeight:600}},"✓ Every order in production has its serials.") :
+    h("div",null, h("table",{style:{borderCollapse:"collapse",width:"100%"}},
+      h("thead",null,h("tr",null,th(""),th("Contract"),th("Client"),th("W/O released"),th("Sl Nos"),th("Units"),th("Serials to be given"))),
+      h("tbody",null, rows.map(r=>{ const on = !!pick[r.cn]; const b = on ? [n, n+r.units-1] : null; if(on) n += r.units;
+        return h("tr",{key:r.cn,"data-testid":"qcsr-cu-row"}, td(h("input",{type:"checkbox",checked:on,onChange:()=>setPick(p=>({ ...p, [r.cn]:!on }))})), td(r.cn,mono), td(r.client||"—"), td(r.at?fmtDMY(r.at):"—"), td(r.sls,mono), td(r.units,mono), td(b ? (b[0]===b[1]?b[0]:b[0]+" – "+b[1]) : "—",mono)); }))),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:10}},
+        h("button",{onClick:onBack,style:btnSecondary},"Cancel"),
+        h("button",{"data-testid":"qcsr-cu-apply",disabled:!total||busy,onClick:apply,style:{...btnPrimary,opacity:total&&!busy?1:.5}}, busy ? "Giving…" : "Apply — give "+total+" serial"+(total===1?"":"s")))));
+}
+
+// ---------------------------------------------------------------- FINISH (painting / pickling & passivation …) ON THE OA
+const oaFinishRequired = (so)=> !!so && String(so.created_at||"") >= OA_FINISH_FROM && !/cancel/i.test(so.status||"");
+const oaFinishOk = (so)=> Array.isArray(so && so.finish_docs) && so.finish_docs.some(d=>d && d.kind && String(d.doc_no||"").trim() && String(d.rev??"").trim() && String(d.title||"").trim() && /^https?:\/\//i.test(String(d.link||"").trim()));
+const oaFinishMissing = (so)=> oaFinishRequired(so) && !oaFinishOk(so);
+function OaFinishBox({ contractInfo, user, onChanged }){
+  const so = contractInfo || {}; const list = Array.isArray(so.finish_docs) ? so.finish_docs : [];
+  const [f,setF] = useState(null); const [err,setErr] = useState(""); const [busy,setBusy] = useState(false);
+  const need = oaFinishRequired(so), miss = oaFinishMissing(so);
+  const save = async(next)=>{
+    setBusy(true); setErr("");
+    const { error } = await sb.from("sale_order_tbl").update({ finish_docs:next }).eq("contract_number",String(so.contract_number));
+    setBusy(false); if(error){ setErr(rpErr(error)); return false; }
+    try{ await logAudit("UPDATE","sale_order_tbl",String(so.contract_number),"Finish documents: "+next.map(d=>d.kind+" "+d.doc_no+" Rev "+d.rev).join(", "),user?.username||"",null,null); }catch(e){}
+    onChanged && onChanged({ finish_docs:next }); return true;
+  };
+  const add = async()=>{
+    const x = f||{}; const bad = [];
+    if(!x.kind) bad.push("finish"); if(!String(x.doc_no||"").trim()) bad.push("document number"); if(!String(x.rev??"").trim()) bad.push("revision");
+    if(!String(x.title||"").trim()) bad.push("title"); if(!/^https?:\/\//i.test(String(x.link||"").trim())) bad.push("link (https://…)");
+    if(bad.length){ setErr("Fill: "+bad.join(", ")+"."); return; }
+    const by = (await despMe(user)) || user?.username || "";
+    if(await save([...list, { kind:x.kind, doc_no:String(x.doc_no).trim(), rev:String(x.rev).trim(), title:String(x.title).trim(), link:String(x.link).trim(), by, at:new Date().toISOString() }])) setF(null);
+  };
+  const lab = (l, c)=> h("label",{style:{display:"grid",gap:2,fontSize:11,color:colors.muted,flex:"1 1 140px"}}, h("span",null,l,h("b",{style:{color:"#c0392b"}}," *")), c);
+  const inp = (k, ph)=> h("input",{"data-testid":"oaf-fin-"+k,value:(f&&f[k])||"",placeholder:ph||"",onChange:e=>setF(p=>({ ...(p||{}), [k]:e.target.value })),style:{...inputStyle,padding:"5px 7px"}});
+  return h("div",{"data-testid":"oa-finish",style:{background:"#fff",border:"1px solid "+(miss?"#c9302c":colors.border),borderRadius:10,margin:"8px 0",overflow:"hidden"}},
+    h("div",{style:{padding:"7px 14px",display:"flex",gap:10,alignItems:"center",background:miss?"#fbe7e4":"#f6f8fa"}},
+      h("b",null,"Finish — painting / pickling & passivation / galvanising …"),
+      miss ? h("span",{"data-testid":"oa-finish-badge",style:{background:"#c9302c",color:"#fff",borderRadius:10,padding:"1px 9px",fontSize:11.5,fontWeight:700}},"⚠ Finish document missing — Draft only") : list.length ? h("span",{style:{background:"#e3f1ea",color:"#0f6a4c",borderRadius:10,padding:"1px 9px",fontSize:11.5,fontWeight:700}},"✓ "+list.length+" on file") : null,
+      h("span",{style:{flex:1}}),
+      !f ? h("button",{"data-testid":"oa-finish-add",onClick:()=>{ setF({ kind:"" }); setErr(""); },style:{...btnSmall,fontWeight:700}},"+ Add finish document") : null),
+    h("div",{style:{padding:"6px 14px 10px",fontSize:12.5}},
+      need && miss ? h("div",{style:{color:"#8a2d2d",marginBottom:6}},"This Order Acceptance can be saved as a Draft, but it can't be approved or sent until its finish document is given — number, revision, title and link.") : null,
+      !need && !list.length ? h("div",{style:{color:colors.muted}},"Not required on Order Acceptances made before 18 Nov 2026 — add it if you have it; the Production Release Pack prints it.") : null,
+      list.map((d,i)=>h("div",{key:i,style:{display:"flex",gap:8,alignItems:"center",padding:"3px 0",borderBottom:"1px dashed "+colors.border}},
+        h("b",null,d.kind), h("span",null,d.doc_no+" Rev "+d.rev+" — "+d.title), h("a",{href:d.link,target:"_blank",rel:"noopener",style:{color:"#0c447c"}},"open ↗"),
+        h("span",{style:{flex:1}}), h("span",{style:{fontSize:11,color:colors.muted}},(d.by||"")+(d.at?" · "+fmtDMY(d.at):"")),
+        h("button",{onClick:async()=>{ if(confirm("Remove "+d.kind+" "+d.doc_no+" from this OA?")) await save(list.filter((_,j)=>j!==i)); },style:{...btnSmall,fontSize:11,color:"#a3312a"}},"Remove"))),
+      f ? h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"flex-end",marginTop:8}},
+        lab("Finish", h("select",{"data-testid":"oaf-fin-kind",value:f.kind||"",onChange:e=>setF(p=>({ ...p, kind:e.target.value })),style:{...inputStyle,padding:"5px 7px"}}, h("option",{value:""},"— choose —"), OA_FINISH_KINDS.map(k=>h("option",{key:k,value:k},k)))),
+        lab("Document no", inp("doc_no","e.g. PS-260160-01")), lab("Rev", inp("rev","0")), lab("Title", inp("title","Painting specification")), lab("Link", inp("link","https://…")),
+        h("button",{"data-testid":"oa-finish-save",disabled:busy,onClick:add,style:{...btnPrimary,padding:"6px 12px"}},busy?"Saving…":"Save"),
+        h("button",{onClick:()=>{ setF(null); setErr(""); },style:btnSmall},"Cancel")) : null,
+      err ? h("div",{style:{color:colors.danger,marginTop:6}},err) : null));
+}
+
+// ---------------------------------------------------------------- PACK — who reads it
+async function rpReaders(){
+  try{ await loadPostPeople(); }catch(e){}
+  const out = new Map();   // name -> post label
+  RP_READ_POSTS.forEach(k=>(postHolders(k)||[]).forEach(n=>{ if(n && !out.has(n)) out.set(n, postLabel(k)); }));
+  try{ (await superAdminNames()).forEach(n=>{ if(n && !out.has(n) && n!==POST_VACANT_CONTACT) out.set(n, "Super Admin"); }); }catch(e){}
+  return out;
+}
+const rpKoNames = ()=> Array.from(new Set(KO_POSTS.flatMap(k=>postHolders(k)||[]))).filter(Boolean);
+
+// made at W/O release (woReleaseRun)
+async function rpOpen(cn, by, toState, serials){
+  cn = String(cn); const now = new Date().toISOString();
+  const { data: ex, error: e0 } = await sb.from("release_pack_tbl").select("*").eq("contract_number",cn).maybeSingle();
+  if(e0) throw new Error(rpErr(e0));
+  const { data: so } = await sb.from("sale_order_tbl").select("customer_name").eq("contract_number",cn).maybeSingle();
+  const client = (so&&so.customer_name)||"";
+  if(!ex){ const { error } = await sb.from("release_pack_tbl").insert({ contract_number:cn, released_at:now, released_by:by||"", release_state:toState||"", state:"live", reread_from:now, updated_at:now });
+    if(error) throw new Error(rpErr(error)); }
+  else await sb.from("release_pack_tbl").update({ release_state:toState||ex.release_state, state:"live", reread_from:now, updated_at:now }).eq("contract_number",cn);
+  await rpHist(cn, "W/O released — "+woLabel(toState||"")+(serials&&serials.n?" · serials "+qcsrRange(serials)+" given":"")+(ex?" (released again)":" · pack opened"), by, true);
+  try{ const R = await rpReaders(); await notifyPeople(Array.from(R.keys()), "📦 Production Release Pack — "+cn+(client?" "+client:"")+": the W/O is released. Read the pack (Order Status › Kick-off meetings).", "info", { kind:"open", open:{ tab:"kickoff" }, group:"rp:"+cn+":open" }); }catch(e){}
+  try{ await loadPostPeople(); const ko = rpKoNames(); if(ko.length) await notifyPeople(ko, "🤝 Kick-off meeting due for "+cn+(client?" "+client:"")+" within "+KO_DAYS+" days of the W/O release. Start it in Order Status › Kick-off meetings.", "action", { kind:"open", open:{ tab:"kickoff" }, group:"ko:"+cn }); }catch(e){}
+  try{ await rpSyncOne(cn, by||"App", true); }catch(e){}
+}
+async function rpHist(cn, what, by, critical){ try{ await sb.from("release_pack_hist_tbl").insert({ contract_number:String(cn), at:new Date().toISOString(), what:String(what||"").slice(0,600), by:by||"App", critical:!!critical }); }catch(e){} }
+
+// ---------------------------------------------------------------- PACK — the data
+async function rpLoad(cn){
+  cn = String(cn);
+  const [P, soR, C, regR, slT, glT, dR, rR, hR, kR, tR] = await Promise.all([
+    sb.from("release_pack_tbl").select("*").eq("contract_number",cn).maybeSingle(),
+    sb.from("sale_order_tbl").select("*").eq("contract_number",cn).maybeSingle(),
+    despContract(cn).catch(()=>null),
+    sb.from("qc_serial_register_tbl").select("serial,item_sl_no,void_at").eq("contract_number",cn),
+    sb.from("quote_sl_testing_tbl").select("*").eq("reference_number",cn),
+    sb.from("quote_global_testing_tbl").select("*").eq("reference_number",cn),
+    sb.from("universal_documents_tbl").select("*").eq("entity_type","contract").eq("entity_id",cn),
+    sb.from("release_pack_read_tbl").select("*").eq("contract_number",cn),
+    sb.from("release_pack_hist_tbl").select("*").eq("contract_number",cn).order("at",{ ascending:false }).limit(300),
+    sb.from("kickoff_meeting_tbl").select("*").eq("contract_number",cn).maybeSingle(),
+    sb.from("task_tbl").select("id,title,assignee,department,post_key,due_date,created_at,status,ref,checklists").eq("ref",cn).neq("status","done"),
+  ]);
+  const so = soR.data || {}; const docs = (dR.data||[]).filter(d=>!d.is_archived);
+  let hist = []; if(docs.length){ const { data } = await sb.from("universal_document_history_tbl").select("*").in("document_id",docs.map(d=>d.id)); hist = data||[]; }
+  const docRows = docs.map(d=>{ const revs = hist.filter(x=>String(x.document_id)===String(d.id)).sort((a,b)=>(Number(a.rev_number)||0)-(Number(b.rev_number)||0) || String(a.changed_at||"").localeCompare(String(b.changed_at||"")) || (a.id-b.id));
+    const last = revs[revs.length-1]||{}; const linkRow = revs.slice().reverse().find(x=>x.link)||{};
+    return { id:d.id, number:d.doc_number||"", name:d.doc_name||d.category||"", category:d.category||"", rev:last.rev_number??"", status:last.status||"", dir:last.direction||"", at:last.changed_at||last.created_at||null,
+      link:linkRow.link||d.link||"", prod:!!(d.for_production||d.handed_over||/production/i.test(String(d.purpose||""))) }; })
+    .sort((a,b)=>String(a.category).localeCompare(String(b.category)) || String(a.number).localeCompare(String(b.number)));
+  let x = null; try{ const M = await ospLoad(); x = ospStage(cn, M); }catch(e){}
+  const serials = (regR.data||[]).filter(r=>!r.void_at);
+  const tests = [ ...(slT.data||[]).map(t=>({ sl:String(t.item_sl_no??""), test:String(t.test_name||"").trim() })), ...(glT.data||[]).map(t=>({ sl:t.item_sl_no!=null?String(t.item_sl_no):"all", test:String(t.test_name||"").trim() })) ].filter(t=>t.test);
+  return { cn, P:P.data||null, missing:!!P.error, so, lines:(C&&C.lines)||[], client:so.customer_name||(C&&C.customer)||"", serials, tests, docs:docRows,
+    reads:rR.data||[], hist:hR.data||[], meeting:kR.data||null, cards:tR.data||[], x };
+}
+function rpSerialText(serials, sl){ const s = serials.filter(r=>String(r.item_sl_no)===String(sl)).map(r=>Number(r.serial)).sort((a,b)=>a-b); if(!s.length) return "—";
+  const parts = []; let a = s[0], b = s[0]; for(let i=1;i<=s.length;i++){ if(s[i]===b+1){ b = s[i]; continue; } parts.push(a===b?String(a):a+"–"+b); a = s[i]; b = s[i]; } return parts.join(", "); }
+const rpCode = (st)=> { const m = String(st||"").match(/code\s*([123])/i); return m ? Number(m[1]) : 0; };
+function rpCritical(D){
+  const out = []; const so = D.so||{}, x = D.x||{};
+  const red = (t, d)=> out.push({ lv:"red", t, d }); const amb = (t, d)=> out.push({ lv:"amber", t, d });
+  if(x.hold) red("On hold", (x.hold.reason||x.hold.why||"")+(x.hold.by?" — "+x.hold.by:""));
+  if(/^Hold/.test(so.go_ahead_state||"")) red("Production on hold", "W/O state: "+(so.go_ahead_state||"Hold"));
+  if(x.stage==="bom") red("BOM summary not made / Production BOM not approved", "Purchase cannot start until it is.");
+  if(["pbm","pbe","pba"].includes(x.stage)) amb("Purchase BOM not approved yet", (OAF_SHORT[x.stage]||x.stage));
+  if(x.stage==="pr") amb("PR not released yet", "Purchase BOM approved — PR release pending.");
+  if(so.ship_tba || !String(so.shipping_address||"").trim()) red("Shipping address not given", "Needed for the DC and the invoice.");
+  if(oaFinishMissing(so)) red("Finish document missing on the OA", "Painting / pickling & passivation document — number, revision, title and link.");
+  D.docs.filter(d=>rpCode(d.status)===3).forEach(d=>red(d.number+" at Code 3", "Rework and resubmit — "+d.name));
+  D.docs.filter(d=>rpCode(d.status)===2).forEach(d=>amb(d.number+" at Code 2", "Resubmission due — "+d.name));
+  if(paymentTermSmellsOfAdvance(so.payment_term)) amb("Advance in the payment terms", "Accounts to confirm it is received — "+String(so.payment_term||"").slice(0,90));
+  const late = D.cards.filter(t=>t.due_date && t.due_date < rpToday());
+  if(late.length) amb(late.length+" open card"+(late.length>1?"s":"")+" late on this contract", Array.from(new Set(late.map(t=>t.assignee).filter(Boolean))).join(", "));
+  if(!(D.meeting && D.meeting.held_at) && D.P && rpDays(D.P.released_at) > KO_DAYS) red("Kick-off meeting not held", rpDays(D.P.released_at)+" days since the W/O release (limit "+KO_DAYS+").");
+  return out;
+}
+function rpChase(D){
+  const by = {}; RP_DEPTS.forEach(d=>by[d[0]] = []); by.other = [];
+  D.cards.forEach(t=>{ const k = rpDeptOf(t); const late = t.due_date && t.due_date < rpToday(); by[k].push({ t:t.title, who:t.assignee||"Unassigned", age:rpDays(t.created_at), due:t.due_date, late }); });
+  const so = D.so||{};
+  if(so.ship_tba || !String(so.shipping_address||"").trim()) by.sales.unshift({ t:"Shipping address from the client", who:"Sales", age:rpDays(so.created_at), late:true });
+  D.docs.filter(d=>rpCode(d.status)===3 || rpCode(d.status)===2).forEach(d=>by.doc.unshift({ t:d.number+" Rev "+d.rev+" — "+d.status, who:"Document Control", age:rpDays(d.at), late:rpCode(d.status)===3 }));
+  if(paymentTermSmellsOfAdvance(so.payment_term)) by.acc.unshift({ t:"Advance per payment terms — confirm received", who:"Accounts", age:rpDays(so.created_at) });
+  return by;
+}
+// what the History compares, and which changes are critical
+function rpFacts(D){
+  const f = {}; const so = D.so||{};
+  f["state"] = so.go_ahead_state||""; f["hold"] = D.x && D.x.hold ? "on hold" : "";
+  f["ship"] = (so.ship_tba || !String(so.shipping_address||"").trim()) ? "not given" : "given";
+  f["delivery"] = [so.delivery_days, so.delivery_trigger].filter(Boolean).join(" ");
+  D.lines.forEach(l=>{ f["qty|"+l.item_sl_no] = String(l.ordered); });
+  f["tests"] = Array.from(new Set(D.tests.map(t=>t.sl+":"+t.test))).sort().join(", ");
+  f["finish"] = (Array.isArray(so.finish_docs)?so.finish_docs:[]).map(d=>d.kind+" "+d.doc_no+" Rev "+d.rev).join(", ");
+  D.docs.forEach(d=>{ f["doc|"+(d.number||d.id)] = "Rev "+d.rev+" · "+(d.status||"—"); });
+  f["serials"] = String(D.serials.length);
+  f["stage"] = D.x && D.x.stage ? (OAF_SHORT[D.x.stage]||D.x.stage) : "";
+  return f;
+}
+function rpDiff(a, b){
+  const lines = []; const keys = Array.from(new Set([...Object.keys(a||{}), ...Object.keys(b||{})]));
+  const lab = (k)=> k==="state"?"W/O state":k==="hold"?"Hold":k==="ship"?"Shipping address":k==="delivery"?"Delivery":k==="tests"?"Tests":k==="finish"?"Finish documents":k==="serials"?"Serials given":k==="stage"?"Order stage":
+    k.startsWith("qty|")?"Quantity Sl No "+k.slice(4):k.startsWith("doc|")?k.slice(4):k;
+  keys.forEach(k=>{ const o = (a||{})[k]??"", n = (b||{})[k]??""; if(String(o)===String(n)) return;
+    const crit = k==="hold" ? !!n : k==="state" ? true : k==="delivery" ? !!o : k.startsWith("qty|") ? !!o : k==="tests" ? !!o || !!n : k.startsWith("doc|") ? rpCode(n)===3 : k==="ship" ? n!=="given" && !!o : false;
+    lines.push({ what:lab(k)+": "+(o===""?"—":o)+" → "+(n===""?"—":n), critical:crit }); });
+  return lines;
+}
+async function rpSyncOne(cn, by, quiet){
+  const D = await rpLoad(cn); if(!D.P) return null;
+  const so = D.so||{};
+  if(D.P.state==="live" && /closed|cancel/i.test(so.status||"")){
+    await sb.from("release_pack_tbl").update({ state:"frozen", frozen_at:new Date().toISOString(), frozen_reason:/cancel/i.test(so.status)?"OA cancelled":"Payment received — OA closed", updated_at:new Date().toISOString() }).eq("contract_number",String(cn));
+    await rpHist(cn, "Pack frozen — "+(/cancel/i.test(so.status)?"OA cancelled":"payment received, OA closed"), by, false); return D; }
+  if(D.P.state!=="live") return D;
+  try{ const s = await qcsrAutoSync(cn, "App", "OA quantity", true); if(s.n || s.voided) { await rpHist(cn, (s.n?"Serials given: "+qcsrRange(s):"")+(s.n&&s.voided?" · ":"")+(s.voided?s.voided+" serial(s) marked unused (quantity down)":""), "App", !!s.voided); if(s.n||s.voided) D.serials = ((await sb.from("qc_serial_register_tbl").select("serial,item_sl_no,void_at").eq("contract_number",String(cn))).data||[]).filter(r=>!r.void_at); } }catch(e){}
+  const facts = rpFacts(D); const prev = D.P.snapshot || null;
+  const changes = prev ? rpDiff(prev, facts) : [];
+  const now = new Date().toISOString(); const patch = { snapshot:facts, updated_at:now };
+  for(const c of changes) await rpHist(cn, c.what, "App", c.critical);
+  const crit = changes.filter(c=>c.critical);
+  if(crit.length){ patch.reread_from = now;
+    if(!quiet) try{ const R = await rpReaders(); await notifyPeople(Array.from(R.keys()), "⚠ Pack "+cn+(D.client?" "+D.client:"")+" — critical change: "+crit.map(c=>c.what).join(" · ").slice(0,300)+". Read the pack again.", "action", { kind:"open", open:{ tab:"kickoff" }, group:"rp:"+cn+":crit:"+now }); }catch(e){} }
+  // one daily digest of routine changes
+  const today = rpToday();
+  if(D.P.digest_day !== today){
+    const since = D.P.digest_at || D.P.released_at; const routine = (D.hist||[]).filter(r=>!r.critical && r.at > since && r.at < now);
+    const fresh = changes.filter(c=>!c.critical);
+    const all = [...routine.map(r=>r.what), ...fresh.map(c=>c.what)];
+    if(all.length && !quiet) try{ const R = await rpReaders(); await notifyPeople(Array.from(R.keys()), "📦 Pack "+cn+(D.client?" "+D.client:"")+" — "+all.length+" update"+(all.length>1?"s":"")+": "+all.slice(0,4).join(" · ").slice(0,300)+(all.length>4?" …":""), "info", { kind:"open", open:{ tab:"kickoff" }, group:"rp:"+cn+":day:"+today }); }catch(e){}
+    patch.digest_day = today; patch.digest_at = now; }
+  // kick-off reminder once a day after 2 days
+  if(!(D.meeting && D.meeting.held_at) && rpDays(D.P.released_at) > KO_DAYS && D.P.ko_remind_day !== today && !quiet){
+    try{ await loadPostPeople(); const ko = rpKoNames(); if(ko.length) await notifyPeople(ko, "🔴 Kick-off meeting for "+cn+(D.client?" "+D.client:"")+" is "+rpDays(D.P.released_at)+" days after the W/O release (limit "+KO_DAYS+"). Hold it in Order Status › Kick-off meetings.", "action", { kind:"open", open:{ tab:"kickoff" }, group:"ko:"+cn+":"+today }); }catch(e){}
+    patch.ko_remind_day = today; }
+  await sb.from("release_pack_tbl").update(patch).eq("contract_number",String(cn));
+  D.P = { ...D.P, ...patch }; return D;
+}
+let RP_SYNC_AT = 0;
+async function rpSyncAll(by){ RP_SYNC_AT = Date.now(); try{ const { data, error } = await sb.from("release_pack_tbl").select("contract_number").eq("state","live"); if(error) return; for(const r of (data||[])){ try{ await rpSyncOne(r.contract_number, by); }catch(e){ console.warn("pack sync", r.contract_number, e); } } }catch(e){} }
+function rpSyncSoon(user){ if(Date.now()-RP_SYNC_AT < 60*60000) return; RP_SYNC_AT = Date.now(); setTimeout(()=>{ rpSyncAll((user&&user.username)||"App"); }, 9000); }
+const rpReadValid = (D, name)=> (D.reads||[]).some(r=>sameName(r.reader, name) && (!D.P || !D.P.reread_from || r.read_at >= D.P.reread_from));
+
+// ---------------------------------------------------------------- PACK — the PDF (built fresh each time it is opened)
+async function rpPdf(D){
+  const { jsPDF } = window.jspdf; const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
+  const W = 210, M = 14; const asof = "As of "+fmtDMYTime(new Date().toISOString())+" — the app has the latest";
+  const GRN = [15,122,92], RED = [163,49,42], AMB = [133,79,11], INK = [29,36,48], MUT = [106,115,128];
+  const R = await rpReaders(); const so = D.so||{};
+  const foot = ()=>{ const n = doc.getNumberOfPages(); for(let i=1;i<=n;i++){ doc.setPage(i); doc.setFontSize(7.5); doc.setTextColor(...MUT); doc.text(asof, W-M, 8, { align:"right" }); doc.text("Production Release Pack · "+D.cn+" · page "+i+" of "+n, M, 290); } };
+  let y = 0; const chap = (t)=>{ if(y > 250){ doc.addPage(); y = 18; } doc.setFontSize(9); doc.setTextColor(...GRN); doc.setFont(undefined,"bold"); doc.text(t.toUpperCase(), M, y); doc.setFont(undefined,"normal"); y += 4; };
+  const tbl = (head, body, opts)=>{ doc.autoTable({ startY:y, head:[head], body: body.length ? body : [[{ content:"—", colSpan:head.length }]], margin:{ left:M, right:M }, styles:{ fontSize:8.5, cellPadding:1.6, textColor:INK, overflow:"linebreak" }, headStyles:{ fillColor:[240,242,245], textColor:MUT, fontStyle:"bold" }, theme:"grid", ...(opts||{}) }); y = doc.lastAutoTable.finalY + 7; };
+  const para = (t, col)=>{ doc.setFontSize(9); doc.setTextColor(...(col||INK)); const ls = doc.splitTextToSize(t, W-2*M); if(y + ls.length*4 > 282){ doc.addPage(); y = 18; } doc.text(ls, M, y); y += ls.length*4 + 2; };
+  // cover
+  y = 26; doc.setFontSize(10); doc.setTextColor(...GRN); doc.setFont(undefined,"bold"); doc.text("PRODUCTION RELEASE PACK", M, y); y += 9;
+  doc.setFontSize(18); doc.setTextColor(...INK); doc.text(doc.splitTextToSize(D.cn+" · "+(D.client||""), W-2*M), M, y); y += 9; doc.setFont(undefined,"normal");
+  doc.setFontSize(9.5); doc.setTextColor(...MUT); doc.text(D.P && D.P.state==="frozen" ? "Frozen "+fmtDMY(D.P.frozen_at)+" — "+(D.P.frozen_reason||"") : "Live pack — it updates by itself until payment is received", M, y); y += 8;
+  const units = D.lines.reduce((s,l)=>s+(Number(l.ordered)||0),0);
+  tbl(["",""],[
+    ["Client PO", [so.po_number, so.po_date?fmtDMY(so.po_date):""].filter(Boolean).join(" · ")||"—"],
+    ["W/O released", D.P ? fmtDMY(D.P.released_at)+" by "+(D.P.released_by||"—") : "—"],
+    ["Release state", woLabel(so.go_ahead_state||"")+(/Code 2/.test(so.go_ahead_state||"")?" — documents may still change":"")],
+    ["Delivery", [so.delivery_days?so.delivery_days+" days":"", so.delivery_trigger||""].filter(Boolean).join(" from ")||"—"],
+    ["Items", D.lines.length+" Sl No · "+units+" units · "+D.serials.length+" serials given"],
+    ["Kick-off meeting", D.meeting && D.meeting.held_at ? "Held "+fmtDMY(D.meeting.held_at)+" ("+(D.meeting.held_by||"")+")" : "Not held yet — VP Projects / Technical Head"],
+  ], { showHead:false, columnStyles:{ 0:{ cellWidth:40, fontStyle:"bold", textColor:MUT } } });
+  chap("Contents"); para("1 Critical · 2 What each head must chase · 3 Order summary & serials · 4 Testing & inspection · 5 Finish (painting / pickling & passivation) · 6 Other special requirements · 7 Document index · 8 Kick-off meeting · 9 Who has read the pack · 10 History");
+  // 1 critical
+  doc.addPage(); y = 18; chap("1 · Critical — what can stop this order");
+  const cr = rpCritical(D); tbl(["","What","Detail"], cr.map(c=>[c.lv==="red"?"●":"◐", c.t, c.d||""]), { columnStyles:{ 0:{ cellWidth:7, textColor:RED } }, didParseCell:(d)=>{ if(d.section==="body" && d.column.index===0){ const c = cr[d.row.index]; if(c) d.cell.styles.textColor = c.lv==="red"?RED:AMB; } } });
+  // 2 chase
+  chap("2 · What each head must chase"); const ch = rpChase(D);
+  [...RP_DEPTS.map(d=>[d[0],d[1]]), ["other","Other"]].forEach(([k,l])=>{ const L = ch[k]||[]; if(!L.length && k==="other") return;
+    tbl([l+(L.length?" ("+L.length+")":""),"With","Age","Due"], L.map(i=>[i.t, i.who||"", i.age+" d", i.due?fmtDMY(i.due)+(i.late?" LATE":""):""]), { columnStyles:{ 1:{ cellWidth:34 }, 2:{ cellWidth:14 }, 3:{ cellWidth:26 } } }); });
+  // 3 summary
+  doc.addPage(); y = 18; chap("3 · Order summary & serials");
+  tbl(["Sl","Item","Description","Qty","Serials"], D.lines.map(l=>[l.item_sl_no, l.item||"", l.description||"", l.ordered, rpSerialText(D.serials, l.item_sl_no)]), { columnStyles:{ 0:{ cellWidth:9 }, 3:{ cellWidth:11 }, 4:{ cellWidth:38 } } });
+  // 4 tests
+  chap("4 · Testing & inspection");
+  const tmap = new Map(); D.tests.forEach(t=>{ const k = t.test; if(!tmap.has(k)) tmap.set(k, new Set()); tmap.get(k).add(t.sl); });
+  tbl(["Test","Sl Nos"], Array.from(tmap.entries()).map(([t,s])=>[t, Array.from(s).join(", ")]));
+  const ex = so.nde_note || so.test_note || so.nde_exception_note || ""; if(ex) para("Exceptions: "+ex, MUT);
+  // 5 finish
+  chap("5 · Finish — painting / pickling & passivation / galvanising");
+  const fin = Array.isArray(so.finish_docs) ? so.finish_docs : [];
+  tbl(["Finish","Document","Rev","Title","Link"], fin.map(d=>[d.kind, d.doc_no, d.rev, d.title, { content:"open", link:d.link }]), { didDrawCell:(d)=>{ if(d.section==="body" && d.column.index===4 && fin[d.row.index]) doc.link(d.cell.x, d.cell.y, d.cell.width, d.cell.height, { url:fin[d.row.index].link }); } });
+  if(!fin.length) para(oaFinishRequired(so) ? "MISSING — the finish document must be given on the Order Acceptance." : "Not given on this Order Acceptance (made before the finish rule).", oaFinishRequired(so)?RED:MUT);
+  // 6 other
+  chap("6 · Other special requirements");
+  const other = [ ["Payment terms", so.payment_term], ["Shipping address", so.ship_tba ? "To be advised" : so.shipping_address], ["Special notes", so.special_notes || so.notes || so.remarks] ].filter(r=>r[1]);
+  tbl(["",""], other.map(r=>[r[0], String(r[1])]), { showHead:false, columnStyles:{ 0:{ cellWidth:40, fontStyle:"bold", textColor:MUT } } });
+  // 7 documents
+  doc.addPage(); y = 18; chap("7 · Document index");
+  tbl(["Document","Name","Rev","Status","Link"], D.docs.map(d=>[d.number, d.name, String(d.rev), d.status||"—", d.link?{ content:"open" }:"—"]),
+    { didDrawCell:(c)=>{ const d = D.docs[c.row.index]; if(c.section==="body" && c.column.index===4 && d && d.link) doc.link(c.cell.x, c.cell.y, c.cell.width, c.cell.height, { url:d.link }); } });
+  para("Links open in OneDrive — the reader needs OneDrive access.", MUT);
+  // 8 meeting
+  chap("8 · Kick-off meeting"); const mt = D.meeting;
+  if(!mt || !mt.held_at) para(mt && mt.started_at ? "Started "+fmtDMY(mt.started_at)+" by "+(mt.started_by||"")+" — not closed yet." : "Not held yet. Started and closed by the VP Projects or Technical Head post.", MUT);
+  else { para("Held "+fmtDMYTime(mt.held_at)+" — "+(mt.held_by||"")+". Present: "+((mt.attendees||[]).join(", ")||"—")); if(mt.minutes) para("Minutes: "+mt.minutes);
+    tbl(["Action","Owner","Due"], (mt.actions||[]).map(a=>[a.text, a.owner, a.due?fmtDMY(a.due):""])); }
+  // 9 reads
+  chap("9 · Who has read the pack");
+  tbl(["Who","Post","Read"], Array.from(R.entries()).map(([n,p])=>{ const r = (D.reads||[]).filter(x=>sameName(x.reader,n)).sort((a,b)=>String(b.read_at).localeCompare(String(a.read_at)))[0]; const ok = rpReadValid(D, n);
+    return [n, p, r ? fmtDMYTime(r.read_at)+(ok?"":" — read again (critical change since)") : "not yet"]; }));
+  // 10 history
+  doc.addPage(); y = 18; chap("10 · History");
+  tbl(["When","What changed","By",""], (D.hist||[]).map(r=>[fmtDMYTime(r.at), r.what, r.by||"", r.critical?"critical":""]), { columnStyles:{ 0:{ cellWidth:30 }, 2:{ cellWidth:26 }, 3:{ cellWidth:16, textColor:RED } } });
+  foot(); return doc;
+}
+
+// ---------------------------------------------------------------- KICK-OFF MEETINGS (Order Status › Kick-off meetings)
+function KickoffScreen({ user }){
+  const [list,setList] = useState(null); const [sel,setSel] = useState(null); const [D,setD] = useState(null); const [missing,setMissing] = useState(false);
+  const [me,setMe] = useState(""); const [myK,setMyK] = useState([]); const [emps,setEmps] = useState([]); const [R,setR] = useState(new Map());
+  const [m,setM] = useState(null); const [busy,setBusy] = useState(false); const [msg,setMsg] = useState(""); const [pdf,setPdf] = useState(null); const [tick,setTick] = useState(0);
+  const [hist,setHist] = useState(false);
+  useEffect(()=>{ (async()=>{ setMe((await despMe(user))||user.username||""); try{ const r = await myPostKeys(user); setMyK((r&&r.keys)||[]); }catch(e){}
+    try{ const { data } = await sb.from("employee_tbl").select("employee_name,department,status").order("employee_name"); setEmps((data||[]).filter(empLive)); }catch(e){}
+    setR(await rpReaders()); })(); },[]);
+  useEffect(()=>{ (async()=>{
+    const [P, K] = await Promise.all([ sb.from("release_pack_tbl").select("*").order("released_at",{ ascending:false }), sb.from("kickoff_meeting_tbl").select("*") ]);
+    if(P.error || K.error){ setMissing(true); setList([]); return; }
+    const km = new Map((K.data||[]).map(k=>[String(k.contract_number), k]));
+    const cns = (P.data||[]).map(p=>p.contract_number); let cl = new Map();
+    if(cns.length){ const { data } = await sb.from("sale_order_tbl").select("contract_number,customer_name").in("contract_number",cns); (data||[]).forEach(s=>cl.set(String(s.contract_number), s.customer_name||"")); }
+    setList((P.data||[]).map(p=>({ ...p, client:cl.get(String(p.contract_number))||"", k:km.get(String(p.contract_number))||null })));
+  })(); },[tick]);
+  useEffect(()=>{ if(!sel){ setD(null); return; } setD(null); setMsg(""); rpSyncOne(sel, me||"App", true).then(d=>{ setD(d); const k = d && d.meeting;
+    setM(k && !k.held_at ? { attendees:k.attendees||[], minutes:k.minutes||"", actions:k.actions||[] } : null); }).catch(e=>setMsg(rpErr(e))); },[sel, tick]);
+  const mayRun = user.role==="super_admin" || KO_POSTS.some(k=>myK.includes(k));
+  const koWho = KO_POSTS.map(k=>postLabel(k)+" ("+((postHolders(k)||[]).join(", ")||"post empty")+")").join(" or ");
+  if(missing) return h("div",{style:{padding:20,maxWidth:760}}, h("h2",{style:{fontSize:17}},"Kick-off meetings"), h("div",{style:{background:"#fff4d6",color:"#854f0b",borderRadius:8,padding:"10px 12px",fontSize:13}},"Not set up on this company yet. A Super Admin runs "+RP_SQL+" in Supabase first."));
+  const waiting = (list||[]).filter(p=>!(p.k && p.k.held_at) && p.state==="live"), held = (list||[]).filter(p=>p.k && p.k.held_at);
+  const card = (p)=>{ const d = rpDays(p.released_at); const late = !(p.k&&p.k.held_at) && d > KO_DAYS;
+    return h("div",{key:p.contract_number,"data-testid":"ko-item",onClick:()=>setSel(String(p.contract_number)),style:{border:"1px solid "+(String(sel)===String(p.contract_number)?"#0f7a5c":colors.border),background:String(sel)===String(p.contract_number)?"#e4f3ed":"#fff",borderRadius:8,padding:"7px 10px",margin:"6px 0",cursor:"pointer"}},
+      h("b",null,p.contract_number), " · ", p.client||"—", h("br"),
+      h("span",{style:{fontSize:11.5,color:late?"#a3312a":colors.muted,fontWeight:late?700:400}}, p.k&&p.k.held_at ? "held "+fmtDMY(p.k.held_at)+" · "+((p.k.actions||[]).length)+" actions" : "W/O "+fmtDMY(p.released_at)+" · "+d+" day"+(d===1?"":"s")+(late?" — over "+KO_DAYS:"")+(p.k&&p.k.started_at?" · started":""))); };
+  const readNow = async()=>{ if(!D) return; const post = R.get(me) || "";
+    const { error } = await sb.from("release_pack_read_tbl").insert({ contract_number:D.cn, reader:me, post:post, read_at:new Date().toISOString() }); if(error){ setMsg(rpErr(error)); return; }
+    await rpHist(D.cn, "Read by "+me+(post?" ("+post+")":""), me, false); appToast("✓ Marked read"); setTick(x=>x+1); };
+  const openPdf = async()=>{ if(!D) return; try{ const doc = await rpPdf(D); setPdf({ doc, filename:"Production_Release_Pack_"+D.cn+".pdf" }); }catch(e){ alert("The pack could not be built: "+(e.message||e)); } };
+  const start = async()=>{ if(!mayRun){ alert("Only "+koWho+" or a Super Admin can start the kick-off meeting."); return; }
+    const row = { contract_number:D.cn, started_by:me, started_at:new Date().toISOString(), attendees:[], minutes:"", actions:[], status:"started" };
+    const { error } = D.meeting ? await sb.from("kickoff_meeting_tbl").update({ started_by:me, started_at:row.started_at, status:"started" }).eq("contract_number",D.cn) : await sb.from("kickoff_meeting_tbl").insert(row);
+    if(error){ setMsg(rpErr(error)); return; } await rpHist(D.cn, "Kick-off meeting started by "+me, me, false); setTick(x=>x+1); };
+  const saveM = async(close)=>{
+    if(!m || busy) return; if(!mayRun){ alert("Only "+koWho+" or a Super Admin can run the kick-off meeting."); return; }
+    const acts = (m.actions||[]).filter(a=>String(a.text||"").trim());
+    const bad = acts.filter(a=>!a.owner || !a.due); if(bad.length){ setMsg("Every action needs an owner and a due date ("+bad.length+" missing)."); return; }
+    if(close && !(m.attendees||[]).length){ setMsg("Tick who attended before closing the meeting."); return; }
+    setBusy(true); setMsg("");
+    try{
+      let out = acts;
+      if(close){ out = []; for(const a of acts){ if(a.done_card){ out.push(a); continue; } const id = await rpActionToCard(D.cn, D.client, a, me); out.push({ ...a, done_card:id||true }); } }
+      const patch = { attendees:m.attendees, minutes:m.minutes||"", actions:out, ...(close?{ held_at:new Date().toISOString(), held_by:me, status:"held" }:{}) };
+      const { error } = await sb.from("kickoff_meeting_tbl").update(patch).eq("contract_number",D.cn); if(error) throw new Error(rpErr(error));
+      if(close){ await rpHist(D.cn, "Kick-off meeting held — "+m.attendees.length+" present, "+out.length+" action(s)", me, false);
+        const absent = Array.from(R.keys()).filter(n=>!(m.attendees||[]).some(a=>sameName(a,n)));
+        try{ if(absent.length) await notifyPeople(absent, "🤝 Kick-off meeting held for "+D.cn+(D.client?" "+D.client:"")+" — you were not there. Read the pack and the minutes (Order Status › Kick-off meetings).", "action", { kind:"open", open:{ tab:"kickoff" }, group:"ko:"+D.cn+":held" }); }catch(e){}
+        appToast("✓ Kick-off meeting held — it moves to History; the pack stays live."); }
+      else appToast("✓ Saved");
+      setTick(x=>x+1);
+    }catch(e){ setMsg(String(e.message||e)); } finally{ setBusy(false); }
+  };
+  const th = (x)=> h("th",{style:{textAlign:"left",padding:"4px 6px",fontSize:10.5,textTransform:"uppercase",color:colors.muted,borderBottom:"2px solid "+colors.dark}},x);
+  const td = (c,s)=> h("td",{style:{padding:"4px 6px",borderBottom:"1px solid "+colors.border,fontSize:12.5,verticalAlign:"top",...(s||{})}},c);
+  const crit = D ? rpCritical(D) : []; const chase = D ? rpChase(D) : null;
+  const mayRead = R.has(me) || user.role==="super_admin";
+  return h("div",{"data-testid":"ko-screen",style:{padding:"14px 18px"}},
+    h("h2",{style:{fontSize:17,margin:"0 0 2px"}},"Kick-off meetings & Production Release Packs"),
+    h("div",{style:{fontSize:12.5,color:colors.muted,marginBottom:10}},"A contract lands here when its W/O is released. The kick-off is held within "+KO_DAYS+" days, started and closed by "+koWho+". Once held it becomes history; the pack stays live until payment is received."),
+    h("div",{style:{display:"grid",gridTemplateColumns:"280px 1fr",gap:14,alignItems:"start"}},
+      h("div",null,
+        h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"8px 10px"}}, h("b",null,"Waiting for kick-off ("+waiting.length+")"), !list ? h("div",{style:{color:colors.muted}},"Loading…") : waiting.length ? waiting.map(card) : h("div",{style:{fontSize:12,color:colors.muted,marginTop:6}},"None.")),
+        h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"8px 10px",marginTop:10}},
+          h("div",{style:{display:"flex",alignItems:"center"}}, h("b",null,"Held — history ("+held.length+")"), h("span",{style:{flex:1}}), h("span",{onClick:()=>setHist(x=>!x),style:{fontSize:11.5,color:"#0c447c",cursor:"pointer"}},hist?"hide":"show")),
+          hist ? held.map(card) : null)),
+      !sel ? h("div",{style:{color:colors.muted,padding:20}},"Pick a contract on the left.") : !D ? h("div",{style:{color:colors.muted,padding:20}},msg||"Reading the pack…") :
+      h("div",{"data-testid":"ko-detail",style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"10px 14px"}},
+        h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}},
+          h("b",{style:{fontSize:15}},D.cn+" · "+(D.client||"")), h("span",{style:{flex:1}}),
+          h("button",{"data-testid":"rp-open",onClick:openPdf,style:{...btnSecondary,padding:"6px 12px",fontWeight:700}},"📦 Open the pack (PDF)"),
+          mayRead ? (rpReadValid(D, me) ? h("span",{style:{fontSize:12,color:"#0f6a4c",fontWeight:700}},"✓ You have read it") : h("button",{"data-testid":"rp-read",onClick:readNow,style:{...btnPrimary,padding:"6px 12px"}},"✓ I have read the pack")) : null,
+          !D.meeting || !D.meeting.started_at ? h("button",{"data-testid":"ko-start",onClick:start,title:mayRun?"":"Only "+koWho,style:{...btnPrimary,background:"#5b3fa3",borderColor:"#5b3fa3",padding:"6px 12px",opacity:mayRun?1:.55}},"▶ Start the kick-off meeting") : null),
+        h("div",{style:{fontSize:11.5,color:colors.muted,margin:"3px 0 8px"}}, "W/O released "+fmtDMY(D.P.released_at)+" by "+(D.P.released_by||"—")+" · "+woLabel(D.so.go_ahead_state||"")+(D.P.state==="frozen"?" · pack frozen ("+(D.P.frozen_reason||"")+")":" · pack live")),
+        msg ? h("div",{style:{color:colors.danger,fontSize:12.5,margin:"4px 0"}},msg) : null,
+        h("div",{style:{fontWeight:700,fontSize:13,margin:"6px 0 4px"}},"Critical"),
+        crit.length ? crit.map((c,i)=>h("div",{key:i,"data-testid":"rp-crit",style:{borderLeft:"4px solid "+(c.lv==="red"?"#c9302c":"#d08a1c"),background:c.lv==="red"?"#fdecea":"#fff4d6",padding:"4px 9px",margin:"3px 0",borderRadius:"0 6px 6px 0",fontSize:12.5}}, h("b",null,c.t), c.d?" — "+c.d:"")) : h("div",{style:{fontSize:12.5,color:"#0f6a4c"}},"✓ Nothing critical."),
+        h("div",{style:{fontWeight:700,fontSize:13,margin:"10px 0 4px"}},"What each head must chase"),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(250px,1fr))",gap:8}}, [...RP_DEPTS.map(d=>[d[0],d[1]]), ["other","Other"]].filter(([k])=>(chase[k]||[]).length || k!=="other").map(([k,l])=>
+          h("div",{key:k,style:{border:"1px solid "+colors.border,borderRadius:8,padding:"6px 9px"}}, h("b",{style:{fontSize:12.5}},l+" "), (chase[k]||[]).length ? h("span",{style:{fontSize:11,color:(chase[k]).some(i=>i.late)?"#a3312a":"#0c467e",fontWeight:700}},(chase[k]).length+" open") : h("span",{style:{fontSize:11,color:"#0f6a4c"}},"nothing open"),
+            h("ul",{style:{margin:"3px 0 0",paddingLeft:16,fontSize:12}}, (chase[k]||[]).slice(0,6).map((i,j)=>h("li",{key:j,style:{color:i.late?"#a3312a":colors.text}}, i.t+" — "+i.who+" · "+i.age+" d")))))),
+        D.meeting && D.meeting.held_at ? h("div",{style:{marginTop:12,background:"#f6f8fa",borderRadius:8,padding:"8px 12px",fontSize:12.5}},
+            h("b",null,"Kick-off held "+fmtDMYTime(D.meeting.held_at)+" — "+(D.meeting.held_by||"")), h("div",null,"Present: "+((D.meeting.attendees||[]).join(", ")||"—")), D.meeting.minutes ? h("div",null,"Minutes: "+D.meeting.minutes) : null,
+            h("ul",{style:{margin:"4px 0 0",paddingLeft:16}}, (D.meeting.actions||[]).map((a,i)=>h("li",{key:i}, a.text+" — "+a.owner+" · due "+fmtDMY(a.due))))) :
+        m ? h("div",{"data-testid":"ko-meeting",style:{marginTop:12,borderTop:"2px solid #5b3fa3",paddingTop:8}},
+          h("b",{style:{color:"#5b3fa3"}},"Kick-off meeting — started "+fmtDMYTime(D.meeting.started_at)+" by "+(D.meeting.started_by||"")),
+          h("div",{style:{fontWeight:700,fontSize:12.5,margin:"8px 0 3px"}},"Attendance"),
+          h("div",{style:{display:"flex",flexWrap:"wrap",gap:"4px 14px",fontSize:12.5}}, Array.from(R.entries()).map(([n,p])=>h("label",{key:n}, h("input",{type:"checkbox","data-testid":"ko-att",checked:(m.attendees||[]).includes(n),onChange:()=>setM(x=>({ ...x, attendees:(x.attendees||[]).includes(n)?x.attendees.filter(a=>a!==n):[...(x.attendees||[]), n] }))})," "+n+" — "+p))),
+          h("div",{style:{fontWeight:700,fontSize:12.5,margin:"10px 0 3px"}},"Actions — each goes on the owner's card for "+D.cn+" as a checklist line"),
+          h("table",{style:{borderCollapse:"collapse",width:"100%"}}, h("thead",null,h("tr",null,th("Action"),th(h("span",null,"Owner",h("b",{style:{color:"#c0392b"}}," *"))),th(h("span",null,"Due",h("b",{style:{color:"#c0392b"}}," *"))),th(""))),
+            h("tbody",null, (m.actions||[]).map((a,i)=>{ const set = (p)=>setM(x=>({ ...x, actions:x.actions.map((y,j)=>j===i?{ ...y, ...p }:y) }));
+              return h("tr",{key:i}, td(h("input",{"data-testid":"ko-act-text",value:a.text||"",onChange:e=>set({ text:e.target.value }),style:{...inputStyle,width:"100%",padding:"4px 6px"}})),
+                td(h("select",{"data-testid":"ko-act-owner",value:a.owner||"",onChange:e=>set({ owner:e.target.value }),style:{...inputStyle,padding:"4px 6px",borderColor:!a.owner&&a.text?"#c9302c":undefined}}, h("option",{value:""},"— owner —"), emps.map(e=>h("option",{key:e.employee_name,value:e.employee_name},e.employee_name+(e.department?" · "+e.department:""))))),
+                td(h("input",{type:"date","data-testid":"ko-act-due",value:a.due||"",min:rpToday(),onChange:e=>set({ due:e.target.value }),style:{...inputStyle,padding:"4px 6px",borderColor:!a.due&&a.text?"#c9302c":undefined}})),
+                td(h("button",{onClick:()=>setM(x=>({ ...x, actions:x.actions.filter((_,j)=>j!==i) })),style:{...btnSmall,fontSize:11}},"✕"))); }),
+              h("tr",null, td(h("button",{"data-testid":"ko-act-add",onClick:()=>setM(x=>({ ...x, actions:[...(x.actions||[]), { text:"", owner:"", due:"" }] })),style:{...btnSmall,fontWeight:700}},"+ Add an action"),{ borderBottom:"none" })))),
+          h("div",{style:{fontWeight:700,fontSize:12.5,margin:"10px 0 3px"}},"Minutes / remarks"),
+          h("textarea",{"data-testid":"ko-minutes",value:m.minutes||"",onChange:e=>setM(x=>({ ...x, minutes:e.target.value })),rows:3,style:{...inputStyle,width:"100%",fontFamily:"inherit"}}),
+          h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}},
+            h("button",{onClick:()=>saveM(false),disabled:busy,style:btnSecondary},"Save and continue later"),
+            h("button",{"data-testid":"ko-close",onClick:()=>saveM(true),disabled:busy,style:{...btnPrimary,padding:"7px 14px"}},busy?"Saving…":"✓ Meeting held — close"))) : null)),
+    pdf ? h(PdfPreviewModal,{ doc:pdf.doc, filename:pdf.filename, onClose:()=>setPdf(null) }) : null);
+}
+// an action → a checklist line on the owner's open card for the contract (or a new card)
+async function rpActionToCard(cn, client, a, by){
+  const item = { id:"ko|"+Date.now()+"|"+Math.random().toString(36).slice(2,6), text:"Kick-off: "+a.text, due:a.due||"", done:false, items:[] };
+  const { data: ex } = await sb.from("task_tbl").select("id,checklists").eq("assignee",a.owner).eq("ref",String(cn)).neq("status","done").order("id",{ ascending:false }).limit(1);
+  let id = ex && ex[0] ? ex[0].id : null; let cls = ex && ex[0] ? (ex[0].checklists||[]) : null;
+  if(!id){ const ids = await ospTaskCards(String(cn), client||"", [a.owner], ()=>null, "Kick-off actions — "+cn+(client?" "+client:""), a.due||null, "From the kick-off meeting of "+cn+" ("+fmtDMY(new Date().toISOString())+", "+by+")."); id = ids[0]||null;
+    if(id){ const { data: t } = await sb.from("task_tbl").select("checklists").eq("id",id).maybeSingle(); cls = (t&&t.checklists)||[]; } }
+  if(!id) return null;
+  cls = Array.isArray(cls) ? cls.slice() : []; let ci = cls.findIndex(c=>c && c.id==="kickoff");
+  if(ci<0){ cls.push({ id:"kickoff", name:"Kick-off actions", items:[] }); ci = cls.length-1; }
+  cls[ci] = { ...cls[ci], items:[...(cls[ci].items||[]), item] };
+  await sb.from("task_tbl").update({ checklists:cls }).eq("id",id);
+  try{ await taskLog(id, by, "Kick-off action added: "+a.text); }catch(e){}
+  try{ await notifyPeople([a.owner], "🤝 Kick-off "+cn+": "+a.text+" — due "+fmtDMY(a.due)+" (on your card).", "action", { kind:"open", open:{ tab:"tasks" } }); }catch(e){}
+  return id;
+}
+
 function OrderFlowScreen({ user, dept }){
   const [D,setD] = useState(null); const [M,setM] = useState(null);
   useEffect(()=>{ let live = true; (async()=>{ try{ await loadPostPeople(); }catch(e){} const [d, mm] = await Promise.all([osLoadAll(), ospLoad()]); if(live){ setD(d); setM(mm); } })(); return ()=>{ live = false; }; },[]);
