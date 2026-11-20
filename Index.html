@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-20T04:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-20T14:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -15620,6 +15620,103 @@ function OaFunnelPanel({ contractInfo, statusOptions, changeStatus }){
   return h("div",{"data-testid":"oaf"}, fold, stagePanel, orderPanel, docPanel,
     h("div",{style:{textAlign:"right",marginTop:4}}, h("button",{onClick:()=>{ setX(null); setDc(null); load(true); },style:{...btnSmall,fontSize:11}},"↻ Refresh")));
 }
+// 2026-11-20T14:00:00Z: BILLING / SHIPPING ADDRESS ON THE OA — one bold Edit button. Before the Commercial Terms are approved anyone
+// who can open the OA changes them; after approval only the Accounts post (and Super Admins), with no code. Live DCs of the contract
+// are revised by themselves (same DC number, Rev n, history kept); the Production Manager and Stores posts get a bell.
+const OA_ADR_POST = "accounts";
+async function oaAdrMay(user, approved){
+  if(!user) return false; if(!approved) return true; if(user.role==="super_admin") return true;
+  try{ const { keys } = await myPostKeys(user); return (keys||[]).includes(OA_ADR_POST); }catch(e){ return false; }
+}
+const oaAdrT = (x)=> String(x||"").replace(/\r/g,"").trim();
+function OaAddressBox({ contractInfo, user, onChanged }){
+  const C = contractInfo||{}; const cn = String(C.contract_number||"");
+  const approved = !!C.commercial_approved_by;
+  const [may,setMay] = useState(null); const [holders,setHolders] = useState("");
+  const [open,setOpen] = useState(false); const [f,setF] = useState(null); const [dcs,setDcs] = useState(null);
+  const [busy,setBusy] = useState(false); const [err,setErr] = useState(""); const [hist,setHist] = useState([]);
+  useEffect(()=>{ let dead=false; (async()=>{ const m = await oaAdrMay(user, approved); if(!dead) setMay(m);
+    try{ await loadPostPeople(); if(!dead) setHolders(postHolders(OA_ADR_POST).join(" or ")); }catch(e){} })(); return ()=>{ dead=true; }; },[cn, approved, user && user.username]);
+  const loadHist = async()=>{ try{ const { data } = await sb.from("audit_log").select("*").eq("table_name","sale_order_tbl").eq("record_id",cn).ilike("record_summary","Address%").order("performed_at",{ascending:false}).limit(20); setHist(data||[]); }catch(e){ setHist([]); } };
+  useEffect(()=>{ if(cn) loadHist(); },[cn]);
+  const openIt = async()=>{
+    if(!may){ alert("The Order Acceptance is approved — only the "+postLabel(OA_ADR_POST)+" post can change the billing / shipping address"+(holders?": "+holders:"")+". Ask them to change it here (no code needed)."); return; }
+    setErr(""); setF({ bill:C.billing_address||"", ship:C.shipping_address||"", same: !!C.billing_address && oaAdrT(C.billing_address)===oaAdrT(C.shipping_address), why:"" });
+    setDcs(null); setOpen(true);
+    try{ const { data } = await sb.from("dc_tbl").select("*").eq("contract_number",cn); setDcs((data||[]).filter(d=>d.status!=="Cancelled" && !d.is_test)); }catch(e){ setDcs([]); }
+  };
+  const save = async()=>{
+    const bill = oaAdrT(f.bill), ship = f.same ? bill : oaAdrT(f.ship);
+    if(!bill){ setErr("Give the billing address."); return; }
+    if(!ship){ setErr("Give the shipping address, or tick Same as billing."); return; }
+    const oldB = oaAdrT(C.billing_address), oldS = oaAdrT(C.shipping_address);
+    const bCh = bill!==oldB, sCh = ship!==oldS;
+    if(!bCh && !sCh){ setErr("Nothing has changed."); return; }
+    if(!(await oaAdrMay(user, approved))){ setErr("Only the "+postLabel(OA_ADR_POST)+" post can change the address of an approved Order Acceptance"+(holders?": "+holders:"")+"."); return; }
+    setBusy(true); setErr("");
+    let by = user?.username||"unknown"; try{ by = (await despMe(user)) || by; }catch(e){}
+    const what = [bCh?"Billing":null, sCh?("Shipping"+(ship===bill?" (same as billing)":"")):null].filter(Boolean).join(" + ")+" address";
+    const why = oaAdrT(f.why);
+    const { error } = await sb.from("sale_order_tbl").update({ billing_address:bill, shipping_address:ship, ship_tba:false }).eq("contract_number",cn);
+    if(error){ setBusy(false); setErr("Could not save: "+error.message); return; }
+    await logAudit("UPDATE","sale_order_tbl",cn,"Address changed on the Order Acceptance: "+what+(approved?" (after approval)":"")+(why?" — "+why:""),by,{ billing_address:C.billing_address||null, shipping_address:C.shipping_address||null },{ billing_address:bill, shipping_address:ship });
+    // Despatch details keep following the OA where they did
+    if(sCh){ try{ const { data: cd } = await sb.from("contract_despatch_tbl").select("*").eq("contract_number",cn).maybeSingle();
+      if(cd && (cd.ship_same_as_oa || oaAdrT(cd.ship_address)===oldS || !oaAdrT(cd.ship_address))) await sb.from("contract_despatch_tbl").update({ ship_address:ship, ship_same_as_oa:true }).eq("contract_number",cn); }catch(e){} }
+    // Live DCs: revised by themselves — same number, Rev n, history line. Bill To is read live from the OA; Deliver To is stored on the DC.
+    const revised = [];
+    for(const d of (dcs||[])){
+      const rn = (Number(d.rev_no)||0)+1; const patch = { rev_no:rn, ...(sCh ? { ship_address:ship } : {}) };
+      let r = await sb.from("dc_tbl").update(patch).eq("id",d.id);
+      if(r.error && /rev_no/.test(r.error.message||"")){ const p2 = { ...patch }; delete p2.rev_no; r = Object.keys(p2).length ? await sb.from("dc_tbl").update(p2).eq("id",d.id) : { error:null }; }
+      if(!r.error){ revised.push({ d, rn }); await invHist(null, d.id, "DC revised – Rev "+rn, by, what+" changed on the Order Acceptance by "+by+(why?" — "+why:"")+(d.bill_no||d.status==="Despatched"?" · the tax invoice / e-way bill keep the old address":"")); }
+    }
+    // Bell to the Production Manager and Stores posts (lands in their Bell list)
+    try{ await loadPostPeople(true); const names = [...postHolders("production_manager"), ...postHolders("stores")];
+      const msg = revised.length
+        ? cn+" "+(C.customer_name||"")+" — "+what+" changed on the Order Acceptance by "+by+". DC revised: "+revised.map(x=>despNo(x.d)+" Rev "+x.rn).join(", ")+". Use the revised DC; old copies are void."
+        : cn+" "+(C.customer_name||"")+" — "+what+" changed on the Order Acceptance by "+by+". No DC yet: the new address goes on the DC when it is made.";
+      await notifyPeople(names, msg, "info", revised.length ? { kind:"open", open:{ dc:revised[0].d.id } } : { kind:"open", open:{ contract:cn } }); }catch(e){}
+    setBusy(false); setOpen(false); await loadHist();
+    alert("Saved. "+what+" changed."+(revised.length?"\n\nDC revised: "+revised.map(x=>despNo(x.d)+" → Rev "+x.rn).join(", ")+".":"")+"\n\nThe "+postLabel("production_manager")+" and "+postLabel("stores")+" posts have been told.");
+    onChanged && onChanged();
+  };
+  const billed = (dcs||[]).filter(d=>d.bill_no || d.status==="Despatched");
+  const box = { background:"#fff", border:"1px solid "+colors.border, borderRadius:6, padding:"8px 10px", fontSize:11.5, whiteSpace:"pre-line", minHeight:40 };
+  return h("div",{"data-testid":"oa-adr",style:{background:"#f6fbf9",border:"1px solid #cfe3dc",borderRadius:8,padding:"10px 12px",marginBottom:8}},
+    h("div",{style:{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}},
+      h("button",{"data-testid":"oa-adr-edit",onClick:openIt,title:may===false?("Only the "+postLabel(OA_ADR_POST)+" post"+(holders?" ("+holders+")":"")+" can change it after approval"):"Change the billing / shipping address",
+        style:{font:"inherit",fontSize:14,fontWeight:800,letterSpacing:.3,background:may===false?"#e7e5e4":"#c2410c",color:may===false?"#78716c":"#fff",border:"2px solid "+(may===false?"#d6d3d1":"#9a3412"),borderRadius:8,padding:"7px 16px",cursor:may===false?"not-allowed":"pointer",boxShadow:may===false?"none":"0 2px 0 #7c2d12"}},"✎ EDIT BILLING / SHIPPING ADDRESS"),
+      h("span",{style:{fontSize:11.5,color:may===false?"#a3312a":colors.muted}},
+        !approved ? "Anyone who can open this OA can change the addresses." : may ? h("span",null,h("b",null,postLabel(OA_ADR_POST)+" post"),": you can change them straight away (no code).") :
+        "Approved — only the "+postLabel(OA_ADR_POST)+" post can change the addresses"+(holders?": "+holders:"")+".")),
+    h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:8}},
+      h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:2}},"Billing address"),h("div",{style:box},C.billing_address||"—")),
+      h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:2}},"Shipping address"),h("div",{style:box},C.shipping_address||(C.ship_tba?"To be advised by the customer before despatch":"—")))),
+    hist.length ? h("details",{style:{marginTop:6,fontSize:11}},h("summary",{style:{cursor:"pointer",color:colors.muted}},"Address history ("+hist.length+")"),
+      hist.map((a,i)=>h("div",{key:i,style:{borderLeft:"3px solid #1f6f6b",paddingLeft:7,margin:"4px 0"}},fmtDMYTime(a.created_at||a.performed_at||"")+" · "+(a.performed_by||"")+" — "+String(a.record_summary||"").replace(/^Address changed on the Order Acceptance: /,"")))) : null,
+    open && f ? h("div",{onClick:e=>{ if(e.target===e.currentTarget && !busy) setOpen(false); },style:{position:"fixed",inset:0,background:"rgba(0,0,0,.4)",zIndex:1300,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"40px 12px",overflowY:"auto"}},
+      h("div",{style:{background:"#fff",borderRadius:10,width:620,maxWidth:"100%",boxShadow:"0 10px 40px rgba(0,0,0,.25)"}},
+        h("div",{style:{background:"#1d3b33",color:"#fff",padding:"12px 16px",borderRadius:"10px 10px 0 0"}},h("b",null,"✎ Billing / shipping address — "+cn),
+          h("div",{style:{fontSize:11.5,opacity:.8}},approved?"Approved OA — changed by the "+postLabel(OA_ADR_POST)+" post, kept in the history":"Not yet approved")),
+        h("div",{style:{padding:"14px 16px",display:"grid",gap:10}},
+          h("label",{style:{display:"grid",gap:3,fontSize:11.5,color:colors.muted}},h("span",null,"Billing address ",h("span",{style:{color:"#c0392b"}},"*")),
+            h("textarea",{"data-testid":"oa-adr-bill",rows:4,value:f.bill,onChange:e=>setF(x=>({...x,bill:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12.5}})),
+          h("label",{style:{display:"flex",gap:6,alignItems:"center",fontSize:12.5,fontWeight:600}},h("input",{type:"checkbox","data-testid":"oa-adr-same",checked:f.same,onChange:e=>setF(x=>({...x,same:e.target.checked}))}),"Shipping address same as billing address"),
+          h("label",{style:{display:"grid",gap:3,fontSize:11.5,color:colors.muted}},h("span",null,"Shipping address ",h("span",{style:{color:"#c0392b"}},"*")),
+            h("textarea",{"data-testid":"oa-adr-ship",rows:3,value:f.same?f.bill:f.ship,disabled:f.same,onChange:e=>setF(x=>({...x,ship:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12.5,background:f.same?"#f4f4f2":"#fff"}})),
+          h("label",{style:{display:"grid",gap:3,fontSize:11.5,color:colors.muted}},"Reason / note (optional)",
+            h("input",{value:f.why,onChange:e=>setF(x=>({...x,why:e.target.value})),placeholder:"e.g. client mail of 20.11.2026",style:{...inputStyle,padding:"6px 8px",fontSize:12.5}})),
+          dcs===null ? h("div",{style:{fontSize:11.5,color:colors.muted}},"Checking for DCs…") :
+          dcs.length ? h("div",{style:{background:"#fff4d6",color:"#7a5200",border:"1px solid #f0d58a",borderRadius:6,padding:"8px 10px",fontSize:12}},
+            h("b",null,"⚠ DC already made for this contract: "+dcs.map(d=>despNo(d)+((Number(d.rev_no)||0)?" (Rev "+d.rev_no+")":"")).join(", ")+"."),
+            " Saving revises "+(dcs.length>1?"them":"it")+" by itself — same DC number, ",h("b",null,"Rev "+dcs.map(d=>(Number(d.rev_no)||0)+1).join(" / ")),", history kept. The "+postLabel("production_manager")+" and "+postLabel("stores")+" posts get a bell.",
+            billed.length ? h("div",{style:{marginTop:4}},"Already billed / despatched: "+billed.map(d=>despNo(d)).join(", ")+" — the tax invoice and e-way bill keep the old address.") : null) : null,
+          err ? h("div",{style:{background:"#fdecea",color:"#a3312a",borderRadius:6,padding:"7px 10px",fontSize:12}},err) : null),
+        h("div",{style:{padding:"10px 16px",borderTop:"1px solid "+colors.border,display:"flex",gap:8,justifyContent:"flex-end"}},
+          h("button",{onClick:()=>setOpen(false),disabled:busy,style:btnSecondary},"Cancel"),
+          h("button",{"data-testid":"oa-adr-save",onClick:save,disabled:busy||dcs===null,style:{...btnPrimary,background:"#0f6e56"}},busy?"Saving…":"Save")))) : null);
+}
 function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, onEditDetails, onPoFieldsSaved }){
   const isAdminOrAbove = user.role==="admin" || user.role==="super_admin";
   const isSuperAdmin = user.role==="super_admin";
@@ -16389,6 +16486,7 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
         contractInfo.no_docs_at ? " · No documents required" : "");
   return h("div",{style:{marginTop:10}},
     h(CtfFlag,{ key:"ctf"+contractInfo.contract_number, cn:contractInfo.contract_number }),
+    h(OaAddressBox,{ key:"adr"+contractInfo.contract_number, contractInfo, user, onChanged:()=>{ onChanged && onChanged(); } }),   // 2026-11-20T14:00:00Z
     h(OaFinishBox,{ key:"fin"+contractInfo.contract_number, contractInfo, user, onChanged:()=>{ onChanged && onChanged(); } }),   // 2026-11-18T13:00:00Z   // 2026-11-02T08:00:00Z
     apBox,
     h(PurOwnerTag,{ key:"pot"+contractInfo.contract_number, cn:contractInfo.contract_number }),   // 2026-11-03T07:00:00Z
@@ -37282,6 +37380,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"20 Nov 2026", summary:"Built on 2026-11-20T14:00:00Z, on top of 2026-11-20T04:00:00Z. NEEDS SQL (both companies): structure_dc_rev_2026-11-20.sql. ORDER ACCEPTANCE — EDIT BILLING / SHIPPING ADDRESS: a bold orange button in the OA banner with both addresses under it and an Address history. Before the Commercial Terms are approved anyone who can open the OA changes them; after approval only the Accounts post (and Super Admins) — no code, reason optional. Shipping same as billing tick. A DC already made is revised by itself: same DC number, REV n in bold red on the DC screen and PDF, a line in the DC history; Accounts is warned first, and told that a billed / despatched DC keeps the old address on the tax invoice and e-way bill. Despatch details follow the OA where they did. A bell goes to the Production Manager and Stores posts (into their Bell list). BELL LIST: items go stale after 7 working days (was 3); information bells from this build on also get the 7-day due date; approval bells keep their own days." },
   { date:"20 Nov 2026", summary:"Built on 2026-11-20T04:00:00Z, on top of 2026-11-20T03:00:00Z. No SQL. TASKS › LIST VIEW: rows stay compact with Due · Assign · Move · Copy · ▾ more always visible. ▾ more opens the board card itself under the row (same code: every chip, badge, checklist, sub-task and button); ▴ less folds it. Expand all / Collapse all at the top. Assign = quick hand-over to someone in the department with a due date (also in the bulk bar). Board and list share the open/closed state of a card." },
   { date:"20 Nov 2026", summary:"Built on 2026-11-20T03:00:00Z, on top of 2026-11-20T02:00:00Z. No SQL. TASKS › LIST VIEW: every open row has Move · Copy · Due buttons (show on hover; always on a tablet) — the same Move and Copy dialogs as Board view, so a card can be copied to one or several people. Hold Ctrl while dropping a row on a person (or pile) to copy instead of move. Tick boxes on the rows: a bar appears with Move to… / Copy to… / Due date for all ticked cards at once (Tick all, Clear); dragging a ticked row takes the ticked group. Cards you can't move are skipped and named." },
   { date:"20 Nov 2026", summary:"Built on 2026-11-20T02:00:00Z, on top of 2026-11-19T18:00:00Z. No SQL. LEVEL GAUGE QUESTIONNAIRE – valves and accessories: Gate/Ball isolation valves and drain/vent valves get the same price-list questions as a valve offer (size, and rating for isolation valves, filled in; the lowest-cost model that fits is picked). Plugs are picked from Material Rates (spec · grade · rate) by drain/vent size; no rate = flagged. Auto shut-off: the app looks up the Auto Shut-off Valve item by nozzle size and adds its BOM lines x number of valves (grades in MOC); fabricated models also get flanges by the flange standard picked (from Material Rates, default WNRF at the gauge class, 1 per valve, editable); cast models no flanges; no BOM for that size = falls back to the SOP weight. Every line the gateways add carries the sub-assembly Gauge Valves & Accessories." },
@@ -63108,7 +63207,8 @@ function DualScroll({ style, boxRef, testid, children }){
 // Not repeated here: bells that only open a task card (the card is already on the board) and OA approval bells (in ✅ My approvals).
 // From before this build: only the open "Do it" bells of the last 30 days are brought in; old FYI / Look-at-it bells are left alone.
 const BELL_LIST_FROM = "2026-11-13T11:30:00Z";   // the build time (17:00 IST)
-const BELL_DEFAULT_DAYS = 3;
+const BELL_DEFAULT_DAYS = 7;   // 2026-11-20T14:00:00Z: 7 days (was 3); info bells also go stale from this build on
+const BELL_INFO_DUE_FROM = "2026-11-20T14:00:00Z";
 function bellDueDays(n){ const t = String(n.notif_type||""); if(/approval/i.test(t)) return APPR_RED_DAYS; return BELL_DEFAULT_DAYS; }
 function bellKind(n){ return n.action_kind==="act" ? "do" : n.action_kind==="open" ? "look" : "info"; }
 function bellSkip(n){ const o = notifOpenOf(n); if(o && o.task!=null && Object.keys(o).length===1) return true; if(n.notif_type==="so_approval") return true; return false; }
@@ -63122,7 +63222,7 @@ async function bellListLoad(who){
       if(k==="do") return (n.action_state||"open")==="open";
       if(k==="look") return fresh && (n.action_state||"open")==="open";
       return fresh && !n.is_read; })
-    .map(n=>{ const k = bellKind(n); const due = k==="info" ? null : wdAdd(String(n.created_at||today).slice(0,10), bellDueDays(n));
+    .map(n=>{ const k = bellKind(n); const due = (k==="info" && String(n.created_at||"") < BELL_INFO_DUE_FROM) ? null : wdAdd(String(n.created_at||today).slice(0,10), bellDueDays(n));
       const late = due ? rvwLate(due, today) : null;
       return { n, k, due, late, stale: late!=null && late>0, soon: late===0 || late===-1 }; })
     .sort((a,b)=> (b.stale?1:0)-(a.stale?1:0) || String(a.due||"9").localeCompare(String(b.due||"9")) || String(b.n.created_at).localeCompare(String(a.n.created_at)));
@@ -73356,6 +73456,7 @@ async function despDcPdf(D){
   const { dc, lines, serials, boxes, C, S, gp } = D;
   const wm = dc.is_test ? "TEST" : (dc.status==="Approved"||dc.status==="Despatched") ? null : "DRAFT";
   const { doc, W, co } = await despPdfStart("portrait", "DELIVERY CHALLAN", "Goods sent against the Tax Invoice of the same number · not a tax invoice", wm);
+  if(Number(dc.rev_no)>0){ doc.setFillColor(185,28,28); doc.roundedRect(W-38,26,28,8.5,1.2,1.2,"F"); doc.setTextColor(255,255,255); doc.setFontSize(13); doc.setFont(undefined,"bold"); doc.text("REV "+dc.rev_no, W-24, 32, {align:"center"}); doc.setTextColor(28,31,26); doc.setFont(undefined,"normal"); }   // 2026-11-20T14:00:00Z
   let y = 39;
   doc.setFontSize(7.6); doc.setTextColor(60,60,60); doc.setFont(undefined,"normal");
   doc.text(["GSTIN: "+(S.our_gstin||"—")+"   PAN: "+(S.our_pan||"—")+"   State: "+(S.our_state||"—")+(S.our_state_code?" ("+S.our_state_code+")":""), "Despatched from: "+(S.factory_address||"—")], 10, y); y += 8;
@@ -73389,7 +73490,7 @@ async function despDcPdf(D){
   doc.text("QC", 10+cw+2, y+24); doc.text("For "+pdfFooterCompanyName(co), 10+cw*2+2, y+4); doc.text("Stores In-charge / Authorised", 10+cw*2+2, y+24);
   doc.setFontSize(7); doc.setTextColor(120,120,120);
   doc.text("Rate, value and tax are not shown on a delivery challan. Product serial numbers: format YY-NNNNNNN, each used once only.", 10, y+31);
-  despPdfFooter(doc, co, "Delivery Challan "+despNo(dc));
+  despPdfFooter(doc, co, "Delivery Challan "+despNo(dc)+(Number(dc.rev_no)>0?" Rev "+dc.rev_no:""));
   pdfShow(doc, ("DC_"+despNo(dc)+"_"+(dc.contract_number||"")).replace(/[^A-Za-z0-9_-]+/g,"_")+".pdf");
 }
 // Serials of a line handed out to boxes in box order.
@@ -74594,7 +74695,7 @@ function DcEditor({ user, me, P, S, dcId, contract, lot, onClose, onChanged }){
   return h("div",{style:{padding:"12px 18px"}},
     h("div",{style:{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}},
       h("button",{onClick:()=>onClose&&onClose(),style:btnSmall},"← All DCs"),
-      h("h2",{style:{fontSize:18,margin:0}}, dc.id ? "DC "+despNo(dc) : "New DC"), dc.is_test ? despStatusPill("TEST") : null,
+      h("h2",{style:{fontSize:18,margin:0}}, dc.id ? "DC "+despNo(dc) : "New DC"), Number(dc.rev_no)>0 ? h("span",{"data-testid":"dc-rev",title:"Revised after the address on the Order Acceptance changed — see the history",style:{background:"#b91c1c",color:"#fff",fontWeight:900,fontSize:14,padding:"2px 10px",borderRadius:4,letterSpacing:.5}},"REV "+dc.rev_no) : null, dc.is_test ? despStatusPill("TEST") : null,
       h("span",{style:{fontSize:13,color:colors.muted}}, "Contract "+C.cn+" · "+C.customer+" · "+(C.isExport?"Export":"Domestic"))),
     h("div",{style:{margin:"6px 0 8px"}}, lotRow ? lotFlow : flow),
     lotRow ? h("div",{"data-testid":"dc-lot-banner",style:{background:lotBanner[0],color:lotBanner[1],borderRadius:8,padding:"8px 12px",fontWeight:700,fontSize:13,marginBottom:8}}, lotBanner[2])
