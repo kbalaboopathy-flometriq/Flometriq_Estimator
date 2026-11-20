@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-18T13:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-20T04:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -8602,6 +8602,337 @@ function PriceListMaster({ user }){
   );
 }
 
+// ===== 2026-11-19T12:00:00Z: Level Gauge — questionnaire picks the model; CC rules fill qty/lengths; gateways add valves/plugs/illuminator =====
+const LG_K = 8*25.4*25.4*25.4;
+const LG_NUT_KG = {8:0.005, 10:0.011, 12:0.017, 16:0.034};   // hex nut weight each, by M size (M10 = 0.011 kg)   // weight = L x W x T / (8 x 25.4^3) — the SOP's deliberate shop allowance
+const LG_NOZ = ["15nb","20nb","25nb","40nb","50nb"];
+const LG_DV_SIZES = ['1/2"','3/4"','1"'];
+const LG_DV_NB = {'1/2"':15,'3/4"':20,'1"':25};
+const LG_PLUG_SPEC = {'1/2"':'Plug-1/2" -NPTx1"lng','3/4"':'Plug-3/4"-NPTx1"lng','1"':'Plug-1" -NPTx1"lng'};
+const LG_ACC = "Gauge Valves & Accessories";   // 2026-11-20T02:00:00Z: sub-assembly heading for every line the gateways add
+const lgNorm = t=>String(t||"").replace(/\s+/g,"");
+const lgIsCast = m=>/cast/i.test(String((m&&m.construction)||"")+" "+String((m&&m.category)||""));
+// Auto Shut-off Valve models of one size (item master names vary: "Auto Shut-off Valve", "Auto Shut Off Valve" …)
+async function lgAsvModels(nb){
+  const { data, error } = await sb.from("model_tbl").select("*").ilike("item","%auto%shut%off%");
+  if(error) return [];
+  return (data||[]).filter(m=>!m.archived_at && sizeToNB(m.size)===Number(nb)).sort((a,b)=>String(a.model).localeCompare(String(b.model)));
+}
+async function lgRatesOfShape(shape){
+  const { data, error } = await sb.from("material_rates").select("material_shape,material_spec,material_grade,rate").eq("material_shape",shape).limit(2000);
+  return error?[]:(data||[]);
+}
+const LG_ILLUM = ["None","Standard","Explosion-proof Dhanbad","Explosion-proof ATEX"];
+// WNRF flange weights (kg, approx. ASME B16.5) used only for the auto shut-off valve SOP weight: 4 kg + one flange
+const LG_FLANGE_KG = {150:{15:0.9,20:1.1,25:1.4,40:2.2,50:2.7},300:{15:1.1,20:1.6,25:2.0,40:3.6,50:4.1}};
+const LG_GATEWAY_DEFAULTS = [
+  {gateway:"isolation",option_label:"Auto shut-off",source:"sop_weight",pricelist_item:null,is_default:true},
+  {gateway:"isolation",option_label:"Ball valve",source:"pricelist",pricelist_item:"Ball Valve"},
+  {gateway:"isolation",option_label:"Gate valve",source:"pricelist",pricelist_item:"Gate Valve"},
+  {gateway:"drain",option_label:"Plug",source:"plug",is_default:true},{gateway:"drain",option_label:"Gate valve",source:"pricelist",pricelist_item:"Gate Valve"},
+  {gateway:"drain",option_label:"Ball valve",source:"pricelist",pricelist_item:"Ball Valve"},{gateway:"drain",option_label:"Needle valve",source:"pricelist",pricelist_item:"Needle Valve"},
+  {gateway:"vent",option_label:"Plug",source:"plug",is_default:true},{gateway:"vent",option_label:"Gate valve",source:"pricelist",pricelist_item:"Gate Valve"},
+  {gateway:"vent",option_label:"Ball valve",source:"pricelist",pricelist_item:"Ball Valve"},{gateway:"vent",option_label:"Needle valve",source:"pricelist",pricelist_item:"Needle Valve"}];
+function lgSolveGlass(cc, style){   // the SOP algorithm — fixed, nobody edits it
+  let best=null; const mx=Math.ceil(cc/240)+1;
+  for(let a=0;a<=mx;a++) for(let b=0;b<=mx;b++){
+    const n=a+b; if(!n) continue; const glass=340*a+240*b, sec=glass+20*(n-1);
+    if(style==="SS" ? sec>cc : sec>=cc-80) continue;
+    const c={n14:a,n10:b,n,glass,sec};
+    if(!best){ best=c; continue; }
+    const better = style==="SS" ? (glass>best.glass||(glass===best.glass&&(n<best.n||(n===best.n&&a>best.n14))))
+                                : (n>best.n||(n===best.n&&(glass>best.glass||(glass===best.glass&&a>best.n14))));
+    if(better) best=c;
+  }
+  return best;
+}
+function lgModelCode(q){ return (q.type)+"-"+q.mnt+"-"+q.cls+"-"+q.chf+"-"+(q.type==="TLG"&&q.mica?"M":"0")+(q.frost?"F":"0")+(q.scale?"S":"0"); }
+function lgVars(q){
+  const cc=Number(q.cc)||0, cls=Number(q.cls)||150, g=cc>0?lgSolveGlass(cc,q.mnt):null; if(!g) return null;
+  const typ=q.type, gps=typ==="RLG"?1:2;
+  const V={CC:cc,CHAMBER:cc+80,N14:g.n14,N10:g.n10,GPS:gps,CPT:cls===150?25:28,PLT:cls===150?32:40,CLS:cls,
+    BOLTS:typ==="RLG"?7*g.n14+5*g.n10:14*g.n14+10*g.n10,UBL:cls===150?220:230,VIS:g.sec-40,SEC:g.sec,GLASS:g.glass,NOZL:String(q.noz||"20nb").toLowerCase()};
+  V.VIS_M=Math.ceil(V.VIS/1000);
+  V.SOP_MODEL=typ+"-"+g.n10+""+g.n14+"-"+cc+(typ==="TLG"&&q.mica?"-M":"")+"-"+(q.illum&&q.illum!=="None"?"I":"0");
+  return V;
+}
+function lgFill(str, V){ return String(str==null?"":str).replace(/\{(\w+)\}/g,(m,k)=>V[k]!==undefined?V[k]:m); }
+function lgEval(rule, V){
+  const e=String(rule||"").replace(/[A-Z_][A-Z0-9_]*/g,k=>V[k]!==undefined?String(V[k]):"NaN");
+  if(!/^[0-9+\-*/(). NaN]*$/.test(e)) return 0;
+  try{ const v=Function('"use strict";return ('+e+')')(); return isFinite(v)?Math.max(0,Math.round(v)):0; }catch(x){ return 0; }
+}
+function lgUnitWeight(shape, spec, cut){
+  const n=(String(spec||"").match(/\d+(\.\d+)?/g)||[]).map(Number), c=(String(cut||"").match(/\d+(\.\d+)?/g)||[]).map(Number), s=String(shape||"").toLowerCase();
+  if(s==="sqbar") return (n[0]||0)*(n[0]||0)*(c[0]||0)/LG_K;
+  if(s==="flat")  return (n[0]||0)*(n[1]||0)*(c[0]||0)/LG_K;
+  if(s==="plate") return (c[0]||0)*(c[1]||0)*(c[2]||n[0]||0)/LG_K;
+  if(s==="rod")   return Math.PI/4*(n[0]||0)*(n[0]||0)*(c[0]||0)/LG_K;
+  if(s==="nut")   return LG_NUT_KG[n[0]]||0;   // 2026-11-19T18:00:00Z: nuts priced by weight, count stays in the cutting list
+  return 0;
+}
+// master BOM rows of the picked model -> quote lines at this CC
+function lgTransform(rows, V){
+  const out=[];
+  (rows||[]).forEach(r=>{
+    const hasRule=!!(r.lg_qty_rule||r.lg_cut_rule||r.lg_spec_rule);
+    if(!hasRule){ out.push(r); return; }
+    const pieces = r.lg_qty_rule ? lgEval(r.lg_qty_rule,V) : (Number(r.cutting_plan_qty)||Number(r.qty_required)||0);
+    if(r.lg_qty_rule && pieces<=0) return;            // e.g. no 14" sections at this CC — line dropped, never a zero row
+    const spec = r.lg_spec_rule ? lgFill(r.lg_spec_rule,V) : r.material_spec;
+    const cut  = r.lg_cut_rule ? lgFill(r.lg_cut_rule,{...V,Q:pieces}) : (r.cutting_plan_layout_size||"");
+    const u=String(r.uom||"").toLowerCase().trim();
+    let qty=pieces;
+    if(u==="kg"||u==="kgs") qty=Math.round(pieces*lgUnitWeight(r.material_shape,spec,cut)*1000)/1000;
+    else if(["m","mtr","mtrs","meter","metre","meters","metres"].includes(u)) qty=Math.round(pieces*V.VIS/1000*1000)/1000;
+    out.push({...r, material_spec:spec, cutting_plan_layout_size:cut, cutting_plan_qty:cut?pieces:(r.cutting_plan_qty||0), qty_required:qty});
+  });
+  const ord=["Main Chamber","Cover Plate 14″","Cover Plate 10″","Glass 14″","Glass 10″","Gasket 14″","Gasket 10″","U-Bolts","Studs","Nuts","Mica 14″","Mica 10″","Frost Shield 14″","Frost Shield 10″","Scale","Flanges"];
+  const rk=c=>{ const i=ord.indexOf(c); return i<0?99:i; };
+  return out.map((r,i)=>[r,i]).sort((a,b)=>rk(a[0].component)-rk(b[0].component)||a[1]-b[1]).map(x=>x[0]);
+}
+function lgNbOf(size){ const m=String(size||"").match(/\d+/); return m?Number(m[0]):null; }
+async function lgPricelistFor(item, nb){
+  if(!item||!nb) return [];
+  const sizes=[nb+"nb",nb+"NB",nb+"Nb",nb+" nb",nb+" NB"];
+  const { data, error } = await sb.from("pricelist_models").select("model_code,item,size,valve_type,end_conn,rating,body,description,list_price,uplift_pct").eq("item",item).eq("active",true).in("size",sizes).order("list_price",{ascending:true}).limit(25);
+  if(error) return [];
+  return data||[];
+}
+async function lgIlluminators(){
+  const { data, error } = await sb.from("pricelist_models").select("model_code,item,size,valve_type,description,list_price,uplift_pct").ilike("item","%illuminator%").eq("active",true).order("list_price",{ascending:true}).limit(25);
+  return error?[]:(data||[]);
+}
+function lgPlLabel(r){ return [r.model_code, r.end_conn, r.rating, r.body].filter(Boolean).join(" · ")+" — ₹ "+fmt2(pricelistCost(r)); }
+function lgPickDefault(rows, prefEnds, cls){
+  if(!rows.length) return "";
+  for(const e of prefEnds){ const hit=rows.filter(r=>String(r.end_conn||"").toUpperCase()===e && (e!=="FL"||String(r.rating||"").replace(/\D/g,"")===String(cls))); if(hit.length) return hit[0].model_code; }
+  return rows[0].model_code;
+}
+// gateway lines (outside the model): isolation valves, drain, vent, illuminator
+function lgGatewayLines(q, V, sel, baseSf, kgUom){
+  const L=[]; const stamp=Date.now(); let k=0;
+  const mk=(o)=>({ id:"lg-gw-"+stamp+"-"+(k++), item:"Level Gauge", size:q.cls+"#", model:lgModelCode(q), sub_assembly:LG_ACC, material_shape:"", cutting_plan_layout_size:"", cutting_plan_qty:0, cutting_plan_uom:"", sf:baseSf, _manual:true, ...o });
+  const isoQty=Math.max(0,Number(q.isoQty)||0);
+  const r3=x=>Math.round((Number(x)||0)*1000)/1000;
+  if(isoQty>0){
+    const asv=sel.asv||{};
+    if(sel.iso.source==="sop_weight" && asv.model && asv.rows && asv.rows.length){
+      // 2026-11-20T02:00:00Z: the Auto Shut-off Valve item's own BOM (this nozzle size), x number of valves
+      asv.rows.forEach(r=>{ const { id, created_at, updated_at, lg_spec_rule, lg_qty_rule, lg_cut_rule, ...rest } = r;
+        L.push(mk({ ...rest, item:"Level Gauge", size:q.cls+"#", model:lgModelCode(q), sub_assembly:LG_ACC, _lg:"isolation", sf:baseSf,
+          qty_required:r3(Number(r.qty_required)*isoQty), cutting_plan_qty:(Number(r.cutting_plan_qty)||0)*isoQty,
+          cutting_plan_layout_size:(r.cutting_plan_layout_size?r.cutting_plan_layout_size+" – ":"")+"auto shut-off "+asv.model.model+" × "+isoQty })); });
+      if(!lgIsCast(asv.model) && asv.flgSpec && Number(asv.fpv)>0)
+        L.push(mk({ component:"Auto Shut-off Flanges", _lg:"isolation", material_shape:"Flange", material_spec:asv.flgSpec, uom:"Nos", qty_required:isoQty*Number(asv.fpv),
+          cutting_plan_layout_size:Number(asv.fpv)+" per valve × "+isoQty+" valves" }));
+    } else if(sel.iso.source==="sop_weight"){
+      const nb=lgNbOf(V.NOZL)||20, fl=(LG_FLANGE_KG[V.CLS]||{})[nb]||1.1, each=Math.round((4+fl)*1000)/1000;
+      L.push(mk({ component:"Isolation Valve – Auto shut-off", _lg:"isolation", material_shape:"SqBar", material_spec:"SquareBar-40mm", uom:kgUom,
+        qty_required:Math.round(isoQty*each*1000)/1000, cutting_plan_layout_size:"Auto shut-off valve "+V.NOZL+" "+V.CLS+"# – SOP weight 4 kg + flange "+fl+" kg = "+each+" kg each ("+isoQty+" nos)", cutting_plan_qty:isoQty, cutting_plan_uom:"Nos" }));
+    } else if(sel.iso.row){
+      L.push(mk({ component:"Isolation Valve – "+sel.iso.label, _lg:"isolation", material_shape:"Valve", material_spec:sel.iso.row.item+" "+sel.iso.row.model_code, uom:"Nos", qty_required:isoQty, _rate:pricelistCost(sel.iso.row) }));
+    } else {
+      L.push(mk({ component:"Isolation Valve – "+sel.iso.label, _lg:"isolation", material_shape:"Valve", material_spec:sel.iso.label+" "+V.NOZL+" "+V.CLS+" LBS (not in price list)", uom:"Nos", qty_required:isoQty, _rate:0 }));
+    }
+  }
+  [["drain","Drain"],["vent","Vent"]].forEach(([g,word])=>{
+    const s=sel[g];
+    if(s.source==="plug" && s.plug) L.push(mk({ component:word+" Plug", _lg:g, material_shape:"Plug", material_spec:s.plug.spec, uom:"Nos", qty_required:1, _grade:s.plug.grade }));
+    else if(s.source==="plug") L.push(mk({ component:word+" Plug", _lg:g, material_shape:"Plug", material_spec:LG_PLUG_SPEC[s.size]||LG_PLUG_SPEC['3/4"'], uom:"Nos", qty_required:1 }));
+    else if(s.row) L.push(mk({ component:word+" Valve – "+s.label, _lg:g, material_shape:"Valve", material_spec:s.row.item+" "+s.row.model_code, uom:"Nos", qty_required:1, _rate:pricelistCost(s.row) }));
+    else L.push(mk({ component:word+" Valve – "+s.label, _lg:g, material_shape:"Valve", material_spec:s.label+" "+s.size+" (not in price list)", uom:"Nos", qty_required:1, _rate:0 }));
+  });
+  if(q.illum && q.illum!=="None"){
+    const r=sel.illum.row;
+    L.push(mk({ component:"Illuminator", _lg:"illuminator", material_shape:"Illuminator", material_spec:"Illuminator-"+q.illum+(r?" ("+r.model_code+")":""), uom:"Nos", qty_required:V.VIS_M,
+      cutting_plan_layout_size:"1 per metre of visible length ("+V.VIS+" mm)", _rate:r?pricelistCost(r):0 }));
+  }
+  return L;
+}
+function LevelGaugeQuestionnaire({ onClose, onBuild, initial }){
+  const [q,setQ]=useState(initial||{type:"RLG",mnt:"SS",cls:"150",chf:"SQ",mica:false,frost:false,scale:false,cc:"",noz:"20nb",isoType:"Auto shut-off",isoQty:"2",drainType:"Plug",drainSize:'3/4"',ventType:"Plug",ventSize:'3/4"',illum:"None"});
+  const [opts,setOpts]=useState(LG_GATEWAY_DEFAULTS);
+  const [pl,setPl]=useState({iso:[],drain:[],vent:[],illum:[]});
+  const [plSel,setPlSel]=useState({iso:"",drain:"",vent:"",illum:""});
+  const [master,setMaster]=useState({code:"",rows:null,err:""});
+  const [busy,setBusy]=useState(false);
+  // 2026-11-20T02:00:00Z: price-list questions (Valve Finder), plugs from Material Rates, Auto Shut-off Valve BOM
+  const [plRow,setPlRow]=useState({iso:null,drain:null,vent:null});   // model picked through the price-list questions
+  const [vf,setVf]=useState(null);                                     // {g, item, answers}
+  const [vfSetup,setVfSetup]=useState(null); const [vfAll,setVfAll]=useState(null);
+  const [plugRates,setPlugRates]=useState(null); const [flgRates,setFlgRates]=useState(null);
+  const [asv,setAsv]=useState({nb:null,list:null,rows:null});
+  const set=(k,v)=>setQ(p=>({...p,[k]:v}));
+  useEffect(()=>{ lgRatesOfShape("Plug").then(setPlugRates,()=>setPlugRates([])); lgRatesOfShape("Flange").then(setFlgRates,()=>setFlgRates([])); },[]);
+  useEffect(()=>{ (async()=>{ try{ const { data, error } = await sb.from("lg_gateway_option_tbl").select("*").eq("active",true).order("sort_order"); if(!error && data && data.length) setOpts(data); }catch(e){} })(); },[]);
+  const optFor=(g)=>opts.filter(o=>o.gateway===g);
+  const optOf=(g,label)=>optFor(g).find(o=>o.option_label===label)||optFor(g)[0]||{source:"plug",option_label:label};
+  const V=useMemo(()=>lgVars(q),[q]);
+  const code=lgModelCode(q);
+  useEffect(()=>{ let dead=false; setMaster(m=>({...m,code,rows:null,err:""}));
+    sb.from("bom").select("*").eq("model",code).order("id").then(({data,error})=>{ if(dead) return; setMaster({code,rows:error?[]:(data||[]),err:error?error.message:""}); });
+    return ()=>{ dead=true; }; },[code]);
+  // price-list variants for each gateway that uses the price list
+  const isoO=optOf("isolation",q.isoType), drO=optOf("drain",q.drainType), veO=optOf("vent",q.ventType);
+  useEffect(()=>{ setPlRow(r=>({...r,iso:null})); },[q.isoType,q.noz,q.cls]);
+  useEffect(()=>{ setPlRow(r=>({...r,drain:null})); },[q.drainType,q.drainSize]);
+  useEffect(()=>{ setPlRow(r=>({...r,vent:null})); },[q.ventType,q.ventSize]);
+  const nozNb=lgNbOf(q.noz);
+  useEffect(()=>{ if(isoO.source!=="sop_weight") return; let dead=false; setAsv({nb:nozNb,list:null,rows:null});
+    lgAsvModels(nozNb).then(list=>{ if(dead) return; setAsv(a=>({...a,list})); const pick=list.find(m=>m.model===q.asvModel)||list[0];
+      if(pick && pick.model!==q.asvModel) set("asvModel",pick.model); if(!pick) set("asvModel",""); },()=>{ if(!dead) setAsv(a=>({...a,list:[]})); });
+    return ()=>{ dead=true; }; },[isoO.source,nozNb]);
+  const asvModel=(asv.list||[]).find(m=>m.model===q.asvModel)||null;
+  useEffect(()=>{ if(!asvModel){ setAsv(a=>({...a,rows:null})); return; } let dead=false;
+    sb.from("bom").select("*").eq("model",asvModel.model).order("id").then(({data,error})=>{ if(!dead) setAsv(a=>({...a,rows:error?[]:(data||[])})); });
+    return ()=>{ dead=true; }; },[asvModel&&asvModel.model]);
+  // flange standards offered = Flange specs in Material Rates for this nozzle size
+  const flgOpts=useMemo(()=>{ const t="-"+nozNb+"nb-"; return Array.from(new Set((flgRates||[]).map(r=>r.material_spec).filter(sp=>String(sp||"").toLowerCase().replace(/\s+/g,"").includes(t)))).sort(); },[flgRates,nozNb]);
+  const flgDefault=flgOpts.find(sp=>new RegExp("\\b"+q.cls+"\\s*LBS-WNRF","i").test(sp))||flgOpts[0]||("Flange-"+nozNb+"nb-ANSI B16.5 "+q.cls+" LBS-WNRF");
+  const flgSpec=(q.asvFlg && (flgOpts.includes(q.asvFlg)||!flgOpts.length))?q.asvFlg:flgDefault;
+  const plugOpts=(size)=>(plugRates||[]).filter(r=>lgNorm(r.material_spec).startsWith(lgNorm("Plug-"+size))).sort((a,b)=>String(a.material_spec+a.material_grade).localeCompare(String(b.material_spec+b.material_grade)));
+  const plugPick=(size,cur)=>{ const o=plugOpts(size); return o.find(r=>r.material_spec+"||"+r.material_grade===cur) || o.find(r=>/316L/i.test(r.material_grade)&&Number(r.rate)>0) || o.find(r=>Number(r.rate)>0) || o[0] || null; };
+  const openVf=async(g,o,nb)=>{
+    let all=vfAll, setup=vfSetup;
+    if(!all){ try{ all=await fetchAllPricelistModels(false); }catch(e){ all=[]; } setVfAll(all); }
+    if(!setup){ try{ setup=await loadValveFinderSetup(); }catch(e){ setup={questions:[],labels:[],families:{},vendors:new Map(),extras:[]}; } setVfSetup(setup); }
+    const item=(Array.from(new Set(all.map(r=>r.item))).find(it=>norm(it)===norm(o.pricelist_item)))||o.pricelist_item||"";
+    const ofItem=all.filter(r=>norm(r.item)===norm(item)), ans={};
+    const sz=ofItem.find(r=>sizeToNB(r.size)===Number(nb)); if(sz) ans.size=sz.size;
+    if(g==="iso"){ const rt=ofItem.find(r=>(!sz||r.size===sz.size) && String(r.rating||"").replace(/\D/g,"")===String(q.cls)); if(rt) ans.rating=rt.rating; }
+    setVf({g,item,answers:ans});
+  };
+  const vfDone=(rows)=>{ const best=(rows||[]).slice().sort((a,b)=>pricelistCost(a)-pricelistCost(b))[0]; if(best) setPlRow(r=>({...r,[vf.g]:best})); setVf(null); };
+  useEffect(()=>{ let dead=false; const nb=lgNbOf(q.noz);
+    (isoO.source==="pricelist"?lgPricelistFor(isoO.pricelist_item,nb):Promise.resolve([])).then(r=>{ if(dead) return; setPl(p=>({...p,iso:r})); setPlSel(s=>({...s,iso:lgPickDefault(r,["FL","SWSC","SCRD"],q.cls)})); });
+    return ()=>{ dead=true; }; },[q.isoType,q.noz,q.cls,isoO.pricelist_item,isoO.source]);
+  useEffect(()=>{ let dead=false;
+    (drO.source==="pricelist"?lgPricelistFor(drO.pricelist_item,LG_DV_NB[q.drainSize]):Promise.resolve([])).then(r=>{ if(dead) return; setPl(p=>({...p,drain:r})); setPlSel(s=>({...s,drain:lgPickDefault(r,["SCRD","SWSC","FL"],q.cls)})); });
+    return ()=>{ dead=true; }; },[q.drainType,q.drainSize,drO.pricelist_item,drO.source]);
+  useEffect(()=>{ let dead=false;
+    (veO.source==="pricelist"?lgPricelistFor(veO.pricelist_item,LG_DV_NB[q.ventSize]):Promise.resolve([])).then(r=>{ if(dead) return; setPl(p=>({...p,vent:r})); setPlSel(s=>({...s,vent:lgPickDefault(r,["SCRD","SWSC","FL"],q.cls)})); });
+    return ()=>{ dead=true; }; },[q.ventType,q.ventSize,veO.pricelist_item,veO.source]);
+  useEffect(()=>{ let dead=false; if(!q.illum||q.illum==="None"){ setPl(p=>({...p,illum:[]})); return; }
+    lgIlluminators().then(r=>{ if(dead) return; setPl(p=>({...p,illum:r})); const t=q.illum.toLowerCase(); const hit=r.find(x=>String((x.valve_type||"")+" "+(x.description||"")+" "+x.model_code).toLowerCase().includes(t.includes("atex")?"atex":t.includes("dhanbad")?"dhanbad":"standard")); setPlSel(s=>({...s,illum:hit?hit.model_code:""})); });
+    return ()=>{ dead=true; }; },[q.illum]);
+  const lines = useMemo(()=> (V && master.rows) ? lgTransform(master.rows, V) : [], [V, master.rows]);
+  const plugOf=(size,cur)=>{ const r=plugPick(size,cur); return r?{spec:r.material_spec,grade:r.material_grade,rate:Number(r.rate)||0}:null; };
+  const sel = { iso:{source:isoO.source,label:q.isoType,row:plRow.iso||pl.iso.find(r=>r.model_code===plSel.iso)},
+    asv:{model:asvModel,rows:asv.rows,flgSpec,fpv:q.asvFpv==null||q.asvFpv===""?1:Number(q.asvFpv)},
+    drain:{source:drO.source,label:q.drainType,size:q.drainSize,row:plRow.drain||pl.drain.find(r=>r.model_code===plSel.drain),plug:plugOf(q.drainSize,q.drainPlug)},
+    vent:{source:veO.source,label:q.ventType,size:q.ventSize,row:plRow.vent||pl.vent.find(r=>r.model_code===plSel.vent),plug:plugOf(q.ventSize,q.ventPlug)},
+    illum:{row:pl.illum.find(r=>r.model_code===plSel.illum)} };
+  const errs=[];
+  if(!(Number(q.cc)>0)) errs.push("CC distance is required.");
+  else if(!V) errs.push("No glass combination fits this CC distance.");
+  if(isoO.source==="sop_weight" && Number(q.isoQty)>0 && (asv.list===null || (asvModel && asv.rows===null))) errs.push("Loading the Auto Shut-off Valve BOM…");
+  if(master.rows && !master.rows.length) errs.push("Model "+code+" is not in the master BOMs. Run lg_seed_level_gauge_models_2026-11-19.sql, or ask a Super Admin.");
+  const lab=(t,req)=>h("div",{style:{fontSize:11.5,color:colors.muted,margin:"8px 0 3px"}},t,req?h("span",{style:{color:"#c0392b",marginLeft:2}},"*"):null);
+  const sel1=(k,list,labels)=>h("select",{value:q[k],onChange:e=>set(k,e.target.value),style:{...inputStyle,fontSize:13,padding:"6px 8px"}},list.map((v,i)=>h("option",{key:v,value:v},labels?labels[i]:v)));
+  const chk=(k,t,dis)=>h("label",{style:{display:"flex",gap:6,alignItems:"center",fontSize:13,opacity:dis?0.45:1,margin:"6px 0"}},h("input",{type:"checkbox",disabled:dis,checked:!!q[k]&&!dis,onChange:e=>set(k,e.target.checked)}),t);
+  const plPick=(g,rows,src,o,nb)=> src!=="pricelist" ? null :
+    h("div",null,
+      h("div",{style:{display:"flex",gap:6,alignItems:"center",marginTop:5,flexWrap:"wrap"}},
+        h("button",{type:"button","data-testid":"lg-vf-"+g,onClick:()=>openVf(g,o,nb),style:{...btnPrimary,fontSize:11.5,padding:"4px 10px"}},"Price-list questions…"),
+        plRow[g] && h("span",{style:{fontSize:11.5,color:"#0f6e56"}},"✓ "+plRow[g].model_code+" — ₹ "+fmt2(pricelistCost(plRow[g]))),
+        plRow[g] && h("button",{type:"button",onClick:()=>setPlRow(r=>({...r,[g]:null})),style:{...btnSmall,fontSize:11}},"Clear")),
+      !plRow[g] && plPickList(g,rows));
+  const plPickList=(g,rows)=>
+    rows.length ? h("select",{value:plSel[g],onChange:e=>setPlSel(s=>({...s,[g]:e.target.value})),style:{...inputStyle,fontSize:12,padding:"5px 7px",marginTop:4}},rows.map(r=>h("option",{key:r.model_code,value:r.model_code},lgPlLabel(r))))
+                : h("div",{style:{fontSize:11.5,color:"#a3312a",marginTop:4}},"Not in the price list for this size — the line is added without a price (flagged).");
+  const build=async()=>{
+    if(errs.length||!V||!master.rows) return;
+    setBusy(true);
+    const baseSf = Number((master.rows.find(r=>r.sf!=null)||{}).sf)||3.1;
+    const kgUom = (master.rows.find(r=>/^kgs?$/i.test(String(r.uom||"").trim()))||{}).uom||"Kg";
+    const gw = lgGatewayLines(q, V, sel, baseSf, kgUom);
+    onBuild({ q, V, model:code, size:q.cls+"#", lines:lines.concat(gw) });
+  };
+  const box={border:"1px solid "+colors.border,borderRadius:8,padding:"8px 10px",marginTop:8};
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:1060,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"24px 12px",overflowY:"auto"}},
+    h("div",{"data-testid":"lg-questionnaire",style:{background:"#fff",borderRadius:10,width:1180,maxWidth:"96vw",boxShadow:"0 10px 40px rgba(0,0,0,0.25)"}},
+      h("div",{style:{padding:"12px 16px",borderBottom:"1px solid "+colors.border,display:"flex",alignItems:"center",gap:10}},
+        h("div",{style:{fontWeight:700,color:colors.dark,fontSize:15}},"Level Gauge – questionnaire"),
+        h("div",{style:{fontSize:12,color:colors.muted}},"The answers pick the model; the CC distance sets the lengths and quantities."),
+        h("span",{style:{marginLeft:"auto"}}),
+        h("button",{onClick:onClose,style:{...btnSecondary,padding:"5px 12px"}},"Close")),
+      h("div",{style:{display:"grid",gridTemplateColumns:"360px 1fr",gap:14,padding:14}},
+        h("div",null,
+          h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}},
+            h("div",null,lab("Gauge type",1),sel1("type",["RLG","TLG"],["Reflex","Transparent"])),
+            h("div",null,lab("Mounting",1),sel1("mnt",["SS","EE"],["Side and Side","End and End"])),
+            h("div",null,lab("Pressure class",1),sel1("cls",["150","300"],["150#","300#"])),
+            h("div",null,lab("CC distance (mm)",1),h("input",{type:"number","data-testid":"lg-cc",value:q.cc,onChange:e=>set("cc",e.target.value),style:{...inputStyle,fontSize:13,padding:"6px 8px"}})),
+            h("div",null,lab("Chamber",1),sel1("chf",["SQ","PL"],["Square (40 sq bar)","Large flat (80 plate)"])),
+            h("div",null,lab("Nozzle size",1),sel1("noz",LG_NOZ))),
+          chk("mica","Mica shield (Transparent only)",q.type!=="TLG"), chk("frost","Frosting shield (acrylic)"), chk("scale","Scale (25 x 3)"),
+          h("div",{style:box},
+            h("div",{style:{fontWeight:600,fontSize:12.5,color:colors.dark}},"Isolation valves"),
+            h("div",{style:{display:"grid",gridTemplateColumns:"1fr 80px",gap:8}},
+              h("div",null,lab("Type",1),h("select",{value:q.isoType,onChange:e=>set("isoType",e.target.value),style:{...inputStyle,fontSize:13,padding:"6px 8px"}},optFor("isolation").map(o=>h("option",{key:o.option_label,value:o.option_label},o.option_label)))),
+              h("div",null,lab("Qty",1),h("input",{type:"number",value:q.isoQty,onChange:e=>set("isoQty",e.target.value),style:{...inputStyle,fontSize:13,padding:"6px 8px"}}))),
+            isoO.source==="sop_weight" ? (
+              asv.list===null ? h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:4}},"Looking for an Auto Shut-off Valve BOM for "+nozNb+"NB…") :
+              !asvModel ? h("div",{style:{fontSize:11.5,color:"#7a5200",background:"#fff4d6",borderRadius:6,padding:"5px 8px",marginTop:4}},"No Auto Shut-off Valve BOM for "+nozNb+"NB in the BOM master. Falling back to the SOP weight: 4 kg + one "+q.noz+" "+q.cls+"# flange per valve, at the square-bar rate of the grade picked in MOC.") :
+              h("div",{style:{marginTop:4}},
+                h("div",{style:{fontSize:11.5,color:"#0f6e56",background:"#e4f3ed",borderRadius:6,padding:"5px 8px"}},
+                  "Auto Shut-off Valve "+asvModel.model+" ("+(asvModel.construction||asvModel.category||"Fabricated")+") — "+(asv.rows===null?"loading its BOM…":asv.rows.length+" BOM lines, × "+(Number(q.isoQty)||0)+" valves."),
+                  asv.rows && !asv.rows.length ? h("div",{style:{color:"#a3312a"}},"This model has no BOM lines yet — add them in the BOM master.") : null),
+                (asv.list||[]).length>1 && h("div",null,lab("Auto shut-off model",1),h("select",{value:q.asvModel||"",onChange:e=>set("asvModel",e.target.value),style:{...inputStyle,fontSize:12,padding:"5px 7px"}},asv.list.map(m=>h("option",{key:m.model,value:m.model},m.model+(m.construction?" ("+m.construction+")":""))))),
+                lgIsCast(asvModel) ? h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:4}},"Cast body — no flange step.") :
+                h("div",{style:{display:"grid",gridTemplateColumns:"1fr 80px",gap:8}},
+                  h("div",null,lab("Flange standard",1),h("select",{"data-testid":"lg-asv-flg",value:flgSpec,onChange:e=>set("asvFlg",e.target.value),style:{...inputStyle,fontSize:12,padding:"5px 7px"}},
+                    (flgOpts.length?flgOpts:[flgDefault]).map(sp=>h("option",{key:sp,value:sp},sp)))),
+                  h("div",null,lab("Per valve",1),h("input",{type:"number",min:0,value:q.asvFpv==null?1:q.asvFpv,onChange:e=>set("asvFpv",e.target.value),style:{...inputStyle,fontSize:13,padding:"5px 7px"}}))))
+            ) : plPick("iso",pl.iso,isoO.source,isoO,nozNb)),
+          [["drain","Drain","drainType","drainSize"],["vent","Vent","ventType","ventSize"]].map(([g,word,tk,sk])=>{ const o=g==="drain"?drO:veO;
+            return h("div",{key:g,style:box},
+              h("div",{style:{fontWeight:600,fontSize:12.5,color:colors.dark}},word),
+              h("div",{style:{display:"grid",gridTemplateColumns:"1fr 90px",gap:8}},
+                h("div",null,lab("Plug or valve",1),h("select",{value:q[tk],onChange:e=>set(tk,e.target.value),style:{...inputStyle,fontSize:13,padding:"6px 8px"}},optFor(g).map(x=>h("option",{key:x.option_label,value:x.option_label},x.option_label)))),
+                h("div",null,lab("Size",1),sel1(sk,LG_DV_SIZES))),
+              o.source==="plug" ? (()=>{ const pk=g==="drain"?"drainPlug":"ventPlug", opts=plugOpts(q[sk]), cur=plugPick(q[sk],q[pk]);
+                  if(plugRates===null) return h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:4}},"Loading plugs from Material Rates…");
+                  if(!opts.length) return h("div",{style:{fontSize:11.5,color:"#7a5200",marginTop:4}},"No "+q[sk]+" plug in Material Rates — added as "+(LG_PLUG_SPEC[q[sk]]||"")+", grade picked in MOC.");
+                  return h("div",null, lab("Plug (Material Rates)",1),
+                    h("select",{"data-testid":"lg-plug-"+g,value:cur?cur.material_spec+"||"+cur.material_grade:"",onChange:e=>set(pk,e.target.value),style:{...inputStyle,fontSize:12,padding:"5px 7px"}},
+                      opts.map(r=>h("option",{key:r.material_spec+"||"+r.material_grade,value:r.material_spec+"||"+r.material_grade},r.material_spec+" · "+r.material_grade+" · "+(Number(r.rate)>0?"₹ "+fmt2(Number(r.rate)):"no rate")))),
+                    cur && !(Number(cur.rate)>0) && h("div",{style:{fontSize:11.5,color:"#a3312a",marginTop:3}},"No rate for this plug and grade — the line comes in without a price (flagged)."));
+                })() : plPick(g,pl[g],o.source,o,LG_DV_NB[q[sk]])); }),
+          h("div",{style:box},
+            h("div",{style:{fontWeight:600,fontSize:12.5,color:colors.dark}},"Illuminator"),
+            lab("Type",1), sel1("illum",LG_ILLUM),
+            q.illum!=="None" && (pl.illum.length ? h("select",{value:plSel.illum,onChange:e=>setPlSel(s=>({...s,illum:e.target.value})),style:{...inputStyle,fontSize:12,padding:"5px 7px",marginTop:4}},h("option",{value:""},"— no price-list item (line without price) —"),pl.illum.map(r=>h("option",{key:r.model_code,value:r.model_code},lgPlLabel(r))))
+              : h("div",{style:{fontSize:11.5,color:"#a3312a",marginTop:4}},"No illuminator in the price list yet — the line is added without a price (flagged).")))
+        ),
+        h("div",null,
+          h("div",{style:{display:"flex",gap:16,alignItems:"flex-end",flexWrap:"wrap"}},
+            h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"Model (picked by the app)"),h("div",{"data-testid":"lg-model",style:{fontFamily:"ui-monospace,Consolas,monospace",fontWeight:700,fontSize:17,color:colors.dark}},code)),
+            V && h("div",null,h("div",{style:{fontSize:11,color:colors.muted}},"SOP number"),h("div",{style:{fontFamily:"ui-monospace,Consolas,monospace",fontSize:14}},V.SOP_MODEL)),
+            V && h("div",{style:{fontSize:12,color:colors.muted}},V.N14+" × 14″ + "+V.N10+" × 10″ · section "+V.SEC+" · visible "+V.VIS+" · chamber "+V.CHAMBER+" mm")),
+          errs.length>0 && h("div",{style:{background:"#fdecea",color:"#a3312a",borderRadius:6,padding:"6px 10px",fontSize:12,marginTop:8}},errs.join(" ")),
+          h("div",{style:{fontWeight:600,fontSize:12.5,color:colors.dark,margin:"10px 0 4px"}},"BOQ",h("span",{style:{fontWeight:400,color:colors.muted,marginLeft:6}},"(model lines at this CC — gateway lines are added on Build BOM; grades are picked next, as for strainers)")),
+          master.rows===null ? h("div",{style:{fontSize:12,color:colors.muted}},"Loading the model…") :
+          h("div",{style:{maxHeight:420,overflowY:"auto"}},
+            h("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12}},
+              h("thead",null,h("tr",null,["Component","Shape","Material spec","Cutting plan","Qty","UOM"].map(t=>h("th",{key:t,style:{textAlign:"left",borderBottom:"2px solid #333",padding:"5px 6px"}},t)))),
+              h("tbody",null,lines.map((r,i)=>h("tr",{key:i},
+                h("td",{style:{padding:"4px 6px",borderBottom:"1px solid #eee",fontWeight:600}},r.component),
+                h("td",{style:{padding:"4px 6px",borderBottom:"1px solid #eee"}},r.material_shape),
+                h("td",{style:{padding:"4px 6px",borderBottom:"1px solid #eee"}},r.material_spec),
+                h("td",{style:{padding:"4px 6px",borderBottom:"1px solid #eee"}},r.cutting_plan_layout_size||"—"),
+                h("td",{style:{padding:"4px 6px",borderBottom:"1px solid #eee",textAlign:"right"}},r.qty_required),
+                h("td",{style:{padding:"4px 6px",borderBottom:"1px solid #eee"}},r.uom))))))
+        )),
+      h("div",{style:{padding:"10px 16px",borderTop:"1px solid "+colors.border,display:"flex",gap:8,justifyContent:"flex-end"}},
+        h("button",{onClick:onClose,style:btnSecondary},"Cancel"),
+        vf && h(ValveFinderForm,{ setup:vfSetup, allRows:vfAll||[], item:vf.item, answers:vf.answers,
+          onPickItem:(it)=>setVf(v=>({...v,item:it,answers:{}})), onAnswers:(a)=>setVf(v=>v?({...v,answers:a}):v),
+          onDone:(rows)=>vfDone(rows), onSkip:()=>setVf(null), onClose:()=>setVf(null) }),
+        h("button",{"data-testid":"lg-build",disabled:!!errs.length||busy||master.rows===null,onClick:build,title:errs.join(" "),style:{...btnPrimary,opacity:(errs.length||busy||master.rows===null)?0.5:1}},"Build BOM →"))));
+}
+
 function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefresh, onOpenQuote, initialModel, onConsumedInitialModel, pendingNewSlNo, onConsumedPendingNewSlNo, onGoToTab }) {
   const { models = [], customModelName, itemOptions = [], modelCatalog = [], gradesBySpec, rateBySpecGrade, allSpecs = [], uoms = [], allComponents = [], subAssembliesByComponent, loadingMaster } = masterData;   // 2026-10-30T08:00:00Z: defaults — signing out and in as another login crashed here
   const [isCustomModel,setIsCustomModel]=useState(false);
@@ -9050,6 +9381,22 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     setCart(c=>c.slice(0,keep.cartIndex).concat([keep.original]).concat(c.slice(keep.cartIndex)));
     setPlSel(null); setPlOpts({});
     setPlAdded("Line "+(keep.cartIndex+1)+" put back unchanged.");
+  };
+  // 2026-11-19T12:00:00Z: Level Gauge — the questionnaire replaces the Size/Model pick
+  const isLG = norm(itemFilterEst)==="level gauge";
+  const [lgOpen,setLgOpen]=useState(false);
+  const [lgCtx,setLgCtx]=useState(null);
+  useEffect(()=>{ if(isLG && pricingWay!=="pricelist" && !lgCtx) setLgOpen(true); },[isLG]);
+  const buildLevelGauge = ({ q, V, model, size, lines:built })=>{
+    setLgOpen(false); setLgCtx({ q, V, model });
+    setPricingWay("bom"); setIsCustomModel(false); setSizeFilterEst(size); setModelFilter("");
+    setSelectedModel(model); setMocSelections({}); setMocMode("shape"); setFreeText(""); setParsedMatches(null); setNoBomAck(false); setNoBomPl(null);
+    const ov={}; built.forEach(l=>{ if(l._rate>0) ov[l.id]={rate:l._rate}; if(l._grade) ov[l.id]={...(ov[l.id]||{}),grade:l._grade}; });
+    setOverrides(ov);
+    setLines(built); setLoadingLines(false);
+    const desc=(q.type==="RLG"?"Reflex":"Transparent")+" Level Gauge, "+(q.mnt==="SS"?"Side and Side":"End and End")+", "+q.cls+"#, CC "+V.CC+" mm, "+(q.chf==="SQ"?"square chamber":"large flat chamber")+(q.type==="TLG"&&q.mica?", mica":"")+(q.frost?", frosting shield":"")+(q.scale?", scale":"")+(q.illum&&q.illum!=="None"?", illuminator ("+q.illum+")":"")+", "+q.isoQty+" isolation valves ("+q.isoType+") "+q.noz+", drain: "+q.drainType+" "+q.drainSize+", vent: "+q.ventType+" "+q.ventSize+" — model "+model+" / "+V.SOP_MODEL;
+    setRefDesc(desc);
+    setMocLines(built.filter(l=>l._rate===undefined && !l._grade)); setShowMOC(true);
   };
   const selectModel = async(m)=>{
     setPricingWay(customModelName && m===customModelName ? "custom" : "bom");
@@ -9800,6 +10147,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
 
   const clearEstimate = ()=>{
     if(!confirm("Clear the current estimate and all cart items?")) return;
+    setLgCtx(null);   // 2026-11-19T12:00:00Z
     requestCodeConfirm(
       "Confirm clearing the cart",
       "This removes "+cart.length+" unsaved Sl No"+(cart.length===1?"":"s")+" and all header details entered for this quote. This can't be undone.",
@@ -10649,6 +10997,12 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
         h("div",{style:{fontSize:11,letterSpacing:"0.08em",color:colors.mutedLight,marginBottom:8}},"ITEM"),
         h("input",{list:"est-item-list",value:itemFilterEst,onChange:e=>handleItemSelectEst(e.target.value),placeholder:"Type or pick an item…",style:{...inputStyle,fontSize:13,marginBottom:8}}),
         h("datalist",{id:"est-item-list"},itemOptionsCascadeEst.map(m=>h("option",{key:m,value:m}))),
+        isLG ? h("div",{"data-testid":"lg-sidebox",style:{border:"1px solid #0f766e",borderRadius:8,padding:"8px 10px",background:"#eef6f5",marginBottom:8}},
+          h("div",{style:{fontSize:12,fontWeight:600,color:"#0f6e56",marginBottom:4}},"Level gauge"),
+          lgCtx ? h("div",{style:{fontSize:11.5,color:colors.text,marginBottom:6}},h("div",{style:{fontFamily:"ui-monospace,Consolas,monospace"}},lgCtx.model),"CC "+lgCtx.V.CC+" mm · "+lgCtx.V.SOP_MODEL)
+                : h("div",{style:{fontSize:11.5,color:colors.muted,marginBottom:6}},"Size and model are picked by the app from the questionnaire."),
+          h("button",{onClick:()=>setLgOpen(true),style:{...btnPrimary,width:"100%",fontSize:12,padding:"7px 8px"}},lgCtx?"Edit questionnaire (rebuild BOM)":"Open questionnaire")) :
+        h(React.Fragment,null,
         h("div",{style:{fontSize:11,letterSpacing:"0.08em",color:colors.mutedLight,marginBottom:8,opacity:itemFilterEst?1:0.5}},"SIZE"),
         h("input",{list:"est-size-list",disabled:!itemFilterEst,value:sizeFilterEst,onChange:e=>handleSizeSelectEst(e.target.value),placeholder:itemFilterEst?"Type or pick a size…":"Select item first",style:{...inputStyle,fontSize:13,marginBottom:8,background:itemFilterEst?"#fff":colors.bg,opacity:itemFilterEst?1:0.5}}),
         h("datalist",{id:"est-size-list"},sizeOptionsForItemEst.map(m=>h("option",{key:m,value:m}))),
@@ -10666,6 +11020,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
             ...(modelFieldFocused?{position:"absolute",width:360,zIndex:50,boxShadow:"0 4px 14px rgba(0,0,0,0.15)",border:"1px solid #0f766e"}:{})}
         })
         )
+        )
       ),
       h("div",{style:{overflowY:"auto",flex:1}},
         pricingWay==="pricelist" ? (
@@ -10681,6 +11036,7 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
           })
         ) :
         loadingMaster?h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"Loading models…"):
+        isLG?h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},lgCtx?"Model "+lgCtx.model+" loaded. Pick grades in MOC; from here it works like any other BOM.":"Answer the level gauge questionnaire — the app picks the model."):
         !sizeFilterEst?h("div",{style:{padding:16,fontSize:12,color:colors.mutedLight}},"Pick an item and size above to see models."):
         filteredModels.map(m=>h("div",{key:m,onClick:()=>selectModel(m),style:{padding:"9px 16px",fontSize:13,cursor:"pointer",background:m===selectedModel?colors.dark:"transparent",color:m===selectedModel?"#fff":colors.text,borderBottom:"1px solid #f0eee5"}},m))
       ),
@@ -11146,6 +11502,9 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     // "+ Add to estimate" gateway — Quote# first, then branches to either
     // the full Save popup (new quote) or the simple save (new Sl No on an
     // existing quote), or navigates straight to Quotes (view existing).
+    lgOpen && h(LevelGaugeQuestionnaire,{ initial:lgCtx?lgCtx.q:null, onClose:()=>setLgOpen(false), onBuild:(b)=>{
+      if(lines.length && !window.confirm("Rebuild the level gauge BOM? The current lines (and grades picked) are replaced by the new build.")) return;
+      buildLevelGauge(b); } }),
     showAddGateway && h("div",{style:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:1050,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
       h("div",{style:{background:"#fff",borderRadius:12,width:420,maxWidth:"calc(94vw / var(--uiz,1))",boxShadow:"0 8px 32px rgba(0,0,0,0.2)",overflow:"hidden"}},
         h("div",{style:{background:colors.dark,padding:"12px 16px"}},
@@ -36923,6 +37282,11 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"20 Nov 2026", summary:"Built on 2026-11-20T04:00:00Z, on top of 2026-11-20T03:00:00Z. No SQL. TASKS › LIST VIEW: rows stay compact with Due · Assign · Move · Copy · ▾ more always visible. ▾ more opens the board card itself under the row (same code: every chip, badge, checklist, sub-task and button); ▴ less folds it. Expand all / Collapse all at the top. Assign = quick hand-over to someone in the department with a due date (also in the bulk bar). Board and list share the open/closed state of a card." },
+  { date:"20 Nov 2026", summary:"Built on 2026-11-20T03:00:00Z, on top of 2026-11-20T02:00:00Z. No SQL. TASKS › LIST VIEW: every open row has Move · Copy · Due buttons (show on hover; always on a tablet) — the same Move and Copy dialogs as Board view, so a card can be copied to one or several people. Hold Ctrl while dropping a row on a person (or pile) to copy instead of move. Tick boxes on the rows: a bar appears with Move to… / Copy to… / Due date for all ticked cards at once (Tick all, Clear); dragging a ticked row takes the ticked group. Cards you can't move are skipped and named." },
+  { date:"20 Nov 2026", summary:"Built on 2026-11-20T02:00:00Z, on top of 2026-11-19T18:00:00Z. No SQL. LEVEL GAUGE QUESTIONNAIRE – valves and accessories: Gate/Ball isolation valves and drain/vent valves get the same price-list questions as a valve offer (size, and rating for isolation valves, filled in; the lowest-cost model that fits is picked). Plugs are picked from Material Rates (spec · grade · rate) by drain/vent size; no rate = flagged. Auto shut-off: the app looks up the Auto Shut-off Valve item by nozzle size and adds its BOM lines x number of valves (grades in MOC); fabricated models also get flanges by the flange standard picked (from Material Rates, default WNRF at the gauge class, 1 per valve, editable); cast models no flanges; no BOM for that size = falls back to the SOP weight. Every line the gateways add carries the sub-assembly Gauge Valves & Accessories." },
+  { date:"19 Nov 2026", summary:"Built on 2026-11-19T18:00:00Z, on top of 2026-11-19T12:00:00Z. NEEDS SQL (both companies): lg_nuts_studs_kg_2026-11-19.sql. LEVEL GAUGES: nuts and studs are priced by weight (Kg) instead of per piece. Nuts: count from the questionnaire x hex nut weight (M10 = 0.011 kg). Studs (Transparent gauges): now 10 mm rod (Rod-10Dia) cut to the stud length, threaded M10, by weight like the U-bolts. The cutting list keeps the number of pieces." },
+  { date:"19 Nov 2026", summary:"Built on 2026-11-19T12:00:00Z, on top of 2026-11-18T13:00:00Z. NEEDS SQL (both companies, already run): lg_structural_2026-11-19.sql then lg_seed_level_gauge_models_2026-11-19.sql. LEVEL GAUGES: in the Estimator, item Level Gauge opens a questionnaire (gauge type, mounting, class, CC, chamber, nozzle, mica, frosting shield, scale, isolation valves, drain, vent, illuminator). The answers pick one of the 96 master models automatically (no Size/Model pick); the CC distance sets the glass split, lengths, cutting plans and quantities by the SOP algorithm; a BOQ shows the lines. Build BOM loads them into the normal BOM screen with the gateway lines — isolation valves (auto shut-off by the SOP weight, ball/gate from the price list), drain and vent (plug by size, or gate/ball/needle valve from the price list) and illuminator (1 per metre). Grades are picked in MOC and from there it is the same as a strainer (add/delete lines, line and global Sf, save). The default Sf comes from the master (3.1; 2.1 in Levaflow). Edit questionnaire rebuilds the BOM." },
   { date:"18 Nov 2026", summary:"Built on 2026-11-18T13:00:00Z, on top of 2026-11-18T07:00:00Z. NEEDS SQL: structure_release_pack_2026-11-18.sql (BOTH companies). SERIALS: given by the app when the W/O is released (one per unit, every Sl No); a raised OA quantity gets more, a lowered one marks spare serials (not on a DC) unused with the reason; QC's + New entry is gone; Super Admins get a one-time Catch-up for orders already in production. PRODUCTION RELEASE PACK: a live PDF per contract made at W/O release — Critical, what each head must chase, order summary & serials, testing, Finish, other requirements, document index with links, kick-off, who has read it, History. It updates itself until the OA is closed (payment received) or cancelled; critical changes ask every head to read again, routine ones come in a daily digest. Read by Super Admins and the Finance Director, Accounts, Purchase Manager, QC, VP Projects, Production Manager, Stores, Factory Manager, Sales Head, Technical Head and Document Controller posts. KICK-OFF MEETINGS (Order Status › Kick-off meetings): every released W/O waits here; red and a daily reminder after 2 days; started and closed by the VP Projects and Technical Head posts; attendance, actions (owner* due*) that go on the owner's card as checklist lines, minutes; once held it moves to history. FINISH ON THE OA: Order Acceptances made from now need a finish document (painting / pickling & passivation / galvanising …: number, revision, title, link) — they save as Draft with a red badge but can't be approved until it is given." },
   { date:"18 Nov 2026", summary:"Built on 2026-11-18T07:00:00Z, on top of 2026-11-18T06:00:00Z. No SQL. COMPLETE THE INVOICE: nothing is mandatory while the invoice is a draft — no red boxes, no asterisks, no 'to fill' count; Save with whatever is known. When Ready for IRN is pressed, the same pop-up opens with every missing field red and mandatory (freight, insurance, LR no and date or No LR, mode, transporter GSTIN / ID, e-way distance, exchange rate and ports for exports) and Ready for IRN stays blocked until they are filled." },
   { date:"18 Nov 2026", summary:"Built on 2026-11-18T06:00:00Z, on top of 2026-11-18T03:00:00Z. No SQL. FLOW — BADGES: Order Status › Flow, all contracts, now shows each step as a badge instead of a dot — done steps with their date, the current step with who holds it and its days (red when late); the IRN steps sit under With Accounts. New filters: Waiting on (department) and Only late. ⟶ ORDER FLOW BUTTONS: Order Status › Flow (after Pending Orders – By value); Accounts › Billing (opens on Accounts); Purchase › Procurement for the Purchase Manager post; Production › Progress for the Production Manager post. ORDER PROCESSING REVIEW — ✓ COMPLETED on every line (Super Admins, Document Controller post, VP Projects post, or the line's owner; New owner stays as it was): document lines = the task card's Send to client (date, link*, what changed — revision Out, card closes, chase starts, no assignee); OA = OA sent (date*, to*); W/O = release + mandatory pick of the next stage's person (Technical / Design & Estimation people + department heads) and due date — the BOM summary card goes on that person's board; PR (last stage) asks 'close this card?' then releases the PR; BOM summary is approved in Production BOM as before. Review refreshes after each press; ↩ Undo for 10 minutes. New last block UNASSIGNED ON DOCUMENT CONTROL: documents with no owner — 👤 Give an owner (that department's people + department heads, due date*) or ✓ Completed straight away." },
@@ -69641,6 +70005,7 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
   const setLook = v=>{ setAssignLook(v); try{ localStorage.setItem("task_assign_look",v); }catch(e){} };
   const [lvSel,setLvSel] = useState("my:"); const [lvQ,setLvQ] = useState(""); const [lvClosed,setLvClosed] = useState({}); const [lvDone,setLvDone] = useState(false);
   const [lvSort,setLvSort] = useState({}); const [lvAdd,setLvAdd] = useState(""); const [lvDrop,setLvDrop] = useState("");
+  const [lvPick,setLvPick] = useState([]);   // 2026-11-20T03:00:00Z: rows ticked in List view for bulk Move / Copy / Due
   const [docLab,setDocLab] = useState({});       // 176: document id -> status label for document task cards
   // 151: All boards — every department's board as a band; folded / open and the band order are kept per person in this browser
   const [abOpen,setAbOpen] = useState(()=>{ try{ return JSON.parse(localStorage.getItem("ab_open")||"null"); }catch(e){ return null; } });
@@ -70174,19 +70539,43 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
   const peopleIn = (d)=> emps.filter(e=>e.employee_name!=="Unassigned" && empInDept(e,d)).map(e=>e.employee_name).sort();
   const openCardMove = (t)=> setCardAct({ kind:"move", t, dept:taskDept(t)||allDeptsList[0]||"", to:t.assignee||TASK_PILE, due:d10(t.due_date)&&d10(t.due_date)>=today?d10(t.due_date):"", why:"", busy:false });
   const openCardCopy = (t)=> setCardAct({ kind:"copy", t, dept:taskDept(t)||allDeptsList[0]||"", title:t.title||"", people:{ [t.assignee||TASK_PILE]:true }, due:d10(t.due_date)&&d10(t.due_date)>=today?d10(t.due_date):"", chk:true, sub:false, lnk:true, busy:false });
+  // 2026-11-20T03:00:00Z: List view — several cards at once (ts), and Ctrl+drop presets the person
+  const openBulk = (kind, ts, preset)=>{ const t = ts[0]; if(!t) return; const p = preset||{};
+    const dept = p.dept || taskDept(t) || allDeptsList[0] || "";
+    if(kind==="move"||kind==="assign"){ const ppl0 = peopleIn(dept).filter(x=>!ts.every(c=>c.assignee===x));
+      setCardAct({ kind:"move", quick:kind==="assign", t, ts, dept, to:p.to||(kind==="assign"?(ppl0[0]||TASK_PILE):TASK_PILE), due:d10(t.due_date)&&d10(t.due_date)>=today?d10(t.due_date):"", why:"", busy:false }); }
+    else if(kind==="copy") setCardAct({ kind, t, ts, dept, title:t.title||"", people:{ [p.to||t.assignee||TASK_PILE]:true }, due:d10(t.due_date)&&d10(t.due_date)>=today?d10(t.due_date):"", chk:true, sub:false, lnk:true, busy:false });
+    else setCardAct({ kind:"due", t, ts, due:"", busy:false }); };
   const cardActModal = ()=>{
     if(!cardAct) return null;
     const a = cardAct, t = a.t; const set = (p)=> setCardAct(x=>({...x,...p}));
+    const many = (a.ts && a.ts.length>1) ? a.ts : null;   // 2026-11-20T03:00:00Z
+    const allTs = a.ts && a.ts.length ? a.ts : [t];
     const close = ()=>{ if(!a.busy) setCardAct(null); };
     const lab = (l,c)=> h("label",{style:{display:"grid",gap:3,fontSize:11.5,color:colors.muted}},l,c);
     const sel = (v,on,opts)=> h("select",{value:v,onChange:e=>on(e.target.value),style:{...inputStyle,padding:"5px 8px"}},opts);
     const ppl = peopleIn(a.dept);
-    const crossMove = a.kind==="move" && a.dept!==taskDept(t) && !(a.to!==TASK_PILE && empInDept(empOf(a.to), taskDept(t)));
+    const crossOf = (c)=> a.kind==="move" && a.dept!==taskDept(c) && !(a.to!==TASK_PILE && empInDept(empOf(a.to), taskDept(c)));
+    const crossMove = allTs.some(crossOf);
     const goMove = async()=>{
       const toPile = a.to===TASK_PILE;
       if(!toPile && (!a.due || a.due<today)){ alert("Give a due date (today or later)."); return; }
       if(crossMove && !a.why.trim()){ alert("Moving to another department needs a reason \u2014 it goes into the card's history."); return; }
-      if(toPile ? (taskIsPile(t) && taskDept(t)===a.dept) : (t.assignee===a.to && taskDept(t)===a.dept && d10(t.due_date)===a.due)){ alert("Nothing to change \u2014 it is already there."); return; }
+      const same = (c)=> toPile ? (taskIsPile(c) && taskDept(c)===a.dept) : (c.assignee===a.to && taskDept(c)===a.dept && d10(c.due_date)===a.due);
+      if(many){   // 2026-11-20T03:00:00Z: several cards from List view
+        const go = many.filter(c=>canEdit(c) && !same(c)), skip = many.filter(c=>!canEdit(c));
+        if(!go.length){ alert(skip.length ? "None of these can be moved by you \u2014 only the holder, whoever created the card, the board's approver or an Admin can move a card." : "Nothing to change \u2014 they are already there."); return; }
+        set({busy:true}); let n=0;
+        for(const c of go){ const due = a.due || (c.due_date||null); const cx = crossOf(c);
+          const ok = await move(c,{ assignee:toPile?null:a.to, due_date:due, department:a.dept }, taskWho(c)+" \u2192 "+(toPile?a.dept+" Unassigned pile":a.to)+(due?", due "+fmtDMY(due):"")+(cx?" (moved from "+(taskDept(c)||"no department")+" to "+a.dept+" \u2014 "+a.why.trim()+")":"")+" (List view, "+go.length+" cards)");
+          if(ok!==false){ n++;
+            if(cx) for(const s2 of tasks.filter(k=>k.parent_id===c.id && k.status!=="done" && (k.assignee||null)===(c.assignee||null))){
+              const { error } = await sb.from("task_tbl").update({ assignee:toPile?null:a.to, department:a.dept, moved_by:me, moved_at:new Date().toISOString(), moved_what:"Moved with its card \u2014 "+a.why.trim() }).eq("id",s2.id);
+              if(!error) await taskLog(s2.id, me, "Moved with its card \u201c"+c.title+"\u201d to "+a.dept+" \u2014 "+a.why.trim()); } } }
+        setCardAct(null); setLvPick([]); await load(false);
+        alert(n+" card"+(n===1?"":"s")+" moved to "+(toPile?"the "+a.dept+" Unassigned pile":a.to)+"."+(skip.length?"\n\n"+skip.length+" not moved (you can't move them): "+skip.map(c=>"\u201c"+c.title+"\u201d").join(", "):""));
+        return; }
+      if(same(t)){ alert("Nothing to change \u2014 it is already there."); return; }
       set({busy:true});
       const due = a.due || (t.due_date||null);
       const what = taskWho(t)+" \u2192 "+(toPile?a.dept+" Unassigned pile":a.to)+(due?", due "+fmtDMY(due):"")+(crossMove?" (moved from "+(taskDept(t)||"no department")+" to "+a.dept+" \u2014 "+a.why.trim()+")":"")+" (on the card)";
@@ -70203,14 +70592,15 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
     const untick = (items)=> (items||[]).map(i=>{ const c = {...i, done:false}; delete c.done_by; delete c.done_at; if(c.items) c.items = untick(c.items); return c; });
     const goCopy = async()=>{
       const to = Object.keys(a.people).filter(k=>a.people[k]);
-      if(!a.title.trim()){ alert("Give the copy a title."); return; }
+      if(!many && !a.title.trim()){ alert("Give the copy a title."); return; }
       if(!to.length){ alert("Tick who gets the copy (or the Unassigned pile)."); return; }
       if(to.some(p=>p!==TASK_PILE) && (!a.due || a.due<today)){ alert("Give a due date (today or later)."); return; }
       set({busy:true});
-      const made = [];
+      const made = []; let total = 0;
+      for(const t of allTs){ const title = many ? (t.title||"") : a.title.trim(); made.length = 0;   // 2026-11-20T03:00:00Z: each ticked card, copied to each ticked person
       for(const p of to){
         const toPile = p===TASK_PILE;
-        const row = { title:a.title.trim(), assignee:toPile?null:p, department:a.dept||null, due_date:a.due||null, status:"open", created_by:me,
+        const row = { title, assignee:toPile?null:p, department:a.dept||null, due_date:a.due||null, status:"open", created_by:me,
           labels: a.lnk ? (t.labels||[]) : [], links: a.lnk ? (t.links||[]) : [], checklists: a.chk ? (t.checklists||[]).map(c=>({...c, items:untick(c.items)})) : [],
           ref: a.lnk ? (t.ref||null) : null, customer: a.lnk ? (t.customer||null) : null, notes: t.notes||null, ...(t.task_type ? { task_type:t.task_type } : {}) };
         const { data, error } = await sb.from("task_tbl").insert(row).select().single();
@@ -70228,17 +70618,36 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
         if(!toPile && p!==me){ try{ await sb.from("notifications_tbl").insert({ employee_name:p, message:"A copy of \u201c"+t.title+"\u201d was given to you by "+(me||"")+(a.due?", due "+fmtDMY(a.due):"") }); }catch(e){} }
       }
       if(made.length) await taskLog(t.id, me, "Copied to "+made.map(m=>"#"+m.id+" ("+m.to+")").join(", "));
-      setCardAct(null); await load(false);
-      if(made.length) alert(made.length+" cop"+(made.length===1?"y":"ies")+" made: "+made.map(m=>m.to).join(", ")+".");
+      total += made.length; }
+      setCardAct(null); setLvPick([]); await load(false);
+      if(total) alert(total+" cop"+(total===1?"y":"ies")+" made"+(many?" ("+allTs.length+" cards \u00d7 "+to.length+")":"")+": "+to.map(p=>p===TASK_PILE?"the "+a.dept+" pile":p).join(", ")+".");
     };
     const ticked = Object.keys(a.people||{}).filter(k=>a.people[k]).length;
+    if(a.kind==="due"){   // 2026-11-20T03:00:00Z: one due date for the ticked cards
+      const goDue = async()=>{ if(!a.due || a.due<today){ alert("Give a due date (today or later)."); return; }
+        const go = allTs.filter(c=>canEdit(c) && !(c.proc_plan_id && c.parent_id)), skip = allTs.length-go.length;
+        if(!go.length){ alert("None of these can be changed by you \u2014 only the holder, whoever created the card, the board's approver or an Admin can change a due date."); return; }
+        set({busy:true}); let n=0;
+        for(const c of go){ if(d10(c.due_date)===a.due){ n++; continue; } const ok = await move(c,{ due_date:a.due }, "Due date "+(c.due_date?fmtDMY(c.due_date):"none")+" \u2192 "+fmtDMY(a.due)+" (List view, "+go.length+" cards)"); if(ok!==false) n++; }
+        setCardAct(null); setLvPick([]); await load(false);
+        alert("Due date "+fmtDMY(a.due)+" set on "+n+" card"+(n===1?"":"s")+"."+(skip?"\n\n"+skip+" not changed (you can't change them, or the date comes from the Procurement Gantt).":"")); };
+      return h("div",{onClick:e=>{ if(e.target===e.currentTarget) close(); },style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.35)",zIndex:1170,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"70px 12px",overflowY:"auto"}},
+        h("div",{style:{background:"#fff",borderRadius:10,width:400,maxWidth:"100%",padding:"14px 16px",display:"grid",gap:10,border:"1px solid #0f7a5c"}},
+          h("b",{style:{fontSize:14}},"\ud83d\udcc5 Due date for "+allTs.length+" card"+(allTs.length===1?"":"s")),
+          lab(h("span",null,"Due date",h("span",{style:{color:colors.danger,marginLeft:2}},"*")),h("input",{type:"date",value:a.due,min:today,onChange:e=>set({due:e.target.value}),style:{...inputStyle,padding:"5px 8px"}})),
+          h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
+            h("button",{onClick:close,disabled:a.busy,style:btnSmall},"Cancel"),
+            h("button",{onClick:goDue,disabled:a.busy,style:{...btnPrimary,padding:"6px 14px",background:"#0f7a5c"}},a.busy?"Working\u2026":"Set due date"))));
+    }
     return h("div",{onClick:e=>{ if(e.target===e.currentTarget) close(); },style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.35)",zIndex:1170,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"70px 12px",overflowY:"auto"}},
       h("div",{style:{background:"#fff",borderRadius:10,width:460,maxWidth:"100%",padding:"14px 16px",display:"grid",gap:10,border:"1px solid #0f7a5c"}},
-        h("b",{style:{fontSize:14}},(a.kind==="move"?"Move":"Copy")+" \u201c"+t.title+"\u201d"),
-        a.kind==="copy" ? lab("Title of the copy",h("input",{value:a.title,onChange:e=>set({title:e.target.value}),style:{...inputStyle,padding:"5px 8px"}})) : null,
+        h("b",{style:{fontSize:14}},(a.kind==="move"?(a.quick?"\ud83d\udc64 Assign":"Move"):"Copy")+(many?" "+many.length+" cards":" \u201c"+t.title+"\u201d")),
+        a.quick ? h("div",{style:{fontSize:11.5,color:colors.muted}},"Give it to someone in "+a.dept+" with a due date (same as dragging it onto the person). For another department or the pile use Move.") : null,
+        many ? h("div",{style:{fontSize:11.5,color:colors.muted,maxHeight:90,overflowY:"auto",background:"#f6f5f0",borderRadius:6,padding:"5px 8px"}},many.map(c=>h("div",{key:c.id},"\u2022 "+c.title))) : null,
+        a.kind==="copy" && !many ? lab("Title of the copy",h("input",{value:a.title,onChange:e=>set({title:e.target.value}),style:{...inputStyle,padding:"5px 8px"}})) : null,
         h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}},
-          lab("Department",sel(a.dept,v=>set(a.kind==="move" ? {dept:v, to:TASK_PILE} : {dept:v, people:{ [TASK_PILE]:true }}),allDeptsList.map(d=>h("option",{key:d,value:d},d)))),
-          a.kind==="move" ? lab("To",sel(a.to,v=>set({to:v}),[h("option",{key:"p",value:TASK_PILE},"\ud83d\udce5 Unassigned pile"),...ppl.map(p=>h("option",{key:p,value:p},p))]))
+          a.quick ? null : lab("Department",sel(a.dept,v=>set(a.kind==="move" ? {dept:v, to:TASK_PILE} : {dept:v, people:{ [TASK_PILE]:true }}),allDeptsList.map(d=>h("option",{key:d,value:d},d)))),
+          a.kind==="move" ? lab(a.quick?"Give to":"To",sel(a.to,v=>set({to:v}),[...(a.quick?[]:[h("option",{key:"p",value:TASK_PILE},"\ud83d\udce5 Unassigned pile")]),...ppl.map(p=>h("option",{key:p,value:p},p))]))
             : lab("Due date",h("input",{type:"date",value:a.due,min:today,onChange:e=>set({due:e.target.value}),style:{...inputStyle,padding:"5px 8px"}}))),
         a.kind==="move" ? lab("Due date",h("input",{type:"date",value:a.due,min:today,onChange:e=>set({due:e.target.value}),style:{...inputStyle,padding:"5px 8px"}})) : null,
         crossMove ? lab("Reason (another department \u2014 goes into the history)",h("input",{value:a.why,onChange:e=>set({why:e.target.value}),placeholder:"e.g. Purchase to follow up",style:{...inputStyle,padding:"5px 8px"}})) : null,
@@ -70253,7 +70662,7 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
           (t.proc_plan_id || t.enquiry_id) ? h("div",{style:{fontSize:11.5,color:"#854f0b",background:"#fff4d6",borderRadius:6,padding:"5px 8px"}},"The copy is a plain task \u2014 not tied to the "+(t.proc_plan_id?"Procurement Gantt":"enquiry")+".") : null) : null,
         h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end"}},
           h("button",{onClick:close,disabled:a.busy,style:btnSmall},"Cancel"),
-          h("button",{onClick:a.kind==="move"?goMove:goCopy,disabled:a.busy,style:{...btnPrimary,padding:"6px 14px",background:"#0f7a5c"}},a.busy?"Working\u2026":a.kind==="move"?"Move":(ticked>1?"Make "+ticked+" copies":"Make the copy")))));
+          h("button",{onClick:a.kind==="move"?goMove:goCopy,disabled:a.busy,style:{...btnPrimary,padding:"6px 14px",background:"#0f7a5c"}},a.busy?"Working\u2026":a.kind==="move"?(a.quick?(many?"Assign "+many.length+" cards":"Assign"):many?"Move "+many.length+" cards":"Move"):((ticked*allTs.length)>1?"Make "+(ticked*allTs.length)+" copies":"Make the copy")))));
   };
   // 151: the due date changed right on the card (or sub-task, or table row). A procurement sub-task's date comes from the Gantt.
   const dueChip = (t, small)=>{
@@ -70429,7 +70838,13 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
     if(assignee && assignee!==me){ try{ await notifyRows([{ employee_name:assignee, message:"📋 "+me+" gave you a task: "+data.title+(p.due?" (due "+fmtDMY(p.due)+")":""), kind:"task", ...notifActCols({ kind:"open", open:{ task:data.id }, help:{ btn:"Open the card", what:"A task for you", do:["Open the card to see what is needed and by when."] } }) }]); }catch(e){} }
     setTasks(ts=>[...ts, data]); setLvAdd(""); appToast("✓ "+(assignee ? "Added for "+assignee : "Added to Unassigned "+department)+(p.due?" · due "+fmtDMY(p.due):""));
   };
-  const lvDropOn = (L, id)=>{ setLvDrop(""); const t = tasks.find(x=>String(x.id)===String(id)); if(!t || !L) return;
+  const lvDropOn = (L, id, copy)=>{ setLvDrop("");
+    // 2026-11-20T03:00:00Z: Ctrl held while dropping = copy; a ticked group goes together
+    const ids = String(id||"").split(",").filter(Boolean); const ts = ids.map(i=>tasks.find(x=>String(x.id)===i)).filter(Boolean);
+    if(!L || !ts.length) return;
+    const to = L.key.indexOf("pile:")===0 ? TASK_PILE : L.key.indexOf("p:")===0 ? L.person : null;
+    if(to && (copy || ts.length>1)){ openBulk(copy?"copy":"move", ts, { dept:L.dept, to }); return; }
+    const t = ts[0];
     if(!canEdit(t)){ alert("Only "+(t.assignee||"its holder")+", whoever created it, the board's approver or an Admin can move this card."); return; }
     if(L.key.indexOf("pile:")===0){ if(taskIsPile(t) && taskDept(t)===L.dept) return; setDateAsk({ pileDept:L.dept, task:t, date:"", assignTo:TASK_PILE }); return; }
     if(L.key.indexOf("p:")!==0 || t.assignee===L.person) return;
@@ -70448,13 +70863,19 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
     const circ = h("span",{onClick:ev=>{ ev.stopPropagation(); lvCircle(t); },title: done?"Completed":t.status==="approval"?"Under approval":taskIsPile(t)&&!t.parent_id?"Close (no assignment)":"Complete",
       style:{width:20,height:20,flex:"0 0 20px",borderRadius:10,border:"2px solid "+(done?"#0f7a5c":t.status==="approval"?"#e0a12b":"#6b6f60"),background:done?"#0f7a5c":t.status==="approval"?"#e0a12b":"#fff",color:"#fff",fontSize:11,display:"flex",alignItems:"center",justifyContent:"center",cursor:done?"default":"pointer",marginTop:2}}, done?"✓":t.status==="approval"?"…":"");
     const showWho = L.key==="my:"||L.key==="urg:"||L.key.indexOf("rg:")===0;
-    return h("div",{key:t.id,draggable:!done,onDragStart:ev=>{ try{ ev.dataTransfer.setData("text/plain",String(t.id)); }catch(x){} },onClick:()=>setOpenId(t.id),"data-t":"lv-row",
-        style:{display:"flex",gap:12,alignItems:"flex-start",background:"#fff",borderRadius:6,padding:"10px 14px",marginBottom:4,boxShadow:"0 1px 1px rgba(0,0,0,.06)",cursor:"pointer"}},
+    const picked = lvPick.includes(t.id);   // 2026-11-20T03:00:00Z
+    const rb = (ic, label, on, title, dis)=> h("button",{"data-t":"lv-act",onClick:ev=>{ ev.stopPropagation(); if(dis){ alert(dis); return; } on(); },onMouseDown:ev=>ev.stopPropagation(),title:dis||title,
+      style:{font:"inherit",fontSize:11,fontWeight:600,border:"1px solid "+colors.border,background:"#fff",color:dis?colors.mutedLight:colors.text,borderRadius:6,padding:"2px 8px",cursor:"pointer",whiteSpace:"nowrap"}},ic+" "+label);
+    const noMove = canEdit(t) ? null : "Only "+(t.assignee||"its holder")+", whoever created it, the board's approver or an Admin can move this card.";
+    const noDue = (t.proc_plan_id && t.parent_id) ? "This date comes from the Procurement Gantt \u2014 change it there." : noMove;
+    return h("div",{key:t.id,className:"lv-rowx",draggable:!done,onDragStart:ev=>{ try{ ev.dataTransfer.setData("text/plain", picked && lvPick.length>1 ? lvPick.join(",") : String(t.id)); }catch(x){} },onClick:()=>setOpenId(t.id),"data-t":"lv-row",
+        style:{display:"flex",gap:12,alignItems:"flex-start",background:picked?"#eaf5f1":"#fff",borderRadius:6,padding:"10px 14px",marginBottom:4,boxShadow:picked?"inset 3px 0 0 #0f6e56":"0 1px 1px rgba(0,0,0,.06)",cursor:"pointer"}},
+      !done ? h("input",{type:"checkbox","data-t":"lv-pick",checked:picked,onClick:ev=>ev.stopPropagation(),onChange:()=>setLvPick(p=>p.includes(t.id)?p.filter(x=>x!==t.id):[...p,t.id]),title:"Tick to Move / Copy / change the due date of several cards at once",style:{marginTop:3,width:16,height:16,accentColor:"#0f6e56",cursor:"pointer"}}) : null,
       circ,
       h("div",{style:{flex:1,minWidth:0}},
         h("div",{style:{fontSize:14,lineHeight:1.35,textDecoration:done?"line-through":"none",color:done?colors.muted:colors.text}}, e ? (e.company_name||t.customer||"")+(quoteOf(t)?" · "+quoteOf(t):"")+" — "+t.title : t.title),
         h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginTop:3,fontSize:12,color:colors.muted,alignItems:"center"}},
-          done ? h("span",null,"✓ completed"+(t.approved_at?" "+fmtDMY(t.approved_at):"")) : t.due_date ? h("span",{style:{color:od?colors.danger:undefined,fontWeight:od?600:400}},"📅 "+fmtDMY(t.due_date)+(od?" · "+over+" day"+(over===1?"":"s")+" over":"")) : h("span",null,"No due date"),
+          done ? h("span",null,"✓ completed"+(t.approved_at?" "+fmtDMY(t.approved_at):"")) : dueEd===t.id ? dueChip(t, true) : t.due_date ? h("span",{style:{color:od?colors.danger:undefined,fontWeight:od?600:400}},"📅 "+fmtDMY(t.due_date)+(od?" · "+over+" day"+(over===1?"":"s")+" over":"")) : h("span",null,"No due date"),
           t.status==="approval" ? h("span",{style:{fontSize:10.5,fontWeight:700,borderRadius:8,padding:"0 7px",background:"#fff4d6",color:"#854f0b"}},"Under approval") : null,
           (()=>{ const cn = e ? "" : taskContractOf(t);   // 2026-11-16T07:00:00Z: contract · quote · client
             if(cn) return h("span",{style:{display:"inline-flex",gap:4,alignItems:"center"}}, h(CtCtx,{ ct:cn, client:ctClientOf(cn)||t.customer, stop:true }), copyBtn(cn));
@@ -70467,16 +70888,26 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
           (()=>{ const [d,n] = taskProgress(t); return n ? h("span",null,"☑ "+d+"/"+n) : null; })(),
           comments[t.id] ? h("span",null,"💬 "+comments[t.id]) : null,
           showWho ? h("span",null,taskWho(t)) : null)),
+      h("div",{className:"lv-acts",style:{display:"flex",gap:4,alignSelf:"center",flexWrap:"wrap",justifyContent:"flex-end"}},   // 2026-11-20T04:00:00Z: always visible
+        !done ? rb("\ud83d\udcc5","Due",()=>setDueEd(t.id),"Change the due date",noDue) : null,
+        !done ? rb("\ud83d\udc64","Assign",()=>openBulk("assign",[t],{ dept:taskDept(t)||L.dept }),"Give it to someone in the department, with a due date",noMove) : null,
+        !done ? rb("\u21c4","Move",()=>openCardMove(t),"Move to another person, pile or department",noMove) : null,
+        !done ? rb("\u29c9","Copy",()=>openCardCopy(t),"Make a copy (or several) of this card",null) : null,
+        h("button",{"data-t":"lv-more",onClick:ev=>{ ev.stopPropagation(); setExpanded(m=>{ const x={...m}; if(x[t.id]) delete x[t.id]; else x[t.id]=true; return x; }); },onMouseDown:ev=>ev.stopPropagation(),
+          title:expanded[t.id]?"Fold the card back":"Open the full card here (same as on the board)",
+          style:{font:"inherit",fontSize:11,fontWeight:700,border:"1px solid #9fcfbf",background:"#fff",color:"#0f7a5c",borderRadius:6,padding:"2px 8px",cursor:"pointer",whiteSpace:"nowrap"}},expanded[t.id]?"\u25b4 less":"\u25be more")),
       h("span",{onClick:ev=>{ ev.stopPropagation(); if(!canEdit(t)){ alert("Only "+(t.assignee||"its holder")+", whoever created it, the board's approver or an Admin can mark this card urgent."); return; } move(t,{ urgent:!t.urgent }, t.urgent?"No longer urgent":"Marked urgent ★"); },
         title:t.urgent?"Urgent — click to clear":"Mark urgent",style:{fontSize:18,cursor:"pointer",color:t.urgent?"#d9a400":"#9a9c92",userSelect:"none"}}, t.urgent?"★":"☆"));
   };
+  // 2026-11-20T04:00:00Z: a row, and under it the board card itself when ▾ more is open
+  const lvRowX = (t, L)=> expanded[t.id] ? h("div",{key:"x"+t.id},lvRow(t,L),h("div",{"data-t":"lv-card",style:{margin:"-2px 0 8px 34px"}},card(t))) : lvRow(t,L);
   const listViewUI = ()=>{
     const lists = lvLists(); const L = lists.find(x=>x.key===lvSel) || lists.find(x=>x.key==="my:");
     const q = lvQ.trim().toLowerCase();
     const sideItem = (x)=>{ const c = lvOpenCount(x); const on = x.key===L.key;
-      return h("div",{key:x.key,"data-lv":x.key,onClick:()=>{ setLvSel(x.key); setLvDone(false); },
+      return h("div",{key:x.key,"data-lv":x.key,onClick:()=>{ setLvSel(x.key); setLvDone(false); setLvPick([]); },
           onDragOver:ev=>{ if(x.key.indexOf("pile:")===0||x.key.indexOf("p:")===0){ ev.preventDefault(); if(lvDrop!==x.key) setLvDrop(x.key); } }, onDragLeave:()=>{ if(lvDrop===x.key) setLvDrop(""); },
-          onDrop:ev=>{ ev.preventDefault(); lvDropOn(x, ev.dataTransfer.getData("text/plain")); },
+          onDrop:ev=>{ ev.preventDefault(); lvDropOn(x, ev.dataTransfer.getData("text/plain"), ev.ctrlKey||ev.metaKey); },
           style:{display:"flex",alignItems:"center",gap:10,padding:"7px 14px 7px 24px",cursor:"pointer",borderLeft:"3px solid "+(on?"#0f6e56":"transparent"),background:lvDrop===x.key?"#e4f3ed":on?"#e4f3ed":"transparent",outline:lvDrop===x.key?"2px dashed #0f6e56":"none",outlineOffset:-2,fontWeight:on?600:400}},
         h("span",{style:{width:20,textAlign:"center",color:x.ic==="✖"?colors.danger:colors.muted}},x.ic), h("span",{style:{flex:1,minWidth:0}},x.label),
         h("span",{style:{fontSize:12,borderRadius:9,padding:"0 7px",background:c.od?"#fdecea":"#eceae0",color:c.od?colors.danger:colors.muted,fontWeight:c.od?700:400}},c.n)); };
@@ -70515,14 +70946,26 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
                 return { head:t.title, lines:[ cn ? [cn, ctQ(cn), ctClientOf(cn)||t.customer].filter(Boolean).join(" · ") : (t.customer||""), t.due_date ? "Due "+fmtDMY(t.due_date)+(over?" · "+over+" day"+(over>1?"s":"")+" over ⚠️":"") : "" ] }; });
               const odN = open.filter(t=>taskOverdue(t,today)).length;
               waOpen(L.label, waText(L.label, open.length+" card"+(open.length>1?"s are":" is")+" open on your board"+(odN?", "+odN+" overdue":"")+(open.length>25?" (first 25 by due date)":"")+":", its, "Please update the cards today (done, or a new date with the reason).", me)); }, true) : null,
+            open.length ? h("button",{"data-t":"lv-exall",onClick:()=>{ const allOn = open.every(t=>expanded[t.id]); setExpanded(m=>{ const x={...m}; open.forEach(t=>{ if(allOn) delete x[t.id]; else x[t.id]=true; }); return x; }); },
+              style:{background:"rgba(255,255,255,.18)",color:"#fff",border:0,borderRadius:6,padding:"5px 10px",fontSize:12,cursor:"pointer"}},open.every(t=>expanded[t.id])?"\u25b4 Collapse all":"\u25be Expand all") : null,
             h("select",{value:sortKey,onChange:e=>setLvSort(m=>({ ...m, [L.key]:e.target.value })),style:{background:"rgba(255,255,255,.18)",color:"#fff",border:0,borderRadius:6,padding:"5px 8px",fontSize:12}},
               [["due","Sort: Due date"],["added","Sort: Date added — newest first"],["title","Sort: A–Z"]].map(([k,l])=>h("option",{key:k,value:k,style:{color:"#000"}},l))))),
         h("div",{style:{overflow:"auto",flex:1,padding:"6px 26px 10px"}},
           L.key.indexOf("p:")===0 && postHas("accounts", L.label) ? h(ShipAwaitedPanel,{ user, compact:true }) : null,   // 2026-11-16T10:00:00Z: the Accounts post's board
+          (()=>{ const pk = lvPick.map(id=>tasks.find(x=>x.id===id)).filter(x=>x && x.status!=="done"); if(!pk.length) return null;   // 2026-11-20T03:00:00Z
+            return h("div",{"data-t":"lv-bulk",style:{position:"sticky",top:0,zIndex:2,display:"flex",gap:8,alignItems:"center",background:"#fff",borderRadius:6,padding:"7px 12px",marginBottom:8,boxShadow:"0 2px 6px rgba(0,0,0,.2)",flexWrap:"wrap"}},
+              h("b",{style:{color:"#0f6e56"}},pk.length+" selected"),
+              h("button",{onClick:()=>openBulk("assign",pk,{ dept:taskDept(pk[0])||L.dept }),style:btnSmall},"\ud83d\udc64 Assign to\u2026"),
+              h("button",{onClick:()=>openBulk("move",pk),style:btnSmall},"\u21c4 Move to\u2026"),
+              h("button",{onClick:()=>openBulk("copy",pk),style:btnSmall},"\u29c9 Copy to\u2026"),
+              h("button",{onClick:()=>openBulk("due",pk),style:btnSmall},"\ud83d\udcc5 Due date"),
+              h("span",{style:{flex:1}}),
+              h("button",{onClick:()=>setLvPick(open.map(x=>x.id)),style:btnSmall},"Tick all "+open.length),
+              h("button",{onClick:()=>setLvPick([]),style:btnSmall},"Clear")); })(),
           isRg && open.length ? h("div",{style:{color:"#fff",fontWeight:700,fontSize:12,margin:"2px 0 6px"}},"WAITING FOR APPROVAL") : null,
-          open.length ? open.map(t=>lvRow(t,L)) : h("div",{style:{color:"#fff",opacity:.85,textAlign:"center",padding:30}},isRg?"No regret waiting for approval":"Nothing open here"),
+          open.length ? open.map(t=>lvRowX(t,L)) : h("div",{style:{color:"#fff",opacity:.85,textAlign:"center",padding:30}},isRg?"No regret waiting for approval":"Nothing open here"),
           done.length ? h("div",{onClick:()=>setLvDone(x=>!x),style:{margin:"8px 0 4px",color:"#fff",fontWeight:600,fontSize:12.5,cursor:"pointer",userSelect:"none"}},(lvDone?"▾ ":"▸ ")+(isRg?"Regretted ":"Completed ")+done.length) : null,
-          lvDone ? done.slice(0,60).map(t=>h("div",{key:"d"+t.id},lvRow(t,L), isRg && mayClosePile(t) ? h("div",{style:{textAlign:"right",margin:"-2px 0 6px"}},h("button",{onClick:ev=>{ ev.stopPropagation(); reopenRegret(t); },style:{...btnSmall,fontSize:10.5,padding:"1px 7px"}},"↺ Reopen")) : null)) : null,
+          lvDone ? done.slice(0,60).map(t=>h("div",{key:"d"+t.id},lvRowX(t,L), isRg && mayClosePile(t) ? h("div",{style:{textAlign:"right",margin:"-2px 0 6px"}},h("button",{onClick:ev=>{ ev.stopPropagation(); reopenRegret(t); },style:{...btnSmall,fontSize:10.5,padding:"1px 7px"}},"↺ Reopen")) : null)) : null,
           lvDone && done.length>60 ? h("div",{style:{color:"#fff",fontSize:11.5,textAlign:"center"}},"Showing the latest 60 — the board's Completed lists have the rest.") : null),
         canAdd ? h("div",{style:{margin:"6px 26px 16px",background:"rgba(255,255,255,.93)",borderRadius:6,padding:"4px 10px",display:"flex",gap:8,alignItems:"center"}},
           h("b",{style:{fontSize:20,color:"#0f6e56"}},"+"),
