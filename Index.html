@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-21T06:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-21T07:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -15645,6 +15645,9 @@ async function oaAdrMay(user, approved){
   try{ const { keys } = await myPostKeys(user); return (keys||[]).includes(OA_ADR_POST); }catch(e){ return false; }
 }
 const oaAdrT = (x)=> String(x||"").replace(/\r/g,"").trim();
+// 2026-11-21T07:00:00Z: the Bill To name — the OA's own, else the customer name
+const BILLNAME_SQL = "structure_oa_billing_name_2026-11-21.sql";
+const oaBillName = (C)=> (C && C.billing_name!==undefined && C.billing_name!==null) ? String(C.billing_name) : String((C&&C.customer_name)||"");
 function OaAddressBox({ contractInfo, user, onChanged }){
   const C = contractInfo||{}; const cn = String(C.contract_number||"");
   const approved = !!C.commercial_approved_by;
@@ -15657,7 +15660,7 @@ function OaAddressBox({ contractInfo, user, onChanged }){
   useEffect(()=>{ if(cn) loadHist(); },[cn]);
   const openIt = async()=>{
     if(!may){ alert("The Order Acceptance is approved — only the "+postLabel(OA_ADR_POST)+" post can change the billing / shipping address"+(holders?": "+holders:"")+". Ask them to change it here (no code needed)."); return; }
-    setErr(""); setF({ bill:C.billing_address||"", ship:C.shipping_address||"", same: !!C.billing_address && oaAdrT(C.billing_address)===oaAdrT(C.shipping_address), why:"" });
+    setErr(""); setF({ name: oaBillName(C), bill:C.billing_address||"", ship:C.shipping_address||"", same: !!C.billing_address && oaAdrT(C.billing_address)===oaAdrT(C.shipping_address), why:"" });
     setDcs(null); setOpen(true);
     try{ const { data } = await sb.from("dc_tbl").select("*").eq("contract_number",cn); setDcs((data||[]).filter(d=>d.status!=="Cancelled" && !d.is_test)); }catch(e){ setDcs([]); }
   };
@@ -15667,14 +15670,18 @@ function OaAddressBox({ contractInfo, user, onChanged }){
     if(!ship){ setErr("Give the shipping address, or tick Same as billing."); return; }
     const oldB = oaAdrT(C.billing_address), oldS = oaAdrT(C.shipping_address);
     const bCh = bill!==oldB, sCh = ship!==oldS;
-    if(!bCh && !sCh){ setErr("Nothing has changed."); return; }
+    const name = oaAdrT(f.name), nCh = name!==oaAdrT(oaBillName(C));   // 2026-11-21T07:00:00Z
+    if(!bCh && !sCh && !nCh){ setErr("Nothing has changed."); return; }
     if(!(await oaAdrMay(user, approved))){ setErr("Only the "+postLabel(OA_ADR_POST)+" post can change the address of an approved Order Acceptance"+(holders?": "+holders:"")+"."); return; }
     setBusy(true); setErr("");
     let by = user?.username||"unknown"; try{ by = (await despMe(user)) || by; }catch(e){}
-    const what = [bCh?"Billing":null, sCh?("Shipping"+(ship===bill?" (same as billing)":"")):null].filter(Boolean).join(" + ")+" address";
+    const what = [nCh?"Bill To name":null, bCh?"Billing":null, sCh?("Shipping"+(ship===bill?" (same as billing)":"")):null].filter(Boolean).join(" + ")+((bCh||sCh)?" address":"");
     const why = oaAdrT(f.why);
-    const { error } = await sb.from("sale_order_tbl").update({ billing_address:bill, shipping_address:ship, ship_tba:false }).eq("contract_number",cn);
-    if(error){ setBusy(false); setErr("Could not save: "+error.message); return; }
+    const { error } = await sb.from("sale_order_tbl").update({ billing_address:bill, shipping_address:ship, ship_tba:false, ...(nCh ? { billing_name:name } : {}) }).eq("contract_number",cn);
+    if(error){ setBusy(false); setErr(/billing_name/.test(error.message||"") ? "Run "+BILLNAME_SQL+" first (both companies), then try again." : "Could not save: "+error.message); return; }
+    // draft tax invoices / PIs of this contract take the new Bill To (issued ones never change)
+    if(nCh || bCh){ const bt = [name, bill].filter(Boolean).join("\n");
+      for(const t of ["invoice_tbl","proforma_tbl"]){ try{ await sb.from(t).update({ bill_to:bt }).eq("contract_number",cn).eq("status","Draft"); }catch(e){} } }
     await logAudit("UPDATE","sale_order_tbl",cn,"Address changed on the Order Acceptance: "+what+(approved?" (after approval)":"")+(why?" — "+why:""),by,{ billing_address:C.billing_address||null, shipping_address:C.shipping_address||null },{ billing_address:bill, shipping_address:ship });
     // Despatch details keep following the OA where they did
     if(sCh){ try{ const { data: cd } = await sb.from("contract_despatch_tbl").select("*").eq("contract_number",cn).maybeSingle();
@@ -15707,7 +15714,7 @@ function OaAddressBox({ contractInfo, user, onChanged }){
         !approved ? "Anyone who can open this OA can change the addresses." : may ? h("span",null,h("b",null,postLabel(OA_ADR_POST)+" post"),": you can change them straight away (no code).") :
         "Approved — only the "+postLabel(OA_ADR_POST)+" post can change the addresses"+(holders?": "+holders:"")+".")),
     h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:8}},
-      h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:2}},"Billing address"),h("div",{style:box},C.billing_address||"—")),
+      h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:2}},"Billing address — printed as Bill To"),h("div",{style:box},[oaBillName(C) && !oaAdrT(C.billing_address).toLowerCase().startsWith(oaAdrT(oaBillName(C)).toLowerCase()) ? oaBillName(C) : "", C.billing_address||"—"].filter(Boolean).join("\n"))),
       h("div",null,h("div",{style:{fontSize:10.5,color:colors.muted,marginBottom:2}},"Shipping address"),h("div",{style:box},C.shipping_address||(C.ship_tba?"To be advised by the customer before despatch":"—")))),
     hist.length ? h("details",{style:{marginTop:6,fontSize:11}},h("summary",{style:{cursor:"pointer",color:colors.muted}},"Address history ("+hist.length+")"),
       hist.map((a,i)=>h("div",{key:i,style:{borderLeft:"3px solid #1f6f6b",paddingLeft:7,margin:"4px 0"}},fmtDMYTime(a.created_at||a.performed_at||"")+" · "+(a.performed_by||"")+" — "+String(a.record_summary||"").replace(/^Address changed on the Order Acceptance: /,"")))) : null,
@@ -15716,6 +15723,8 @@ function OaAddressBox({ contractInfo, user, onChanged }){
         h("div",{style:{background:"#1d3b33",color:"#fff",padding:"12px 16px",borderRadius:"10px 10px 0 0"}},h("b",null,"✎ Billing / shipping address — "+cn),
           h("div",{style:{fontSize:11.5,opacity:.8}},approved?"Approved OA — changed by the "+postLabel(OA_ADR_POST)+" post, kept in the history":"Not yet approved")),
         h("div",{style:{padding:"14px 16px",display:"grid",gap:10}},
+          h("label",{style:{display:"grid",gap:3,fontSize:11.5,color:colors.muted}},h("span",null,"Bill To name ",h("span",{style:{fontWeight:400}},"— first line of Bill To on the DC, Tax Invoice and PI. Clear it to print the billing address exactly as it is.")),
+            h("input",{"data-testid":"oa-adr-name",value:f.name,onChange:e=>setF(x=>({...x,name:e.target.value})),placeholder:"(blank — the billing address is printed as it is)",style:{...inputStyle,padding:"6px 8px",fontSize:12.5}})),
           h("label",{style:{display:"grid",gap:3,fontSize:11.5,color:colors.muted}},h("span",null,"Billing address ",h("span",{style:{color:"#c0392b"}},"*")),
             h("textarea",{"data-testid":"oa-adr-bill",rows:4,value:f.bill,onChange:e=>setF(x=>({...x,bill:e.target.value})),style:{...inputStyle,padding:"6px 8px",fontSize:12.5}})),
           h("label",{style:{display:"flex",gap:6,alignItems:"center",fontSize:12.5,fontWeight:600}},h("input",{type:"checkbox","data-testid":"oa-adr-same",checked:f.same,onChange:e=>setF(x=>({...x,same:e.target.checked}))}),"Shipping address same as billing address"),
@@ -37560,6 +37569,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"21 Nov 2026", summary:"Built on 2026-11-21T07:00:00Z, on top of 2026-11-21T06:00:00Z. SQL: structure_oa_billing_name_2026-11-21.sql (both companies). BILL TO NAME: the OA's Edit billing / shipping address box has a 'Bill To name' line (starts as the customer name). It is the first line of Bill To on the DC, Tax Invoice, PI and Delivery Instruction; clear it to print the billing address exactly as it is (e.g. 250056 — LARSEN & TOUBRO LIMITED … without 'L & T Constructions Minerals & Metals'). The name is never printed twice when the billing address already starts with it. A change revises live DCs (Rev n, bell to Production Manager and Stores, as before) and updates draft tax invoices / PIs; issued ones keep what they had." },
   { date:"21 Nov 2026", summary:"Built on 2026-11-21T06:00:00Z, on top of 2026-11-21T05:00:00Z. No SQL. BUILD A — DOCUMENTS ONLY MAKE THE INITIAL-SUBMISSION CARDS: the order's document list (Contract Register and Order Acceptance checklist) makes one card per document in Document Control › 📥 Unassigned and blocks nothing; mandatory documents no longer stop the OA's commercial approval (the customer's PO still blocks the OA PDF; W/O release unchanged). G.A DRAWING / ITP are asked one by one — Yes makes the card; No needs the Technical Head's OK before the OA can be approved (nothing else is blocked): the Technical Head post gets a card and a bell and presses Approve under 'G.A Drawing / ITP' in the OA's approval box, or gives a Document not-required code (one use, 24 h, that contract) which the user enters there. A Technical Head, Estimation admin or Super Admin saying No is only asked 'Are you sure?'. Applies to every OA not yet approved. WITHDRAW, NOT DELETE: an Out / In entry in Documents is withdrawn ('not sent' / 'not received') with a reason and a Deletion code (Super Admins excepted); it stays under the trail struck through, and the Technical Head post gets a bell. Wording: 'short of Code 1 / 2'." },
   { date:"21 Nov 2026", summary:"Built on 2026-11-21T05:00:00Z, on top of 2026-11-21T04:00:00Z. No SQL. + ADD NEW SL NO on a quote / OA with many Sl Nos (FXDS260108, 42+): the EXISTING list in the pop-up grew taller than the screen and, the box being centred, pushed the Sl No box and Continue off the top — no way to add Sl 43. The list now has its own scroll (with the count), and the pop-up opens from the top and scrolls if ever too tall." },
   { date:"21 Nov 2026", summary:"Built on 2026-11-21T04:00:00Z, on top of 2026-11-21T03:00:00Z. No SQL. ROUTE TEMPLATE GATE: every Sl No of an Order Acceptance needs a route template (model → template in Production › Models, or the naming rule). If one is missing the OA PDF is blocked (OAs not yet sent; sent OAs are never blocked) with the Sl No, model and who it waits on; the Technical Head and Production Manager posts get one card 'Route templates missing on Order Acceptances' with a checklist line per Sl No (all open OAs, sent ones too), and every day a bell to them and to the OA post for blocked OAs, until the template exists. A Super Admin may release one OA's PDF with a reason (kept on the audit trail); the reminders go on. The Technical Head post can now create templates too (Production › Route templates). Production › Models: + Model not in the list (custom OA models, with the missing ones offered) → template. OPA models now use the OPA--ORIFICE-PLATE template. ACCOUNTS › BILLING › AGEING & PIs DUE (new): Ageing — every invoice and PI marked sent and not fully paid, days since sent, buckets 0–7 / 8–15 / 16–30 / 31–60 / 61–90 / 90+ with outstanding per currency, Excel; PIs due by milestone — payment milestones with no PI, due with the order (advance), when the DC is made (balance / before despatch), after despatch (retention), others to check; PIs issued not sent. Every day the Accounts post gets a 'Payment follow-up' card (a line per invoice / PI sent over 7 days and not paid) and a 'PIs due by payment milestone' card (a line per PI due over 3 days, or issued and not sent); lines go away by themselves once paid / sent." },
@@ -73113,7 +73123,10 @@ async function despContract(cn, exceptDcId){
   const country = company ? String(company.billing_country||company.country||"").trim() : "";
   const isExport = currency!=="INR" || (!!country && !/^india$/i.test(country));
   const buyerAddr = (so&&so.billing_address) || (company ? [company.billing_street||company.street, company.billing_city||company.city, company.billing_state||company.state, company.billing_pin||company.pin, country].filter(Boolean).join(", ") : "");
-  return { cn, so, ests:ests||[], lines, despatch:dd||null, company, customer:cust, isExport, currency, country,
+  // 2026-11-21T07:00:00Z: Bill To name — the OA's own (blank = print the billing address as it is); never printed twice
+  const bnRaw = (so && so.billing_name!==undefined && so.billing_name!==null) ? String(so.billing_name).trim() : String(cust||"").trim();
+  const billName = bnRaw && String(buyerAddr||"").trim().toLowerCase().replace(/\s+/g," ").startsWith(bnRaw.toLowerCase().replace(/\s+/g," ")) ? "" : bnRaw;
+  return { cn, so, ests:ests||[], lines, despatch:dd||null, company, customer:cust, billName, isExport, currency, country,
     buyerAddr, buyerGstin: company ? (company.gst_tax_id||"") : "", oaShip:(so&&so.shipping_address)||"", po_number:(head.po_number||"")+(so && Number(so.amd_no)>0 ? " / Amendment "+so.amd_no+(so.amd_ref?" ("+so.amd_ref+(so.amd_date?" dt "+fmtDMY(String(so.amd_date).slice(0,10)):"")+")":"") : ""), po_date:head.po_date||"",   /* 2026-10-31T16:00:00Z: DC, packing slip, invoice, PI print the amendment */
     dcCount:(dcs||[]).filter(d=>d.status!=="Cancelled" && !d.is_test).length };
 }
@@ -73687,6 +73700,7 @@ function despPdfFooter(doc, co, label){
     doc.text(pdfFooterCompanyName(co)+" · "+label+" · page "+pg+" of "+pages, doc.internal.pageSize.getWidth()/2, doc.internal.pageSize.getHeight()-6, {align:"center"}); }
 }
 const DESP_TBL = { theme:"grid", headStyles:{ fillColor:[29,58,51], textColor:255, fontSize:8 }, bodyStyles:{ fontSize:8, lineColor:[216,212,197], lineWidth:0.2, textColor:[28,31,26] }, margin:{ left:10, right:10 } };
+const cBill = (C)=> (C && ("billName" in C)) ? C.billName : (C ? C.customer : "");   // 2026-11-21T07:00:00Z
 function despNo(dc){ return dc.bill_no || dc.draft_no || ("DC "+dc.id); }
 async function despDcPdf(D){
   const { dc, lines, serials, boxes, C, S, gp } = D;
@@ -73696,7 +73710,7 @@ async function despDcPdf(D){
   let y = 39;
   doc.setFontSize(7.6); doc.setTextColor(60,60,60); doc.setFont(undefined,"normal");
   doc.text(["GSTIN: "+(S.our_gstin||"—")+"   PAN: "+(S.our_pan||"—")+"   State: "+(S.our_state||"—")+(S.our_state_code?" ("+S.our_state_code+")":""), "Despatched from: "+(S.factory_address||"—")], 10, y); y += 8;
-  const bill = [C.customer, C.buyerAddr, C.buyerGstin?"GSTIN: "+C.buyerGstin:"", C.country?"Country: "+C.country:""].filter(Boolean).join("\n");
+  const bill = [cBill(C), C.buyerAddr, C.buyerGstin?"GSTIN: "+C.buyerGstin:"", C.country?"Country: "+C.country:""].filter(Boolean).join("\n");
   const ship = [dc.ship_contact, dc.ship_address, dc.ship_phone].filter(Boolean).join("\n") || "Same as Bill To";
   const parties = [[{content:"Customer (Bill To)",styles:{fontStyle:"bold"}},{content:"Deliver To",styles:{fontStyle:"bold"}}],[bill, ship]];
   if(dc.is_export && dc.handoff_contact) parties.push([{content:"Notifying Party",styles:{fontStyle:"bold"}},{content:[dc.handoff_contact,dc.handoff_address,dc.handoff_phone].filter(Boolean).join("\n")}]);
@@ -87167,7 +87181,7 @@ async function invMakeFromDc(dcId, user){
     : terms.packing_forwarding_basis==="Percentage" ? (!(Number(terms.packing_forwarding_value)||0) ? (pfNotes||"Included") : (Number(terms.packing_forwarding_value)||0)+"%"+pfNoteAdd) : (terms.packing_forwarding||"");
   let vehicle = ""; if(x.gp) vehicle = x.gp.vehicle_no||"";
   const row = { dc_id:dc.id, invoice_no:dc.bill_no, fy:dc.fy||despFy(), invoice_date:invDate, status:"Draft", is_export:!!dc.is_export, contract_number:dc.contract_number, customer_name:C.customer,
-    bill_to:[C.customer, C.buyerAddr].filter(Boolean).join("\n"), buyer_gstin:C.buyerGstin||null, buyer_state: dc.is_export ? (C.country||null) : (GST_STATES[buyerCode]||(C.company&&(C.company.billing_state||C.company.state))||null),
+    bill_to:[cBill(C), C.buyerAddr].filter(Boolean).join("\n"), buyer_gstin:C.buyerGstin||null, buyer_state: dc.is_export ? (C.country||null) : (GST_STATES[buyerCode]||(C.company&&(C.company.billing_state||C.company.state))||null),
     pos_state: dc.is_export ? GST_STATES["96"] : (GST_STATES[buyerCode]||null), pos_code: dc.is_export ? "96" : (buyerCode||null),
     ship_to:[dc.ship_contact, dc.ship_address, dc.ship_phone].filter(Boolean).join("\n")||null, handoff: dc.is_export ? ([dc.handoff_contact, dc.handoff_address, dc.handoff_phone].filter(Boolean).join("\n")||null) : null,
     po_no:C.po_number||null, po_date:C.po_date ? toISODate(C.po_date) : null, oa_date:(C.so&&C.so.oa_issued_on)||null, currency, fx_rate: dc.is_export ? (fx||null) : 1,
@@ -87435,7 +87449,7 @@ async function invOaNow(inv){
   const buyerCode = invStateCodeFromGstin(C.buyerGstin) || invStateCodeFromName(C.company && (C.company.billing_state||C.company.state));
   const dd = C.despatch||{};
   const ship = [dd.ship_contact||dc.ship_contact, dd.ship_address||dc.ship_address||C.oaShip, dd.ship_phone||dc.ship_phone].filter(Boolean).join("\n")||null;
-  const out = { bill_to:[C.customer, C.buyerAddr].filter(Boolean).join("\n"), buyer_gstin:C.buyerGstin||null,
+  const out = { bill_to:[cBill(C), C.buyerAddr].filter(Boolean).join("\n"), buyer_gstin:C.buyerGstin||null,
     pos_state: inv.is_export ? GST_STATES["96"] : (GST_STATES[buyerCode]||null), pos_code: inv.is_export ? "96" : (buyerCode||null), ship_to:ship,
     po_no:C.po_number||null, po_date:C.po_date ? toISODate(C.po_date) : null, payment_term:(terms&&terms.payment_term)||null,
     tax_term: inv.is_export ? "Nil — export under LUT" : ((terms&&terms.tax)||((C.so&&C.so.gst_structure_name)||null)) };
@@ -89102,7 +89116,7 @@ async function invMakeService(ct, picks, user){
   const billNo = despBillNo(S2.bill_prefix, r.no, fy);
   const buyerCode = invStateCodeFromGstin(C.buyerGstin) || invStateCodeFromName(C.company && (C.company.billing_state||C.company.state));
   const row = { dc_id:null, is_service:true, invoice_no:billNo, fy, invoice_date:invDate, status:"Draft", is_export:isExport, contract_number:ct, customer_name:C.customer,
-    bill_to:[C.customer, C.buyerAddr].filter(Boolean).join("\n"), buyer_gstin:C.buyerGstin||null, buyer_state: isExport ? (C.country||null) : (GST_STATES[buyerCode]||(C.company&&(C.company.billing_state||C.company.state))||null),
+    bill_to:[cBill(C), C.buyerAddr].filter(Boolean).join("\n"), buyer_gstin:C.buyerGstin||null, buyer_state: isExport ? (C.country||null) : (GST_STATES[buyerCode]||(C.company&&(C.company.billing_state||C.company.state))||null),
     pos_state: isExport ? GST_STATES["96"] : (GST_STATES[buyerCode]||null), pos_code: isExport ? "96" : (buyerCode||null),
     po_no:C.po_number||null, po_date:C.po_date ? toISODate(C.po_date) : null, oa_date:(C.so&&C.so.oa_issued_on)||null, currency, fx_rate: isExport ? (fx||null) : 1,
     payment_term:(terms&&terms.payment_term)||null, delivery_term:null, transport_term:null, packing_term:null, insurance_term:null,
@@ -89440,7 +89454,7 @@ async function diMakeFromContract(cn, why, user){
   if(r.needStart) r = await despSeriesNext("DIRECT", fy, 1, user?.username);
   const diNo = "DI/"+despPad(r.no,4)+"/"+fy;
   const row = { di_no:diNo, rev:0, fy, di_date:today, status:"Draft", is_export:isExp, contract_number:cn, customer_name:C.customer, why_direct:why||null,
-    bill_to:[C.customer, C.buyerAddr].filter(Boolean).join("\n"), buyer_gstin:C.buyerGstin||null, buyer_state: isExp ? (C.country||null) : (GST_STATES[buyerCode]||(C.company&&(C.company.billing_state||C.company.state))||null),
+    bill_to:[cBill(C), C.buyerAddr].filter(Boolean).join("\n"), buyer_gstin:C.buyerGstin||null, buyer_state: isExp ? (C.country||null) : (GST_STATES[buyerCode]||(C.company&&(C.company.billing_state||C.company.state))||null),
     pos_state: isExp ? GST_STATES["96"] : (GST_STATES[buyerCode]||null), pos_code: isExp ? "96" : (buyerCode||null),
     ship_to:[dd.ship_contact, dd.ship_address||C.oaShip, dd.ship_phone].filter(Boolean).join("\n")||null,
     handoff: isExp && dd.handoff_needed ? ([dd.handoff_contact, dd.handoff_address, dd.handoff_phone].filter(Boolean).join("\n")||null) : null,
@@ -89832,7 +89846,7 @@ async function piMakeFromContract(cn, user){
   const so = C.so || {};
   const poFb = C.po_date ? null : await piPoFallback(cn, so);
   const row = { pi_no:null, rev:0, fy:despFy(), pi_date:today, status:"Draft", is_export:isExp, contract_number:cn, customer_name:C.customer,
-    bill_to:[C.customer, C.buyerAddr].filter(Boolean).join("\n"), buyer_gstin:C.buyerGstin||null, buyer_state: isExp ? (C.country||null) : (GST_STATES[buyerCode]||(C.company&&(C.company.billing_state||C.company.state))||null),
+    bill_to:[cBill(C), C.buyerAddr].filter(Boolean).join("\n"), buyer_gstin:C.buyerGstin||null, buyer_state: isExp ? (C.country||null) : (GST_STATES[buyerCode]||(C.company&&(C.company.billing_state||C.company.state))||null),
     pos_state: isExp ? GST_STATES["96"] : (GST_STATES[buyerCode]||null), pos_code: isExp ? "96" : (buyerCode||null),
     ship_to:[dd.ship_contact, dd.ship_address||C.oaShip, dd.ship_phone].filter(Boolean).join("\n")||null,
     handoff: isExp && dd.handoff_needed ? ([dd.handoff_contact, dd.handoff_address, dd.handoff_phone].filter(Boolean).join("\n")||null) : null,
