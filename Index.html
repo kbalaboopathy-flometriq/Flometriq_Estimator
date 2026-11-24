@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-23T12:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-24T06:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -689,7 +689,7 @@ const SV_SAVEBTN = /^\W*(save|submit|post|update|create|record|approve|endorse|s
 // 2026-11-13T10:00:00Z: buttons that look like Save but only filter, show, print or open something — they never make a screen a form
 const SV_NOTSAVE = /^\W*(apply|show|go|refresh|export|excel|pdf|print|download|preview|filter|search|find)\b|^\s*[+＋]|create order acceptance|save (as )?pdfs?\b|save as excel|save pdfs|(…|\.\.\.|→)\s*$/i;
 const svIsSaveBtn = (b)=>{ const l = svLabel(b); return SV_SAVEBTN.test(l) && !SV_NOTSAVE.test(l) && !/^\s*[+＋]/.test(String(b.textContent||"")); };
-const SV_ACTBTN = /^\W*(save|submit|post|update|create|record|approve|endorse|send|apply|confirm|add|delete|remove|move|mark|release|assign|allot|import|upload|generate|book|issue|receive|accept|reject|return|hold|place|link|set|change|rename|clone|copy|done|complete|reopen|hand|yes|ok|replace|merge|start|finish|park|unpark|revise|request|raise|log|use|give|make|enter|pay|bill|keep|swap|tick|post)/i;
+const SV_ACTBTN = /^\W*(save|submit|post|update|create|record|approve|endorse|send|apply|confirm|add|delete|remove|move|mark|release|assign|allot|import|upload|generate|book|issue|receive|accept|reject|return|hold|place|link|set|change|rename|clone|copy|done|complete|reopen|hand|yes|ok|replace|merge|start|finish|park|unpark|revise|request|raise|log|use|give|make|enter|pay|bill|keep|swap|tick|post)\b/i;
 const SV_DELBTN = /^\W*delete\b/i;
 const SV_CLOSEBTN = /^\W*(close|cancel|later|back|discard|×|✕|x)\W*$/i;
 // a form box that counts: inside a screen / pop-up that has a Save-type button; search and filter boxes never count
@@ -841,7 +841,7 @@ let SV_RAW = null;
 function svWatch(b, table, op){
   if(!b || typeof b.then!=="function" || b.__svw) return; b.__svw = true;
   const quiet = SV_QUIET.test(String(table||""));
-  const act = SV.act && Date.now()-SV.act.last < 8000 ? SV.act : null;
+  const act = SV.act && Date.now()-SV.act.last < 8000 && Date.now()-SV.act.at < 20000 ? SV.act : null;   // 2026-11-24T06:00:00Z: a click owns its writes for 20 s at most
   if(quiet || !act) return;
   if(act.done){ act.done = false; act.reopened = (act.reopened||0)+1; }   // 2026-11-14T06:00:00Z: a late write of the same click (PR, task cards, stage) reopens it, so it is settled again
   act.pending++; act.last = Date.now(); if(act.pending===1 && SV.state!=="failed" && SV_ACTBTN.test(act.label||"")) svSetState("saving");
@@ -863,6 +863,8 @@ function svFinish(act){
   const isDel = W.every(w=>w.op==="delete") || SV_DELBTN.test(act.label);
   if(!fails.length && !SV_ACTBTN.test(act.label||"")){ return; }   // a click that is not a save (opening, picking) — no message
   if(!fails.length){
+    if(act.shown) return;   // 2026-11-24T06:00:00Z: already green once — late background writes never bring it back
+    act.shown = true;
     if(act.form) { if(SV.dirty && SV.dirty.scope===act.form) SV.dirty = null; }
     else if(SV.dirty && !SV.dirty.scope.isConnected) SV.dirty = null;
     if(SV.dirty && act.btnScope && SV.dirty.scope===act.btnScope) SV.dirty = null;
@@ -887,6 +889,8 @@ document.addEventListener("click", (e)=>{
   const btn = e.target && e.target.closest ? e.target.closest("button,[role=button],a.btn") : null; if(!btn || !e.isTrusted && !SV.bypass) return;
   if(btn.closest("#sv-dlg,#sv-badge,#sv-fail")) return;
   const label = svLabel(btn);
+  // 2026-11-24T06:00:00Z: menus, tabs, Back / Home / Refresh are never saves
+  if(btn.closest(".menu-tabs,[role=tab],[role=tablist],[role=menuitem],[role=menu],nav") || /^\W*(back|home|refresh|close|cancel)\W*$/i.test(label) || /[▾▸]\s*$/.test(label)){ SV.act = null; return; }
   // Delete: "Going to delete — are you sure?" first
   if(SV_DELBTN.test(label) && SV.bypass!==btn && !btn.closest("[data-nodelask]")){
     e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
@@ -923,7 +927,7 @@ document.addEventListener("click", (e)=>{
 // a pop-up that closes, or another screen opened, takes its "Not saved" with it
 setInterval(()=>{ try{
   if(SV.dirty && !SV.dirty.scope.isConnected){ SV.dirty = null; svSyncGuard(); }
-  if((SV.state==="saved"||SV.state==="deleted") && Date.now()-SV.at>15000) svSetState("clean");
+  if((SV.state==="saved"||SV.state==="deleted") && Date.now()-SV.at>5000) svSetState("clean");   // 2026-11-24T06:00:00Z: 5 s
   // 2026-11-14T06:00:00Z: safety net — "Saving…" never stays up for ever
   if(SV.state==="saving" && Date.now()-SV.at>45000){ const a = SV.act;
     if(a && a.pending>0){ SV.fail = { what:(a.label||"Save")+(a.screen?" · "+a.screen:""), why:"No reply from the server for 45 seconds.", todo:"Refresh the screen and check whether the entry is there before saving again.", raw:"no reply after 45 s ("+a.pending+" write"+(a.pending===1?"":"s")+" waiting)", table:"", op:"", tab:window.__curTab||"", screen:a.screen };
@@ -3883,7 +3887,7 @@ function MenuTabs({ user, active, onChange, onRefresh }) {
         if(gi>=0) visibleGroups[gi] = g; else visibleGroups.push(g); };
       put("Reports", "Pending Orders – By value"); put("Order Status", "Pending Orders – By value"); } }
   if(user.role!=="hr_admin" && !visibleGroups.some(g=>g.label==="Production")){   // 2026-11-15T20:00:00Z: Manufacturing Part 1
-    const qi = visibleGroups.findIndex(g=>g.label==="QC"); const pg = { label:"Production", subgroups:[{ label:"Route cards", tabs:[{key:"mfg_cards",label:"Route cards"},{key:"mfg_floor",label:"Shop-floor overview"}] }, { label:"Progress", tabs:[{key:"mfg_report",label:"Progress report"},{key:"mfg_dash",label:"Dashboard"}] }, { label:"Finished goods", tabs:[{key:"fg_stock",label:"Finished goods"}] }, { label:"Masters", tabs:[{key:"mfg_templates",label:"Route templates"},{key:"mfg_models",label:"Models → route"}] }] };
+    const qi = visibleGroups.findIndex(g=>g.label==="QC"); const pg = { label:"Production", subgroups:[{ label:"Route cards", tabs:[{key:"mfg_cards",label:"Route cards"},{key:"mfg_floor",label:"Shop-floor overview"}] }, { label:"Progress", tabs:[{key:"mfg_report",label:"Progress report"},{key:"mfg_dash",label:"Dashboard"}] }, { label:"Finished goods", tabs:[{key:"fg_stock",label:"Finished goods"}] }, { label:"Masters", tabs:[{key:"mfg_templates",label:"Route templates"},{key:"mfg_models",label:"Models → route"},{key:"mfg_slno_tpl",label:"🧩 Sl No templates"}] }] };
     if(qi>=0) visibleGroups.splice(qi+1,0,pg); else visibleGroups.push(pg); }
   { // 2026-11-18T06:00:00Z: ⟶ Order flow — Order Status (after Pending Orders), Accounts › Billing, Purchase (Purchase Manager post), Production (Production Manager post)
     const addSub = (label, sub, tab)=>{ const gi = visibleGroups.findIndex(g=>g.label===label); if(gi<0) return; let g = visibleGroups[gi];
@@ -16304,7 +16308,10 @@ function ContractStatusBanner({ contractInfo, quoteHeaderRow, user, onChanged, o
     // Open to every role (25 Aug) — status is plain progress tracking,
     // separate entirely from the three-section approval workflow above,
     // which still requires the right role/Admin to sign off.
-    await sb.from("sale_order_tbl").update({status:newStatus}).eq("id",contractInfo.id); try{ oaLoadMine(user); }catch(e){}   // 2026-10-30T12:00:00Z
+    const goesOut = soBeforeOa(contractInfo.status) && !soBeforeOa(newStatus) && !/hold|cancel|lost/i.test(newStatus||"");   // 2026-11-24T06:00:00Z
+    if(goesOut){ const rcb = await rcSentBlock(contractInfo.contract_number); if(rcb){ alert("Stage can't move to "+newStatus+" yet — "+rcb); return; } }
+    await sb.from("sale_order_tbl").update({status:newStatus}).eq("id",contractInfo.id);
+    if(goesOut) rcMakeAfterSent(contractInfo.contract_number, user?.username||"App"); try{ oaLoadMine(user); }catch(e){}   // 2026-10-30T12:00:00Z
     if(/closed/i.test(newStatus||"")) await regFollowOa(contractInfo.contract_number, newStatus, user?.username||"");   // 2026-11-15T09:30:00Z
     await logAudit("UPDATE","sale_order_tbl",contractInfo.contract_number,"Status changed to "+newStatus,user?.username||"unknown",null,null);
     if(onChanged) onChanged();
@@ -21832,8 +21839,11 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
           // out," so ask here rather than leaving Stage to drift
           // silently out of sync with what actually happened. Never
           // forced — Stage stays fully manual either way.
-          if(confirm("This is the Order Acceptance — mark Stage as \"O.A Sent\"?")){
+          const rcb = await rcSentBlock(quoteExportRef);   // 2026-11-24T06:00:00Z
+          if(rcb) alert("The O.A can't be marked Sent yet — "+rcb);
+          else if(confirm("This is the Order Acceptance — mark Stage as \"O.A Sent\"?")){
             await sb.from("sale_order_tbl").update({status:"O.A Sent"}).eq("id",contractInfo.id); try{ oaLoadMine(user); }catch(e){}
+            rcMakeAfterSent(quoteExportRef, user?.username||"App");
             await logAudit("UPDATE","sale_order_tbl",quoteExportRef,"Stage advanced to O.A Sent (generated via PDF)",user?.username||"unknown",null,null);
             if(onContractInfoChanged) onContractInfoChanged();
           }
@@ -37591,6 +37601,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"24 Nov 2026", summary:"Built on 2026-11-24T06:00:00Z, on top of 2026-11-24T04:00:00Z. NEEDS SQL: structure_route_template_per_slno_2026-11-24.sql (both companies). ROUTE CARDS FROM THE OA: (1) a Sl No may carry its own route template (Production › 🧩 Sl No templates) — before the model's and the naming rule; Custom items get one there; (2) an OA cannot be marked sent / issued while any Sl No has no template, and the moment it goes its route cards are made (full order qty); a one-time pass makes the cards of OAs already sent; (3) Production › Route cards shows In production (in until every piece is despatched), Past production (placed by hand in columns 2–5 — no route card, view only; columns 6–7 are out) and Coming (OA sent, not yet released — view only, the Production Manager post may mark early with a reason); (4) from day 4 after an OA is approved with a Sl No still without a template, every PDF of the Technical Head post stops until it is set (PDF unblock code from a Super Admin for 2 days). SAVE BADGE (ave build): only real save buttons count — whole words (Setup, Users, Issues… no longer), menu / tab / Back / Home clicks never; once a save is green, later background writes cannot bring it back (only a failure shows); \u201cSaved\u201d fades after 5 seconds." },
+  { date:"24 Nov 2026", summary:"Built on 2026-11-24T04:00:00Z, on top of 2026-11-23T12:00:00Z. No SQL. PURCHASE MANAGER POST CAN FINISH ANY PURCHASE WORK: (1) the PO PDF stop for an owner whose procurement plan is past due no longer stops the Purchase Manager post or a Super Admin — it still stops the owner and the engineers, so their plan dates keep being chased; (2) the Purchase Manager post may do everything a PO owner / Purchase Engineer does: mark a PO as sent (and the ask after the PDF), reopen, amend, move a planned date on the Procurement Gantt that another engineer holds, and work the Procurement cards on the Purchase board. Every such action is logged as done for the owner." },
   { date:"23 Nov 2026", summary:"Built on 2026-11-23T12:00:00Z, on top of 2026-11-23T11:00:00Z. No SQL. STAGES — A HAND MOVE IS A PUSH, NEVER A PIN: a card moved (placed) by hand on the Order Status board takes the steps before it as done, and from there the process flow takes over — the step at that stage done (or the contract's data already further on) moves it on at once. Fixes cards held at the old hand placement while the OA says “Work order released” (e.g. 260095, 260163 go to BOM summary pending on the first load). Only a hand move BACK holds until the step is done again. Board, OA, Stage report, Gateways, Flow and the Order Processing Review all use the same rule. Every move of the flow from a hand move is in the audit log; the hand move is retired once the data has caught up. ORDER STATUS › 🧭 STAGE AUDIT: every live contract — the stage shown, its data alone, the last hand move, what to look at (red where they disagree; amber where earlier steps were taken as done), Evidence per step (OA, W/O, Production BOM, Purchase BOM, PR, material, production), Excel. A daily check sends the Document Controller post and the Super Admins a bell when anything disagrees." },
   { date:"23 Nov 2026", summary:"Built on 2026-11-23T11:00:00Z, on top of 2026-11-23T10:00:00Z. No SQL. SAVE BADGE: no more blinking from yellow to green — “Not saved” and “Saving…” show only when they last more than about a second; a quick save (a card move, an auto-save) goes straight to the green “Saved ✓”, and repeated quick saves keep it green." },
   { date:"23 Nov 2026", summary:"Built on 2026-11-23T10:00:00Z, on top of 2026-11-23T08:00:00Z. NEEDS SQL: structure_build_2026-11-23c.sql (BOTH companies). BUILD 3C — STORES EARMARK, PR IN THE PURCHASE UNIT, AMEND PR FROM THE MASTERS. STOCK EARMARK: when the Production BOM is approved, the Stores post gets a card (2 working days) — Stores › Inventory › Stock earmark: per material, the free tags with their size and the qty to set aside (Suggest fills oldest first up to the need); Earmark done or Nothing in stock. The tags are set aside for the contract at once; the Purchase BOM owner and the Purchase Manager get a bell. PURCHASE BOM: takes from stock only what Stores earmarked; while the earmark is open its lines wait (“waiting for the Stores earmark”) — Refresh once Stores is done; past 2 working days with no earmark, everything is bought. Purchase BOMs made before this build keep taking free stock as before. PR: lines come in the purchase unit — fasteners and castings in Nos (from the Production BOM's Nos), gaskets in Nos from their plan, welding rod Pack / Case as Nos; plate, sheet and mesh stay in Kg / Sqft with their plan. A PO from such a PR keeps the PR's Nos. AMEND PR: a new line is picked from the masters — Shape → Spec → Grade (red * when its family needs them); typing is gone." },
@@ -49399,7 +49411,9 @@ function ProcGanttScreen({ user, onGoToTab, initial, onOpenCard }){
 
   // 154: a planned date already set may be moved only by the holder of that material's card (or an Admin)
   const isAdminU = user && (user.role==="admin" || user.role==="super_admin");
-  const mayMove = (form)=> isAdminU || (!!me && pgHolder(ptasks, plan && plan.id, form)===me);
+  const [isPMp,setIsPMp] = useState(false);   // 2026-11-24T04:00:00Z
+  useEffect(()=>{ myPostKeys(user).then(r=>setIsPMp(((r&&r.keys)||[]).includes("purchase_manager"))).catch(()=>{}); },[user && user.id]);
+  const mayMove = (form)=> isAdminU || isPMp || (!!me && pgHolder(ptasks, plan && plan.id, form)===me);   // 2026-11-24T04:00:00Z: + the Purchase Manager post
   const leave = (then)=>{ if(dirty) setAsk({ what:"Procurement Gantt dates", onSave:async()=>{ if(await saveEdit()) then(); }, then }); else then(); };
   const pick = (cn)=> leave(()=>{ setEd(null); setCur(cn); });
 
@@ -61709,7 +61723,7 @@ function App() {
     tab==="os_reports"?h(OrderStatusBoard,{key:"osrep",user:uTab,sessionCompany,startView:"report"}):
     tab==="os_insights"?h(InsightsScreen,{user:uTab,onOpenContract:openContract}):
     (tab==="orders_money" || OM_KEYS.includes(tab))?h(OrdersMoneyScreen,{user,start:tab}):
-    tab==="fg_stock"?h(FgScreen,{user}): tab==="mfg_cards"?h(MfgCardsScreen,{user}): tab==="mfg_floor"?h(MfgFloorScreen,{user}): tab==="mfg_report"?h(MfgReportScreen,{user}): tab==="mfg_dash"?h(MfgDashScreen,{user}): tab==="mfg_templates"?h(MfgTemplatesScreen,{user}): tab==="mfg_models"?h(MfgModelsScreen,{user}):   // 2026-11-15T20:00:00Z: Manufacturing
+    tab==="fg_stock"?h(FgScreen,{user}): tab==="mfg_cards"?h(MfgCardsScreen,{user}): tab==="mfg_floor"?h(MfgFloorScreen,{user}): tab==="mfg_report"?h(MfgReportScreen,{user}): tab==="mfg_dash"?h(MfgDashScreen,{user}): tab==="mfg_templates"?h(MfgTemplatesScreen,{user}): tab==="mfg_slno_tpl"?h(RcSlnoTplScreen,{user}): tab==="mfg_models"?h(MfgModelsScreen,{user}):   // 2026-11-15T20:00:00Z: Manufacturing
     tab==="reports_progress"?h(ProgressReportScreen,{user:uTab,onOpenContract:openContract}):   // 2026-11-08: Order Progress Report   // 2026-11-01T12:00:00Z
     tab==="os_delivery"?h(DeliveryScreen,{user:uTab,onOpenContract:openContract}):
     (tab==="customer_requests"||tab==="os_customer_requests")?h(CustomerRequestsScreen,{key:tab,user:uTab,onOpenContract:openContract}):   // 2026-11-01T10:00:00Z
@@ -62210,6 +62224,7 @@ async function stepLoadMine(user, force){
   try{ const { data, error } = await sb.from("pending_step_tbl").select("*").eq("owner",name).is("done_at",null).is("closed_at",null); if(!error) rows = data||[]; }catch(e){}
   try{ await avlLoadMine(user, name); }catch(e){}   // 237
   try{ await oaLoadMine(user); }catch(e){}   // 2026-10-30T12:00:00Z
+  try{ setTimeout(()=>rtgThLoad(user), 9000); }catch(e){}   // 2026-11-24T06:00:00Z
   try{ setTimeout(()=>oaMorningCheck(user), 6000); setTimeout(()=>oaScoreSweep(), 30000); }catch(e){}   // 2026-11-04T04:00:00Z
   try{ await socLoadMine(user); }catch(e){}   // 2026-10-31T10:00:00Z
   try{ await osStaleLoadMine(user, name); setTimeout(()=>osStaleSweepSoon((user&&user.username)||"App"), 40000); }catch(e){}   // 2026-11-13T00:00 (Build 4): stale order steps
@@ -62422,7 +62437,7 @@ function stepShowBlocked(rows){
     box.querySelector("#flo-stale-open").onclick = ()=>{ wrap.remove(); appOpenTab("stale_items"); };
   }catch(e){ alert("No PDFs until your stale items are cleared — Tasks → Stale Items says what to do."); }
 }
-function stepPdfAllowed(){ if(!stepPdfAllowedStale()) return false; try{ if(!osStalePdfAllowed()) return false; }catch(e){} try{ return avlPdfAllowed() && oaPdfAllowed() && socPdfAllowed(); }catch(e){ return true; } }   // Build 4: + stale order steps   // 2026-10-31T10:00:00Z: + POs of cancelled orders (Purchase Manager)   // 2026-10-30T12:00:00Z: + the O.A block   // 237: + the AVL-link block
+function stepPdfAllowed(){ if(!stepPdfAllowedStale()) return false; try{ if(!osStalePdfAllowed()) return false; }catch(e){} try{ return avlPdfAllowed() && oaPdfAllowed() && socPdfAllowed() && rtgThPdfAllowed(); }catch(e){ return true; } }   // Build 4: + stale order steps   // 2026-10-31T10:00:00Z: + POs of cancelled orders (Purchase Manager)   // 2026-10-30T12:00:00Z: + the O.A block   // 237: + the AVL-link block
 function stepPdfAllowedStale(){
   const st = (STALE_ME.rows||[]).filter(stepIsStale);
   if(!st.length) return true;
@@ -64356,7 +64371,7 @@ function PurchaseOrderEditor({ user, who:whoIn, poId, createKind, onClose, onCha
   const pdf = async()=>{
     { const g = lineGate("the PDF"); if(g){ alert(g); return; } }   // 2026-11-22T18:30:00Z
     try{ if(po.source==="App") await purPdfPack(po, lines, vendor); else await purPdf(po, lines, vendor); }catch(e){ if(!/stale items/i.test(e.message||"")) alert("PDF failed: "+(e.message||e)); return; }
-    if(po.stage==="Approved" && isOwner) setSentDlg({ on:toISODate(new Date()), to:po.vendor_contact||"", how:"Email", note:"", link:"", ask:true });
+    if(po.stage==="Approved" && (isOwner || who.pm || who.sa)) setSentDlg({ on:toISODate(new Date()), to:po.vendor_contact||"", how:"Email", note:"", link:"", ask:true });   // 2026-11-24T04:00:00Z
   };
   const markSent = async()=>{
     const d = sentDlg; if(!d.on){ alert("Give the date it was sent."); return; } if(!String(d.to||"").trim()){ alert("Say to whom it was sent."); return; }
@@ -64365,7 +64380,7 @@ function PurchaseOrderEditor({ user, who:whoIn, poId, createKind, onClose, onCha
     const patch = { stage:"Sent", status:"Open", sent_on:d.on, sent_to:d.to.trim(), sent_how:d.how, sent_by:who.name, sent_at:now, sent_link:String(d.link||"").trim() };
     const { error } = await sb.from("po_register").update(patch).eq("id",po.id); if(error){ alert(/sent_link/.test(error.message||"") ? "Run structure_po_like_sale_order_2026-10-20.sql first (both companies)." : "Could not save: "+error.message); return; }
     await stepDone(po.po_kind, po.po_no, "sent", who.name, "Sent to "+d.to.trim()+" by "+d.how+" on "+fmtDMY(d.on)+(d.note?" — "+d.note:""));
-    await logAudit("UPDATE","po_register",po.po_no,"Marked as sent: "+d.to+" · "+d.how+" · "+fmtDMY(d.on),user.username||"");
+    await logAudit("UPDATE","po_register",po.po_no,"Marked as sent: "+d.to+" · "+d.how+" · "+fmtDMY(d.on)+(!isOwner && po.owner_name ? " — by "+who.name+" for "+po.owner_name+" (Purchase Manager post)" : ""),user.username||"");
     setPo(p=>({ ...p, ...patch })); setSentDlg(null); setMsg("Marked as sent."); stepRefresh(user); onChanged && onChanged();
   };
   const revise = async(reason, what)=>{   // 217: Amend PO
@@ -64671,7 +64686,7 @@ function PurchaseOrderEditor({ user, who:whoIn, poId, createKind, onClose, onCha
           po.id && po.stage==="Approved" && (isOwner || who.pm || who.sa) ? h("button",{onClick:()=>setSentDlg({ on:toISODate(new Date()), to:po.vendor_contact||"", how:"Email", note:"", link:"" }),style:{...btnPrimary,background:"#085041"}},"Mark as sent…") : null,
           !legacy && po.id && po.stage==="Approved" && (who.make||isOwner) ? h("button",{onClick:()=>setReasonDlg("reopen"),style:btnSmall},"Reopen to edit…") : null,
           po.id && ["Sent","Partly received","Received"].includes(po.stage) && (isOwner||who.pm||who.sa) ? h("button",{onClick:()=>setAmdDlg({ why:"", what:[] }),style:{...btnSmall,color:"#8a5200",borderColor:"#c47a00",fontWeight:700}},"Amend PO…") : null,
-          !legacy && po.id && po.stage==="Draft" && !who.cancel && isOwner ? h("button",{"data-testid":"po-draft-delete",onClick:async()=>{ if(!(await draftDelConfirm("Draft PO "+po.po_no+(po.vendor_name?" — "+po.vendor_name:"")))) return; await cancelPo("Draft discarded by the person who made it"); },style:{...btnSmall,color:"#8a2d2d"}},"Discard draft PO") : null,
+          !legacy && po.id && po.stage==="Draft" && !who.cancel && (isOwner || who.pm) ? h("button",{"data-testid":"po-draft-delete",onClick:async()=>{ if(!(await draftDelConfirm("Draft PO "+po.po_no+(po.vendor_name?" — "+po.vendor_name:"")))) return; await cancelPo("Draft discarded by the person who made it"); },style:{...btnSmall,color:"#8a2d2d"}},"Discard draft PO") : null,
           !legacy && po.id && po.stage!=="Cancelled" && po.stage!=="Received" && who.cancel ? h("button",{onClick:async()=>{ if(po.stage!=="Draft" && !who.sa){ const c = prompt("PO "+po.po_no+" has been issued ("+po.stage+"). Cancelling it needs a Deletion code from a Super Admin:"+delCodeFrom()); if(c===null) return; const r = await verifyAndConsumeDeletionCode(c, user?.username||"unknown"); if(!r.ok){ alert(r.reason); return; } } setReasonDlg("cancel"); },style:{...btnSmall,color:"#8a2d2d"}},"Cancel PO…") : null,
           h("button",{onClick:close,style:btnSmall},"Close"))),
       legacy ? h("div",{style:{fontSize:12,background:"#faf9f4",border:"1px solid "+colors.border,borderRadius:6,padding:"7px 10px",marginBottom:10}},
@@ -67329,6 +67344,8 @@ async function purOwnerHasPo(cn){
 }
 // OA issue needs MTC & AVL (as before) and a named purchase owner (Linde orders left out)
 async function oaIssueCheck(cn, so){
+  { const tb = await rcSentBlock(cn); if(tb) return { block:tb, warn:null }; }   // 2026-11-24T06:00:00Z: every Sl No needs a route template before the OA goes
+  setTimeout(()=>{ try{ rcMakeAfterSent(cn, window.__sessUser||"App"); }catch(e){} }, 20000);   // its route cards follow (made even if this save is abandoned — harmless)
   const mb = await mtcBlockCheck(cn, so);
   if(mb && mb.block) return mb;
   try{ const cust = (so && (so.customer_name||so.customer)) || "";
@@ -67443,6 +67460,9 @@ async function purOwnerStaleCards(name){
 async function purPdfOwnerGate(po){
   try{
     const me = window.__sessUser || "";
+    // 2026-11-24T04:00:00Z: the Purchase Manager post and Super Admins are never stopped — they finish the work of an owner who is away
+    if(window.__sessRole==="super_admin") return true;
+    try{ await loadPostPeople(); if(me && postHas("purchase_manager", me)) return true; }catch(e){}
     let owner = null; if(po && po.contract_ref){ const o = await purOwnerOf(po.contract_ref); owner = o && o.purchase_owner; }
     const who = owner || po.owner_name || null; if(!who) return true;
     const st = await purOwnerStaleCards(who); if(!st.length) return true;
@@ -69790,6 +69810,139 @@ function StageAuditScreen({ user }){
               td(h("button",{"data-testid":"sa-open",onClick:()=>setOpen(open===r.cn?null:r.cn),style:{...btnSmall,fontSize:11}},open===r.cn?"Hide":"Evidence"))),
             open===r.cn ? h("tr",null,h("td",{colSpan:6,style:{background:"#faf9f5",padding:"6px 10px",borderBottom:"1px solid "+colors.border}},
               h("div",{style:{display:"grid",gridTemplateColumns:"170px 1fr",gap:"2px 10px",fontSize:12}}, ...ospEvidence(r.x, d.M).flatMap(([k,v])=>[h("b",{key:k},k), h("span",{key:k+"v"},v)])))) : null))))));
+}
+
+// ===================== 2026-11-24T06:00:00Z: ROUTE CARDS FROM THE OA =====================
+// * every Sl No may carry its own route template (estimates.route_template) — before the model's (Production › Models) and the naming rule
+// * an OA cannot be marked sent / issued while a Sl No has no template; when it goes, its route cards are made at once (full qty)
+// * Production › Route cards: In production (in until every piece is despatched) · Past production (placed by hand, cols 2–5, no route card)
+//   · Coming (OA sent, not yet released — read-only; the Production Manager post may mark early, with a reason)
+// * the Technical Head post: from day 4 after an OA is approved with a Sl No still without a template, its PDFs stop (PDF unblock code)
+const RC_SQL = "structure_route_template_per_slno_2026-11-24.sql";
+const RC_TH_FROM = "2026-11-24";
+function rcTplCode(e, m){ return (e && String(e.route_template||"").trim()) || (m && String(m.route_template||"").trim()) || mfgRule(e && e.model).tpl || null; }
+async function rcSentBlock(cn){
+  let miss = [];
+  try{ const M = await rtgMissing([cn]); if(!M) return null; miss = M.get(String(cn))||[]; }catch(e){ return null; }
+  if(!miss.length) return null;
+  let who = []; try{ await loadPostPeople(); who = Array.from(new Set(RTG_POSTS.flatMap(k=>postHolders(k)))); }catch(e){}
+  return "a route template is missing for "+miss.map(m=>"Sl "+m.sl+" ("+(m.model||"no model")+")").join(", ")+". The OA can't be marked sent until every Sl No has one — the Technical Head / Production Manager ("+(who.join(" or ")||"no one holds the posts")+") set it in Production › Sl No templates.";
+}
+const RC_MAKING = new Set();
+async function rcMakeAfterSent(cn, by, tries){
+  cn = String(cn||"").trim(); if(!cn || RC_MAKING.has(cn)) return; RC_MAKING.add(cn);
+  try{ const w = { me: by||"App" }; const r = await mfgMakeCards(cn, w);
+    if(r && r.made && r.made.length) try{ await logAudit("INSERT","route_card_tbl",cn,"Route cards made when the OA was sent: Sl "+r.made.join(", "),by||"App",null,null); }catch(e){} }
+  catch(e){
+    if((tries||0)<1){ RC_MAKING.delete(cn); setTimeout(()=>rcMakeAfterSent(cn, by, (tries||0)+1), 60000); return; }
+    try{ await loadPostPeople(); await notifyPeople(postHolders("production_manager"), "⚠ Route cards of "+cn+" could not be made when its OA was sent ("+(e.message||e)+"). Open Production › Route cards → "+cn+" — they are made on opening.", "order_status", { kind:"open", open:{ tab:"mfg_cards" } }); }catch(x){}
+  } finally { RC_MAKING.delete(cn); }
+}
+// one-time (then daily) pass: every sent, open OA gets its cards
+async function rcBackfill(by){
+  const k = "rcBackfill|"+toISODate(new Date()); try{ if(localStorage.getItem(k)) return; localStorage.setItem(k,"1"); }catch(e){ return; }
+  try{ const sos = await fetchPaged(()=>sb.from("sale_order_tbl").select("contract_number,status"));
+    const live = sos.filter(s=>s.contract_number && !soBeforeOa(s.status) && !/cancel|clos|paid|payment received|short/i.test(String(s.status||""))).map(s=>String(s.contract_number));
+    const have = new Set((await fetchPaged(()=>sb.from("route_card_tbl").select("contract_number"))).map(r=>String(r.contract_number)));
+    let n = 0;
+    for(const cn of live.filter(c=>!have.has(c))){ try{ const r = await mfgMakeCards(cn, { me: by||"App" }); n += (r.made||[]).length; }catch(e){ if(mfgErrMissing(e)) return; } }
+    if(n) try{ await logAudit("INSERT","route_card_tbl","backfill","Route cards made for sent OAs (one-time pass): "+n+" Sl Nos",by||"App",null,null); }catch(e){}
+  }catch(e){ console.warn("route card backfill", e); }
+}
+// ---- the Technical Head post: PDFs stop from day 4 after OA approval while a Sl No has no template ----
+let RTG_TH = { rows:[], until:0, user:null };
+function rcDayFrom(at){ const a = String(at||"").slice(0,10); const s = a && a > RC_TH_FROM ? a : RC_TH_FROM; return oaDayNo(s+"T06:00:00"); }
+async function rtgThLoad(user){
+  RTG_TH = { rows:[], until:0, user };
+  if(!user || user.role==="super_admin") return RTG_TH;
+  let keys = []; try{ keys = (await myPostKeys(user)).keys||[]; }catch(e){}
+  if(!keys.includes("technical_head")) return RTG_TH;
+  try{ const { data } = await sb.from("sale_order_tbl").select("contract_number,customer_name,status,commercial_approved_by,commercial_approved_at").not("commercial_approved_at","is",null);
+    const live = (data||[]).filter(r=>r.commercial_approved_by && !/cancel|clos|paid|payment received|short/i.test(String(r.status||""))).map(r=>({ ...r, day:rcDayFrom(r.commercial_approved_at) })).filter(r=>r.day>=4);
+    if(!live.length) return RTG_TH;
+    const M = await rtgMissing(live.map(r=>r.contract_number)); if(!M) return RTG_TH;
+    const rows = live.filter(r=>(M.get(String(r.contract_number))||[]).length).map(r=>({ ...r, miss:M.get(String(r.contract_number)) }));
+    let until = 0;
+    if(rows.length){ try{ const { data: c } = await sb.from("authorization_codes").select("used_at").eq("code_type","pdf_unblock").eq("used",true).eq("used_by",user.username).order("used_at",{ascending:false}).limit(1);
+      const u = c && c[0] && c[0].used_at; if(u) until = new Date(u).getTime()+OA_UNBLOCK_HOURS*3600e3; }catch(e){} }
+    RTG_TH = { rows, until, user };
+  }catch(e){}
+  return RTG_TH;
+}
+function rtgThPdfAllowed(){
+  const u = RTG_TH.user; if(!u || u.role==="super_admin") return true;
+  const rows = RTG_TH.rows||[]; if(!rows.length) return true;
+  if(RTG_TH.until && Date.now() < RTG_TH.until) return true;
+  (async()=>{ let sa = []; try{ sa = await superAdminNames(); }catch(e){}
+    const list = rows.slice(0,15).map(r=>"• "+r.contract_number+(r.customer_name?" "+r.customer_name:"")+" — "+r.miss.map(m=>"Sl "+m.sl).join(", ")).join("\n")+(rows.length>15?"\n… and "+(rows.length-15)+" more":"");
+    const c = window.prompt("⛔ Your PDFs are stopped: Order Acceptances approved more than 3 days ago still have Sl Nos without a route template:\n\n"+list+
+      "\n\nSet them in Production › Sl No templates (or Production › Models) — PDFs open again by themselves.\n\nOr type a PDF unblock code from a Super Admin ("+(sa.join(", ")||"a Super Admin")+") — PDFs then work for 2 days:", "");
+    if(!c) return;
+    const r = await oaUseCode(c, u.username); if(!r.ok){ alert(r.why); return; }
+    RTG_TH.until = Date.now()+OA_UNBLOCK_HOURS*3600e3;
+    try{ await logAudit("UPDATE","sale_order_tbl",rows.map(x=>x.contract_number).join(", ").slice(0,200),"PDF unblock code used (route templates missing, Technical Head post) — code from "+(r.by||"?"),u.username); }catch(e){}
+    alert("PDFs work for the next 2 days. Set the missing route templates before then, or the stop comes back."); })();
+  return false;
+}
+// ---- Production › Sl No templates: a route template per Sl No (Custom items, models with no template) ----
+function RcSlnoTplScreen({ user }){
+  const [who,setWho] = useState(null); const [rows,setRows] = useState(null); const [codes,setCodes] = useState([]); const [err,setErr] = useState(""); const [pick,setPick] = useState({}); const [busy,setBusy] = useState(""); const [q,setQ] = useState(""); const [msg,setMsg] = useState("");
+  const load = async()=>{ setErr("");
+    try{ const w = await mfgWho(user); setWho(w);
+      const T = (await mfgTemplates()).filter(t=>!t.archived_at).map(t=>t.code).sort(); setCodes([...T, "BOI"]);
+      const sos = await fetchPaged(()=>sb.from("sale_order_tbl").select("contract_number,customer_name,status,commercial_approved_at"));
+      const live = sos.filter(s=>s.contract_number && !/cancel|clos|paid|payment received|short|lost/i.test(String(s.status||"")));
+      const M = await rtgMissing(live.map(s=>s.contract_number)) || new Map();
+      const cust = new Map(live.map(s=>[String(s.contract_number), s]));
+      const cns = Array.from(M.keys()); const desc = new Map();
+      for(let i=0;i<cns.length;i+=150){ const r = await sb.from("estimates").select("reference_number,item_sl_no,description,order_qty").in("reference_number",cns.slice(i,i+150)); (r.data||[]).forEach(e=>desc.set(e.reference_number+"|"+e.item_sl_no, e)); }
+      const out = []; M.forEach((miss, cn)=>miss.forEach(m=>{ const s = cust.get(cn)||{}; const e = desc.get(cn+"|"+m.sl)||{};
+        out.push({ cn, sl:m.sl, model:m.model, why:m.why, cust:s.customer_name||"", status:s.status||"", sent:!soBeforeOa(s.status), day: s.commercial_approved_at ? rcDayFrom(s.commercial_approved_at) : 0, desc:e.description||"", qty:e.order_qty }); }));
+      out.sort((a,b)=>String(b.cn).localeCompare(String(a.cn)) || a.sl-b.sl); setRows(out);
+    }catch(e){ setErr(mfgErrMissing(e) ? "Run "+MFG_SQL+" first (both companies)." : (e.message||String(e))); } };
+  useEffect(()=>{ load(); },[]);
+  const can = who && (who.th || who.pm || who.sa);
+  const save = async(r)=>{ const code = pick[r.cn+"|"+r.sl]; if(!code){ setMsg("Pick a template first."); return; }
+    setBusy(r.cn+"|"+r.sl); setMsg("");
+    const u = await sb.from("estimates").update({ route_template:code }).eq("reference_number",r.cn).eq("item_sl_no",r.sl);
+    setBusy("");
+    if(u.error){ setMsg(/route_template/.test(u.error.message||"") ? "Run "+RC_SQL+" first (both companies)." : "Not saved: "+u.error.message); return; }
+    try{ await logAudit("UPDATE","estimates",r.cn+" Sl "+r.sl,"Route template for this Sl No set to "+code+" ("+(r.model||"no model")+")",who.me,null,null); }catch(e){}
+    setRows(x=>x.filter(y=>!(y.cn===r.cn && y.sl===r.sl))); setMsg("✓ "+r.cn+" Sl "+r.sl+" → "+code+(code==="BOI"?" (bought out — no route card)":""));
+    if(r.sent && code!=="BOI") rcMakeAfterSent(r.cn, who.me);
+    try{ rtgRefresh(who.me, true); }catch(e){} };
+  const t = q.trim().toLowerCase();
+  const list = (rows||[]).filter(r=>!t || (r.cn+" "+r.cust+" "+r.model+" "+r.desc).toLowerCase().includes(t));
+  const th = { textAlign:"left", padding:"6px 8px", fontSize:11.5, borderBottom:"1px solid "+colors.border, background:"#f4f2ea", position:"sticky", top:0 };
+  const td = { padding:"5px 8px", fontSize:12, borderBottom:"1px solid #eeece4", verticalAlign:"top" };
+  return h("div",{"data-testid":"rc-slno-tpl",style:{padding:"14px 18px"}},
+    h("div",{style:{fontSize:18,fontWeight:700}},"🧩 Sl No templates"),
+    h("div",{style:{fontSize:12.5,color:colors.muted,margin:"2px 0 10px",maxWidth:900}},"Sl Nos of open Order Acceptances that have no route template — mostly Custom items, which have no model. Pick the template for each (BOI = bought out, no route card). A Sl No's own template comes before its model's. An OA can't be marked sent while any Sl No is here; from day 4 after an OA is approved, the Technical Head post's PDFs stop until its Sl Nos are done."),
+    !can && who ? h("div",{style:{fontSize:12.5,color:"#8a5200",marginBottom:8}},"View only — the Technical Head / Production Manager post or a Super Admin sets templates.") : null,
+    h("input",{value:q,onChange:e=>setQ(e.target.value),placeholder:"Contract, client, model or description",style:{...inputStyle,maxWidth:420,marginBottom:8}}),
+    msg ? h("div",{style:{fontSize:12.5,color:/^✓/.test(msg)?"#0b5a40":colors.danger,margin:"4px 0 8px"}},msg) : null,
+    err ? h("div",{style:{color:colors.danger}},err) : !rows ? h("div",{style:{color:colors.muted}},"Reading the Order Acceptances…") :
+    !list.length ? h("div",{style:{color:"#0b5a40",fontSize:13}},"✓ Every Sl No of every open Order Acceptance has a route template.") :
+    h("div",{style:{maxHeight:"70vh",overflow:"auto",border:"1px solid "+colors.border,borderRadius:6,background:"#fff"}},
+      h("table",{style:{borderCollapse:"collapse",width:"100%"}},
+        h("thead",null,h("tr",null,["Contract","Sl","Client","Model","Description","Qty","Why","Template"].map(x=>h("th",{key:x,style:th},x)))),
+        h("tbody",null, list.map(r=>{ const k = r.cn+"|"+r.sl; return h("tr",{key:k},
+          h("td",{style:{...td,fontWeight:700,whiteSpace:"nowrap"}}, r.cn, r.sent ? h("div",{style:{fontSize:10.5,color:"#a3312a",fontWeight:400}},"OA sent") : r.day>=4 ? h("div",{style:{fontSize:10.5,color:"#a3312a",fontWeight:400}},"day "+r.day+" — PDFs stopped") : null),
+          h("td",{style:td},r.sl), h("td",{style:td},r.cust), h("td",{style:td},r.model||"—"),
+          h("td",{style:{...td,maxWidth:420,fontSize:11.5}},r.desc), h("td",{style:td},r.qty==null?"":r.qty), h("td",{style:{...td,fontSize:11.5,color:colors.muted}},r.why),
+          h("td",{style:{...td,whiteSpace:"nowrap"}}, can ? h(React.Fragment,null,
+            h("select",{value:pick[k]||"",onChange:e=>setPick(p=>({ ...p, [k]:e.target.value })),style:{...inputStyle,width:150,padding:"3px 5px",fontSize:12}}, h("option",{value:""},"Pick…"), codes.map(c=>h("option",{key:c,value:c},c))),
+            h("button",{disabled:busy===k,onClick:()=>save(r),style:{...btnSmall,marginLeft:4}},busy===k?"…":"Set")) : "—")); })))));
+}
+// ---- which contracts Production › Route cards shows, and how ----
+// prod: in production (until every piece is despatched) · past: placed by hand in cols 2–5 (no route card, view only) · coming: OA sent, not yet released
+async function rcDespatched(cns){
+  const out = new Map(); if(!cns.length) return out;
+  let lots = []; for(const ch of mfgChunks(cns, 100)){ try{ const a = await sb.from("so_lot_tbl").select("contract_number,lines,status,dc_id").in("contract_number",ch); lots.push(...((a && a.data)||[])); }catch(e){} }
+  const ids = Array.from(new Set(lots.map(l=>l.dc_id).filter(Boolean).map(String))); const dcs = new Map();
+  for(const ch of mfgChunks(ids, 100)){ try{ const d = await sb.from("dc_tbl").select("id,status").in("id",ch); ((d && d.data)||[]).forEach(x=>dcs.set(String(x.id), x.status)); }catch(e){} }
+  lots.filter(l=>!/return|cancel/i.test(String(l.status||"")) && l.dc_id && dcs.get(String(l.dc_id))==="Despatched").forEach(l=>{ const k = String(l.contract_number); out.set(k,(out.get(k)||0)+(l.lines||[]).reduce((m,x)=>m+(Number(x.qty)||0),0)); });
+  return out;
 }
 
 // 175: ✓ Completed on a document card = it goes to the client. Which list it lands in, and with which status.
@@ -73621,7 +73774,8 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
   // department (all boards, all dashboards); approving stays with each
   // department's approver.
   const isDocCtl = !!me && nameIn(docCtl, me);   // 2026-11-11T08:30:00Z: login "Ramesh" = employee "Ramesh S"
-  const canEdit = (t)=> isAdmin || isDocCtl || sameName(t.assignee, me) || sameName(t.created_by, me) || canApprove(t);
+  const canEdit = (t)=> isAdmin || isDocCtl || sameName(t.assignee, me) || sameName(t.created_by, me) || canApprove(t)
+    || (!!me && postHas("purchase_manager", me) && (/purchase/i.test(taskDept(t)||"") || (t.labels||[]).includes("Procurement")));   // 2026-11-24T04:00:00Z
   const labelColor = (l)=> (labels.find(x=>x.label===l)||{}).color || "#7a8a86";
   const authDepts = (isAdmin || isDocCtl) ? Array.from(new Set([...deptMaster, ...emps.flatMap(x=>empBoards(x))].filter(Boolean))).sort()
                             : Array.from(new Set(approvers.filter(x=>sameName(x.employee_name, me)).map(x=>x.department))).sort();
@@ -81728,7 +81882,7 @@ const omRateOf = (rates, c)=> c==="INR" ? 1 : (Number(rates[c])>0 ? Number(rates
 // contract), / P J Q x by the Production Supervisor posts, T R N and x on QC rows by the QC post. A QC hold (ITP) row must
 // be x before a later step of that piece can be x. Undo only by the person who marked it, the same day (Super Admin any time).
 const MFG_SQL = "structure_manufacturing_2026-11-15.sql";
-const MFG_KEYS = ["mfg_cards","mfg_floor","mfg_report","mfg_dash","mfg_templates","mfg_models","fg_stock"];
+const MFG_KEYS = ["mfg_cards","mfg_floor","mfg_report","mfg_dash","mfg_templates","mfg_models","mfg_slno_tpl","fg_stock"];
 const MFG_SQL2 = "structure_manufacturing_part2_2026-11-15.sql";
 const MFG_RULES = [["re", "^DP.*-CASTED", "CAST", "Cast"], ["pre", ["SD-CA"], "CAST", "Cast"], ["pre", ["SD-FA"], "BSK-FAB", "Fabricated"], ["pre", ["BFFL", "BFS", "BFP", "BFE", "BEE"], "BSK-FAB", "Fabricated"], ["pre", ["BCP", "BCE", "BCS"], "CAST", "Cast"], ["pre", ["YIC"], "CAST", "Investment cast"], ["pre", ["YCP", "YCE", "YCS", "YSCW", "YSW"], "CAST", "Cast"], ["pre", ["YFG"], "Y-FORGED", "Forged"], ["pre", ["YBS", "YFB"], "YBR", "Bar stock"], ["pre", ["YFEE", "YFE", "YFP", "YFS", "Y-FIRELINE"], "Y-FAB", "Fabricated"], ["re", "^TSTR.*-CA-", "T-CAST", "Cast"], ["pre", ["T STRAINER-CASTING"], "T-CAST", "Cast"], ["pre", ["TCA"], "T-CAST", "Cast"], ["pre", ["TFS"], "T-FAB", "Fabricated"], ["pre", ["TEMP.STR"], "CSTR", "Fabricated"], ["pre", ["TCE"], "HOLD", "On hold \u2014 to check"], ["pre", ["T-STRAINER", "TSTR"], "T-FAB", "Fabricated"], ["pre", ["CONICAL", "BASKET-", "PLATE-", "AR-S-"], "CSTR", "Fabricated"], ["pre", ["DP-", "DS-", "DS ", "DFS", "DSTR"], "DSTR-FAB", "Fabricated"], ["pre", ["ASC-", "ASTR"], "SCS", "Fabricated"], ["pre", ["HYC"], "HYC", "Fabricated"], ["pre", ["DB-CA", "DTB-CA"], "CAST", "Cast"], ["pre", ["DB-", "DTB"], "PENDING", "Fabricated"], ["pre", ["OPA"], "OPA--ORIFICE-PLATE", "Fabricated"], ["pre", ["MCH", "ARS"], "PENDING", "Fabricated"], ["re", "^[0-9]+-STL-", "PENDING", "Fabricated"], ["pre", ["MSEP", "AV-CS", "AR-SL"], "TRADE", "Traded (buy & sell)"]];
 const MFG_WORD = { PENDING:"Template to come from the Production Head", BOI:"Bought out (BOI) — no route", HOLD:"On hold — to check" };
@@ -81819,7 +81973,7 @@ async function mfgMakeCards(cn, who){
   const made = [], skipped = [];
   for(const e of todo){
     const sl = Number(e.item_sl_no), m = mt.get(e.model) || {};
-    const code = m.route_template || mfgRule(e.model).tpl;
+    const code = rcTplCode(e, m);   // 2026-11-24T06:00:00Z: the Sl No's own template first
     const qty = Math.max(0, (Number(e.order_qty)||1) - (Number(e.cancelled_qty)||0));
     if(!qty){ skipped.push({ sl, model:e.model, why:"Cancelled" }); continue; }
     if(!code || !T.has(code)){ skipped.push({ sl, model:e.model||"(no model)", why: MFG_WORD[code] || (code ? "Template "+code+" is not in the masters" : "No route template for this model — set it in Production › Models") }); continue; }
@@ -82274,6 +82428,13 @@ function MfgGrid({ D, card, who, brush, onChanged, setMsg, onTrace }){
   const [ask,setAsk] = useState(null); const [busy,setBusy] = useState(false); const pressT = React.useRef(null); const [jw,setJw] = useState(null);
   const today = mfgToday();
   const apply = async(step, list)=>{
+    if(who.lock==="past"){ setMsg({ err:true, t:"Past production — placed past production on the board; this route card is view only." }); return; }   // 2026-11-24T06:00:00Z
+    if(who.lock==="coming"){
+      if(!(who.pm || who.sa)){ setMsg({ err:true, t:"Not released yet — "+(who.holding||"waiting for release")+". View only until the contract is in Production in progress (the Production Manager post may mark early)." }); return; }
+      if(!window.__rcEarly || window.__rcEarly.card!==card.contract_number){
+        const why0 = window.prompt("This contract is not released yet ("+(who.holding||"waiting")+"). Marking early — why? (e.g. cutting from stock)", ""); if(!why0 || String(why0).trim().length<3) return;
+        window.__rcEarly = { card:card.contract_number, why:String(why0).trim() };
+        try{ await logAudit("UPDATE","route_card_tbl",String(card.contract_number),"Route card marked before release ("+(who.holding||"")+") — "+String(why0).trim(),who.me,null,null); }catch(e){} } }
     const k = MFG_MK[brush]||{};
     const okP = [], why = [];
     list.forEach(p=>{ const w = mfgCheck(D, card, step, p, brush, who); if(w) why.push(w); else okP.push(p); });
@@ -82592,23 +82753,28 @@ function MfgContract({ cn, user, who, onBack, sl: sl0 }){
 }
 // ---------- Production › Route cards ----------
 function MfgCardsScreen({ user }){   // 2026-11-15T22:00:00Z: one way in — contracts in Production in progress only (and approved stock contracts)
+  const [part,setPart] = useState("prod");   // 2026-11-24T06:00:00Z: prod | coming | past
   const [who,setWho] = useState(null); const [rows,setRows] = useState(null); const [err,setErr] = useState(""); const [open,setOpen] = useState(null); const [pq,setPq] = useState("");
   const load = async()=>{ setErr("");
     try{ const w = await mfgWho(user); setWho(w);
-      const IP = await mfgInProd();
+      const IP = await mfgInProd({ all:true });   // 2026-11-24T06:00:00Z
+      if(w.pm || w.sa) setTimeout(()=>rcBackfill(w.me), 3000);   // one-time pass: cards for OAs already sent
       const rc = await sb.from("route_card_tbl").select("contract_number,item_sl_no"); if(rc.error) throw rc.error;
       const m = new Map(); (rc.data||[]).forEach(r=>{ const k = String(r.contract_number); m.set(k,(m.get(k)||0)+1); });
       let fc = new Map(); try{ fc = await mfgForecastMap(); }catch(e){}
       setRows(Array.from(IP.values()).map(r=>({ ...r, cards:m.get(r.cn)||0, pct:(fc.get(r.cn)||{}).pct })).sort((a,b)=>String(b.cn).localeCompare(String(a.cn))));
     }catch(e){ setErr(mfgErrMissing(e) ? "Run "+MFG_SQL+" first (both companies)." : (e.message||String(e))); } };
   useEffect(()=>{ load(); try{ if(window.__mfgOpen){ setOpen(String(window.__mfgOpen)); window.__mfgOpen = null; } }catch(e){} },[]);
-  if(open && who) return h(MfgContract,{ cn:open, user, who, onBack:()=>{ setOpen(null); setPq(""); load(); } });
+  if(open && who){ const r0 = (rows||[]).find(r=>r.cn===open) || {};
+    return h(MfgContract,{ cn:open, user, who:{ ...who, lock: r0.kind==="past" ? "past" : r0.kind==="coming" ? "coming" : null, holding:r0.holding||"" }, onBack:()=>{ setOpen(null); setPq(""); load(); } }); }
   const pt = pq.trim().toLowerCase();
-  const plist = (rows||[]).filter(r=>!pt || (r.cn+" "+r.qn+" "+r.cust).toLowerCase().includes(pt)).slice(0,80);
+  const plist = (rows||[]).filter(r=>(r.kind||"prod")===part).filter(r=>!pt || (r.cn+" "+r.qn+" "+r.cust).toLowerCase().includes(pt)).slice(0,part==="coming"?400:120);
+  const nOf = (k)=> (rows||[]).filter(r=>(r.kind||"prod")===k).length;
   const pill = (t, bg, fg)=> h("span",{style:{fontSize:11,padding:"1px 7px",borderRadius:4,background:bg||"#f4f2ea",color:fg||colors.muted,border:"1px solid "+colors.border,whiteSpace:"nowrap"}},t);
   return h("div",{"data-testid":"mfg-cards",style:{padding:"14px 18px",maxWidth:760}},
     h("div",{style:{fontSize:18,fontWeight:700}},"Route cards"),
-    h("div",{style:{fontSize:12.5,color:colors.muted,margin:"2px 0 10px"}},"Contracts in Production in progress — the same as that column of the Order Status board — and approved stock contracts. Pick one; its Sl Nos open as tiles."),
+    h("div",{style:{fontSize:12.5,color:colors.muted,margin:"2px 0 8px"}},"In production: contracts in Production in progress on the Order Status board (and approved stock contracts), until every piece is despatched. Coming: OA sent, not yet released — view only (the Production Manager post may mark early, with a reason). Past production: placed past production by hand — no route card."),
+    h("div",{style:{display:"flex",gap:6,margin:"0 0 8px"}}, [["prod","🏭 In production"],["coming","⏳ Coming"],["past","📦 Past production"]].map(([k,t])=>h("button",{key:k,"data-testid":"mfg-part-"+k,onClick:()=>setPart(k),style:{...btnSmall,fontWeight:part===k?700:400,background:part===k?"#e3f3ec":"#fff",borderColor:part===k?"#0f7a5c":colors.border}},t+" ("+nOf(k)+")"))),
     h("input",{"data-testid":"mfg-pick",value:pq,placeholder:"Contract, quote number or client",autoComplete:"off",autoFocus:true,
       onChange:e=>setPq(e.target.value),onKeyDown:e=>{ if(e.key==="Enter" && plist.length) setOpen(plist[0].cn); },style:{...inputStyle}}),
     err ? h("div",{style:{color:colors.danger,marginTop:10}},err) : !rows ? h("div",{style:{marginTop:10,color:colors.muted}},"Reading the Order Status board…") :
@@ -82617,10 +82783,11 @@ function MfgCardsScreen({ user }){   // 2026-11-15T22:00:00Z: one way in — con
         plist.length ? plist.map(r=>h("div",{key:r.cn,"data-testid":"mfg-open-"+r.cn,onClick:()=>setOpen(r.cn),style:{padding:"8px 10px",fontSize:13,cursor:"pointer",borderBottom:"1px solid #eeece4",display:"flex",gap:8,alignItems:"baseline",flexWrap:"wrap"}},
           h("b",null,r.cn), h("span",{style:{color:colors.muted}},"– "+(r.qn||(r.stock?"stock":"no quote no."))+" –"), h("span",{style:{flex:1,minWidth:160}},r.cust),
           r.hold ? pill("On hold","#fbe3e3","#a3312a") : null,
+          r.kind==="coming" ? pill("⏳ "+(r.holding||"not released"),"#fff4d6","#7a5200") : r.kind==="past" ? pill("past production — no route card","#f1efe8","#5f5e5a") : null,
           pill(r.cards ? r.cards+" Sl No" : "cards made on opening"),
           r.cards ? pill(r.pct ? r.pct+"% done" : "not started") : null)) :
         h("div",{style:{padding:"8px 10px",fontSize:12.5,color:colors.muted}}, (rows||[]).length ? "No contract in production matches." : "No contract is in Production in progress.")),
-      h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:6}},(rows||[]).length+" contract(s). Before W/O release, or once every piece is in a lot (or placed past production on the board), a contract does not show here.")));
+      h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:6}},plist.length+" contract(s) shown. A contract leaves the list once every piece is despatched, or when it is placed at Despatched / Payment received on the board.")));
 }
 
 // ---------- Production › Route templates (Part 2: edit with revisions, new from a copy) ----------
@@ -82675,7 +82842,8 @@ async function rtgMissing(cns){
   if(T.error) return null; const live = new Set((T.data||[]).filter(t=>!t.archived_at).map(t=>t.code)); if(!live.size) return null;   // no templates in this company yet: no gate
   const list = Array.from(new Set((cns||[]).map(String))); let es = [];
   for(let i=0;i<list.length;i+=150){ const part = list.slice(i,i+150);
-    let r = await sb.from("estimates").select("reference_number,item_sl_no,model,order_qty,cancelled_qty").in("reference_number",part);
+    let r = await sb.from("estimates").select("reference_number,item_sl_no,model,order_qty,cancelled_qty,route_template").in("reference_number",part);   // 2026-11-24T06:00:00Z
+    if(r.error) r = await sb.from("estimates").select("reference_number,item_sl_no,model,order_qty,cancelled_qty").in("reference_number",part);
     if(r.error) r = await sb.from("estimates").select("reference_number,item_sl_no,model,order_qty").in("reference_number",part);
     if(r.error) return null; es = es.concat(r.data||[]); }
   const models = Array.from(new Set(es.map(e=>e.model).filter(Boolean))); const mt = new Map();
@@ -82683,9 +82851,9 @@ async function rtgMissing(cns){
   const out = new Map();
   for(const e of es){
     const qty = Math.max(0,(Number(e.order_qty)||1)-(Number(e.cancelled_qty)||0)); if(!qty) continue;
-    const code = (mt.get(e.model)||{}).route_template || mfgRule(e.model).tpl;
+    const code = rcTplCode(e, mt.get(e.model));   // 2026-11-24T06:00:00Z
     if(code==="BOI") continue;
-    const why = !e.model ? "No model on this Sl No" : !code ? "No route template for this model" : MFG_WORD[code] ? MFG_WORD[code] : !live.has(code) ? "Template "+code+" is not in the masters" : "";
+    const why = !e.model && !code ? "No model on this Sl No" : !code ? "No route template for this model" : MFG_WORD[code] ? MFG_WORD[code] : !live.has(code) ? "Template "+code+" is not in the masters" : "";
     if(!why) continue;
     const k = String(e.reference_number); out.set(k, [...(out.get(k)||[]), { sl:Number(e.item_sl_no), model:e.model||"", why, inMaster: mt.has(e.model) }]);
   }
@@ -83243,7 +83411,7 @@ function fgValue(r, estOf){
 const fgMoney = (v, ccy)=> (ccy && ccy!=="INR" ? ccy+" " : "₹ ")+Math.round(Number(v)||0).toLocaleString("en-IN");
 const fgLakh = (v)=> "₹ "+(Math.round((Number(v)||0)/1000)/100).toFixed(2)+" L";
 // contracts in Production in progress — the same rule as the Order Status board — plus approved stock contracts
-async function mfgInProd(){
+async function mfgInProd(opts){   // 2026-11-24T06:00:00Z: opts.all → also past production and coming
   const out = new Map();
   let M = null; try{ M = await ctfBoard(true); }catch(e){ M = null; }
   if(M && M.so){
@@ -83254,15 +83422,23 @@ async function mfgInProd(){
     for(const ch of mfgChunks(cands.map(c=>c.cn), 100)){
       try{ const a = await sb.from("so_lot_tbl").select("contract_number,lines,status").in("contract_number",ch); lots.push(...((a && a.data)||[])); }catch(e){}
       try{ const b = await sb.from("estimates").select("reference_number,item_sl_no,order_qty,cancelled_qty").in("reference_number",ch); ests.push(...((b && b.data)||[])); }catch(e){} }
-    cands.forEach(c=>{ const p = plM.get(c.cn); if(p && typeof osPlaceCol==="function" && osPlaceCol(p)>1) return;   // placed past production on the board
+    const desp = await rcDespatched(cands.map(c=>c.cn));   // 2026-11-24T06:00:00Z: in until every piece is despatched
+    cands.forEach(c=>{ const p = plM.get(c.cn); const col = p && typeof osPlaceCol==="function" ? osPlaceCol(p) : 1;
+      if(col>=6) return;   // placed at despatched / paid: out
       const need = ests.filter(e=>String(e.reference_number)===c.cn).reduce((n,e)=>n+Math.max(0,(Number(e.order_qty)||1)-(Number(e.cancelled_qty)||0)),0);
-      const inLots = lots.filter(l=>String(l.contract_number)===c.cn && !/return|cancel/i.test(String(l.status||""))).reduce((n,l)=>n+(l.lines||[]).reduce((m,x)=>m+(Number(x.qty)||0),0),0);
-      if(need>0 && inLots>=need) return;   // every piece already in a lot → past production
-      out.set(c.cn, { cn:c.cn, cust:c.so.customer_name||"", qn:c.so.quote_reference_number||"", hold:c.hold, stock:false, at:c.so.created_at }); });
+      if(need>0 && (desp.get(c.cn)||0)>=need) return;   // every piece despatched
+      if(col>1){ if(opts && opts.all) out.set(c.cn, { cn:c.cn, cust:c.so.customer_name||"", qn:c.so.quote_reference_number||"", hold:c.hold, stock:false, at:c.so.created_at, kind:"past", col }); return; }
+      out.set(c.cn, { cn:c.cn, cust:c.so.customer_name||"", qn:c.so.quote_reference_number||"", hold:c.hold, stock:false, at:c.so.created_at, kind:"prod" }); });
+    if(opts && opts.all){   // coming: OA sent, not yet in production
+      M.so.forEach((so, cn)=>{ cn = String(cn); if(out.has(cn) || cands.some(c=>c.cn===cn)) return; if(soBeforeOa(so.status) || /cancel|clos|paid|payment received|short|lost/i.test(String(so.status||""))) return;
+        let x = null; try{ x = ospStage(cn, M); }catch(e){} if(!x || !x.stage || x.stage==="prod") return;
+        const col = (OSP_COLS.find(c=>c.k===x.stage)||{}).label || x.stage;
+        out.set(cn, { cn, cust:so.customer_name||"", qn:so.quote_reference_number||"", hold:!!x.hold, stock:false, at:so.created_at, kind:"coming", holding:col }); });
+    }
   }
   try{ const [{ data: cs }, { data: ls }] = await Promise.all([ sb.from("stock_contract_tbl").select("st_no,purpose,status,approved_at,created_at"), sb.from("stock_contract_line_tbl").select("st_no,approved_at,closed_at") ]);
     const ok = new Set((ls||[]).filter(l=>l.approved_at && !l.closed_at).map(l=>String(l.st_no)));
-    (cs||[]).filter(c=>c.status!=="Cancelled" && !/closed|complete/i.test(String(c.status||"")) && ok.has(String(c.st_no))).forEach(c=>out.set(String(c.st_no), { cn:String(c.st_no), cust:"Stock — "+(c.purpose||""), qn:"", stock:true, at:c.approved_at||c.created_at })); }catch(e){}
+    (cs||[]).filter(c=>c.status!=="Cancelled" && !/closed|complete/i.test(String(c.status||"")) && ok.has(String(c.st_no))).forEach(c=>out.set(String(c.st_no), { cn:String(c.st_no), cust:"Stock — "+(c.purpose||""), qn:"", stock:true, at:c.approved_at||c.created_at, kind:"prod" })); }catch(e){}
   return out;
 }
 // ---------- Stores / Production › Finished goods ----------
