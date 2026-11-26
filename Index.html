@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-25T17:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-26T03:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -1642,15 +1642,87 @@ function buildPriceDataSection(currency, orderQty, totalSalesValue, conversionRa
 // 2026-11-08T21:00:00Z (currency): one check for every place a rate is typed. A foreign currency needs a real rate
 // (more than 10 — a rate of 1 counted USD as rupees on 260105 / 260109 / 260128 / 260164); a USD rate outside
 // 70–120 is almost always a typo (386 on 260070, 1.0951 on 260018) and is asked about before it is saved.
-function fxRateCheck(ccy, rate){
+function fxRateCheck(ccy, rate, prev){   // prev = the rate(s) this quote already carries: keeping it is never stopped
   const c = String(ccy||"INR").trim().toUpperCase(); const r = Number(rate);
   if(c==="INR") return { err:"", warn:"" };
   if(!(r>10)) return { err:"Enter the conversion rate as 1 "+c+" = ? INR (more than 10). A rate of 1 would count "+c+" as rupees.", warn:"" };
   if(c==="USD" && (r<70 || r>120)) return { err:"", warn:"1 USD = "+r+" INR is outside the usual 70 – 120.\n\nIs that rate right?" };
+  // 2026-11-26T03:30:00Z: more than 10% away from Sales' latest rate for this currency is stopped at the quote
+  { const L = SALES_FX.map[c]; if(!SALES_FX.at && !SALES_FX.p) salesFxLoad();
+    const keep = [].concat(prev==null?[]:prev).some(p=>Number(p)>0 && Math.abs(Number(p)-r)<0.0001);
+    if(!keep && L && L.rate>10 && Math.abs(r-L.rate)/L.rate > 0.10){
+      const msg = "1 "+c+" = "+r+" INR is more than 10% away from Sales' latest rate, 1 "+c+" = "+Number(L.rate).toFixed(2)+" INR"+(L.ref?" (quote "+L.ref+(L.date?", "+fmtDMY(L.date):"")+")":"")+".";
+      if(fxGuardMayPass()) return { err:"", warn:msg+"\n\nYou are the Sales Head / a Super Admin — save this as the new rate?" };
+      try{ const me = window.__fxMe; const who = me ? me.name : "someone"; notifyPeople(postHolders("sales_head")||[], "💱 Conversion rate stopped: "+who+" tried "+msg+" If the rate has really moved, save it yourself on that quote.", "warning"); }catch(e){}
+      return { err: msg+"\n\nCorrect the rate. If the rate has really moved, the Sales Head ("+(postPersonText("sales_head")||"the Sales Head post")+") or a Super Admin ("+saNamesTxt()+") saves it — they have been told.", warn:"" };
+    } }
   return { err:"", warn:"" };
 }
+// ===================== 2026-11-26T03:30:00Z: ONE QUOTE VALUE, ONE RATE =====================
+// Quote value = the "Gross Amount (Basic Price)" as printed, in the quote's own currency, kept in quote_value_snapshot_tbl
+// (printed_gross, written when the quote PDF is made; quotes not printed since use total_value_in_currency). Contract value =
+// the PO value. INR = value × Sales' latest conversion rate for that currency: the rate on the most recent quote made in it
+// (Sales' rate, with their margin — not the Accounts rate). A latest rate more than 10% away from the median of the five before
+// it is ignored unless a second quote confirms it (within 2%), so one wrong entry can't swing every figure.
+const SALES_FX = { map:{ INR:{ rate:1 } }, at:0, p:null };
+const SALES_FX_SUBS = new Set();
+async function salesFxLoad(force){
+  if(!force && SALES_FX.at && Date.now()-SALES_FX.at<600000) return SALES_FX.map;
+  if(SALES_FX.p) return SALES_FX.p;
+  SALES_FX.p = (async()=>{
+    const m = { INR:{ rate:1 } };
+    try{
+      const rows = await fetchPaged(()=>sb.from("estimates").select("reference_number,currency,conversion_rate,quote_date,created_at").neq("currency","INR").gt("conversion_rate",10).order("id"));
+      const byQ = new Map();   // one rate per quote (its header), dated by quote date, else when it was made
+      (rows||[]).forEach(r=>{ const ref = String(r.reference_number||""); if(!ref || /^\d{6}$/.test(ref)) return; const c = String(r.currency||"").trim().toUpperCase(); const fx = Number(r.conversion_rate); if(!c || !(fx>10)) return;
+        const d = String(r.quote_date||r.created_at||"").slice(0,10); const k = c+"|"+ref; const o = byQ.get(k); if(!o || d>o.d) byQ.set(k,{ c, ref, fx, d }); });
+      const byC = {}; byQ.forEach(v=>{ (byC[v.c] = byC[v.c]||[]).push(v); });
+      Object.keys(byC).forEach(c=>{ const L = byC[c].sort((a,b)=> a.d===b.d ? String(a.ref).localeCompare(String(b.ref)) : a.d.localeCompare(b.d));   // oldest → newest
+        for(let i=L.length-1;i>=0;i--){ const x = L[i]; const prev = L.slice(Math.max(0,i-5), i).map(y=>y.fx).sort((a,b)=>a-b);
+          const med = prev.length ? prev[Math.floor(prev.length/2)] : null; const next = i>0 ? L[i-1].fx : null;
+          const ok = med==null || Math.abs(x.fx-med)/med <= 0.10 || (next!=null && Math.abs(x.fx-next)/next <= 0.02);
+          if(ok){ m[c] = { rate:x.fx, ref:x.ref, date:x.d }; break; } } });
+    }catch(e){ console.warn("Sales rates", e); }
+    SALES_FX.map = m; SALES_FX.at = Date.now(); SALES_FX.p = null; SALES_FX_SUBS.forEach(f=>{ try{ f(); }catch(e){} }); return m;
+  })();
+  return SALES_FX.p;
+}
+function salesRate(ccy){ const c = String(ccy||"INR").trim().toUpperCase(); if(c==="INR" || !c) return 1; if(!SALES_FX.at && !SALES_FX.p) salesFxLoad(); const r = SALES_FX.map[c]; return r ? r.rate : null; }
+function salesRatesTxt(){ return Object.keys(SALES_FX.map).filter(c=>c!=="INR").sort().map(c=>{ const r = SALES_FX.map[c]; return c+" "+Number(r.rate).toFixed(2)+(r.ref?" ("+r.ref+(r.date?" · "+fmtDMY(r.date):"")+")":""); }).join(" · "); }
+function useSalesFx(){ const [,f] = useState(0); useEffect(()=>{ const fn = ()=>f(x=>x+1); SALES_FX_SUBS.add(fn); salesFxLoad().then(fn); return ()=>SALES_FX_SUBS.delete(fn); },[]); }
+// written each time the quote PDF is made — the figure printed as Gross Amount (Basic Price). Never blocks the PDF.
+async function qvSavePrinted(ref, gross, ccy, user){
+  try{ const v = Number(gross); if(!ref || !(v>=0) || !isFinite(v)) return;
+    const row = { printed_gross:Number(v.toFixed(2)), printed_currency:String(ccy||"INR").toUpperCase(), printed_at:new Date().toISOString() };
+    const { data: ex } = await sb.from("quote_value_snapshot_tbl").select("id").eq("reference_number",ref).maybeSingle();
+    if(ex){ await sb.from("quote_value_snapshot_tbl").update(row).eq("id",ex.id); }
+    else { await sb.from("quote_value_snapshot_tbl").insert({ reference_number:ref, entity_type:"quote", total_value:0, total_value_in_currency:row.printed_gross, currency:row.printed_currency, computed_at:row.printed_at, computed_by:user?.username||"unknown", ...row }); }
+  }catch(e){ console.warn("printed value not kept", e); }
+}
+// a quote's value in its own currency: the printed Gross Amount, else the stored value
+function qvCcy(sn){ if(!sn) return null; const p = Number(sn.printed_gross); if(p>0) return { value:p, ccy:String(sn.printed_currency||sn.currency||"INR").toUpperCase(), printed:true };
+  const c = String(sn.currency||"INR").toUpperCase(); const v = sn.total_value_in_currency!=null ? Number(sn.total_value_in_currency) : (c==="INR" ? Number(sn.total_value) : NaN);
+  return isFinite(v) ? { value:v, ccy:c, printed:false } : null; }
+// the same in INR at Sales' latest rate (null when the rate for that currency isn't known yet)
+function qvInr(sn){ const q = qvCcy(sn); if(!q) return null; const r = salesRate(q.ccy); return r ? q.value*r : null; }
+// stored values of many quotes: Map quote no → snapshot row
+async function qvLoad(refs){
+  const out = new Map(); const L = Array.from(new Set((refs||[]).filter(Boolean).map(String)));
+  for(let i=0;i<L.length;i+=150){ try{ const { data } = await sb.from("quote_value_snapshot_tbl").select("*").in("reference_number",L.slice(i,i+150)); (data||[]).forEach(r=>out.set(String(r.reference_number), r)); }catch(e){} }
+  return out;
+}
+async function qvLoadAll(){ const out = new Map(); try{ const rows = await fetchPaged(()=>sb.from("quote_value_snapshot_tbl").select("*").order("id")); (rows||[]).forEach(r=>out.set(String(r.reference_number), r)); }catch(e){} return out; }
+// spread one quote's value over its Sl Nos in proportion to their BOM sums (equal shares when there are none), so Sl No
+// reports add up to exactly the quote value. rows: [{reference_number,item_sl_no,...}], raw(row) = BOM sum of that Sl No.
+function qvSpread(rows, raw, snaps){
+  const tot = new Map(), cnt = new Map(); rows.forEach(r=>{ const k = String(r.reference_number); tot.set(k,(tot.get(k)||0)+(Number(raw(r))||0)); cnt.set(k,(cnt.get(k)||0)+1); });
+  return rows.map(r=>{ const k = String(r.reference_number); const v = qvInr(snaps.get(k)); if(v==null) return { ...r, totalValue:0, noValue:true };
+    const t = tot.get(k)||0; return { ...r, totalValue: t>0 ? v*(Number(raw(r))||0)/t : v/(cnt.get(k)||1) }; });
+}
+// the Sales Head / Super Admin may save a rate past the 10% guard; everyone else is stopped
+function fxGuardMayPass(){ const me = window.__fxMe; if(!me) return false; if(me.role==="super_admin") return true; try{ return (postHolders("sales_head")||[]).some(n=>sameName(n, me.name)); }catch(e){ return false; } }
 // true = go ahead (no problem, or the user confirmed the unusual rate)
-function fxRateOk(ccy, rate){ const k = fxRateCheck(ccy, rate); if(k.err){ alert(k.err); return false; } if(k.warn && !confirm(k.warn+"\n\nOK = save with this rate · Cancel = go back and correct it")) return false; return true; }
+function fxRateOk(ccy, rate, prev){ const k = fxRateCheck(ccy, rate, prev); if(k.err){ alert(k.err); return false; } if(k.warn && !confirm(k.warn+"\n\nOK = save with this rate · Cancel = go back and correct it")) return false; return true; }
 function poPricePaid(est){
   if(!est) return null;
   const v = Number(est.po_price_value);
@@ -2815,7 +2887,7 @@ function useSessionGate(user, signOut){
       const live = await sessLive(uname); const me = sessId();
       const others = live.filter(r=>r.id!==me);
       if(others.length >= SESS_MAX){ setS({ st:"full", others }); return; }
-      await sessRegister(uname); window.__sessUser = uname; setS({ st:"ok" });
+      await sessRegister(uname); window.__sessUser = uname; try{ salesFxLoad(); }catch(e){} setS({ st:"ok" });
     }catch(e){ if(!sessMissing(e)) console.warn("Session check failed — the app opens anyway", e); window.__sessUser = null; setS({ st:"ok", off:true }); }
   },[uname]);
   useEffect(()=>{ check(); },[check]);
@@ -3841,7 +3913,7 @@ function MenuTabs({ user, active, onChange, onRefresh }) {
     ...(isAdmin ? [{ label:"BOM", subgroups:[ { label:"BOM", tabs:[{key:"bom_form",label:"BOM Entry Form"}] } ]}] : []),
     orderStatusGroup,
     { label:"Order Status", subgroups:[{ label:"Order Status", tabs:[{key:"order_board",label:"Order Status Board"},{key:"os_wo_pending",label:"W/O Release pending"},{key:"os_wo_parked",label:"W/O Engineering / On Hold"},{key:"os_po_awaited",label:"PO awaited — LOI / verbal"},{key:"os_reports",label:"Stage reports (PDF)"},{key:"os_insights",label:"Insights"},{key:"os_delivery",label:"Delivery"},{key:"os_customer_requests",label:"Customer requests"},{key:"os_golive",label:"Confirm delivery dates"},{key:"os_std_days",label:"Standard days & codes"},{key:"os_stale",label:"Stale steps"},{key:"stock_contracts",label:"Stock Contract Register"},{key:"stock_board",label:"Stock Orders"}] }] },   // 2026-10-28T05:00:00Z
-    { label:"QC", subgroups:[{ label:"Registers", tabs:[{key:"qc_serials",label:"Serial Number Register"},{key:"qc_serial_start",label:"Serials at start (switch)"}] }, { label:"Templates", tabs:[{key:"doc_register",label:"Document Number Register"}] }, { label:"Quality", tabs:[{key:"qc_incoming",label:"Incoming inspection"},{key:"qc_rfi",label:"RFI route cards & QC packages"},{key:"qc_owners",label:"QC owners"},{key:"qc_dossiers",label:"Dossiers"}] }] },   // 2026-10-30T16:30:00Z / 349   // 2026-11-22T10:00:00Z
+    { label:"QC", subgroups:[{ label:"Registers", tabs:[{key:"qc_serials",label:"Serial Number Register"},{key:"qc_serial_start",label:"Serials at start (switch)"}] }, { label:"Templates", tabs:[{key:"qc_templates",label:"📋 QC Templates"},{key:"doc_register",label:"Document Number Register"}] }, { label:"Quality", tabs:[{key:"qc_incoming",label:"Incoming inspection"},{key:"qc_rfi",label:"RFI route cards & QC packages"},{key:"qc_owners",label:"QC owners"},{key:"qc_dossiers",label:"Dossiers"}] }] },   // 2026-10-30T16:30:00Z / 349   // 2026-11-22T10:00:00Z
     purchaseGroup,
     storesGroup,
     accountsGroup,
@@ -3886,7 +3958,7 @@ function MenuTabs({ user, active, onChange, onRefresh }) {
   const visibleGroups0 = nonEmpty((isApprovalRole && !isAdmin && !isHrAdmin)
     ? [{ label:"Sales", subgroups:[{ label:"Order Acceptance", tabs:[{key:"sale_order_entry",label:"Order Acceptance"},{key:"wo_pending",label:"W/O Release pending"},{key:"wo_parked",label:"W/O Engineering / On Hold"},{key:"po_awaited",label:"PO awaited — LOI / verbal"},{key:"customer_requests",label:"Customer requests"}] }] },
        ...(isTechHeadRole ? [engGroup, { label:"BOM", subgroups:[ { label:"BOM", tabs:[{key:"bom_form",label:"BOM Entry Form"}] } ]}] : []),   // 235: Technical Head
-       orderStatusGroup, { label:"Order Status", subgroups:[{ label:"Order Status", tabs:[{key:"order_board",label:"Order Status Board"},{key:"os_wo_pending",label:"W/O Release pending"},{key:"os_wo_parked",label:"W/O Engineering / On Hold"},{key:"os_po_awaited",label:"PO awaited — LOI / verbal"},{key:"os_reports",label:"Stage reports (PDF)"},{key:"os_insights",label:"Insights"},{key:"os_delivery",label:"Delivery"},{key:"os_customer_requests",label:"Customer requests"},{key:"os_golive",label:"Confirm delivery dates"},{key:"os_std_days",label:"Standard days & codes"},{key:"os_stale",label:"Stale steps"},{key:"stock_contracts",label:"Stock Contract Register"},{key:"stock_board",label:"Stock Orders"}] }] }, { label:"QC", subgroups:[{ label:"Registers", tabs:[{key:"qc_serials",label:"Serial Number Register"}] }, { label:"Templates", tabs:[{key:"doc_register",label:"Document Number Register"}] }] }, ...(isTechHeadRole ? [purchaseGroup] : []), storesGroup, accountsGroup,
+       orderStatusGroup, { label:"Order Status", subgroups:[{ label:"Order Status", tabs:[{key:"order_board",label:"Order Status Board"},{key:"os_wo_pending",label:"W/O Release pending"},{key:"os_wo_parked",label:"W/O Engineering / On Hold"},{key:"os_po_awaited",label:"PO awaited — LOI / verbal"},{key:"os_reports",label:"Stage reports (PDF)"},{key:"os_insights",label:"Insights"},{key:"os_delivery",label:"Delivery"},{key:"os_customer_requests",label:"Customer requests"},{key:"os_golive",label:"Confirm delivery dates"},{key:"os_std_days",label:"Standard days & codes"},{key:"os_stale",label:"Stale steps"},{key:"stock_contracts",label:"Stock Contract Register"},{key:"stock_board",label:"Stock Orders"}] }] }, { label:"QC", subgroups:[{ label:"Registers", tabs:[{key:"qc_serials",label:"Serial Number Register"}] }, { label:"Templates", tabs:[{key:"qc_templates",label:"📋 QC Templates"},{key:"doc_register",label:"Document Number Register"}] }] }, ...(isTechHeadRole ? [purchaseGroup] : []), storesGroup, accountsGroup,
        tasksGroup,   // 235: all three approval roles have task boards
        { label:"Attendance", tabs:[{key:"att_hub",label:"Attendance"}] },
        ...(isTechHeadRole ? [reportsGroup] : []), setupGroup]   // 129 / 172: approval roles see Order Status, Stores, Accounts
@@ -3925,6 +3997,10 @@ function MenuTabs({ user, active, onChange, onRefresh }) {
     addSub("Accounts", "Billing", { key:"chase_pay", label:"📨 Chase letters — payment" });
     addSub("QC", "Quality", { key:"chase_qc", label:"📨 RFI reminders" });   // 2026-11-25T02:00:00Z   // 2026-11-23T12:00:00Z
     addSub("Order Status", "Kick-off", { key:"kickoff", label:"🤝 Kick-off meetings" });   // 2026-11-18T13:00:00Z
+    { const sees = (k)=> visibleGroups.some(g=>(g.tabs||[]).concat(...(g.subgroups||[]).map(x=>x.tabs||[])).some(t=>t.key===k));   // 2026-11-26T01:30:00Z: Funnel and Offers & Orders also in Quotes › Reports
+      if(sees("crm_funnel")) addSub("Sales", "Quotes", { key:"crm_funnel_q", label:"Funnel" });
+      if(sees("quotes_report")) addSub("Sales", "Quotes", { key:"quotes_report_q", label:"Offers & Orders" });
+      if(sees("quotes_report")){ addSub("Sales", "Quotes", { key:"disc_report", label:"Discounts — quoted vs ordered" }); addSub("CRM", "Funnel", { key:"disc_report_c", label:"Discounts — quoted vs ordered" }); } }   // 2026-11-26T03:30:00Z
     addSub("Accounts", "Billing", { key:"order_flow_acc", label:"⟶ Order flow" });
     addSub("Accounts", "Billing", { key:"os_gateways_acc", label:"🚪 Gateways" });   // 2026-11-21T09:00:00Z
     if(holds("purchase_manager")){ addSub("Purchase", "Procurement", { key:"order_flow_pur", label:"⟶ Order flow" }); addSub("Purchase", "Procurement", { key:"os_gateways_pur", label:"🚪 Gateways" }); }
@@ -10590,7 +10666,8 @@ function Estimator({ user, masterData, sessionCompanyId, sessionCompany, onRefre
     let ccNow = customerCountry; if(customerName.trim() && !String(ccNow||"").trim()){ ccNow = await custCountryByName(customerName); if(ccNow) setCustomerCountry(ccNow); }   // 215: read again — it may have been added in CRM since this screen opened
     if(customerName.trim() && !String(ccNow||"").trim()){fail("This customer has no country on file. Add one in CRM → Customers before continuing — currency and conversion rate depend on it.");return;}
     if(currency!=="INR" && !(Number(conversionRate)>10)){fail("Enter a valid conversion rate (1 "+currency+" = ? INR, must be greater than 10) before saving — required for any non-INR quote.");return;}
-    { const fk = fxRateCheck(currency, conversionRate); if(fk.warn && !confirm(fk.warn+"\n\nOK = save with this rate · Cancel = go back and correct it")){ fail("Check the conversion rate."); return; } }   // 2026-11-08T21:00:00Z
+    { const prevFx = await (async()=>{ try{ const rn = refNumber.trim(), base = rn.replace(/(-Rev-?\d+|-R\d+)$/i,""); const { data } = await sb.from("estimates").select("conversion_rate").in("reference_number",[rn,base]).limit(20); return (data||[]).map(d=>Number(d.conversion_rate)); }catch(e){ return []; } })();
+      const fk = fxRateCheck(currency, conversionRate, prevFx); if(fk.err){ alert(fk.err); fail("Check the conversion rate."); return; } if(fk.warn && !confirm(fk.warn+"\n\nOK = save with this rate · Cancel = go back and correct it")){ fail("Check the conversion rate."); return; } }   // 2026-11-08T21:00:00Z
     if(!(await confirmForeignInr(ccNow||customerCountry, currency))) return;   // 172
     if(effectiveCart.length===0){fail("Add at least one model's lines to the estimate first.");return;}
     const ref=refNumber.trim();
@@ -18624,7 +18701,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
     if(!refFilter) return;
     // 2026-11-08T21:00:00Z: the rate is checked before anything is asked about re-pinning PO prices to it
     { const ccy0 = (headerDraft.currency||"").trim()!=="" ? headerDraft.currency : (quoteHeaderRow?quoteHeaderRow.currency:"INR");
-      if((headerDraft.conversion_rate||"").trim()!=="" && String(ccy0||"INR").toUpperCase()!=="INR" && !fxRateOk(ccy0, headerDraft.conversion_rate)) return; }
+      if((headerDraft.conversion_rate||"").trim()!=="" && String(ccy0||"INR").toUpperCase()!=="INR" && !fxRateOk(ccy0, headerDraft.conversion_rate, quoteHeaderRow?quoteHeaderRow.conversion_rate:null)) return; }
     if(!(await guardCurrencyChange())) return;
     const effCurrency = (headerDraft.currency||"").trim()!=="" ? headerDraft.currency : (quoteHeaderRow?quoteHeaderRow.currency:"INR");
     const currencyChanged = (headerDraft.currency||"").trim()!=="" && headerDraft.currency!==(quoteHeaderRow?quoteHeaderRow.currency:"INR");
@@ -19836,7 +19913,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
     const rate = ccy==="INR" ? 1 : Number(currencyPrompt.rate);
     if(!ccy){ setCurrencyPrompt(c=>({...c,error:"Pick the currency the PO is in."})); return; }
     if(ccy!=="INR" && !(rate>10)){ setCurrencyPrompt(c=>({...c,error:"Enter the rate as 1 "+ccy+" = ? INR (more than 10)."})); return; }
-    { const fk = fxRateCheck(ccy, rate); if(fk.warn && !confirm(fk.warn+"\n\nOK = save with this rate · Cancel = go back and correct it")) return; }   // 2026-11-08T21:00:00Z
+    { const fk = fxRateCheck(ccy, rate, orderFx); if(fk.err){ setCurrencyPrompt(c=>({...c,error:fk.err})); return; } if(fk.warn && !confirm(fk.warn+"\n\nOK = save with this rate · Cancel = go back and correct it")) return; }   // 2026-11-08T21:00:00Z
     setCurrencyPrompt(c=>({...c,saving:true,error:""}));
     try{
       const { error } = await sb.from("estimates").update({currency:ccy, conversion_rate:rate, updated_at:new Date().toISOString()}).eq("reference_number",refFilter);
@@ -22190,6 +22267,7 @@ function SavedEstimates({ autoFile, user, sessionCompany, openTarget, onConsumed
           + (testingMode==="separate" ? ((slTestingAll||[]).reduce((s,l)=>s+moneyVal(toDisp(l.price)),0) + (globalTestingAll||[]).reduce((s,l)=>s+moneyVal(toDisp(l.rate)),0)) : 0);
         return exactPricing ? r2(slNoSum + extrasDisp) : slNoSum + extrasDisp;
       })();
+      qvSavePrinted(quoteExportRef, grandTotalPrinted, quoteCurrency, user);   // 2026-11-26T03:30:00Z: the printed Gross Amount is the quote's value everywhere
 
       // 30 Sep (104) — Annexure II "with extras and taxes" (proforma style).
       // Same rounded figures as the basic summary, then P&F (on basic price,
@@ -29434,13 +29512,14 @@ async function ciCanOpen(user){
 }
 async function ciSafe(fn){ try{ const r = await fn(); return r||[]; }catch(e){ console.warn("Customer Insights read", e); return []; } }
 async function ciLoad(){
+  await salesFxLoad();   // 2026-11-26T03:30:00Z
   const D = { err:"", comps:[], hasParent:false, rw:CI_RW_DEFAULT.map(x=>x.slice()), hasRw:false, unmatched:0 };
   const [comps, enqs, ests, snaps, legacy, sos, reg, regLines, invs, terms, acts] = await Promise.all([
     ciSafe(()=>fetchPaged(()=>sb.from("companies").select("*").order("id"))),
     ciSafe(()=>fetchPaged(()=>sb.from("enquiry_tbl").select("*").order("id"))),
     ciSafe(async()=>{ try{ return await fetchPaged(()=>sb.from("estimates").select("reference_number,customer_name,quote_status,quote_date,created_at,abandoned_flag,item_sl_no,model,description,order_qty,status_reason").order("id")); }
       catch(e){ return await fetchPaged(()=>sb.from("estimates").select("reference_number,customer_name,quote_status,quote_date,created_at,item_sl_no,model,description,order_qty").order("id")); } }),
-    ciSafe(()=>fetchPaged(()=>sb.from("quote_value_snapshot_tbl").select("reference_number,total_value").order("id"))),
+    ciSafe(()=>fetchPaged(()=>sb.from("quote_value_snapshot_tbl").select("*").order("id"))),
     ciSafe(()=>fetchPaged(()=>sb.from("legacy_quotes_tbl").select("reference_number,reference_date,customer_name,quote_status,quote_value,quote_currency,status_reason").order("id"))),
     ciSafe(()=>fetchPaged(()=>sb.from("sale_order_tbl").select("*").order("id"))),
     ciSafe(()=>fetchPaged(()=>sb.from("contract_register_tbl").select("*").order("contract_number"))),
@@ -29473,7 +29552,7 @@ async function ciLoad(){
   let un = 0; const unNames = new Map();
   const miss = (name, ref, value)=>{ un++; const n = String(name||"").trim()||"(no name)"; const u = unNames.get(n) || { name:n, n:0, value:0, refs:[] }; u.n++; u.value += value||0; if(u.refs.length<5) u.refs.push(ref); unNames.set(n, u); };
   enqs.forEach(e=>{ const o = find(e.company_name || e.customer_name); if(!o) return; o.enq.push({ no:e.enquiry_number||"", date:String(e.enquiry_date||e.created_at||"").slice(0,10), status:e.status||"" }); });
-  const snapV = new Map(); snaps.forEach(s=>snapV.set(String(s.reference_number), Number(s.total_value)||0));
+  const snapV = new Map(); snaps.forEach(s=>snapV.set(String(s.reference_number), qvInr(s)||0));   // 2026-11-26T03:30:00Z
   // quotes: one per quote number (all revisions of FS260043, FS260043-R01, -R02 are one quote). It counts in the period it was
   // FIRST SENT; value, stage and customer come from its LATEST revision. A blank stage counts as sent when the quote has a value.
   const revs = new Map();
@@ -37661,6 +37740,8 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"26 Nov 2026", summary:"Built on 2026-11-26T03:30:00Z, on top of 2026-11-26T01:30:00Z. Needs SQL: structure_quote_printed_value_2026-11-26.sql (both companies). 💰 ONE VALUE EVERYWHERE: a quote's value is the Gross Amount (Basic Price) printed on it, in its own currency — kept on the quote's stored-value row each time its PDF is made (quotes not printed since use the stored value). A contract's value is its PO value (PO price × qty). INR is always that value × Sales' latest conversion rate for the currency (the rate on the most recent quote made in it — Sales' rate with its margin, not the Accounts rate; a stray rate more than 10% off the ones before it is ignored unless a second quote confirms it). Used by the Funnel (Graph, Cards, Table), Quotes Report, Quote Status Report, Quote Status Review, Won by Owner, CRM Dashboards, Customer Insights, Contract Register, delivery and Order Progress reports. Quote Status Report / Review spread a quote's value over its Sl Nos by BOM share so they add up to the quote. Won by Owner counts quotes, not Sl Nos. 🔢 ONE RULE FOR COUNTING QUOTES (Funnel, Quote Status Report / Review, Won by Owner): each quote once, at its latest revision SENT — an unsent draft revision no longer pulls a sent quote back to Draft; contract numbers never count. 📊 FUNNEL GRAPH: each bar = quotes that reached that stage or went further (count, value and weighted value alike), so the funnel only narrows; 'now here' shows what sits in the stage today; legacy quotes are left out. 💱 RATE GUARD AT THE QUOTE: a conversion rate more than 10% away from Sales' latest rate for that currency is stopped (the Sales Head post is told); the Sales Head or a Super Admin can save it after a confirm. A quote keeping the rate it already has is never stopped. 📋 QUOTE REGISTER: new Stage and Value columns, read from the quote (latest revision sent). 📉 NEW: Quotes › 📊 Reports › Discounts — quoted vs ordered (also under CRM): Day / Week / Month / Quarter / Year with arrows, quoted vs ordered bars and discount % bars, orders with their lines (quoted unit price vs PO price), by FSE and by customer, Excel / PDF. Quoted = the last revision sent on or before the PO date, line by line for the lines and quantities ordered." },
+  { date:"26 Nov 2026", summary:"Built on 2026-11-26T01:30:00Z, on top of 2026-11-25T17:00:00Z. No SQL. 📋 QC TEMPLATES: QC › Templates › QC Templates shows only the QC formats of the Document Number Register — tiles for Waiting for QC Manager / Live / All, the 29-11-2026 deadline with days left, waiting ones first, find, Excel / PDF, and Open on each, which opens the same editor (header fields, sections, check points, columns, Preview PDF, approve). Same rights as the register: the QC Manager post approves; the QA Engineer post can edit; Super Admins can do both. 📊 Funnel and Offers & Orders now also sit under Quotes › 📊 Reports (they stay under CRM too), for logins that can open them." },
   { date:"25 Nov 2026", summary:"Built on 2026-11-25T17:00:00Z, on top of 2026-11-25T15:30:00Z. Needs SQL: structure_quote_reasons_2026-11-25.sql (both companies). 📊 FUNNEL AS A PICTURE: CRM › Funnel opens on a new Graph view (Graph | Cards | Table at the top right; Cards is the drag board as before). Tiles: Draft (not sent yet, kept outside the funnel), open quotes, open pipeline, weighted pipeline (value × each stage's win % from Setup › Quote stages), win rate by count and by value. The funnel: one bar per open stage from Offer Sent, width by Count / Value INR / Weighted INR, how many are at the next stage or beyond, and how many have sat in that stage over 60 days (amber). Closed outcomes as bars, win rate month by month (last 8 months, by the month closed) and the Lost reasons. Click a stage, a tile or an outcome to see its quotes (oldest in stage first) with Excel / PDF export. The owner, zone, register-tab, search and legacy filters apply to the graph; it adds a quote-date period (this financial year by default). 🏷 LOST / DEFERRED REASONS FROM A MASTER: Setup › Quote stages has a new Reasons section — Admins add, order and retire the reasons for each stage that needs one; a retired reason stays on the quotes that carry it. The reason is marked mandatory (*) in the move box. Lost gains “Not on AVL / vendor list”." },
   { date:"25 Nov 2026", summary:"Built on 2026-11-25T15:30:00Z, on top of 2026-11-25T11:00:00Z. No SQL. 🏭 STORES ISSUES FIXED: Stores › Material Outward › + Issue material said \"No lines found for contract …\" for every OA, so nothing could ever be issued. The screen asked the quote lines for a column (item) that does not exist; the read failed and the error was hidden. It now reads the description instead, and any failed read is shown as it is (\"Could not read the OA lines of … — send this to Bala Boopathy\"), never as \"no lines\". The same column was fixed in the cutting list, the Documents box, the contract status banner and Document Control. 🏷 CONTRACT CLIENT BUILD: a contract number reads Contract – Quote – Client and a quotation number reads Quote – Client in lists, reports, headings and drop-downs — the Material Outward list, Order Status, Despatch / billing lists, Accounts registers, the Serial register, Purchase and QC lists, quote screens (Datasheet, BOM, Pricing, Edit Description, follow-ups) and the Quote# pickers. Every Excel / PDF export of a list does the same in its contract / quote / OA / against columns (value, qty and date columns are left alone)." },
   { date:"25 Nov 2026", summary:"Built on 2026-11-25T11:00:00Z, on top of 2026-11-25T09:00:00Z (also carries the 2026-11-25T10:00:00Z changes). Needs SQL: data_ffs_invoices_one_place_2026-11-25.sql (Flometriq; preview first). 🧾 FFS INVOICES IN ONE PLACE: what went out on an FFS invoice before the app is now read straight from that invoice's own lines in the Invoice & PI Register (each line tagged with its OA Sl No) — the DC balance (+n before the app), the direct-invoice balance and Pending Orders all use it. A bill whose number is already on an app DC is not counted twice. The separate 'shipped before the app' rows are retired for these invoices; older rows still count where the invoice has no tagged lines. FFS invoices stay in the Register as FFS rows — read-only, in books, PDF as a true copy — and are never posted, chased in Ageing or sent for an e-invoice. 💰 AGEING & PIs DUE: the tab 'PIs due by milestone' is now 'PI Due but Not Sent'; the Ageing tab has a 'PI For What' column (Advance, Milestone — name, Final settlement, Retention), on screen and in Excel." },
@@ -44498,6 +44579,27 @@ function UnsavedAsk({ onSave, onDiscard, onStay, what }){
         h("button",{onClick:onSave,style:btnPrimary},"Save"))));
 }
 
+// 2026-11-26T03:30:00Z: the Quote Register shows each quote's Stage and Value — read from the quote itself (latest revision sent),
+// never stored on the register line. Value = the printed Gross Amount in the quote's currency, with INR at Sales' latest rate.
+const QREG_V = { by:null, at:0, p:null }; const QREG_SUBS = new Set();
+async function qregValLoad(force){
+  if(!force && QREG_V.by && Date.now()-QREG_V.at<600000) return QREG_V.by;
+  if(QREG_V.p) return QREG_V.p;
+  QREG_V.p = (async()=>{ const by = new Map();
+    try{ const est = await fetchPaged(()=>sb.from("estimates").select("reference_number,quote_status").order("id")); const L = (est||[]).slice(); qKeepLatestSentInPlace(L);
+      const snaps = await qvLoadAll(); await salesFxLoad();
+      L.forEach(r=>{ const f = qFamily(r.reference_number); if(by.has(f)) return; const sn = snaps.get(String(r.reference_number)); by.set(f,{ ref:r.reference_number, stage:r.quote_status||"Draft", q:qvCcy(sn), inr:qvInr(sn) }); });
+    }catch(e){ console.warn("register values", e); }
+    QREG_V.by = by; QREG_V.at = Date.now(); QREG_V.p = null; QREG_SUBS.forEach(f=>{ try{ f(); }catch(e){} }); return by; })();
+  return QREG_V.p;
+}
+function useQregVal(){ const [,f] = useState(0); useEffect(()=>{ const fn = ()=>f(x=>x+1); QREG_SUBS.add(fn); if(!QREG_V.by) qregValLoad(); return ()=>QREG_SUBS.delete(fn); },[]); }
+function QregStage({ q }){ useQregVal(); const v = QREG_V.by && QREG_V.by.get(qFamily(q)); if(!QREG_V.by) return h("span",{style:{color:colors.mutedLight}},"…"); if(!v) return h("span",{style:{color:colors.mutedLight,fontSize:11}},"no quote yet");
+  const k = stageKind(v.stage); const col = k==="won" ? "#0a7d1c" : k==="lost" ? "#b42318" : k==="parked" ? "#6b6f63" : "#1f4e8c";
+  return h("span",{title:"Stage of "+v.ref,style:{fontSize:11.5,fontWeight:600,color:col}}, v.stage, v.ref!==q && qRevNum(v.ref) ? h("span",{style:{fontWeight:400,color:colors.mutedLight}}," · Rev "+qRevNum(v.ref)) : null); }
+function QregValue({ q }){ useQregVal(); const v = QREG_V.by && QREG_V.by.get(qFamily(q)); if(!QREG_V.by) return h("span",{style:{color:colors.mutedLight}},"…"); if(!v || !v.q) return h("span",{style:{color:colors.mutedLight,fontSize:11}},"—");
+  return h("span",{title:(v.q.printed?"Gross Amount (Basic Price) as printed":"Stored value — exact once the quote is printed again")+(v.inr!=null && v.q.ccy!=="INR" ? " · INR "+fmtR(v.inr)+" at Sales' rate "+salesRate(v.q.ccy) : ""),style:{fontVariantNumeric:"tabular-nums"}},
+    v.q.ccy+" "+fmtR(v.q.value, v.q.ccy), v.q.ccy!=="INR" && v.inr!=null ? h("div",{style:{fontSize:10.5,color:colors.muted}},"INR "+fmtR(v.inr)) : null); }
 // ---- QUOTE REGISTER (Sales -> Enquiry -> Quote Register) ----
 const REG_PAGE = 25;
 const REG_COLS = ["First OfferNo","Offer Date","Enquiry No","EDate","Customer Name","City","State","Country"];
@@ -44824,7 +44926,7 @@ function QuoteRegisterScreen({ user, onOpenQuote, onStartQuote, onOpenCard, gate
       td("ed",h("input",{type:"date",value:d.edate||"",onChange:e=>setD({edate:e.target.value}),style:{...inputStyle,width:135,padding:"4px 6px"}})),
       td("cu",h("div",{style:{minWidth:300}},h(CustomerSelect,{value:d.customer_name,onSelect:pickCustomer,user,compact:true})),
         edit.co ? h("button",{onClick:()=>setCustForm({initial:edit.co}),style:{...btnSmall,marginTop:4,fontSize:11}},"Edit Customer") : null),
-      td("ci",lock(d.city)), td("st",lock(d.state)), td("co",lock(d.country)),
+      td("ci",lock(d.city)), td("st",lock(d.state)), td("co",lock(d.country)), td("sg",""), td("vl",""),
       td("x", perLine
         ? ((edit.orig && edit.orig.line_fse && !me?.canOwner)
             ? h("div",null,h("span",{style:{fontSize:11,color:colors.muted}},"editing"),ownerShow(edit.orig),h("div",{style:{fontSize:10,color:colors.mutedLight}},"owner fixed \u2014 Super Admin / Sales Head can change it"))
@@ -44834,7 +44936,7 @@ function QuoteRegisterScreen({ user, onOpenQuote, onStartQuote, onOpenCard, gate
         h("button",{onClick:save,disabled:busy,style:{...btnPrimary,padding:"5px 10px",fontSize:12}},busy?"Saving…":"Save"),
         h("button",{onClick:()=>guard(()=>{ setEdit(null); setChk({bad:[],warn:[],ok:false}); }),style:{...btnSmall}},"Cancel"))));
   };
-  const chkRow = (key)=> (chk.bad.length || chk.warn.length) ? h("tr",{key},h("td",{colSpan:10,style:{padding:"6px 8px",border:"1px solid #e3e0d4",whiteSpace:"normal"}},
+  const chkRow = (key)=> (chk.bad.length || chk.warn.length) ? h("tr",{key},h("td",{colSpan:12,style:{padding:"6px 8px",border:"1px solid #e3e0d4",whiteSpace:"normal"}},
     chk.bad.length ? h("div",{style:{background:"#fdecea",color:"#a3312a",borderRadius:6,padding:"7px 10px",fontSize:12,marginBottom:chk.warn.length?6:0}},h("b",null,"✖ Can't save: "),chk.bad.map((b,i)=>h("div",{key:i},b))) : null,
     chk.warn.length ? h("div",{style:{background:"#fff4d6",color:"#854f0b",borderRadius:6,padding:"7px 10px",fontSize:12}},h("b",null,"⚠ Check before saving:"),chk.warn.map((b,i)=>h("div",{key:i},b)),
       chk.bad.length ? null : h("label",{style:{display:"flex",gap:6,alignItems:"center",marginTop:5}},h("input",{type:"checkbox",checked:chk.ok,onChange:e=>setChk(c=>({...c,ok:e.target.checked}))}),"I've checked — save anyway")) : null)) : null;
@@ -44844,13 +44946,13 @@ function QuoteRegisterScreen({ user, onOpenQuote, onStartQuote, onOpenCard, gate
   rows.forEach((r,i)=>{
     const mo = r.edate ? String(r.edate).slice(0,7) : "";
     if(mo && mo!==lastMonth && !(q.trim()) && !String(sortBy).startsWith("od")){ lastMonth = mo; const dt = new Date(mo+"-01T00:00:00");
-      body.push(h("tr",{key:"m"+r.id},h("td",{colSpan:10,style:{background:"#eceae0",fontWeight:700,fontSize:11.5,color:colors.muted,padding:"4px 8px",border:"1px solid #e3e0d4"}},dt.toLocaleString("en-GB",{month:"long",year:"numeric"})))); }
+      body.push(h("tr",{key:"m"+r.id},h("td",{colSpan:12,style:{background:"#eceae0",fontWeight:700,fontSize:11.5,color:colors.muted,padding:"4px 8px",border:"1px solid #e3e0d4"}},dt.toLocaleString("en-GB",{month:"long",year:"numeric"})))); }
     if(edit && edit.id===r.id){ body.push(editRow("e"+r.id)); const cr = chkRow("c"+r.id); if(cr) body.push(cr); return; }
     const t = tabs.find(x=>x.tab_name===r.tab_name);
     if(ownEdit && ownEdit.id===r.id){
       body.push(h("tr",{key:r.id,style:{background:"#eef6f2"}},
         td("n",h("b",{style:{color:"#1f4e8c"}},h(QtRef,{q:r.quote_no}))), td("od",dmyOrNote(r.offer_date,r.offer_date_note)), td("en",r.enquiry_no||""), td("ed",dmyOrNote(r.edate,r.edate_note)),
-        td("cu",r.customer_name||""), td("ci",r.city||""), td("st",r.state||""), td("co",r.country||""),
+        td("cu",r.customer_name||""), td("ci",r.city||""), td("st",r.state||""), td("co",r.country||""), td("sg",h(QregStage,{q:r.quote_no})), td("vl",h(QregValue,{q:r.quote_no})),
         td("x",ownerPick(ownEdit.fse, ownEdit.tc, v=>setOwnEdit(o=>({...o,fse:v})), v=>setOwnEdit(o=>({...o,tc:v})), null)),
         td("b",h("div",{style:{display:"flex",gap:5}},h("button",{onClick:saveOwner,disabled:busy,style:{...btnPrimary,padding:"5px 10px",fontSize:12}},busy?"Saving…":"Save owner"),h("button",{onClick:()=>setOwnEdit(null),style:{...btnSmall}},"Cancel")))));
       return;
@@ -44866,7 +44968,7 @@ function QuoteRegisterScreen({ user, onOpenQuote, onStartQuote, onOpenCard, gate
             h("div",null,h("span",{title:tip2,style:{display:"inline-block",marginTop:3,fontSize:10.5,fontWeight:700,borderRadius:9,padding:"1px 8px",cursor:"help",whiteSpace:"nowrap",background:SK.bg,color:SK.fg,border:"1px solid "+SK.fg}},
               SK.icon+" "+SK.label+" \u00b7 "+(r.struck_reason||""))), savedBadge("reg:"+r.id)),
           td("od",h("span",{style:sx2},r.offer_date?fmtDMY(r.offer_date):"")), td("en",h("span",{style:sx2},r.enquiry_no||"")), td("ed",h("span",{style:sx2},r.edate?fmtDMY(r.edate):"")),
-          td("cu",h("span",{style:sx2},r.customer_name||"")), td("ci",h("span",{style:sx2},r.city||"")), td("st",h("span",{style:sx2},r.state||"")), td("co",h("span",{style:sx2},r.country||"")),
+          td("cu",h("span",{style:sx2},r.customer_name||"")), td("ci",h("span",{style:sx2},r.city||"")), td("st",h("span",{style:sx2},r.state||"")), td("co",h("span",{style:sx2},r.country||"")), td("sg",""), td("vl",""),
           td("x",""), td("b", me?.admin && !r.enquiry_id && t && t.is_open ? h("button",{onClick:()=>reopenLine(r),title:"Reopen this number (Admins) — the reason is kept in the log",style:{...btnSmall,fontSize:11}},"\u21ba Reopen") : h("span",{style:{fontSize:11,color:colors.mutedLight}},"closed"))));
         return; }
       const tip = (del?"Deleted":"Number changed to "+(r.moved_to||""))+" by "+(r.struck_by||"")+(r.struck_at?" on "+fmtDMYTime(r.struck_at):"")+" \u2014 "+(r.struck_reason||"");
@@ -44877,7 +44979,7 @@ function QuoteRegisterScreen({ user, onOpenQuote, onStartQuote, onOpenCard, gate
             ...(del?{background:"#fdecea",color:"#a3312a",border:"1px solid #a3312a"}:{background:"#fff4d6",color:"#854f0b",border:"1px solid #854f0b"})}},
             del ? "\ud83d\uddd1 Deleted \u00b7 "+(r.struck_reason||"") : "\u21aa Number changed \u2192 "+(r.moved_to||"")+" \u00b7 "+(r.struck_reason||"")))),
         td("od",h("span",{style:sx},r.offer_date?fmtDMY(r.offer_date):"")), td("en",h("span",{style:sx},r.enquiry_no||"")), td("ed",h("span",{style:sx},r.edate?fmtDMY(r.edate):"")),
-        td("cu",h("span",{style:sx},r.customer_name||"")), td("ci",h("span",{style:sx},r.city||"")), td("st",h("span",{style:sx},r.state||"")), td("co",h("span",{style:sx},r.country||"")),
+        td("cu",h("span",{style:sx},r.customer_name||"")), td("ci",h("span",{style:sx},r.city||"")), td("st",h("span",{style:sx},r.state||"")), td("co",h("span",{style:sx},r.country||"")), td("sg",""), td("vl",""),
         td("x",""), td("b",h("span",{style:{fontSize:11,color:colors.mutedLight}},"struck off"))));
       return;
     }
@@ -44886,7 +44988,7 @@ function QuoteRegisterScreen({ user, onOpenQuote, onStartQuote, onOpenCard, gate
         r.source==="Log Follow-ups" ? h("div",{title:"Added from Log Follow-ups"+(r.created_by?" by "+r.created_by:"")+" — check it and log its enquiry",style:{fontSize:10,color:"#1f5fa8",background:"#e6eef8",borderRadius:8,padding:"0 6px",display:"inline-block",marginTop:2}},"from Log Follow-ups") : null,   // 151
         r.moved_from ? h("div",{title:"This number took over from "+r.moved_from,style:{fontSize:10,color:"#0f6b4f",background:"#e4f3ed",borderRadius:8,padding:"0 6px",display:"inline-block",marginTop:2}},"was "+r.moved_from) : null),   // 155
       td("od",dmyOrNote(r.offer_date,r.offer_date_note)), td("en",r.enquiry_no||""), td("ed",dmyOrNote(r.edate,r.edate_note)),
-      td("cu",r.customer_name||"", rowPerLine ? ownerShow(r) : null), td("ci",r.city||""), td("st",r.state||""), td("co",r.country||""),
+      td("cu",r.customer_name||"", rowPerLine ? ownerShow(r) : null), td("ci",r.city||""), td("st",r.state||""), td("co",r.country||""), td("sg",h(QregStage,{q:r.quote_no})), td("vl",h(QregValue,{q:r.quote_no})),
       td("x", r.enquiry_id
         ? h("button",{"data-t":"reg-enq-pill",onClick:()=>guard(()=>{ setEdit(null); setEnqOpen(r.enquiry_id); }),title:"Open the enquiry",   // 185f: one Edit (on the right); this opens the enquiry
             style:{fontSize:10.5,fontWeight:700,borderRadius:9,padding:"2px 8px",background:"#e4f3ed",color:"#085041",border:"1px solid #b7dcc9",cursor:"pointer"}},"\u2713 "+((enqRows[r.enquiry_id]||{}).enquiry_number||"Enquiry"))
@@ -45055,8 +45157,8 @@ function QuoteRegisterScreen({ user, onOpenQuote, onStartQuote, onOpenCard, gate
         tab ? h("span",{style:{fontWeight:400,color:colors.muted,fontSize:11.5,marginLeft:8}},tab.is_open ? "takes "+regTabDescribe(tab) : "history \u2014 closed for new lines") : null),
       h("div",{style:{overflow:"auto",maxHeight:fs?"calc(calc(100vh / var(--uiz,1)) - 250px)":"calc(calc(100vh / var(--uiz,1)) - 360px)",minHeight:200}},
         h("table",{style:{borderCollapse:"collapse",width:"100%",minWidth:1150}},
-          h("thead",null,h("tr",null,...REG_COLS.map(c=>th(c, c==="Customer Name"?240:undefined)),th("Enquiry"),th(""))),
-          h("tbody",null, body.length ? body : h("tr",null,h("td",{colSpan:10,style:{padding:14,color:colors.mutedLight,fontSize:12.5}},q.trim()?"Nothing matches.":"No lines on this tab yet."))))),
+          h("thead",null,h("tr",null,...REG_COLS.map(c=>th(c, c==="Customer Name"?240:undefined)),th("Stage"),th("Value"),th("Enquiry"),th(""))),
+          h("tbody",null, body.length ? body : h("tr",null,h("td",{colSpan:12,style:{padding:14,color:colors.mutedLight,fontSize:12.5}},q.trim()?"Nothing matches.":"No lines on this tab yet."))))),
       h("div",{style:{display:"flex",gap:8,alignItems:"center",justifyContent:"flex-end",padding:"8px 12px",borderTop:"1px solid "+colors.border,fontSize:12}},
         h("button",{disabled:pg<=0,onClick:()=>guard(()=>setPage(pg-1)),style:{...btnSmall,opacity:pg<=0?0.4:1}},"‹ Previous"),
         h("span",null,"Page "+(pg+1)+" of "+(lastPage+1)),
@@ -50607,6 +50709,19 @@ function qKeepLatestInPlace(...arrs){
   return keep;
 }
 
+// 2026-11-26T03:30:00Z: for counts and values (Funnel, Quote Status Report / Review, Won by Owner): each quote family counts
+// once, at its latest revision that has been SENT (stage other than Draft); a family with only drafts counts at its latest.
+// An unsent Rev-1 never pulls a sent quote back to Draft. Contract numbers are never quotes.
+function qKeepLatestSentInPlace(...arrs){
+  const isDraft = (r)=> String((r && r.quote_status)||"").trim().toLowerCase()==="draft" || !(r && r.quote_status);
+  const fam = new Map();
+  arrs.forEach(a=>(a||[]).forEach(r=>{ if(!r || qIsContractRef(r.reference_number)) return; const f = qFamily(r.reference_number), n = qRevNum(r.reference_number);
+    const o = fam.get(f) || { top:-1, sent:-1 }; o.top = Math.max(o.top, n); if(!isDraft(r)) o.sent = Math.max(o.sent, n); fam.set(f,o); }));
+  const keep = new Set();
+  arrs.forEach(a=>(a||[]).forEach(r=>{ if(!r || qIsContractRef(r.reference_number)) return; const o = fam.get(qFamily(r.reference_number)); const want = o.sent>=0 ? o.sent : o.top; if(qRevNum(r.reference_number)===want) keep.add(r.reference_number); }));
+  arrs.forEach(a=>{ if(!Array.isArray(a)) return; const k = a.filter(r=>r && keep.has(r.reference_number)); a.length = 0; k.forEach(x=>a.push(x)); });
+  return keep;
+}
 // ==== 197: Offers & Orders — period buttons, and the Orders received list (Order Acceptances only) ====
 function qrPeriod(p){   // Monday-to-Sunday weeks, calendar months, financial year from 1 April
   const t = new Date(); t.setHours(12,0,0,0); const iso = d=>toISODate(d);
@@ -51190,8 +51305,8 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters, onOpenContract 
       }
       const fBy = new Map(fresh.map(f=>[f.reference_number,f]));
       setRows(rs=>rs.map(r=>{ const f=fBy.get(r.reference_number); if(!f) return r;
-        return {...r, value_inr:Number(f.total_value)||0, value_ccy:Number(f.total_value_in_currency ?? f.total_value)||0,
-          currency:f.currency||r.currency, value_stale:!!f.is_stale}; }));
+        const qc = qvCcy(f)||{}; return {...r, value_inr:qvInr(f), value_ccy:qc.value ?? null,
+          currency:qc.ccy||f.currency||r.currency, value_stale:!!f.is_stale}; }));
     } finally { setValueJob(null); }
   };
   const valueRunRef = useRef(false);
@@ -51478,6 +51593,7 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters, onOpenContract 
       // opened since snapshots began has no value yet, and says so.
       const snaps = await fetchPaged(()=>sb.from("quote_value_snapshot_tbl")
         .select("*").order("reference_number"));   // * so a database without is_stale yet still loads
+      await salesFxLoad();   // 2026-11-26T03:30:00Z
       const snapByRef = new Map(snaps.map(sn=>[sn.reference_number,sn]));
       const latestActByRef = new Map();
       (acts||[]).forEach(a=>{ if(a.chase_reference && !latestActByRef.has(a.chase_reference)) latestActByRef.set(a.chase_reference,a); });
@@ -51518,10 +51634,10 @@ function QuotesReportScreen({ user, onOpenQuote, initialFilters, onOpenContract 
           followup_stage: stageText(act)||"—",
           last_interaction: act ? { date:(act.activity_date||act.created_at||"").slice(0,10), type:act.activity_type||"", by:act.logged_by||"",
             whom:act.contacted_whom||"", text:(act.notes&&String(act.notes).trim()) ? act.notes : (act.discussed_what||"") }   /* 22 Sep: the notes — what was said; the stage has its own column */ : null,
-          value_inr: snapByRef.has(h.reference_number) ? Number(snapByRef.get(h.reference_number).total_value)||0 : null,
-          value_ccy: snapByRef.has(h.reference_number) ? Number(snapByRef.get(h.reference_number).total_value_in_currency ?? snapByRef.get(h.reference_number).total_value)||0 : null,
-          currency: (snapByRef.get(h.reference_number)||{}).currency || h.currency || "INR",
-          fx_to_inr: Number(h.conversion_rate)||null,
+          value_inr: snapByRef.has(h.reference_number) ? qvInr(snapByRef.get(h.reference_number)) : null,   // 2026-11-26T03:30:00Z: printed Gross Amount × Sales' latest rate
+          value_ccy: snapByRef.has(h.reference_number) ? ((qvCcy(snapByRef.get(h.reference_number))||{}).value ?? null) : null,
+          currency: (qvCcy(snapByRef.get(h.reference_number))||{}).ccy || (snapByRef.get(h.reference_number)||{}).currency || h.currency || "INR",
+          fx_to_inr: salesRate((qvCcy(snapByRef.get(h.reference_number))||{}).ccy || h.currency) || Number(h.conversion_rate)||null,
           value_stale: !!(snapByRef.get(h.reference_number)||{}).is_stale,
           next_followup: act?.next_followup_date||"—",
           last_updated: lastUpdated(h),
@@ -52197,7 +52313,8 @@ function CrmDashboardsScreen({ user, onDrillToQuotesReport, onOpenQuote, onGoToT
       // opened since that feature shipped) just shows no value rather
       // than a wrong/guessed one.
       const snaps = await fetchPaged(()=>sb.from("quote_value_snapshot_tbl").select("*").order("reference_number"));
-      const valueByRef = new Map((snaps||[]).map(s=>[s.reference_number,Number(s.total_value)||0]));
+      await salesFxLoad();
+      const valueByRef = new Map((snaps||[]).map(s=>[s.reference_number,qvInr(s)||0]));   // 2026-11-26T03:30:00Z
       // 22 Sep — values the database has marked out of date since they were
       // worked out, and quotes with no value at all, so the cards can say
       // how far to trust their totals.
@@ -52483,7 +52600,8 @@ function CrmFunnelGraph({ cards, statuses, reasons, onCards }){
   const now = new Date(); const fyStart = (now.getMonth()>=3 ? now.getFullYear() : now.getFullYear()-1)+"-04-01";
   const ld = (ms)=>{ const d = new Date(ms); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); };
   const from = period==="fy" ? fyStart : period==="90" ? ld(Date.now()-90*864e5) : period==="365" ? ld(Date.now()-365*864e5) : "";
-  const C = cards.filter(c=>!from || (funDate(c) && funDate(c)>=from));
+  useSalesFx();
+  const C = cards.filter(c=>!c.is_legacy && !qIsContractRef(c.reference_number)).filter(c=>!from || (funDate(c) && funDate(c)>=from));   // 2026-11-26T03:30:00Z: legacy quotes are left out of the graph
   const isDraft = (s)=> String(s||"").trim().toLowerCase()==="draft";
   const openSt = statuses.filter(s=>!isClosedStage(s) && !isDraft(s));
   const wonSt = statuses.filter(s=>stageKind(s)==="won"), lostSt = statuses.filter(s=>stageKind(s)==="lost"), parkSt = statuses.filter(s=>stageKind(s)==="parked");
@@ -52494,8 +52612,12 @@ function CrmFunnelGraph({ cards, statuses, reasons, onCards }){
   const st = openSt.map((s,i)=>{ const L = grp(s); return { s, i, L, n:L.length, v:sum(L), w:winp(s), wv:sum(L)*winp(s)/100, stuck:L.filter(c=>(funDays(c)||0)>FUN_STUCK_DAYS).length }; });
   const wonL = C.filter(c=>wonSt.includes(c.quote_status)), lostL = C.filter(c=>lostSt.includes(c.quote_status));
   const draftL = C.filter(c=>isDraft(c.quote_status));
-  st.forEach((x,i)=>{ x.reach = st.slice(i).reduce((a,y)=>a+y.n,0) + wonL.length; });
-  const meas = (x)=> mode==="cnt" ? x.n : mode==="val" ? x.v : x.wv;
+  // 2026-11-26T03:30:00Z: every bar = quotes that REACHED this stage or went further (now at a later open stage, or Won) — the
+  // same rule for count, value and weighted value, so a bar is never wider than the one above. Won counts at 100%.
+  const wonV0 = sum(wonL);
+  st.forEach((x,i)=>{ const later = st.slice(i); x.reach = later.reduce((a,y)=>a+y.n,0) + wonL.length; x.reachV = later.reduce((a,y)=>a+y.v,0) + wonV0; x.reachW = later.reduce((a,y)=>a+y.wv,0) + wonV0; });
+  const meas = (x)=> mode==="cnt" ? x.reach : mode==="val" ? x.reachV : x.reachW;
+  const noVal = C.filter(c=>c.noValue).length;
   const cr = (x)=> "₹"+(x/1e7).toFixed(2)+" Cr";
   const fmtM = (x)=> mode==="cnt" ? x.toLocaleString("en-IN")+" quotes" : cr(x);
   const openN = st.reduce((a,x)=>a+x.n,0), openV = st.reduce((a,x)=>a+x.v,0), openW = st.reduce((a,x)=>a+x.wv,0);
@@ -52507,22 +52629,22 @@ function CrmFunnelGraph({ cards, statuses, reasons, onCards }){
   const svgH = Math.max(60, st.length*(H+G));
   const bars = st.map((x,i)=>{ const w = Math.max(MINW, MW*meas(x)/max), y = 6+i*(H+G), col = FUN_COLORS[Math.min(i, FUN_COLORS.length-1)], light = i===0, inside = w>110;
     return h("g",{key:x.s,"data-testid":"fun-stage",style:{cursor:"pointer"},onClick:()=>setPick(x.s)},
-      h("title",null, x.s+" — "+x.n+" quotes · INR "+fmtR(x.v)+" · win "+x.w+"% → weighted INR "+fmtR(x.wv)+" · "+x.stuck+" over "+FUN_STUCK_DAYS+" days"),
+      h("title",null, x.s+" — reached this stage or beyond: "+x.reach+" quotes · INR "+fmtR(x.reachV)+". Sitting here now: "+x.n+" · INR "+fmtR(x.v)+" · win "+x.w+"% → weighted INR "+fmtR(x.wv)+" · "+x.stuck+" over "+FUN_STUCK_DAYS+" days"),
       h("rect",{x:0,y:y-4,width:860,height:H+8,fill: pick===x.s ? "#f1f6fd" : "transparent"}),
       h("text",{x:200,y:y+20,textAnchor:"end",fontSize:12.5,fontWeight:700,fill:colors.text}, x.s),
       h("text",{x:200,y:y+36,textAnchor:"end",fontSize:11,fill:colors.muted}, "win "+x.w+"%"),
       h("rect",{x:CX-w/2,y,width:w,height:H,rx:4,fill:col}),
       inside ? h("text",{x:CX,y:y+29,textAnchor:"middle",fontSize:12.5,fontWeight:600,fill: light ? "#0e3d7e" : "#fff"}, fmtM(meas(x)))
              : h("text",{x:CX+w/2+6,y:y+29,fontSize:12,fill:colors.text}, fmtM(meas(x))),
-      h("text",{x:665,y:y+20,fontSize:12,fill:colors.text}, x.n+" · "+cr(x.v)),
+      h("text",{x:665,y:y+20,fontSize:12,fill:colors.text}, "now here: "+x.n+" · "+cr(x.v)),
       h("text",{x:665,y:y+36,fontSize:11.5,fontWeight:600,fill: x.stuck ? "#a8720f" : colors.mutedLight}, x.stuck+" over "+FUN_STUCK_DAYS+" days"),
-      i<st.length-1 ? h("text",{x:CX,y:y+H+14,textAnchor:"middle",fontSize:10.5,fill:colors.muted}, "↓ "+(x.reach ? Math.round(st[i+1].reach/x.reach*100) : 0)+"% are at "+st[i+1].s+" or beyond") : null); });
+      i<st.length-1 ? h("text",{x:CX,y:y+H+14,textAnchor:"middle",fontSize:10.5,fill:colors.muted}, "↓ "+(x.reach ? Math.round(st[i+1].reach/x.reach*100) : 0)+"% went on to "+st[i+1].s) : null); });
   // closed outcomes
   const outs = [...wonSt.map(s=>({ s, L:grp(s), c:"#0aac23", i:"✓" })), ...lostSt.map(s=>({ s, L:grp(s), c:"#dc3c3d", i:"✕" })), ...parkSt.map(s=>({ s, L:grp(s), c:"#9a9d8f", i:"–" }))];
   const oMax = Math.max(1, ...outs.map(o=>mode==="cnt" ? o.L.length : sum(o.L)));
   // win rate by month — last 8 months, by the month the quote was closed (all dates, same filters)
   const months = []; for(let k=7;k>=0;k--){ const d = new Date(now.getFullYear(), now.getMonth()-k, 1); months.push(d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")); }
-  const closedIn = (m, kinds)=> cards.filter(c=>kinds.includes(stageKind(c.quote_status)) && String(c.status_changed_at||"").slice(0,7)===m).length;
+  const closedIn = (m, kinds)=> cards.filter(c=>!c.is_legacy && kinds.includes(stageKind(c.quote_status)) && String(c.status_changed_at||"").slice(0,7)===m).length;
   const wr = months.map(m=>{ const w = closedIn(m,["won"]), l = closedIn(m,["lost"]); return { m, w, l, r: (w+l) ? w/(w+l)*100 : null }; });
   const wx = (i)=> 40+i*52, wy = (v)=> 120-(v)*0.95;
   const pts = wr.map((x,i)=>x.r==null?null:[wx(i), wy(x.r), x]).filter(Boolean);
@@ -52551,7 +52673,7 @@ function CrmFunnelGraph({ cards, statuses, reasons, onCards }){
       h("div",{style:panel},
         h("div",{style:{fontWeight:700,fontSize:13,marginBottom:6}},"Open funnel — "+(openSt[0]||"")+" onwards · click a stage to see its quotes"),
         st.length ? h("svg",{viewBox:"0 0 860 "+svgH,width:"100%",role:"img","aria-label":"Quote funnel by stage"}, bars) : h("div",{style:{color:colors.muted,fontSize:12.5}},"No open stages."),
-        h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:6}},"Width = the measure picked above. Win % comes from Setup › Quote stages — change it there and the funnel follows. “At the next stage or beyond” counts quotes now at a later open stage or Won. Amber = quotes in that stage over "+FUN_STUCK_DAYS+" days (since they moved there). Legacy quotes count but carry no value.")),
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:6}},"Each bar = quotes that reached that stage or went further (a later stage, or Won), by the measure picked above — so the funnel only narrows. “Now here” = quotes sitting in that stage today. Value = the Gross Amount printed on each quote (latest revision sent), in INR at Sales’ latest rates ("+salesRatesTxt()+"). Win % from Setup › Quote stages. Amber = in that stage over "+FUN_STUCK_DAYS+" days. Legacy quotes are left out."+(noVal ? " "+noVal+" quote"+(noVal===1?" has":"s have")+" no stored value yet — counted, value 0." : ""))),
       h("div",{style:panel},
         h("div",{style:{fontWeight:700,fontSize:13,marginBottom:6}},"Closed outcomes"),
         h("div",{style:{display:"grid",gridTemplateColumns:"auto 1fr auto",gap:"6px 10px",alignItems:"center"}},
@@ -52588,6 +52710,159 @@ function CrmFunnelGraph({ cards, statuses, reasons, onCards }){
         pickL.length>60 ? h("div",{style:{fontSize:12,color:colors.muted,alignSelf:"center"}},"… and "+(pickL.length-60)+" more — Export Excel for the full list.") : null,
         !pickL.length ? h("div",{style:{fontSize:12,color:colors.muted}},"No quotes in this stage for these filters.") : null) : null));
 }
+// ===================== 2026-11-26T03:30:00Z: DISCOUNTS — QUOTED vs ORDERED =====================
+// For every Order Acceptance: what was quoted for the lines that were ordered vs what the PO pays.
+// Quoted = the last revision of the quote SENT on or before the PO date; its printed Gross Amount spread over its Sl Nos (by
+// their BOM share), giving a quoted unit price per Sl No; × the PO quantity. Ordered = the PO unit price × PO quantity
+// (the order's PO value when lines carry no PO price). Lines are matched by Sl No; a PO line not on the quote is "not quoted"
+// and stays out of the %. Both sides in INR at Sales' latest rates. Dated by the PO date.
+function ctPoValue(es){   // a contract's PO value from its lines: { value, ccy } in the PO currency (INR if lines differ)
+  const L = (es||[]).map(e=>({ e, p:poPricePaid(e) })).filter(x=>x.p); if(!L.length) return null;
+  const cs = Array.from(new Set(L.map(x=>String(x.p.currency||"INR").toUpperCase())));
+  const qty = (e)=> Math.max(0,(Number(e.order_qty)||0)-(Number(e.cancelled_qty)||0)) || Number(e.order_qty) || 0;
+  if(cs.length===1) return { value:L.reduce((a,x)=>a+x.p.value*qty(x.e),0), ccy:cs[0] };
+  return { value:L.reduce((a,x)=>a+x.p.value*qty(x.e)*(salesRate(x.p.currency)||0),0), ccy:"INR" };
+}
+function discPeriodKey(d, per){ const x = new Date(d+"T12:00:00"); if(isNaN(x)) return null; const y = x.getFullYear(), m = x.getMonth();
+  if(per==="D") return d; if(per==="M") return y+"-"+String(m+1).padStart(2,"0");
+  if(per==="Y"){ const fy = m>=3 ? y : y-1; return "FY"+fy; }
+  if(per==="Q"){ const fy = m>=3 ? y : y-1; const q = Math.floor(((m+9)%12)/3)+1; return "FY"+fy+"-Q"+q; }
+  const mon = new Date(x); mon.setDate(x.getDate()-((x.getDay()+6)%7)); return toISODate(mon); }
+function discBuckets(per, off){ const t = new Date(); t.setHours(12,0,0,0); const out = [];
+  const N = per==="D" ? 7 : per==="W" ? 8 : per==="M" ? 6 : per==="Q" ? 4 : 5;
+  for(let i=N-1;i>=0;i--){ const k = i+off*N; let d = new Date(t);
+    if(per==="D") d.setDate(t.getDate()-k); else if(per==="W") d.setDate(t.getDate()-7*k); else if(per==="M") d = new Date(t.getFullYear(), t.getMonth()-k, 15);
+    else if(per==="Q") d = new Date(t.getFullYear(), t.getMonth()-3*k, 15); else d = new Date(t.getFullYear()-k, t.getMonth(), 15);
+    out.push(discPeriodKey(toISODate(d), per)); }
+  return Array.from(new Set(out)); }
+function discLabel(k, per){ const MN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  if(per==="M"){ return MN[Number(k.slice(5))-1]+" "+k.slice(2,4); } if(per==="D") return fmtDMY(k).slice(0,5); if(per==="W") return "Wk "+fmtDMY(k).slice(0,5);
+  if(per==="Y"){ const y = Number(k.slice(2)); return "FY "+String(y).slice(2)+"-"+String(y+1).slice(2); } if(per==="Q"){ const y = Number(k.slice(2,6)); return k.slice(-2)+" FY"+String(y).slice(2)+"-"+String(y+1).slice(2); } return k; }
+async function discLoad(){
+  await salesFxLoad();
+  const sos = await fetchPaged(()=>sb.from("sale_order_tbl").select("*").order("contract_number"));
+  const live = (sos||[]).filter(o=>!/cancel/i.test(String(o.status||"")) && o.quote_reference_number);
+  const cns = live.map(o=>String(o.contract_number));
+  const oaLines = []; for(let i=0;i<cns.length;i+=150){ const { data } = await sb.from("estimates").select("reference_number,item_sl_no,order_qty,cancelled_qty,description,model,po_sales_price,po_price_value,po_price_currency,po_price_fx,company_id").in("reference_number",cns.slice(i,i+150)); oaLines.push(...(data||[])); }
+  const heads = await fetchPaged(()=>sb.from("estimates").select("reference_number,item_sl_no,order_qty,quote_status,quote_date,created_at").order("id"));
+  const famRows = new Map(); (heads||[]).forEach(r=>{ if(qIsContractRef(r.reference_number)) return; const f = qFamily(r.reference_number); if(!famRows.has(f)) famRows.set(f,[]); famRows.get(f).push(r); });
+  const cos = await fetchPaged(()=>sb.from("companies").select("id,company_name,owner_employee_name").order("id")).catch(()=>[]);
+  const coById = new Map((cos||[]).map(c=>[c.id,c])); const coByName = new Map((cos||[]).map(c=>[String(c.company_name||"").trim().toLowerCase(),c]));
+  // pick the quote revision for each order
+  const pick = new Map();
+  live.forEach(o=>{ const poD = toISODate(o.basis_date || o.oa_issued_on || o.created_at) || ""; const rows = famRows.get(qFamily(o.quote_reference_number))||[];
+    const sent = rows.filter(r=>String(r.quote_status||"").toLowerCase()!=="draft" && (!poD || !String(r.quote_date||r.created_at||"").slice(0,10) || String(r.quote_date||r.created_at||"").slice(0,10)<=poD));
+    const best = (sent.length?sent:rows).reduce((b,r)=> !b || qRevNum(r.reference_number)>qRevNum(b.reference_number) ? r : b, null);
+    pick.set(String(o.contract_number), best ? best.reference_number : o.quote_reference_number); });
+  const qrefs = Array.from(new Set(Array.from(pick.values())));
+  const qLines = []; for(let i=0;i<qrefs.length;i+=150){ const d = await fetchPaged(()=>sb.from("estimate_lines").select("reference_number,item_sl_no,sales_price").in("reference_number",qrefs.slice(i,i+150)).order("id")); qLines.push(...(d||[])); }
+  const snaps = await qvLoad(qrefs);
+  const qSl = new Map();   // quote ref → Map(sl → {unitCcy, ccy, qty})
+  qrefs.forEach(ref=>{ const rows = (heads||[]).filter(r=>r.reference_number===ref); const sn = snaps.get(String(ref)); const qc = qvCcy(sn); if(!qc || !rows.length) return;
+    const raw = (r)=> qLines.filter(l=>l.reference_number===ref && l.item_sl_no===r.item_sl_no).reduce((a,l)=>a+(Number(l.sales_price)||0)*(Number(r.order_qty)||1),0);
+    const tot = rows.reduce((a,r)=>a+raw(r),0); const m = new Map();
+    rows.forEach(r=>{ const share = tot>0 ? qc.value*raw(r)/tot : qc.value/rows.length; const q = Number(r.order_qty)||1; m.set(Number(r.item_sl_no), { unit:share/q, ccy:qc.ccy, qty:q }); });
+    qSl.set(ref, m); });
+  const out = [];
+  live.forEach(o=>{ const cn = String(o.contract_number); const qref = pick.get(cn); const m = qSl.get(qref); const ls = oaLines.filter(l=>String(l.reference_number)===cn);
+    const poD = toISODate(o.basis_date || o.oa_issued_on || o.created_at) || "";
+    const co = (ls[0] && ls[0].company_id && coById.get(ls[0].company_id)) || coByName.get(String(o.customer_name||"").trim().toLowerCase()) || {};
+    let qInr = 0, oInr = 0, matched = 0, notQuoted = 0, noPo = 0; const lines = [];
+    ls.forEach(l=>{ const q = Math.max(0,(Number(l.order_qty)||0)-(Number(l.cancelled_qty)||0)) || Number(l.order_qty) || 0; const p = poPricePaid(l); const qs = m && m.get(Number(l.item_sl_no));
+      const ln = { sl:l.item_sl_no, d:[l.description,l.model].filter(Boolean).join(" · "), qty:q, quoted:qs?{unit:qs.unit,ccy:qs.ccy}:null, po:p?{unit:p.value,ccy:String(p.currency||"INR").toUpperCase()}:null };
+      lines.push(ln);
+      if(!qs){ notQuoted++; return; } if(!p){ noPo++; return; }
+      const qr = salesRate(qs.ccy), pr = salesRate(ln.po.ccy); if(!qr || !pr) return;
+      qInr += qs.unit*q*qr; oInr += p.value*q*pr; matched++; });
+    // no PO prices on the lines: the whole order's PO value against what was quoted for the ordered lines
+    if(!matched && m && Number(o.basis_value)>0){ const pr = salesRate(o.basis_currency||"INR"); let qq = 0;
+      ls.forEach(l=>{ const qs = m.get(Number(l.item_sl_no)); const q = Math.max(0,(Number(l.order_qty)||0)-(Number(l.cancelled_qty)||0)) || Number(l.order_qty)||0; if(qs && salesRate(qs.ccy)) qq += qs.unit*q*salesRate(qs.ccy); });
+      if(qq>0 && pr){ qInr = qq; oInr = Number(o.basis_value)*pr; matched = ls.length; } }
+    out.push({ cn, quote:qref, quoteOrig:o.quote_reference_number, client:o.customer_name||"", fse:co.owner_employee_name||"Unassigned", poDate:poD, qInr, oInr, matched, notQuoted, noPo, lines, noQuoteValue:!m });
+  });
+  return out;
+}
+function DiscountReportScreen({ user, onOpenContract }){
+  useSalesFx();
+  const [rows,setRows] = useState(null); const [per,setPer] = useState("M"); const [off,setOff] = useState(0); const [fse,setFse] = useState(""); const [cust,setCust] = useState(""); const [open,setOpen] = useState(null);
+  useEffect(()=>{ discLoad().then(setRows).catch(e=>{ console.warn(e); setRows([]); }); },[]);
+  if(rows===null) return h("div",{style:{padding:20,color:colors.muted}},"Loading orders and their quotes…");
+  const keys = discBuckets(per, off); const kset = new Set(keys);
+  const R = rows.filter(r=>r.poDate && kset.has(discPeriodKey(r.poDate, per)) && (!fse || r.fse===fse) && (!cust || r.client===cust));
+  const ok = R.filter(r=>r.matched && r.qInr>0);
+  const qT = ok.reduce((a,r)=>a+r.qInr,0), oT = ok.reduce((a,r)=>a+r.oInr,0);
+  const pct = (q,o)=> q>0 ? (q-o)/q*100 : null;
+  const by = keys.map(k=>{ const L = ok.filter(r=>discPeriodKey(r.poDate,per)===k); const q = L.reduce((a,r)=>a+r.qInr,0), o = L.reduce((a,r)=>a+r.oInr,0); return { k, q, o, d:pct(q,o), n:L.length }; });
+  const cr = (x)=> "₹"+(x/1e7).toFixed(2)+" Cr";
+  const tile = (l,v,sub)=> h("div",{style:{background:"#fff",border:"1px solid "+colors.border,borderRadius:8,padding:"9px 12px"}}, h("div",{style:{fontSize:10.5,color:colors.muted,textTransform:"uppercase",letterSpacing:.4}},l), h("div",{style:{fontSize:20,fontWeight:700,marginTop:2}},v), h("div",{style:{fontSize:11,color:colors.muted}},sub));
+  const panel = { background:"#fff", border:"1px solid "+colors.border, borderRadius:8, padding:"12px 14px" };
+  const seg = (opts,cur,set)=> h("span",{style:{display:"inline-flex"}}, opts.map(([k,l],i)=>h("button",{key:k,onClick:()=>set(k),style:{...btnSmall,borderRadius:i===0?"6px 0 0 6px":i===opts.length-1?"0 6px 6px 0":0,marginLeft:i?-1:0,...(cur===k?{background:"#0c447c",color:"#ffd84d",borderColor:"#0c447c",fontWeight:600}:{})}},l)));
+  // bars
+  const maxQ = Math.max(1, ...by.map(b=>Math.max(b.q,b.o))); const W = 760, H0 = 200, X0 = 60, step = (W-X0-10)/Math.max(1,by.length), bw = Math.min(34, step/2.6);
+  const ticks = [0,0.25,0.5,0.75,1].map(f=>f*maxQ);
+  const barsSvg = h("svg",{viewBox:"0 0 "+W+" 250",width:"100%",role:"img","aria-label":"Quoted vs ordered by period"},
+    ticks.map((v,i)=>h("g",{key:i}, h("line",{x1:X0-6,x2:W-6,y1:220-v/maxQ*H0,y2:220-v/maxQ*H0,stroke:"#eeece4"}), h("text",{x:X0-10,y:224-v/maxQ*H0,textAnchor:"end",fontSize:10,fill:colors.muted}, cr(v)))),
+    by.map((b,i)=>{ const x = X0+8+i*step; return h("g",{key:b.k},
+      h("rect",{x,y:220-b.q/maxQ*H0,width:bw,height:b.q/maxQ*H0,rx:3,fill:"#84b9f3"}, h("title",null, discLabel(b.k,per)+" — quoted INR "+fmtR(b.q)+" ("+b.n+" orders)")),
+      h("rect",{x:x+bw+3,y:220-b.o/maxQ*H0,width:bw,height:b.o/maxQ*H0,rx:3,fill:"#1b64be"}, h("title",null, discLabel(b.k,per)+" — ordered INR "+fmtR(b.o))),
+      h("text",{x:x+bw+1.5,y:238,textAnchor:"middle",fontSize:10.5,fill:colors.muted}, discLabel(b.k,per))); }));
+  const maxP = Math.max(5, ...by.map(b=>Math.abs(b.d||0))); const P0 = 40, pstep = (420-P0-10)/Math.max(1,by.length), pbw = Math.min(30, pstep*0.6);
+  const pctSvg = h("svg",{viewBox:"0 0 420 250",width:"100%",role:"img","aria-label":"Discount percent by period"},
+    [0, maxP/2, maxP].map((v,i)=>h("g",{key:i}, h("line",{x1:P0-6,x2:414,y1:220-v/maxP*H0,y2:220-v/maxP*H0,stroke:"#eeece4"}), h("text",{x:P0-10,y:224-v/maxP*H0,textAnchor:"end",fontSize:10,fill:colors.muted}, v.toFixed(0)+"%"))),
+    by.map((b,i)=>{ const x = P0+6+i*pstep; const d = b.d||0; const hh = Math.abs(d)/maxP*H0; return h("g",{key:b.k},
+      b.d==null ? null : h("rect",{x,y:d>=0?220-hh:220,width:pbw,height:hh,rx:3,fill:d>=0?"#c2410c":"#0aac23"}, h("title",null, discLabel(b.k,per)+": "+d.toFixed(1)+"%")),
+      b.d==null ? null : h("text",{x:x+pbw/2,y:d>=0?214-hh:234,textAnchor:"middle",fontSize:10,fill:colors.text}, d.toFixed(1)+"%"),
+      h("text",{x:x+pbw/2,y:246,textAnchor:"middle",fontSize:10,fill:colors.muted}, discLabel(b.k,per))); }));
+  const grp = (key)=>{ const m = new Map(); ok.forEach(r=>{ const k = r[key]||"—"; const o = m.get(k)||{ k, n:0, q:0, o:0 }; o.n++; o.q+=r.qInr; o.o+=r.oInr; m.set(k,o); }); return Array.from(m.values()).map(x=>({ ...x, d:pct(x.q,x.o) })); };
+  const byF = grp("fse").sort((a,b)=>b.o-a.o), byC = grp("client").sort((a,b)=>(b.d||0)-(a.d||0)).slice(0,8);
+  const fses = Array.from(new Set(rows.map(r=>r.fse))).sort(), custs = Array.from(new Set(rows.map(r=>r.client))).filter(Boolean).sort();
+  const th = (t,r)=>h("th",{style:{textAlign:r?"right":"left",padding:"5px 8px",fontSize:11,color:colors.muted,background:"#faf9f4",borderBottom:"1px solid "+colors.border}},t);
+  const td = (t,r,st)=>h("td",{style:{textAlign:r?"right":"left",padding:"5px 8px",fontSize:12.5,borderBottom:"1px solid "+colors.border,fontVariantNumeric:r?"tabular-nums":undefined,...(st||{})}},t);
+  const dTxt = (d)=> d==null ? "—" : d.toFixed(1)+"%"; const dSt = (d)=> d!=null && d>=10 ? {color:"#c2410c",fontWeight:700} : null;
+  const cols = [{label:"Contract",get:r=>r.cn},{label:"Quote (revision compared)",get:r=>r.quote},{label:"Customer",get:r=>r.client},{label:"FSE",get:r=>r.fse},{label:"PO date",get:r=>r.poDate?fmtDMY(r.poDate):""},
+    {label:"Quoted INR",get:r=>Math.round(r.qInr)},{label:"Ordered INR",get:r=>Math.round(r.oInr)},{label:"Discount %",get:r=>{ const d = pct(r.qInr,r.oInr); return d==null?"":Number(d.toFixed(1)); }},{label:"Lines compared",get:r=>r.matched},{label:"Not quoted",get:r=>r.notQuoted},{label:"No PO price",get:r=>r.noPo}];
+  const left = R.filter(r=>!(r.matched && r.qInr>0));
+  return h("div",{"data-testid":"disc-report",style:{padding:"16px 20px"}},
+    h("div",{style:{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:10}},
+      h("h2",{style:{margin:0,fontSize:20}},"Discounts — quoted vs ordered"), h("span",{style:{flex:1}}), h(ExportButtons,{ title:"Discounts — quoted vs ordered", columns:cols, rows:R, filenameBase:"Discounts" })),
+    h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginBottom:8}},
+      seg([["D","Day"],["W","Week"],["M","Month"],["Q","Quarter"],["Y","Year"]], per, (k)=>{ setPer(k); setOff(0); }),
+      h("button",{onClick:()=>setOff(o=>o+1),style:btnSmall},"◀"), h("b",null, discLabel(keys[0],per)+" – "+discLabel(keys[keys.length-1],per)), h("button",{disabled:off===0,onClick:()=>setOff(o=>Math.max(0,o-1)),style:btnSmall},"▶"),
+      h("select",{value:fse,onChange:e=>setFse(e.target.value),style:{...inputStyle,width:"auto",padding:"5px 8px",fontSize:12}}, h("option",{value:""},"All FSEs"), fses.map(f=>h("option",{key:f,value:f},f))),
+      h("select",{value:cust,onChange:e=>setCust(e.target.value),style:{...inputStyle,width:"auto",padding:"5px 8px",fontSize:12,maxWidth:260}}, h("option",{value:""},"All customers"), custs.map(c=>h("option",{key:c,value:c},c)))),
+    h("div",{style:{background:"#fff",border:"1px dashed #c9c4b3",borderRadius:8,padding:"6px 12px",fontSize:12,color:colors.muted,marginBottom:10}},
+      "INR at Sales’ latest conversion rates — the rate on the most recent quote in that currency (Sales’ rate with its margin, not the Accounts rate): ", h("b",{style:{color:colors.text}}, salesRatesTxt()||"INR only"), ". Quoted and ordered use the same rates, so currency never shows as discount."),
+    h("div",{style:{display:"grid",gridTemplateColumns:"repeat(5,minmax(0,1fr))",gap:10,marginBottom:12}},
+      tile("Orders", String(ok.length), R.length>ok.length ? (R.length-ok.length)+" more can’t be compared (below)" : "in these periods"),
+      tile("Quoted (ordered lines)", cr(qT), "last revision sent before the PO"), tile("Ordered (PO value)", cr(oT), "PO price × PO qty"),
+      tile("Discount", cr(qT-oT), "quoted − ordered"), tile("Discount %", dTxt(pct(qT,oT)), "weighted by value")),
+    h("div",{style:{display:"grid",gridTemplateColumns:"minmax(0,1.5fr) minmax(0,1fr)",gap:12,marginBottom:12}},
+      h("div",{style:panel}, h("div",{style:{fontWeight:700,fontSize:13}},"Quoted vs ordered (INR)"),
+        h("div",{style:{fontSize:11.5,color:colors.muted,margin:"3px 0"}}, h("span",{style:{display:"inline-block",width:10,height:10,background:"#84b9f3",borderRadius:2,marginRight:4}}),"Quoted  ", h("span",{style:{display:"inline-block",width:10,height:10,background:"#1b64be",borderRadius:2,margin:"0 4px 0 10px"}}),"Ordered"), barsSvg),
+      h("div",{style:panel}, h("div",{style:{fontWeight:700,fontSize:13}},"Discount %"), h("div",{style:{fontSize:11.5,color:colors.muted,margin:"3px 0"}},"(quoted − ordered) ÷ quoted; green = ordered above quote"), pctSvg)),
+    h("div",{style:{display:"grid",gridTemplateColumns:"minmax(0,1.5fr) minmax(0,1fr)",gap:12}},
+      h("div",{style:panel}, h("div",{style:{fontWeight:700,fontSize:13,marginBottom:6}},"Orders — click a row for its lines"),
+        h("table",{style:{borderCollapse:"collapse",width:"100%"}}, h("tbody",null,
+          h("tr",null, th("Contract – Quote – Client"), th("PO date"), th("Quoted",1), th("Ordered",1), th("Discount",1)),
+          ok.slice().sort((a,b)=>String(b.poDate).localeCompare(String(a.poDate))).map(r=>[
+            h("tr",{key:r.cn,onClick:()=>setOpen(open===r.cn?null:r.cn),style:{cursor:"pointer"}}, td(h("span",null,h("b",null,r.cn)," ",h("span",{style:{color:colors.muted,fontSize:11.5}},"– "+r.quote+" – "+r.client))), td(r.poDate?fmtDMY(r.poDate):""), td(fmtR(r.qInr),1), td(fmtR(r.oInr),1), td(dTxt(pct(r.qInr,r.oInr)),1,dSt(pct(r.qInr,r.oInr)))),
+            open===r.cn ? h("tr",{key:r.cn+"l"}, h("td",{colSpan:5,style:{background:"#fbfaf6",padding:"6px 10px",fontSize:12}},
+              r.lines.map(l=>h("div",{key:l.sl}, "Sl "+l.sl+" · "+(l.d||"")+" · qty "+l.qty+": ",
+                l.quoted ? "quoted "+l.quoted.ccy+" "+fmtR(l.quoted.unit,l.quoted.ccy) : h("i",null,"not quoted"), " → ",
+                l.po ? "PO "+l.po.ccy+" "+fmtR(l.po.unit,l.po.ccy) : h("i",null,"no PO price"),
+                l.quoted && l.po && l.quoted.ccy===l.po.ccy && l.quoted.unit>0 ? h("b",{style:{marginLeft:6,color:(l.quoted.unit-l.po.unit)/l.quoted.unit>=0.1?"#c2410c":colors.text}}," ("+(-(l.quoted.unit-l.po.unit)/l.quoted.unit*100).toFixed(1)+"%)") : null)),
+              onOpenContract ? h("button",{onClick:()=>onOpenContract(r.cn),style:{...btnSmall,marginTop:6}},"Open the contract") : null)) : null]),
+          !ok.length ? h("tr",null,h("td",{colSpan:5,style:{padding:10,color:colors.muted}},"No orders to compare in these periods.")) : null)),
+        left.length ? h("div",{style:{fontSize:12,color:colors.muted,marginTop:8}}, left.length+" order"+(left.length===1?"":"s")+" can’t be compared yet: "+left.slice(0,12).map(r=>r.cn+(r.noQuoteValue?" (quote has no stored value)":r.noPo?" (no PO price)":" (lines don’t match the quote)")).join(", ")+(left.length>12?" …":"")+".") : null,
+        h("div",{style:{fontSize:11.5,color:colors.muted,marginTop:6}},"Quoted = the quote’s printed Gross Amount spread over its Sl Nos (by their BOM share) → a quoted unit price per Sl No, × the PO quantity. Lines not ordered don’t count, so a part order never shows as a false discount. A PO line not on the quote is “not quoted” and stays out of the %.")),
+      h("div",{style:panel},
+        h("div",{style:{fontWeight:700,fontSize:13,marginBottom:6}},"By FSE"),
+        h("table",{style:{borderCollapse:"collapse",width:"100%"}}, h("tbody",null, h("tr",null, th("FSE"), th("Orders",1), th("Ordered",1), th("Discount %",1)),
+          byF.map(x=>h("tr",{key:x.k}, td(x.k), td(x.n,1), td(cr(x.o),1), td(dTxt(x.d),1,dSt(x.d)))))),
+        h("div",{style:{fontWeight:700,fontSize:13,margin:"14px 0 6px"}},"By customer — highest discounts"),
+        h("table",{style:{borderCollapse:"collapse",width:"100%"}}, h("tbody",null, h("tr",null, th("Customer"), th("Orders",1), th("Discount %",1)),
+          byC.map(x=>h("tr",{key:x.k}, td(x.k), td(x.n,1), td(dTxt(x.d),1,dSt(x.d)))))))));
+}
 function CrmFunnelKanban({ user }){
   const [statuses,setStatuses] = useState([]);
   const [cards,setCards] = useState([]); // [{id, reference_number, item_sl_no, customer_name, description, quote_status, totalValue, status_changed_by, status_changed_at, is_legacy, owner, zone, nature}]
@@ -52622,10 +52897,9 @@ function CrmFunnelKanban({ user }){
       fetchPaged(()=>sb.from("legacy_quotes_tbl").select("id,reference_number,customer_name,quote_status,quote_nature,status_changed_by,status_changed_at,reference_date").order("id")).then(data=>({data})),
     ]);
     try{ const oc = await fetchPaged(()=>sb.from("quote_outcomes").select("reference_number,lost_reason")); const m = {}; (oc||[]).forEach(o=>{ if(o.lost_reason) m[o.reference_number] = o.lost_reason; }); setReasons(m); }catch(e){}
-    qKeepLatestInPlace(estimatesRows, legacyRows);   // 141: a quote and its revisions are one card — the latest revision
+    qKeepLatestSentInPlace(estimatesRows); qKeepLatestInPlace(legacyRows);   // 2026-11-26T03:30:00Z: latest SENT revision; contracts never
     const refNums = Array.from(new Set((estimatesRows||[]).map(r=>r.reference_number)));
-    let linesRows = [];
-    for(let k=0;k<refNums.length;k+=150) linesRows = linesRows.concat(await fetchPaged(()=>sb.from("estimate_lines").select("id,reference_number,item_sl_no,sales_price").in("reference_number",refNums.slice(k,k+150)).order("id")));
+    await salesFxLoad(); const snapsQ = await qvLoad(refNums);   // 2026-11-26T03:30:00Z: the printed Gross Amount × Sales' latest rate
     // One card per Quote#, not per Sl No — status, customer, and
     // description are shared across every Sl No now, and showing the same
     // quote as several identical cards would just be clutter. Value sums
@@ -52636,13 +52910,8 @@ function CrmFunnelKanban({ user }){
       byQuote.get(est.reference_number).slNoCount++;
     });
     const liveOut = Array.from(byQuote.values()).map(est=>{
-      const totalValue = (linesRows||[])
-        .filter(l=>l.reference_number===est.reference_number)
-        .reduce((s,l)=>{
-          const parentEst = (estimatesRows||[]).find(e=>e.reference_number===l.reference_number && e.item_sl_no===l.item_sl_no);
-          return s+(Number(l.sales_price)||0)*((parentEst&&parentEst.order_qty)||1);
-        },0);
-      return { ...est, totalValue, is_legacy:false };
+      const sn = snapsQ.get(String(est.reference_number)); const v = qvInr(sn); const qc = qvCcy(sn);
+      return { ...est, totalValue: v||0, noValue: v==null, valueCcy: qc ? qc.value : null, valueCurrency: qc ? qc.ccy : null, is_legacy:false };
     });
     const legacyOut = (legacyRows||[]).map(l=>({ ...l, item_sl_no:null, totalValue:null, is_legacy:true }));
     const allCards = liveOut.concat(legacyOut);
@@ -52842,17 +53111,18 @@ function QuoteStatusReport(){
 
   const load = useCallback(async(status)=>{
     setLoading(true);
-    const { data: estimatesRows } = await sb.from("estimates").select("*").eq("quote_status",status).order("reference_number");
+    const { data: estimatesRows0 } = await sb.from("estimates").select("*").eq("quote_status",status).order("reference_number");
+    const estimatesRows = (estimatesRows0||[]).slice(); qKeepLatestSentInPlace(estimatesRows);   // 2026-11-26T03:30:00Z: one rule for counting quotes
     const refNums = Array.from(new Set((estimatesRows||[]).map(r=>r.reference_number)));
     const { data: linesRows } = refNums.length
       ? await sb.from("estimate_lines").select("reference_number,item_sl_no,sales_price").in("reference_number",refNums)
       : { data: [] };
-    const out = (estimatesRows||[]).map(est=>{
-      // Total Value is always INR — sales_price is stored in INR regardless
-      // of the quote's display currency, so no conversion happens here.
-      const totalValue = (linesRows||[])
-        .filter(l=>l.reference_number===est.reference_number && l.item_sl_no===est.item_sl_no)
-        .reduce((s,l)=>s+(Number(l.sales_price)||0)*(est.order_qty||1),0);
+    await salesFxLoad(); const snapsQ = await qvLoad(refNums);
+    // 2026-11-26T03:30:00Z: the quote's value is its printed Gross Amount in INR at Sales' latest rate, shared over its Sl Nos
+    const rawSl = (est)=> (linesRows||[]).filter(l=>l.reference_number===est.reference_number && l.item_sl_no===est.item_sl_no).reduce((s,l)=>s+(Number(l.sales_price)||0)*(est.order_qty||1),0);
+    const spread = qvSpread(estimatesRows||[], rawSl, snapsQ);
+    const out = spread.map(est=>{
+      const totalValue = est.totalValue;
       return {
         reference_number: est.reference_number, item_sl_no: est.item_sl_no,
         customer_name: est.customer_name||"—", description: est.description||"—",
@@ -52954,16 +53224,17 @@ function QuoteStatusReview({ user }){
       fetchPaged(()=>sb.from("companies").select("id,company_name,zone,billing_state,billing_city,owner_employee_name").order("id")).then(data=>({data}))
     ]);
     const coById = new Map((coRows||[]).map(c=>[c.id,c]));
-    qKeepLatestInPlace(estRows);   // 141: latest revision of each quote only
+    qKeepLatestSentInPlace(estRows);   // 2026-11-26T03:30:00Z: latest SENT revision of each quote; contracts never
     const refNums = Array.from(new Set((estRows||[]).map(r=>r.reference_number)));
+    await salesFxLoad(); const snapsQ = await qvLoad(refNums);
     let lineRows = [];
     for(let k=0;k<refNums.length;k+=150) lineRows = lineRows.concat(await fetchPaged(()=>sb.from("estimate_lines").select("id,reference_number,item_sl_no,sales_price").in("reference_number",refNums.slice(k,k+150)).order("id")));
     const now = Date.now();
     await regLoad(); const regMap = REG.tabs.length ? await regQuoteTabMap() : null;   // 137
+    const valBy = new Map(qvSpread(estRows||[], (e)=>(lineRows||[]).filter(l=>l.reference_number===e.reference_number && l.item_sl_no===e.item_sl_no).reduce((s,l)=>s+(Number(l.sales_price)||0)*(e.order_qty||1),0), snapsQ).map(r=>[r.reference_number+"|"+r.item_sl_no, r.totalValue]));
     const out = (estRows||[]).map(est=>{
       const co = est.company_id ? coById.get(est.company_id) : null;
-      const totalValue = (lineRows||[]).filter(l=>l.reference_number===est.reference_number && l.item_sl_no===est.item_sl_no)
-        .reduce((s,l)=>s+(Number(l.sales_price)||0)*(est.order_qty||1),0);
+      const totalValue = valBy.get(est.reference_number+"|"+est.item_sl_no)||0;   // 2026-11-26T03:30:00Z: printed Gross Amount share
       const changedAt = est.status_changed_at ? new Date(est.status_changed_at) : null;
       const daysInStatus = changedAt ? Math.floor((now-changedAt.getTime())/86400000) : null;
       return {
@@ -53922,19 +54193,18 @@ function WonByOwnerReport(){
     ]);
     setStatuses((allStatusRows||[]).map(r=>r.status).filter(Boolean));
     const coById = new Map((coRows||[]).map(c=>[c.id,c]));
-    qKeepLatestInPlace(estRows);   // 141: latest revision of each quote only
+    qKeepLatestSentInPlace(estRows);   // 2026-11-26T03:30:00Z: latest SENT revision; contracts never
     const won = (estRows||[]).filter(e=>statusesToUse.includes(e.quote_status));
     const refNums = Array.from(new Set(won.map(r=>r.reference_number)));
-    const { data:lineRows } = refNums.length
-      ? await sb.from("estimate_lines").select("reference_number,item_sl_no,sales_price").in("reference_number",refNums)
-      : { data: [] };
+    await salesFxLoad(); const snapsQ = await qvLoad(refNums);   // 2026-11-26T03:30:00Z: printed Gross Amount × Sales' latest rate
     const byOwner = new Map(); const byTab = new Map();
     await regLoad(); const regMap = REG.tabs.length ? await regQuoteTabMap() : null;   // 137
+    const seenQ = new Set();
     won.forEach(est=>{
       const co = est.company_id ? coById.get(est.company_id) : null;
       const owner = (co && co.owner_employee_name) ? co.owner_employee_name : "Unassigned";
-      const value = (lineRows||[]).filter(l=>l.reference_number===est.reference_number && l.item_sl_no===est.item_sl_no)
-        .reduce((s,l)=>s+(Number(l.sales_price)||0)*(est.order_qty||1),0);
+      if(seenQ.has(est.reference_number)) return; seenQ.add(est.reference_number);   // 2026-11-26T03:30:00Z: one quote counts once, at its whole value
+      const value = qvInr(snapsQ.get(String(est.reference_number)))||0;
       if(!byOwner.has(owner)) byOwner.set(owner,{owner,count:0,value:0});
       const rec = byOwner.get(owner); rec.count+=1; rec.value+=value;
       const tn = regTabLabel(regTabOfQuote(regMap, est.reference_number)) || "(not on the register)";
@@ -61724,6 +61994,7 @@ function App() {
 
   const _mLv = (user && user.role!=="super_admin") ? modTabLevel(tab) : "";   // 2026-10-30T08:00:00Z: Rights Grid wins over the department rule
   const _codeTab = tab==="authorization_codes" || tab==="deletion_codes";   // 2026-10-30T12:00:00Z: every admin makes codes
+  try{ window.__fxMe = user ? { role:user.role, name:user.employee_name||user.username||"" } : null; }catch(e){}   // 2026-11-26T03:30:00Z: for the rate guard
   const uTab = _codeTab && user && user.role!=="super_admin" && isCodeAdmin(user) ? { ...user, role:"admin", baseRole:user.role } : _mLv ? modUserFor(tab, user) : accessUserFor(tab, user);
   let accTabMode = _codeTab ? (isCodeAdmin(user) ? "full" : "none") : _mLv ? (_mLv==="none" ? "none" : "full") : accessMenuMode(accessTabMenu(tab)); void accTick;
   if(tab==="po_register" && window.__poAll && accTabMode==="none") accTabMode = "view";   // 301
@@ -62001,6 +62272,7 @@ function App() {
     tab==="gaps_dashboard"?h(GapsChaseDashboard,{user:uTab,onGoTo:goToEntityLookup}):
     tab==="crm_funnel"?h(CrmFunnelKanban,{user:uTab}):
     tab==="quotes_report"?h(QuotesReportScreen,{user:uTab,initialFilters:dashboardDrillFilters,onOpenContract:openContract,onOpenQuote:(ref,slNo)=>{setCameFromQuotesReport(true); setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}}):
+    tab==="quotes_report_q"?h(QuotesReportScreen,{user:uTab,initialFilters:dashboardDrillFilters,onOpenContract:openContract,onOpenQuote:(ref,slNo)=>{setCameFromQuotesReport(true); setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");}}):
     tab==="crm_dashboards"?h(CrmDashboardsScreen,{user:uTab,onDrillToQuotesReport:(f)=>{setDashboardDrillFilters(f); setTab("quotes_report");},onOpenQuote:(ref,slNo)=>{setQuoteToOpen({reference_number:ref,item_sl_no:slNo});setTab("saved");},onGoToTab:setTab}):
     tab==="bom_form"?h(BomEntryForm,{onGoToTab:setTab,user:uTab}):
     tab==="customer_bulk_upload"?h(CustomerBulkUpload,{user:uTab}):
@@ -62016,6 +62288,9 @@ function App() {
     tab==="tour"?h(TourScreen,null):
     tab==="training"?h(TrainingScreen,{user:uTab,onGoToTab:setTab}):
     tab==="doc_register"?h(DocRegisterScreen,{user:uTab}):
+    tab==="qc_templates"?h(QcTemplatesScreen,{user:uTab}):   // 2026-11-26T01:30:00Z
+    tab==="crm_funnel_q"?h(CrmFunnelKanban,{user:uTab}):
+    (tab==="disc_report"||tab==="disc_report_c")?h(DiscountReportScreen,{user:uTab,onOpenContract:openContract}):   // 2026-11-26T03:30:00Z   // 2026-11-26T01:30:00Z: also under Quotes › Reports
     tab==="qc_owners"?h(QcOwnersScreen,{user:uTab}):   // 2026-11-22T10:00:00Z
     tab==="buy_rules"?h(BuyRulesScreen,{user:uTab}):   // 2026-11-22T17:30:00Z
     tab==="stk_earmark"?h(EarmarkScreen,{user:uTab}):   // 2026-11-23T10:00:00Z
@@ -67308,6 +67583,60 @@ function DregBadge({ s, due }){
   const st = s==="approved" ? ["#dcfce7","#166534","Approved"] : s==="retired" ? ["#f3f4f6","#6b7280","Retired"] : late ? ["#fee2e2","#991b1b","Under review — overdue"] : s==="Issued" ? ["#dcfce7","#166534","Issued"] : s==="Superseded" ? ["#f3f4f6","#6b7280","Superseded"] : s==="Cancelled" ? ["#fee2e2","#991b1b","Cancelled"] : ["#ffedd5","#9a3412","Under review"];
   return h("span",{style:{padding:"2px 8px",borderRadius:10,fontSize:11,fontWeight:700,background:st[0],color:st[1],whiteSpace:"nowrap"}}, st[2]);
 }
+// 2026-11-26T01:30:00Z: QC › QC Templates — only the QC formats of the Document Number Register, the ones waiting for the
+// QC Manager first, each opened in the same format editor (edit, preview PDF, approve). Same rights as the register.
+const QC_TPL_DUE = "2026-11-29";
+function QcTemplatesScreen({ user }){
+  const [fmts,setFmts] = useState(null); const [open,setOpen] = useState(null); const [me,setMe] = useState({ me:"", keys:[] });
+  const [show,setShow] = useState("waiting"); const [q,setQ] = useState("");
+  const isSA = !!(user && user.role==="super_admin");
+  const load = async()=>{ const { data, error } = await sb.from("doc_format_tbl").select("format_no,doc_key,title,grp,kind,owner_post,series_key,current_rev,status,review_due,updated_by,updated_at").order("format_no");
+    if(error){ setFmts(false); return; } setFmts(data||[]); DREG.at = 0; };
+  useEffect(()=>{ load(); myPostKeys(user).then(setMe).catch(()=>{}); loadPostPeople(); },[]);
+  if(fmts===null) return h("div",{style:{padding:20,color:colors.muted}},"Loading QC templates…");
+  if(fmts===false) return h("div",{style:{padding:20}}, "The Document Number Register is not set up yet — run ", h("b",null,DREG_SQL), ".");
+  const prefix = (()=>{ const f = fmts.find(x=>/^[A-Z]+-/.test(x.format_no||"")); return f ? f.format_no.split("-")[0] : ""; })();
+  const canEdit = (g, owner)=> isSA || me.keys.includes(DREG_GROUP_POST[g]) || (owner && me.keys.includes(owner)) || (g==="QC" && me.keys.includes("qa_engineer"));
+  const canApprove = (g)=> isSA || me.keys.includes(DREG_GROUP_POST[g]);
+  const qcAll = fmts.filter(f=>f.grp==="QC");
+  const waiting = qcAll.filter(f=>f.status==="under_review"), live = qcAll.filter(f=>f.status==="approved"), other = qcAll.filter(f=>f.status!=="under_review" && f.status!=="approved");
+  const today = dregToday();
+  const dueTxt = (()=>{ const d = Math.round((new Date(QC_TPL_DUE+"T12:00:00") - new Date(today+"T12:00:00"))/864e5);
+    return d>1 ? d+" days left" : d===1 ? "1 day left" : d===0 ? "due today" : "overdue by "+(-d)+" day"+(d===-1?"":"s"); })();
+  const qq = String(q||"").trim().toLowerCase();
+  const L = (show==="waiting" ? waiting : show==="live" ? live : qcAll).filter(f=>!qq || (f.format_no+" "+f.title+" "+(f.kind||"")).toLowerCase().includes(qq))
+    .slice().sort((a,b)=> (a.status==="under_review"?0:1)-(b.status==="under_review"?0:1) || String(a.format_no).localeCompare(String(b.format_no)));
+  const mgr = postPersonText(DREG_GROUP_POST.QC);
+  const pill = (k,l,n,bg,fg)=>h("button",{"data-testid":"qct-show-"+k,onClick:()=>setShow(k),style:{padding:"8px 14px",borderRadius:8,cursor:"pointer",border:"2px solid "+(show===k?fg:"transparent"),background:bg,color:fg,fontWeight:700,fontSize:13}}, l+" ", h("span",{style:{fontSize:18,marginLeft:4}},n));
+  const th = (t,r)=>h("th",{style:{textAlign:r?"right":"left",padding:"6px 8px",background:"#f1f5f9",fontSize:12,borderBottom:"1px solid #e5e7eb",whiteSpace:"nowrap"}},t);
+  const td = (t,mono)=>h("td",{style:{padding:"6px 8px",borderBottom:"1px solid #f1f5f9",fontSize:12.5,fontFamily:mono?"Consolas,monospace":undefined,verticalAlign:"middle"}},t);
+  const cols = [{label:"Document Number",get:f=>f.format_no},{label:"Title",get:f=>f.title},{label:"Kind",get:f=>f.kind||""},{label:"Rev",get:f=>dregRevTxt(f.current_rev)},
+    {label:"Status",get:f=>f.status==="under_review"?"Waiting for QC Manager":f.status==="approved"?"Live":f.status},{label:"Review by",get:f=>f.review_due?fmtDMY(f.review_due):""},{label:"Last changed by",get:f=>f.updated_by||""},{label:"Last changed",get:f=>f.updated_at?fmtDMY(f.updated_at):""}];
+  return h("div",{"data-testid":"qc-templates",style:{padding:"16px 20px"}},
+    h("div",{style:{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}},
+      h("h2",{style:{margin:0,fontSize:20}},"QC Templates"),
+      h("span",{style:{fontSize:12.5,color:colors.muted}},"The QC formats (reports, checklists, registers) the app fills in. Approved by the QC Manager post — ",h("b",null,mgr),"."),
+      h("span",{style:{flex:1}}), h(ExportButtons,{ title:"QC Templates", columns:cols, rows:L, filenameBase:"QC_Templates" }), h("button",{onClick:load,style:btnSmall},"↻ Refresh")),
+    h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center",margin:"14px 0 10px"}},
+      pill("waiting","⏳ Waiting for QC Manager",waiting.length,"#fff4d6","#8a5a00"),
+      pill("live","✓ Live",live.length,"#dcfce7","#166534"),
+      pill("all","All QC templates",qcAll.length,"#eef2ff","#3730a3"),
+      waiting.length ? h("span",{"data-testid":"qct-due",style:{fontSize:13,fontWeight:600,color: today>QC_TPL_DUE ? "#991b1b" : "#8a5a00"}},"Check and approve by "+fmtDMY(QC_TPL_DUE)+" — "+dueTxt) : h("span",{style:{fontSize:13,color:"#166534",fontWeight:600}},"All QC templates are approved."),
+      h("span",{style:{flex:1}}),
+      h("input",{value:q,onChange:e=>setQ(e.target.value),placeholder:"Find number or title…",style:{...inputStyle,width:220}})),
+    h("div",{style:{fontSize:12,color:colors.muted,marginBottom:8}},"Open a template to correct its header fields, sections, check points and columns, see it with Preview PDF, and approve it. A template waiting for approval still works in the app; once approved it goes live, and any later change makes the next revision with its history kept."),
+    other.length && show!=="all" ? h("div",{style:{fontSize:12,color:colors.muted,marginBottom:6}}, other.length+" retired / other — see All.") : null,
+    h("div",{style:{overflowX:"auto",border:"1px solid #e5e7eb",borderRadius:8}},
+      h("table",{style:{borderCollapse:"collapse",width:"100%"}},
+        h("thead",null,h("tr",null, th("Document Number"), th("Title"), th("Kind"), th("Rev"), th("Status"), th("Last changed"), th(""))),
+        h("tbody",null, L.map(f=>h("tr",{key:f.format_no,"data-testid":"qct-row",style:{background:f.status==="under_review"?"#fffdf5":"#fff"}},
+          td(f.format_no,true), td(f.title), td(f.kind||""), td(dregRevTxt(f.current_rev)), td(h(DregBadge,{s:f.status,due:f.review_due})),
+          td((f.updated_by?f.updated_by+" · ":"")+(f.updated_at?fmtDMY(f.updated_at):"")),
+          td(h("button",{"data-testid":"qct-open",onClick:()=>setOpen(f),style:{...btnSmall,background:"#0c447c",color:"#ffd84d",borderColor:"#0c447c",fontWeight:600}}, f.status==="under_review" && canApprove(f.grp) ? "Open · check & approve" : "Open")))),
+          !L.length ? h("tr",null,h("td",{colSpan:7,style:{padding:14,color:colors.muted,fontSize:13}}, show==="waiting" ? "Nothing waiting — every QC template is approved." : "No QC templates found.")) : null))),
+    !canEdit("QC") ? h("div",{style:{fontSize:11.5,color:colors.mutedLight,marginTop:8}},"You can look at the templates. Changing them is for the QC Manager post ("+mgr+"), the QA Engineer post, or a Super Admin ("+saNamesTxt()+").") : null,
+    open ? h(DregFormatModal,{ f0:open, user, prefix, canEdit:canEdit(open.grp, open.owner_post), canApprove:canApprove(open.grp), isSA, onClose:()=>setOpen(null), onChanged:()=>{ load(); } }) : null);
+}
 function DocRegisterScreen({ user }){
   const [tab,setTabS] = useState(()=>{ try{ return localStorage.getItem("dreg_tab")||"docs"; }catch(e){ return "docs"; } });
   const setTab = (t)=>{ setTabS(t); try{ localStorage.setItem("dreg_tab",t); }catch(e){} };
@@ -70278,11 +70607,11 @@ const RPT_HOME = [
   ["chase_all",["Order Status"]],
   ["om_pend",["Order Status"]], ["om_desp",["Order Status"]], ["om_coll",["Order Status"]], ["om_ahead",["Order Status"]], ["om_dash",["Order Status"]],
   // CRM
-  ["crm_dashboards",["CRM"]], ["crm_funnel",["CRM"]], ["quotes_report",["CRM"]], ["customer_insights",["CRM"]], ["gaps_dashboard",["CRM"]],
+  ["crm_dashboards",["CRM"]], ["crm_funnel",["CRM"]], ["quotes_report",["CRM"]], ["disc_report_c",["CRM"]], ["customer_insights",["CRM"]], ["gaps_dashboard",["CRM"]],
   ["followup_log",["CRM"]], ["reports_overdue_calls",["CRM"]], ["reports_overdue_followups",["CRM"]], ["reports_missed_entries",["CRM"]], ["reports_pending_validation",["CRM"]],
   // Sales (Quotes)
   ["reports_quotes",["Sales"],"Quotes report"], ["reports_quote_status",["Sales"]], ["reports_quote_status_review",["Sales"]], ["reports_won_by_owner",["Sales"]],
-  ["reports_status_history",["Sales"]], ["reports",["Sales"]], ["reports_item_coverage",["Sales"]], ["my_orders_flow",["Sales"]],
+  ["reports_status_history",["Sales"]], ["reports",["Sales"]], ["reports_item_coverage",["Sales"]], ["my_orders_flow",["Sales"]], ["crm_funnel_q",["Sales"]], ["quotes_report_q",["Sales"]], ["disc_report",["Sales"]],
   // Document Control
   ["doc_report",["Document Control"]], ["reports_document_register",["Document Control"]],
   // Purchase
@@ -85050,8 +85379,8 @@ const PA_LINK_RE = /^https:\/\/(drive\.google\.com|docs\.google\.com|1drv\.ms|on
 async function ospPoValue(cn){
   try{ const { data: so } = await sb.from("sale_order_tbl").select("quote_reference_number").eq("contract_number",String(cn)).maybeSingle();
     const q = so && so.quote_reference_number; if(!q) return null;
-    const { data: f } = await sb.from("quote_value_snapshot_tbl").select("total_value").eq("reference_number",q).maybeSingle();
-    const v = f && Number(f.total_value); return v>0 ? v : null; }catch(e){ return null; }
+    const { data: f } = await sb.from("quote_value_snapshot_tbl").select("*").eq("reference_number",q).maybeSingle(); await salesFxLoad();
+    const v = f && qvInr(f); return v>0 ? v : null; }catch(e){ return null; }
 }
 async function ospPaSend(cn, user, a){
   const by = user?.username||""; let me = ""; try{ me = await despMe(user); }catch(e){}
@@ -87731,7 +88060,7 @@ async function delLoadAll(){
   let lots = []; try{ const r = await sb.from("so_lot_tbl").select("contract_number,status,shipped_at").limit(5000); lots = r.data||[]; }catch(e){}
   let reqs = []; try{ const r = await sb.from("customer_request_tbl").select("*").order("id",{ascending:false}).limit(2000); if(!r.error) reqs = r.data||[]; }catch(e){}
   const refs = Array.from(new Set((sos||[]).map(s=>s.quote_reference_number).filter(Boolean))); const val = {};
-  for(let i=0;i<refs.length;i+=150){ try{ const { data } = await sb.from("quote_value_snapshot_tbl").select("reference_number,total_value").in("reference_number",refs.slice(i,i+150)); (data||[]).forEach(v=>{ val[v.reference_number] = Number(v.total_value)||0; }); }catch(e){} }
+  for(let i=0;i<refs.length;i+=150){ try{ const { data } = await sb.from("quote_value_snapshot_tbl").select("*").in("reference_number",refs.slice(i,i+150)); await salesFxLoad(); (data||[]).forEach(v=>{ val[v.reference_number] = qvInr(v)||0; }); }catch(e){} }
   // contracts on hold or anticipated with no date in docDeliveryLoad still belong on the dashboard
   const seen = new Set(base.map(b=>String(b.ct)));
   Object.values(dvBy).forEach(v=>{ const cn = String(v.contract_number); if(seen.has(cn)) return; const so = soBy[cn]; if(!so || /cancel|closed/i.test(so.status||"")) return;
@@ -88083,13 +88412,14 @@ async function oprLoad(){
   try{ await osInvLoad(dcs); }catch(e){}   // 344: lots on 12A / 12B
   let est = []; for(let i=0;i<cns.length;i+=150){ try{ const r = await sb.from("estimates").select("reference_number,item_sl_no,order_qty").in("reference_number",cns.slice(i,i+150)); est = est.concat(r.data||[]); }catch(e){} }
   const qrefs = Array.from(new Set(cns.map(cn=>(M.so.get(cn)||{}).quote_reference_number).filter(Boolean)));
-  let vals = []; for(let i=0;i<qrefs.length;i+=150){ try{ const r = await sb.from("quote_value_snapshot_tbl").select("reference_number,total_value").in("reference_number",qrefs.slice(i,i+150)); vals = vals.concat(r.data||[]); }catch(e){} }
+  let vals = []; for(let i=0;i<qrefs.length;i+=150){ try{ const r = await sb.from("quote_value_snapshot_tbl").select("*").in("reference_number",qrefs.slice(i,i+150)); vals = vals.concat(r.data||[]); }catch(e){} }
+  await salesFxLoad();
   let told = [], toldMissing = false; try{ const r = await sb.from("opr_told_tbl").select("*").order("sent_on"); if(r.error) toldMissing = true; else told = r.data||[]; }catch(e){ toldMissing = true; }
   try{ await loadPostPeople(); }catch(e){}
   const planCn = {}; M.plan.forEach((p,cn)=>{ planCn[p.id] = cn; });
   const lineBy = {}; (lines||[]).forEach(l=>{ const cn = planCn[l.plan_id]; if(!cn) return; (lineBy[cn] = lineBy[cn] || []).push(l); });
   const delBy = {}; dels.forEach(d=>{ delBy[String(d.contract_number)] = d; });
-  const valBy = {}; vals.forEach(v=>{ valBy[String(v.reference_number)] = Number(v.total_value)||0; });
+  const valBy = {}; vals.forEach(v=>{ valBy[String(v.reference_number)] = qvInr(v)||0; });
   return { M, cns, lineBy, delBy, lotBy:by(lots,"contract_number"), dcBy:Object.fromEntries(dcs.map(d=>[String(d.id),d])), estBy:by(est,"reference_number"), valBy, toldBy:by(told,"contract_number"), toldMissing };
 }
 function oprDocScore(d){ const L = d.list; if(L==="code2" || L==="done" || L==="info") return 100; if(L==="client") return 30; if(L==="confirm") return 30; return d.since && /code 3/i.test(d.status||"") ? 30 : 0; }
@@ -100658,6 +100988,7 @@ async function crHist(cn, by, what){ try{ await sb.from("contract_register_hist_
 // 2026-11-01T06:00:00Z (Uma): what the client gave (PO / LOI / verbal) and whether the PO is still awaited
 const crBasisOf = (r)=> ({ basis:(r&&r.order_basis)||"", loiRef:(r&&r.loi_ref)||"", loiDate:(r&&r.loi_date)||"", vBy:(r&&r.verbal_by)||"", vWith:(r&&r.verbal_with)||"", vOn:(r&&r.verbal_on)||"", poAwaited:ospPoAwaited(r), chaseDays: ospPoAwaited(r) ? osDays(ospChaseFrom(r)) : 0 });
 async function crLoadAll(){
+  await salesFxLoad();   // 2026-11-26T03:30:00Z: INR at Sales' latest rate
   const [reg, regLines, sos, dues] = await Promise.all([
     fetchPaged(()=>sb.from("contract_register_tbl").select("*").order("contract_number")),
     fetchPaged(()=>sb.from("contract_register_line_tbl").select("*").order("contract_number").order("sl")),
@@ -100669,7 +101000,7 @@ async function crLoadAll(){
   for(let k=0;k<soNums.length;k+=150){
     const part = soNums.slice(k,k+150);
     const [{ data: e }, { data: s }, { data: t }] = await Promise.all([
-      sb.from("estimates").select("reference_number,item_sl_no,description,model,order_qty,currency,conversion_rate,end_user_name,po_number,po_date,tag_number").in("reference_number",part),
+      sb.from("estimates").select("reference_number,item_sl_no,description,model,order_qty,currency,conversion_rate,end_user_name,po_number,po_date,tag_number,po_sales_price,po_price_value,po_price_currency,po_price_fx").in("reference_number",part),
       sb.from("quote_value_snapshot_tbl").select("reference_number,total_value,total_value_in_currency,currency").in("reference_number",part),
       sb.from("quote_commercial_terms").select("reference_number,payment_term,freight,incoterms").in("reference_number",part)]);
     est.push(...(e||[])); snaps.push(...(s||[])); terms.push(...(t||[]));
@@ -100687,13 +101018,14 @@ async function crLoadAll(){
   (sos||[]).forEach(so=>{
     const cn = String(so.contract_number); seen.add(cn);
     const r = regBy.get(cn) || {}; const es = (estBy.get(cn)||[]).sort((a,b)=>a.item_sl_no-b.item_sl_no); const head = es[0]||{};
-    const ccy = String(head.currency||"INR").toUpperCase(); const fx = ccy==="INR" ? 1 : (Number(head.conversion_rate)||null);
-    const sn = snapBy.get(cn); const tm = termBy.get(cn)||{};
-    const valCcy = sn ? Number(sn.total_value_in_currency ?? sn.total_value)||0 : null;
+    // 2026-11-26T03:30:00Z: a contract's value is its PO value (PO price × qty), in the PO currency; INR at Sales' latest rate
+    const pv = ctPoValue(es); const sn = snapBy.get(cn); const tm = termBy.get(cn)||{};
+    const ccy = pv ? pv.ccy : String(head.currency||"INR").toUpperCase(); const fx = salesRate(ccy);
+    const valCcy = pv ? pv.value : (sn ? (qvCcy(sn)||{}).value ?? null : null);
     const soCountry = countryOf.get(String(so.customer_name||r.client||"").trim().toLowerCase())||"";
     out.push({ cn, docsListed:r.docs_listed_at||null, source:"app", quote:so.quote_reference_number||r.quote_number||"", legacyRef:r.legacy_ref||"", client:so.customer_name||r.client||"",
       po: so.basis_number || head.po_number || r.po_no || "", poDate: toISODate(so.basis_date || head.po_date || so.oa_issued_on || so.created_at) || r.po_date || "",
-      ccy, fx, valCcy, valInr: sn ? Number(sn.total_value)||0 : (valCcy!=null && fx ? valCcy*fx : null),
+      ccy, fx, valCcy, valInr: (valCcy!=null && fx) ? valCcy*fx : null,
       status:r.status||"Pending", reason:r.status_reason||"", pay:tm.payment_term||"", freight:tm.freight||"", inco:tm.incoterms||"", endUser:r.end_user||head.end_user_name||"", vendorRule:r.vendor_rule||"", avlLink:r.avl_link||"",
       tpi:r.tpi||"", tpiAgency:r.tpi_agency||"", cert:r.material_cert||"", remarks:r.remarks||"", hasReg:!!r.contract_number, ...crBasisOf(r),
       lines: es.map(e=>({ key:"sl:"+e.item_sl_no, sl:e.item_sl_no, d:[e.description, e.model&&!String(e.description||"").includes(e.model)?e.model:""].filter(Boolean).join(" · "), q:Number(e.order_qty)||null, r:null, v:null, due:dueBy.get(cn+"|"+e.item_sl_no)||"", est:e })),
@@ -100702,7 +101034,7 @@ async function crLoadAll(){
   (reg||[]).forEach(r=>{
     const cn = String(r.contract_number); if(seen.has(cn)) return;
     const ls = (linesBy.get(cn)||[]).map(l=>({ key:"lg:"+l.id, id:l.id, sl:l.sl, d:l.description||"", q:l.qty!=null?Number(l.qty):null, r:l.rate!=null?Number(l.rate):null, v:l.value!=null?Number(l.value):null, due:l.due_date||"" }));
-    const ccy = String(r.currency||"INR").toUpperCase(); const fx = ccy==="INR" ? 1 : (Number(r.fx_rate)||null);
+    const ccy = String(r.currency||"INR").toUpperCase(); const fx = salesRate(ccy) || (ccy==="INR" ? 1 : (Number(r.fx_rate)||null));   // 2026-11-26T03:30:00Z: Sales' latest rate
     const valCcy = ls.reduce((n,l)=>n+(Number(l.v)||0),0);
     const country = countryOf.get(String(r.client||"").trim().toLowerCase())||"";
     out.push({ cn, docsListed:r.docs_listed_at||null, source:r.source||"legacy", quote:r.quote_number||"", legacyRef:r.legacy_ref||"", client:r.client||"", po:r.po_no||"", poDate:r.po_date||"", poDateText:r.po_date_text||"",
