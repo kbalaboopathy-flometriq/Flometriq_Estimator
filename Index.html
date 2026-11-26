@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-26T04:30:00Z";
+  var APP_BUILD_VERSION = "2026-11-26T06:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -713,6 +713,23 @@ const svIsSaveBtn = (b)=>{ const l = svLabel(b); return SV_SAVEBTN.test(l) && !S
 const SV_ACTBTN = /^\W*(save|submit|post|update|create|record|approve|endorse|send|apply|confirm|add|delete|remove|move|mark|release|assign|allot|import|upload|generate|book|issue|receive|accept|reject|return|hold|place|link|set|change|rename|clone|copy|done|complete|reopen|hand|yes|ok|replace|merge|start|finish|park|unpark|revise|request|raise|log|use|give|make|enter|pay|bill|keep|swap|tick|post)\b/i;
 const SV_DELBTN = /^\W*delete\b/i;
 const SV_CLOSEBTN = /^\W*(close|cancel|later|back|discard|×|✕|x)\W*$/i;
+// 2026-11-26T06:30:00Z: EVERY ACTION BUTTON — greyed out while it runs (no double presses), says it is done, and stays greyed out
+// until something on its screen / pop-up changes again. A failure, or a press that wrote nothing, frees it at once.
+const SV_ACTANY = /\b(done|issue|clearance|present|remind|transfer|escalate|withdraw|resubmit|reassign|earmark|void|unlock|extend|despatch|dispatch|verify|sign|lock|freeze|schedule|allocate)\b/i;
+const SV_NOLOCK = /\b(pdf|excel|xlsx|csv|print|preview|download|export|copy|whatsapp|email|mail|call|open|view|refresh|search|find|filter|show|hide|next|previous|prev|more|less|expand|collapse|select all|clear all)\b|^\W*[+＋]/i;
+const svIsActBtn = (l)=> (SV_ACTBTN.test(l) || SV_ACTANY.test(l)) && !SV_NOTSAVE.test(l) && !SV_CLOSEBTN.test(l);
+const SV_LOCKS = new Set();
+(function(){ try{ const st = document.createElement("style"); st.textContent = "button[data-sv-busy]{opacity:.55 !important;cursor:progress !important}button[data-sv-done]{opacity:.55 !important;cursor:not-allowed !important}"; document.head.appendChild(st); }catch(e){} })();
+const SV_LOCK_OBS = (typeof MutationObserver!=="undefined") ? new MutationObserver(ms=>{ ms.forEach(m=>{ const b = m.target; if(b && (b.hasAttribute("data-sv-busy")||b.hasAttribute("data-sv-done")) && !b.disabled) b.disabled = true; }); }) : null;
+function svLock(btn, kind, scope){ try{ if(!btn || !btn.isConnected) return; btn.removeAttribute("data-sv-busy"); btn.removeAttribute("data-sv-done");
+  btn.setAttribute(kind==="done" ? "data-sv-done" : "data-sv-busy", "1"); if(!btn.hasAttribute("data-sv-title")) btn.setAttribute("data-sv-title", btn.title||"");
+  btn.title = kind==="done" ? "Done ✓ — change something on this screen to press it again" : "Working…"; btn.disabled = true;
+  SV_LOCKS.add({ btn, scope: scope || null, tab: window.__curTab||"" }); if(SV_LOCK_OBS) SV_LOCK_OBS.observe(btn, { attributes:true, attributeFilter:["disabled"] }); }catch(e){} }
+function svUnlock(btn){ try{ for(const L of Array.from(SV_LOCKS)) if(L.btn===btn) SV_LOCKS.delete(L);
+  if(!btn) return; const was = btn.hasAttribute("data-sv-busy") || btn.hasAttribute("data-sv-done"); btn.removeAttribute("data-sv-busy"); btn.removeAttribute("data-sv-done");
+  if(btn.hasAttribute("data-sv-title")){ btn.title = btn.getAttribute("data-sv-title"); btn.removeAttribute("data-sv-title"); }
+  if(was) btn.disabled = false; }catch(e){} }
+function svUnlockWhere(test){ for(const L of Array.from(SV_LOCKS)){ if(!L.btn.isConnected){ SV_LOCKS.delete(L); continue; } if(test(L)) svUnlock(L.btn); } }
 // a form box that counts: inside a screen / pop-up that has a Save-type button; search and filter boxes never count
 function svCountsAsForm(el){
   if(!el || el.closest("[data-nodirty],#sv-badge,#sv-dlg,.topbar-user,#app-sticky-header")) return null;
@@ -882,7 +899,7 @@ function svFinish(act){
   const fails = W.filter((w,i)=>!w.ok && !W.slice(i+1).some(x=>x.ok && x.table===w.table));
   const oks = W.filter(w=>w.ok);
   const isDel = W.every(w=>w.op==="delete") || SV_DELBTN.test(act.label);
-  if(!fails.length && !SV_ACTBTN.test(act.label||"")){ return; }   // a click that is not a save (opening, picking) — no message
+  if(!fails.length && !SV_ACTBTN.test(act.label||"")){ if(act.btn && svIsActBtn(act.label||"")){ if(!act.toasted && !act.alerted){ try{ appToast("✓ Done — "+(act.label||"")+(act.screen?" · "+act.screen:"")); }catch(x){} act.toasted = true; } if(act.lock) svLock(act.btn, "done", act.lockScope); else svUnlock(act.btn); } return; }   // a click that is not a save (opening, picking) — no message
   if(!fails.length){
     if(act.shown) return;   // 2026-11-24T06:00:00Z: already green once — late background writes never bring it back
     act.shown = true;
@@ -895,6 +912,7 @@ function svFinish(act){
     else svSetState("dirty");
     if(!act.toasted && !act.alerted) try{ appToast((isDel ? "✓ Deleted" : SV_SAVEBTN.test(act.label) && !/^\W*(approve|endorse|send|post|submit)/i.test(act.label) ? "✓ Saved" : "✓ Done — "+(act.label||"saved"))+(act.screen ? " · "+act.screen : "")); }catch(e){}
     act.toasted = true;   // 2026-11-14T06:00:00Z: one toast per click, even when late writes reopen it
+    if(act.btn){ if(act.lock) svLock(act.btn, "done", act.lockScope); else svUnlock(act.btn); }   // 2026-11-26T06:30:00Z
     return;
   }
   // schema-missing side tables after a successful main save: keep it green, log it quietly
@@ -904,6 +922,7 @@ function svFinish(act){
   svLogFail(info);
   if(!hard.length){ svSyncGuard(); if(!svIsDirty()) svSetState("saved", act.label||""); else if(SV.state==="saving") svSetState("dirty"); if(!act.toasted && !act.alerted) try{ appToast("✓ Saved"+(act.screen?" · "+act.screen:"")); }catch(e){} act.toasted = true; return; }
   SV.fail = info; svSetState("failed", R.why); svFailBox(info);
+  if(act.btn) svUnlock(act.btn);   // 2026-11-26T06:30:00Z: a failed press can be tried again at once
 }
 // a click starts an "action"; the writes that follow belong to it
 document.addEventListener("click", (e)=>{
@@ -933,6 +952,11 @@ document.addEventListener("click", (e)=>{
   SV.act = { at:Date.now(), last:Date.now(), label, btn, form, btnScope: svModalOf(btn) || btn.closest("[data-sv-screen]") || null, screen: svScreen(btn), pending:0, writes:[], toasted:false, alerted:false, done:false };
   SV.fetches = 0;
   const act = SV.act;
+  if(btn.tagName==="BUTTON" && svIsActBtn(label) && !btn.disabled){   // 2026-11-26T06:30:00Z: no double presses
+    act.lock = !SV_NOLOCK.test(label); act.lockScope = act.btnScope || btn.closest("form,section,[data-testid]") || null;
+    setTimeout(()=>{ if(!act.done && btn.isConnected) svLock(btn, "busy", act.lockScope); }, 0);
+    const free = ()=>{ if(act.done) return; if(act.pending>0 || (act.writes.length && !act.done)){ setTimeout(free, 1500); return; } if(!act.writes.length) svUnlock(btn); };
+    setTimeout(free, 3500); }
   // Save pressed with nothing typed and nothing sent: say so
   if(SV_SAVEBTN.test(label) && /^\W*save\b/i.test(label) && !svIsDirty()){
     setTimeout(()=>{ if(act.writes.length || act.pending || act.alerted || act.toasted || SV.fetches) return; try{ appToast("No changes — nothing to save"); }catch(er){} }, 2600); }
@@ -941,6 +965,7 @@ document.addEventListener("click", (e)=>{
 ["input","change"].forEach(ev=>document.addEventListener(ev, (e)=>{
   if(!e.isTrusted) return; const el = e.target; if(!el || !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;
   const tp = String(el.type||"").toLowerCase(); if(ev==="change" && !/checkbox|radio|select|date|time|number/.test(tp) && el.tagName!=="SELECT") return;
+  try{ svUnlockWhere(L=>!L.scope || L.scope.contains(el) || el.closest("[data-sv-screen]")===L.scope.closest("[data-sv-screen]")); }catch(x){}   // 2026-11-26T06:30:00Z: changed again — the button is free
   const scope = svCountsAsForm(el); if(!scope) return;
   if(!SV.dirty || SV.dirty.scope!==scope) SV.dirty = { scope, label: svScreen(el) || "this screen", at:Date.now() };
   svSyncGuard();
@@ -954,7 +979,7 @@ setInterval(()=>{ try{
     if(a && a.pending>0){ SV.fail = { what:(a.label||"Save")+(a.screen?" · "+a.screen:""), why:"No reply from the server for 45 seconds.", todo:"Refresh the screen and check whether the entry is there before saving again.", raw:"no reply after 45 s ("+a.pending+" write"+(a.pending===1?"":"s")+" waiting)", table:"", op:"", tab:window.__curTab||"", screen:a.screen };
       svSetState("failed", "No reply from the server yet — refresh and check the entry"); }
     else svSetState(svIsDirty() ? "dirty" : "clean"); }
-  if(window.__curTab!==SV.tab){ SV.tab = window.__curTab;
+  if(window.__curTab!==SV.tab){ SV.tab = window.__curTab; try{ svUnlockWhere(()=>true); }catch(x){}
     if(SV.dirty && SV.dirty.scope.hasAttribute && SV.dirty.scope.hasAttribute("data-sv-screen")){ SV.dirty = null; svSyncGuard(); }
     if(SV.state!=="failed" && !svIsDirty()) svSetState("clean"); }
 }catch(e){} }, 1000);
@@ -964,8 +989,8 @@ setInterval(()=>{ try{
   window.confirm = function(m){ if(SV.act) SV.act.alerted = true;
     if(SV.delOk && Date.now()-SV.delOk<5000 && /delet|remov/i.test(String(m||""))){ SV.delOk = 0; return true; }   // already asked in our red box
     if(SV.leaveOk && Date.now()-SV.leaveOk<5000 && /without saving|unsaved|not saved|leave anyway|discard|quit/i.test(String(m||""))){ SV.leaveOk = 0; return true; }   // already asked "Quit without saving?"
-    return C.apply(window, arguments); };
-  window.prompt = function(){ if(SV.act) SV.act.alerted = true; return P.apply(window, arguments); };
+    const r = C.apply(window, arguments); if(!r && SV.act && SV.act.btn){ const b0 = SV.act.btn; setTimeout(()=>svUnlock(b0), 10); } return r; };   // 2026-11-26T06:30:00Z: answered No — free the button
+  window.prompt = function(){ if(SV.act) SV.act.alerted = true; const r = P.apply(window, arguments); if((r===null || r==="") && SV.act && SV.act.btn){ const b0 = SV.act.btn; setTimeout(()=>svUnlock(b0), 10); } return r; };
 })();
 window.addEventListener("resize", ()=>svPaint());
 
@@ -3980,7 +4005,7 @@ function MenuTabs({ user, active, onChange, onRefresh }) {
         if(gi>=0) visibleGroups[gi] = g; else visibleGroups.push(g); };
       put("Reports", "Pending Orders – By value"); put("Order Status", "Pending Orders – By value"); } }
   if(user.role!=="hr_admin" && !visibleGroups.some(g=>g.label==="Production")){   // 2026-11-15T20:00:00Z: Manufacturing Part 1
-    const qi = visibleGroups.findIndex(g=>g.label==="QC"); const pg = { label:"Production", subgroups:[{ label:"Route cards", tabs:[{key:"mfg_cards",label:"Route cards"},{key:"mfg_floor",label:"Shop-floor overview"}] }, { label:"Progress", tabs:[{key:"mfg_report",label:"Progress report"},{key:"mfg_dash",label:"Dashboard"}] }, { label:"Finished goods", tabs:[{key:"fg_stock",label:"Finished goods"}] }, { label:"Masters", tabs:[{key:"mfg_templates",label:"Route templates"},{key:"mfg_models",label:"Models → route"},{key:"mfg_slno_tpl",label:"🧩 Sl No templates"}] }] };
+    const qi = visibleGroups.findIndex(g=>g.label==="QC"); const pg = { label:"Production", subgroups:[{ label:"Route cards", tabs:[{key:"mfg_cards",label:"Route cards"},{key:"mfg_floor",label:"Shop-floor overview"}] }, { label:"Progress", tabs:[{key:"mfg_report",label:"Progress report"},{key:"mfg_dash",label:"Dashboard"},{key:"prod_review",label:"Production review"}] }, { label:"Finished goods", tabs:[{key:"fg_stock",label:"Finished goods"}] }, { label:"Masters", tabs:[{key:"mfg_templates",label:"Route templates"},{key:"mfg_models",label:"Models → route"},{key:"mfg_slno_tpl",label:"🧩 Sl No templates"}] }] };
     if(qi>=0) visibleGroups.splice(qi+1,0,pg); else visibleGroups.push(pg); }
   { // 2026-11-18T06:00:00Z: ⟶ Order flow — Order Status (after Pending Orders), Accounts › Billing, Purchase (Purchase Manager post), Production (Production Manager post)
     const addSub = (label, sub, tab)=>{ const gi = visibleGroups.findIndex(g=>g.label===label); if(gi<0) return; let g = visibleGroups[gi];
@@ -37740,6 +37765,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"26 Nov 2026", summary:"Built on 2026-11-26T06:30:00Z, on top of 2026-11-26T04:30:00Z (batch babu). No SQL. 🏭 PRODUCTION REVIEW (Production › 📊 Reports): every open order not fully despatched, live, sorted by its delivery due (the app's delivery rule) — by-PO date and variance, contract, customer, items & qty, the stage as the Order Status board shows it (lots by their column), purchase and QC owner, material in, route-card progress, lots — Excel and PDF (preview). One meeting note per contract: the badge shows the last note with its date and who wrote it; Note… / click the badge to write today's (it replaces the last one). Anyone who can open the report can write. 🎤 Speak turns voice into text (English (India) or Tamil) that you can correct before saving; the recording is never kept. STAGE MOVES ARE LISTS, NOT BELLS: when an order or a lot moves on the board, the post that owns the next step gets the card in its own list on the task board (📝 OA to make, 🚦 W/O to release, 🧾 Purchase BOM…, 📦 PR to release, 🏭 Production in progress, 📋 DC & packing slip to make, 🧪 QC clearance — DC made, 💰 Despatch clearance — Accounts, 🚛 Gate pass & despatch, 💵 Payment to collect …) with a due date, so it is in My Day too; no bell. Whoever pushed it gets the card in 📤 Pushed by me, showing who has it now and for how long; it closes by itself once they have done their step. Existing open Order Status cards move into the right list by their title. ONE STEP = ONE CARD: pressing a step again keeps the open card (no second card); a lot that comes back to a step reopens its card; a lot waiting at the DC or QC step whose card was closed by mistake gets it back when the board is opened. EVERY ACTION BUTTON: greys out the moment it is pressed (no double presses), says it is done, and stays greyed out until something on its screen or pop-up changes again; a failure, a No to the question, or a press that saved nothing frees it at once (PDF, Excel, print, open, refresh never lock)." },
   { date:"26 Nov 2026", summary:"Built on 2026-11-26T04:30:00Z, on top of 2026-11-26T04:00:00Z. Needs SQL: fix_start_materials_data_2026-11-26.sql (preview first; the T-CAST part in both companies). START MATERIALS — two fixes: (1) drains, vents, filter, basket and other non-body parts are now told by the BOM line's component name only — the sub-assembly carries the BOM's own name (e.g. \u201cProd BOM basket-80nb\u201d), which wrongly threw out every line of fabricated basket strainers; (2) when the only lines of a start shape are such parts (a temporary conical strainer's filter plate), they count. The data SQL sets 260015 Sl 1, 2, 10 and 11 to the YBR template (their BOM is YFB bar stock) and remakes their unmarked route cards, and adds the tee to T-CAST's start materials (cast T bodies are entered as Tee)." },
   { date:"26 Nov 2026", summary:"Built on 2026-11-26T04:00:00Z, on top of 2026-11-26T03:30:00Z. Needs SQL: structure_production_start_2026-11-26.sql (both companies). 🏭 NEW ORDER STATUS STAGE “Production started — balance materials awaited”, between Purchase – material in pending and Production in progress: (1) an order moves in by itself when ANY Sl No has ALL its start materials in — received at the factory on the Procurement Gantt, or set aside from stock for the contract; (2) it moves on to Production in progress by itself when the material is 100% in; (3) start materials are set per route template (Production › Route templates, Start materials — the Production Manager or Technical Head post may change them) and found on each Sl No's BOM by material shape, body parts only (drains, vents, davits, filter parts, fasteners and packing are balance materials); TRADE items skip the stage; (4) Start production early… (before any Sl No is start-ready) needs a reason and an Early production start override code from the VP Projects or Production Manager post (Order Status › Standard days & codes); (5) started on stock set aside: a card in the Production Manager post's own list 🏭 Start on earmarked stock (and in My Day); (6) Start materials ▸ on the card shows each Sl No; (7) the old Start production card is gone; on the first sync orders in Production in progress with material still pending move back to the new stage, and orders with all material in move on." },
   { date:"26 Nov 2026", summary:"Built on 2026-11-26T03:30:00Z, on top of 2026-11-26T01:30:00Z. Needs SQL: structure_quote_printed_value_2026-11-26.sql (both companies). 💰 ONE VALUE EVERYWHERE: a quote's value is the Gross Amount (Basic Price) printed on it, in its own currency — kept on the quote's stored-value row each time its PDF is made (quotes not printed since use the stored value). A contract's value is its PO value (PO price × qty). INR is always that value × Sales' latest conversion rate for the currency (the rate on the most recent quote made in it — Sales' rate with its margin, not the Accounts rate; a stray rate more than 10% off the ones before it is ignored unless a second quote confirms it). Used by the Funnel (Graph, Cards, Table), Quotes Report, Quote Status Report, Quote Status Review, Won by Owner, CRM Dashboards, Customer Insights, Contract Register, delivery and Order Progress reports. Quote Status Report / Review spread a quote's value over its Sl Nos by BOM share so they add up to the quote. Won by Owner counts quotes, not Sl Nos. 🔢 ONE RULE FOR COUNTING QUOTES (Funnel, Quote Status Report / Review, Won by Owner): each quote once, at its latest revision SENT — an unsent draft revision no longer pulls a sent quote back to Draft; contract numbers never count. 📊 FUNNEL GRAPH: each bar = quotes that reached that stage or went further (count, value and weighted value alike), so the funnel only narrows; 'now here' shows what sits in the stage today; legacy quotes are left out. 💱 RATE GUARD AT THE QUOTE: a conversion rate more than 10% away from Sales' latest rate for that currency is stopped (the Sales Head post is told); the Sales Head or a Super Admin can save it after a confirm. A quote keeping the rate it already has is never stopped. 📋 QUOTE REGISTER: new Stage and Value columns, read from the quote (latest revision sent). 📉 NEW: Quotes › 📊 Reports › Discounts — quoted vs ordered (also under CRM): Day / Week / Month / Quarter / Year with arrows, quoted vs ordered bars and discount % bars, orders with their lines (quoted unit price vs PO price), by FSE and by customer, Excel / PDF. Quoted = the last revision sent on or before the PO date, line by line for the lines and quantities ordered." },
@@ -62184,7 +62210,7 @@ function App() {
     tab==="os_reports"?h(OrderStatusBoard,{key:"osrep",user:uTab,sessionCompany,startView:"report"}):
     tab==="os_insights"?h(InsightsScreen,{user:uTab,onOpenContract:openContract}):
     (tab==="orders_money" || OM_KEYS.includes(tab))?h(OrdersMoneyScreen,{user,start:tab}):
-    tab==="fg_stock"?h(FgScreen,{user}): tab==="mfg_cards"?h(MfgCardsScreen,{user}): tab==="mfg_floor"?h(MfgFloorScreen,{user}): tab==="mfg_report"?h(MfgReportScreen,{user}): tab==="mfg_dash"?h(MfgDashScreen,{user}): tab==="mfg_templates"?h(MfgTemplatesScreen,{user}): tab==="mfg_slno_tpl"?h(RcSlnoTplScreen,{user}): tab==="mfg_models"?h(MfgModelsScreen,{user}):   // 2026-11-15T20:00:00Z: Manufacturing
+    tab==="fg_stock"?h(FgScreen,{user}): tab==="mfg_cards"?h(MfgCardsScreen,{user}): tab==="mfg_floor"?h(MfgFloorScreen,{user}): tab==="prod_review"?h(ProdReviewScreen,{user}): tab==="mfg_report"?h(MfgReportScreen,{user}): tab==="mfg_dash"?h(MfgDashScreen,{user}): tab==="mfg_templates"?h(MfgTemplatesScreen,{user}): tab==="mfg_slno_tpl"?h(RcSlnoTplScreen,{user}): tab==="mfg_models"?h(MfgModelsScreen,{user}):   // 2026-11-15T20:00:00Z: Manufacturing
     tab==="reports_progress"?h(ProgressReportScreen,{user:uTab,onOpenContract:openContract}):   // 2026-11-08: Order Progress Report   // 2026-11-01T12:00:00Z
     tab==="os_delivery"?h(DeliveryScreen,{user:uTab,onOpenContract:openContract}):
     (tab==="customer_requests"||tab==="os_customer_requests")?h(CustomerRequestsScreen,{key:tab,user:uTab,onOpenContract:openContract}):   // 2026-11-01T10:00:00Z
@@ -70622,7 +70648,7 @@ const RPT_HOME = [
   // Stores
   ["reports_grn_status",["Stores","Purchase"]], ["imt_stock",["Stores"]], ["imt_ledger",["Stores"]], ["sp_report_st",["Stores"]],
   // Production
-  ["mfg_floor",["Production"]], ["mfg_report",["Production"]], ["mfg_dash",["Production"]], ["order_flow_pm",["Production"]],
+  ["prod_review",["Production"]], ["mfg_floor",["Production"]], ["mfg_report",["Production"]], ["mfg_dash",["Production"]], ["order_flow_pm",["Production"]],
   // Accounts
   ["bill_ageing",["Accounts"]], ["einv_report",["Accounts"]], ["acc_vouchers",["Accounts"]], ["acc_daybook",["Accounts"]], ["acc_ledger",["Accounts"]],
   ["order_flow_acc",["Accounts"]], ["gst_variance_report",["Accounts","Admin","Setup"]], ["@Statements",["Accounts"]],
@@ -74756,7 +74782,7 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
   const byDue = (a,b)=> String(a.due_date||"9").localeCompare(String(b.due_date||"9"));
   // A person's board items: their own top-level cards, and their sub-tasks that sit on someone
   // else's card (those show as a slim strip). Their sub-tasks on their OWN cards fold inside the card.
-  const boardItems = (name)=> tasks.filter(t=>t.assignee===name && !taskIsSendStep(t) && !(t.chase_letter_id && t.status!=="done" && !t.parent_id) && !(String(t.ref||"").startsWith("HANDOVER:") && t.status!=="done") && !(String(t.ref||"").startsWith(PS_EMK_PFX) && t.status!=="done") && (!t.parent_id || (parentOf(t)||{}).assignee!==name));   // 250: to-send cards sit in 📤 Approved — to send
+  const boardItems = (name)=> tasks.filter(t=>t.assignee===name && !taskIsSendStep(t) && !(t.chase_letter_id && t.status!=="done" && !t.parent_id) && !(String(t.ref||"").startsWith("HANDOVER:") && t.status!=="done") && !(String(t.ref||"").startsWith(PS_EMK_PFX) && t.status!=="done") && !stgKeyOf(t) && !stgIsPush(t) && (!t.parent_id || (parentOf(t)||{}).assignee!==name));   // 250: to-send cards sit in 📤 Approved — to send
   const isStrip = (t, name)=> !!t.parent_id && (parentOf(t)||{}).assignee!==name;
   const openCount = (name)=> tasks.filter(t=>t.assignee===name && t.status!=="done").length;
   const loadOf = (name)=>{ const s=setFor(deptOf(name)); const n=openCount(name); return { n, s, lvl: n>=Number(s.red_open) ? "over" : n>=Number(s.amber_open) ? "warn" : "ok" }; };
@@ -75175,7 +75201,7 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
         h("span",{onClick:ev=>{ ev.stopPropagation(); setExpanded(m=>{ const x={...m}; if(x[t.id]) delete x[t.id]; else x[t.id]=true; return x; }); },
           style:{marginLeft:"auto",color:"#0f7a5c",fontWeight:700,fontSize:10.5,cursor:"pointer",whiteSpace:"nowrap"}},exp?"▴ less":"▾ more")),
       exp ? h("div",{onClick:ev=>ev.stopPropagation(),style:{borderTop:"1px dashed "+colors.border,marginTop:6,paddingTop:6,cursor:"default"}},
-        (t.labels||[]).length ? h("div",{style:{display:"flex",gap:4,flexWrap:"wrap",marginBottom:4}},(t.labels||[]).map(l=>h("span",{key:l,style:{fontSize:10,fontWeight:700,color:"#fff",background:labelColor(l),borderRadius:9,padding:"1px 7px"}},l))) : null,
+        stgChips(t.labels).length ? h("div",{style:{display:"flex",gap:4,flexWrap:"wrap",marginBottom:4}},stgChips(t.labels).map(l=>h("span",{key:l,style:{fontSize:10,fontWeight:700,color:"#fff",background:labelColor(l),borderRadius:9,padding:"1px 7px"}},l))) : null,
         e ? h("div",{style:{fontWeight:700,fontSize:12,lineHeight:1.3}},t.title) : null,
         o.stageChip ? h("span",{style:{display:"inline-block",marginTop:4,fontSize:10,fontWeight:700,color:"#fff",background:stO.color,borderRadius:8,padding:"1px 7px"}},stO.label) : null,
         h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",marginTop:4,fontSize:11,color:colors.muted}},
@@ -76020,7 +76046,7 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
             h("td",{style:{padding:"7px 10px"}},t.ref||"—"),
             h("td",{style:{padding:"7px 10px",whiteSpace:"nowrap",color:od?colors.danger:colors.text,fontWeight:od?700:400}},t.status==="done"&&t.approved_at?"done "+fmtDMY(t.approved_at):(t.due_date?fmtDMY(t.due_date):"—"),
               closeOf(t)&&t.status!=="done" ? h("div",{style:{fontSize:11,fontWeight:400,color:closeOf(t)<today?colors.danger:colors.muted}},"closes "+fmtDMY(closeOf(t))) : null),
-            h("td",{style:{padding:"7px 10px"}},(t.labels||[]).map(l=>h("span",{key:l,style:{fontSize:10,fontWeight:700,color:"#fff",background:labelColor(l),borderRadius:9,padding:"1px 7px",marginRight:3}},l))),
+            h("td",{style:{padding:"7px 10px"}},stgChips(t.labels).map(l=>h("span",{key:l,style:{fontSize:10,fontWeight:700,color:"#fff",background:labelColor(l),borderRadius:9,padding:"1px 7px",marginRight:3}},l))),
             h("td",{style:{padding:"7px 10px"}},n?d+"/"+n:"—"),
             h("td",{style:{padding:"7px 10px",fontSize:11.5}},nx?nx.text+" ("+fmtDMY(nx.due)+")":"—"),
             h("td",{style:{padding:"7px 10px",fontSize:11.5}},(t.created_by||"—")+(t.created_at?" · "+fmtDMY(t.created_at):"")),
@@ -76043,6 +76069,27 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
       h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6}}, h("b",{style:{fontSize:13}},"🏭 Start on earmarked stock"), h("span",{style:{fontSize:11,color:colors.muted}}, xs.length)),
       ...xs.slice().sort((a,b)=>String(a.due_date||"9").localeCompare(String(b.due_date||"9"))).map(t=>h("div",{key:"pse"+t.id}, card(t))),
       h("div",{style:{fontSize:10.5,color:colors.muted,marginTop:4,lineHeight:1.45}},"Production started on start materials set aside from stock for the contract. Check the stock, issue it to the shop, then finish the card."));
+  };
+  // ===== 2026-11-26T06:30:00Z (babu): STAGE LISTS — one list per Order Status step the person holds, and 📤 Pushed by me
+  const stgCols = ()=>{
+    const mine = tasks.filter(t=>t.assignee===who && stgKeyOf(t)); if(!mine.length) return [];
+    const today = toISODate(new Date());
+    return STG_ORDER.filter(k=>mine.some(t=>stgKeyOf(t)===k)).map(k=>{ const xs = mine.filter(t=>stgKeyOf(t)===k).sort((a,b)=>String(a.due_date||"9").localeCompare(String(b.due_date||"9")));
+      return h("div",{key:"stg|"+k+"|"+who,"data-testid":"stg-list-"+k,style:{minWidth:270,width:270,flexShrink:0,background:"#eef4fb",border:"2px solid #7fa6d6",borderRadius:8,padding:8}},
+        h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6}}, h("b",{style:{fontSize:13}},STG_LISTS[k]), h("span",{style:{fontSize:11,color:colors.muted}}, xs.length)),
+        ...xs.map(t=>h("div",{key:"stg"+t.id}, String(t.due_date||"9")<today ? h("div",{style:{fontSize:10.5,fontWeight:700,color:"#a3312a",margin:"0 2px 2px"}},"Late — due "+fmtDMY(t.due_date)) : null,
+          h("div",{style:{fontSize:10.5,color:colors.muted,margin:"0 2px 2px"}},"Here since "+fmtDMY(t.moved_at||t.created_at)+(t.created_by && t.created_by!=="App" ? " · moved by "+t.created_by : "")), card(t))),
+        h("div",{style:{fontSize:10.5,color:colors.muted,marginTop:4,lineHeight:1.45}},"Orders that reached your step on the Order Status board. Each card closes by itself when you do the step in the app."));
+    });
+  };
+  const pushCol = ()=>{
+    const xs = tasks.filter(t=>t.assignee===who && stgIsPush(t)); if(!xs.length) return null;
+    const today = toISODate(new Date());
+    return h("div",{key:"push|"+who,"data-testid":"push-list",style:{minWidth:270,width:270,flexShrink:0,background:"#f6eefa",border:"2px dashed #a77bc4",borderRadius:8,padding:8}},
+      h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6}}, h("b",{style:{fontSize:13}},"📤 Pushed by me"), h("span",{style:{fontSize:11,color:colors.muted}}, xs.length)),
+      ...xs.slice().sort((a,b)=>String(a.created_at||"").localeCompare(String(b.created_at||""))).map(t=>{ const d = osDays(t.created_at);
+        return h("div",{key:"pu"+t.id}, h("div",{style:{fontSize:10.5,fontWeight:700,color:String(t.due_date||"9")<today?"#a3312a":"#6a1b9a",margin:"0 2px 2px"}},"Waiting "+d+" day"+(d===1?"":"s")+(String(t.due_date||"9")<today?" — late":"")), card(t)); }),
+      h("div",{style:{fontSize:10.5,color:colors.muted,marginTop:4,lineHeight:1.45}},"What you moved on and who has it now. A card closes by itself once they have done their step."));
   };
   // ===== 2026-11-22T18:30:00Z: 🧾 PURCHASE MASTER REQUESTS — the Technical Head post's own list
   const mreqCol = ()=>{
@@ -76085,7 +76132,7 @@ function TaskBoardScreen({ user, onOpenQuote, onStartQuote, openTaskId, onBackTo
         ? (()=>{ const cols = empLo.sort([...EMP_STAGE_COLS.filter(c=>c && (c.key!=="pidc" || boardItems(who).some(t=>taskStage(t,today)==="pidc"))), ...empDoneCols()], c=>c.key); const labels = {}; cols.forEach(c=>{ labels[c.key] = c.label; });   // 138 Build 6
             empVis = empLo.view(cols.map(c=>c.key));
             return h("div",null, h(ListOrderBar,{ lo:empVis, board:"emp_board2", labels }),
-              h(DualScroll,{testid:"emp-board-lists",style:{display:"flex",gap:10,overflowX:"auto",alignItems:"flex-start",paddingBottom:10}}, (!listF || !cols.some(c=>c.key===listF)) ? h(BellBoardList,{ key:"bell|"+who, who, me, user, dept:whoDept, bosses:ap }) : null, (!listF || !cols.some(c=>c.key===listF)) ? h(ApprovalsLists,{ key:"appr|"+who, who, me, user, tasks, approversFor, regretProposed, onOpenTask:(id)=>setOpenId(id), onGoToTab }) : null, (!listF || !cols.some(c=>c.key===listF)) ? chaseCol() : null, (!listF || !cols.some(c=>c.key===listF)) ? mreqCol() : null, (!listF || !cols.some(c=>c.key===listF)) ? handoverCol() : null, (!listF || !cols.some(c=>c.key===listF)) ? psEmkCol() : null, (!listF || !cols.some(c=>c.key===listF)) ? h(WaNudgeList,{ key:"wa|"+who, who, me, user, tasks, approversFor, onOpenTask:(id)=>setOpenId(id) }) : null, cols.filter(c=>!listF || !cols.some(x=>x.key===listF) || c.key===listF).map(empColumn))); })()
+              h(DualScroll,{testid:"emp-board-lists",style:{display:"flex",gap:10,overflowX:"auto",alignItems:"flex-start",paddingBottom:10}}, (!listF || !cols.some(c=>c.key===listF)) ? h(BellBoardList,{ key:"bell|"+who, who, me, user, dept:whoDept, bosses:ap }) : null, (!listF || !cols.some(c=>c.key===listF)) ? h(ApprovalsLists,{ key:"appr|"+who, who, me, user, tasks, approversFor, regretProposed, onOpenTask:(id)=>setOpenId(id), onGoToTab }) : null, (!listF || !cols.some(c=>c.key===listF)) ? chaseCol() : null, (!listF || !cols.some(c=>c.key===listF)) ? mreqCol() : null, (!listF || !cols.some(c=>c.key===listF)) ? handoverCol() : null, (!listF || !cols.some(c=>c.key===listF)) ? psEmkCol() : null, ...((!listF || !cols.some(c=>c.key===listF)) ? stgCols() : []), (!listF || !cols.some(c=>c.key===listF)) ? pushCol() : null, (!listF || !cols.some(c=>c.key===listF)) ? h(WaNudgeList,{ key:"wa|"+who, who, me, user, tasks, approversFor, onOpenTask:(id)=>setOpenId(id) }) : null, cols.filter(c=>!listF || !cols.some(x=>x.key===listF) || c.key===listF).map(empColumn))); })()
         : tableView());
   };
   return h("div",{style:{padding:"14px 18px"}},
@@ -79264,17 +79311,30 @@ function osLotWhere(l, dc){
 const OS_WHO_LABEL = { pm:"production_manager", qc:"qc", stores:"stores", acc:"accounts" };
 function osWhoText(k){ return k ? postPersonText(OS_WHO_LABEL[k]) : ""; }
 // ---- task cards: one per person per step, closed when the step is done ----
-async function osTaskOpen(lot, step, names, title, by){
+async function osTaskOpen(lot, step, names, title, by, act){
+  // 2026-11-26T06:30:00Z (babu): one step = one card. An open card of this step is kept (its text brought up to date); a closed one is
+  // reopened when the lot comes back to the step; a new card only for someone who never had one. The card sits in the receiver's list.
+  let tk = lot.tasks||{}; try{ const { data: fr } = await sb.from("so_lot_tbl").select("tasks").eq("id",lot.id).maybeSingle(); if(fr && fr.tasks) tk = fr.tasks; }catch(e){}
+  const old = ((tk[step])||[]).map(String);
+  const due = STG_LOT_DAYS[step]!=null ? wdAdd(toISODate(new Date()), STG_LOT_DAYS[step]) : null;
+  const help = act && act.help && Array.isArray(act.help.do) ? "\n\nWhat to do:\n• "+act.help.do.join("\n• ") : "";
+  let rows = []; if(old.length){ try{ const { data } = await sb.from("task_tbl").select("id,assignee,status").in("id",old); rows = data||[]; }catch(e){} }
   const ids = [];
   for(const n of Array.from(new Set((names||[]).filter(Boolean)))){
     try{
+      const mine = rows.filter(r=>r.assignee===n).sort((a,b)=>Number(b.id)-Number(a.id));
+      const open = mine.find(r=>r.status!=="done");
+      if(open){ await sb.from("task_tbl").update({ title, due_date:due }).eq("id",open.id); ids.push(open.id); continue; }
+      if(mine[0]){ await sb.from("task_tbl").update({ status:"open", approved_by:null, approved_at:null, title, due_date:due, moved_by:by||"App", moved_at:osIso(), moved_what:"Back at this step — reopened" }).eq("id",mine[0].id);
+        try{ await taskLog(mine[0].id, by||"App", "Reopened: "+title); }catch(x){} ids.push(mine[0].id); continue; }
       let dept = null; try{ const { data: e } = await sb.from("employee_tbl").select("department").eq("employee_name",n).limit(1).maybeSingle(); dept = (e && e.department)||null; }catch(x){}
-      const card = { title, assignee:n, department:dept, labels:["Order Status"], links:[], ref:lot.contract_number, created_by:by||"App", status:"open", checklists:[], notes:"Made by the app from the Order Status board ("+osLotName(lot)+"). It closes itself when the step is done." };
+      const card = { title, assignee:n, department:dept, labels:["Order Status","STG:"+step], links:[], ref:lot.contract_number, created_by:by||"App", status:"open", checklists:[], due_date:due,
+        notes:"Made by the app from the Order Status board ("+osLotName(lot)+"). It closes itself when the step is done."+help };
       const { data: t } = await sb.from("task_tbl").insert(card).select().single();
       if(t){ ids.push(t.id); try{ await taskLog(t.id, by||"App", "Made by the app: "+title); }catch(x){} }
     }catch(e){ console.warn("Order status task", e); }
   }
-  if(ids.length){ const tasks = { ...(lot.tasks||{}), [step]:ids }; lot.tasks = tasks; try{ await sb.from("so_lot_tbl").update({ tasks }).eq("id",lot.id); }catch(e){} }
+  if(ids.length){ const all = Array.from(new Set([...old, ...ids.map(String)])).map(Number); const tasks = { ...tk, [step]:all }; lot.tasks = tasks; try{ await sb.from("so_lot_tbl").update({ tasks }).eq("id",lot.id); }catch(e){} }
   return ids;
 }
 async function osTaskClose(lot, step, by, what){
@@ -79283,16 +79343,86 @@ async function osTaskClose(lot, step, by, what){
     await sb.from("task_tbl").update({ status:"done", approved_by:"App ("+(by||"")+")", approved_at:now, moved_by:by||"App", moved_at:now, moved_what:what||"Done" }).eq("id",id).neq("status","done");
     await taskLog(id, by||"App", what||"Done"); }catch(e){} }
 }
-// Hand the lot to the next people: task cards + a bell notice that lights up the button to press.
+// ===== 2026-11-26T06:30:00Z (babu): STAGE MOVES AS LISTS — a stage move is never a bell. The post that owns the next step gets a card in
+// its own list on the task board (and My Day); the person who pushed it gets the card in 📤 Pushed by me, showing who has it now.
+// One step = one card: pressing a step again keeps the open card; a step that comes back reopens its card.
+const STG_LISTS = { so:"📝 OA to make", wo:"🚦 W/O to release", pr:"📦 PR to release", pa:"✅ Purchase to approve", pas:"🧾 Purchase summary to send",
+  pbm:"🧾 Purchase BOM to make", pbe:"🧾 Purchase BOM to endorse", pbp:"🧾 Purchase BOM to present", pba:"✅ Purchase BOM to approve",
+  start:"🏭 Production to start", prod:"🏭 Production in progress", chase:"📞 PO to chase", oacust:"📨 OA receipt to confirm",
+  dc:"📋 DC & packing slip to make", qc:"🧪 QC clearance — DC made", acc:"💰 Despatch clearance — Accounts", ship:"🚛 Gate pass & despatch", pay:"💵 Payment to collect" };
+const STG_ORDER = Object.keys(STG_LISTS);
+const STG_LOT_DAYS = { dc:2, qc:3, acc:2, ship:2, pay:null };
+const STG_TITLE_RE = [[/^Order Acceptance \(OA\) — /,"so"],[/^Release the W\/O — /,"wo"],[/^Stock check and PR release — /,"pr"],[/^Approve purchase — /,"pa"],
+  [/^Send the purchase summary/,"pas"],[/^Make the Purchase BOM — /,"pbm"],[/^Endorse the Purchase BOM — /,"pbe"],[/^Present the Purchase BOM/,"pbp"],
+  [/^Approve the Purchase BOM — /,"pba"],[/^Start production — /,"start"],[/^Production started — .*make the items/,"prod"],[/^Chase the PO — /,"chase"],
+  [/^Did the customer receive the O\.A/,"oacust"],[/^Issue the QC clearance letter/,"qc"],[/^(Make the DC and packing slip|⏸ Accounts (sent back|held)|↩ QC objected)/,"dc"],
+  [/^(Despatch clearance for |Bill )/,"acc"],[/^(QC documents in for|Despatch clearance given)/,"ship"],[/^Despatched /,"pay"]];
+function stgLabels(t){ return Array.isArray(t && t.labels) ? t.labels.map(String) : []; }
+function stgKeyOf(t){
+  if(!t || t.parent_id || t.status==="done") return null; const L = stgLabels(t);
+  const p = L.find(x=>x.startsWith("PUSH:")); if(p) return null;
+  const s = L.find(x=>x.startsWith("STG:")); if(s) return STG_LISTS[s.slice(4)] ? s.slice(4) : null;
+  if(!L.includes("Order Status")) return null; const title = String(t.title||"");
+  for(const [re,k] of STG_TITLE_RE) if(re.test(title)) return k; return null; }
+const stgIsPush = (t)=> !!t && !t.parent_id && t.status!=="done" && stgLabels(t).some(x=>x.startsWith("PUSH:"));
+const stgChips = (L)=> (Array.isArray(L)?L:[]).filter(x=>!/^(STG|PUSH):/.test(String(x)));
+const STG_ME = new Map();
+async function stgMe(by){
+  const u = by || window.__sessUser || ""; if(!u || u==="App") return "";
+  if(STG_ME.has(u)) return STG_ME.get(u);
+  let n = ""; try{ const { data } = await sb.from("app_users").select("employee_name").eq("username",u).maybeSingle(); n = (data && data.employee_name) || ""; }catch(e){}
+  if(!n){ try{ const { data } = await sb.from("employee_tbl").select("employee_name").eq("employee_name",u).limit(1).maybeSingle(); n = (data && data.employee_name) || ""; }catch(e){} }
+  STG_ME.set(u, n); return n;
+}
+async function stgPushCard(cn, k, to, title, by, due, what){
+  try{ const me = await stgMe(by); const rcv = Array.from(new Set((to||[]).filter(Boolean)));
+    if(!me || rcv.includes(me)) return null;
+    const t0 = "📤 "+String(title||"").replace(/[.\s]+$/,"")+" — now with "+(rcv.join(" / ")||"nobody (post empty)");
+    const { data: ex } = await sb.from("task_tbl").select("id").eq("assignee",me).eq("ref",String(cn)).contains("labels",["PUSH:"+k]).neq("status","done").limit(1);
+    if(ex && ex.length){ await sb.from("task_tbl").update({ title:t0, due_date:due||null }).eq("id",ex[0].id); return ex[0].id; }
+    let dept = null; try{ const { data: e } = await sb.from("employee_tbl").select("department").eq("employee_name",me).limit(1).maybeSingle(); dept = (e && e.department)||null; }catch(x){}
+    const row = { title:t0, assignee:me, department:dept, labels:["Order Status","PUSH:"+k], links:[], ref:String(cn), created_by:me, status:"open", checklists:[], due_date:due||null,
+      notes:"You moved this on"+(what?" ("+what+")":"")+". The card shows who has it now and closes by itself once they have done their step." };
+    const { data: t } = await sb.from("task_tbl").insert(row).select().single();
+    if(t){ try{ await taskLog(t.id, me, "Pushed: "+title); }catch(x){} return t.id; }
+  }catch(e){ console.warn("push card", e); }
+  return null;
+}
+async function stgPushClose(cn, k, by, what){
+  try{ const { data: xs } = await sb.from("task_tbl").select("id").eq("ref",String(cn)).contains("labels",["PUSH:"+k]).neq("status","done");
+    if((xs||[]).length) await ospTasksClose(xs.map(x=>x.id), by||"App", what||"Taken — the next person has done the step"); }catch(e){}
+}
+// a lot whose current step has lost its card (closed by mistake, deleted) gets it back — once every 10 minutes per session
+let STG_HEAL_AT = 0;
+async function stgLotHeal(lots, dcs){
+  if(Date.now()-STG_HEAL_AT < 600000) return; STG_HEAL_AT = Date.now();
+  try{ const dcBy = new Map((dcs||[]).map(d=>[String(d.id), d]));
+    const need = [];
+    for(const l of (lots||[])){ const dc = l.dc_id ? dcBy.get(String(l.dc_id)) : null; const col = osLotCol(l, dc);
+      const step = col===3 ? "qc" : (col===2 && l.ready_at && !l.stores_done_at) ? "dc" : null; if(!step) continue;
+      const ids = ((l.tasks||{})[step]||[]).map(String); if(!ids.length) continue; need.push({ l, step, ids }); }
+    if(!need.length) return;
+    const all = Array.from(new Set(need.flatMap(n=>n.ids))); const st = new Map();
+    for(let i=0;i<all.length;i+=200){ const { data, error } = await sb.from("task_tbl").select("id,status").in("id", all.slice(i,i+200)); if(error) return; (data||[]).forEach(r=>st.set(String(r.id), r.status)); }
+    for(const n of need){ if(n.ids.some(id=>st.has(id) && st.get(id)!=="done")) continue;
+      const last = n.ids.filter(id=>st.has(id)).map(Number).sort((a,b)=>b-a)[0]; if(!last) continue;
+      const due = STG_LOT_DAYS[n.step]!=null ? wdAdd(toISODate(new Date()), STG_LOT_DAYS[n.step]) : null;
+      await sb.from("task_tbl").update({ status:"open", approved_by:null, approved_at:null, due_date:due, moved_by:"App", moved_at:new Date().toISOString(), moved_what:"Reopened — the lot is still at this step" }).eq("id",last);
+      try{ await taskLog(last, "App", "Reopened: "+osLotName(n.l)+" is still waiting at this step"); }catch(x){} }
+  }catch(e){ console.warn("stage heal", e); }
+}
+// Hand the lot to the next people: a card in their list (no bell — 2026-11-26T06:30:00Z babu) + the pusher's 📤 card.
 async function osHand(lot, step, names, msg, act, by){
   const to = Array.from(new Set((names||[]).filter(Boolean)));
-  await notifyPeople(to, msg, "order_status", act ? { ...act, group:"oslot:"+lot.id+":"+step } : null);
-  await osTaskOpen(lot, step, to, msg, by);
+  await osTaskOpen(lot, step, to, msg, by, act);
+  try{ const due = STG_LOT_DAYS[step]!=null ? wdAdd(toISODate(new Date()), STG_LOT_DAYS[step]) : null;
+    await stgPushCard(lot.contract_number, step+"@"+lot.id, to, msg, by, due, osLotName(lot)); }catch(e){}
   return to;
 }
 async function osDone(lot, step, by, what){
-  await notifDone("oslot:"+lot.id+":"+step, by);
+  await notifDone("oslot:"+lot.id+":"+step, by);   // bells made before babu
   await osTaskClose(lot, step, by, what);
+  await stgPushClose(lot.contract_number, step+"@"+lot.id, by, "Taken — "+(what||"done"));
 }
 // ---- the whole board, read in one go ----
 async function osLoadAll(){
@@ -80823,6 +80953,7 @@ function OrderStatusBoard({ user, sessionCompany, startView, startGw }){
     const [m, p, d, st, mm, mk] = await Promise.all([despMe(user), despPeople(), osLoadAll(), despSettings(), ospLoad().catch(()=>null), myPostKeys(user).catch(()=>({ keys:[] })), osMovesLoad()]);
     setMe(m); setP(p); setS(st||{}); setM(mm); setMyKeys((mk&&mk.keys)||[]);
     if(mm && !mm.missing) ospSyncSoon(user);
+    if(!d.err){ try{ stgLotHeal(d.lots, d.dcs); }catch(e){} }   // 2026-11-26T06:30:00Z (babu): a lot waiting at a step always has its card
     // paid in the books? (lots despatched, not yet paid)
     if(!d.err){
       const waiting = d.lots.filter(l=>l.status!=="Returned" && l.shipped_at && !l.paid_at && l.dc_id);
@@ -82690,7 +82821,7 @@ const omRateOf = (rates, c)=> c==="INR" ? 1 : (Number(rates[c])>0 ? Number(rates
 // contract), / P J Q x by the Production Supervisor posts, T R N and x on QC rows by the QC post. A QC hold (ITP) row must
 // be x before a later step of that piece can be x. Undo only by the person who marked it, the same day (Super Admin any time).
 const MFG_SQL = "structure_manufacturing_2026-11-15.sql";
-const MFG_KEYS = ["mfg_cards","mfg_floor","mfg_report","mfg_dash","mfg_templates","mfg_models","mfg_slno_tpl","fg_stock"];
+const MFG_KEYS = ["prod_review","mfg_cards","mfg_floor","mfg_report","mfg_dash","mfg_templates","mfg_models","mfg_slno_tpl","fg_stock"];
 const MFG_SQL2 = "structure_manufacturing_part2_2026-11-15.sql";
 const MFG_RULES = [["re", "^DP.*-CASTED", "CAST", "Cast"], ["pre", ["SD-CA"], "CAST", "Cast"], ["pre", ["SD-FA"], "BSK-FAB", "Fabricated"], ["pre", ["BFFL", "BFS", "BFP", "BFE", "BEE"], "BSK-FAB", "Fabricated"], ["pre", ["BCP", "BCE", "BCS"], "CAST", "Cast"], ["pre", ["YIC"], "CAST", "Investment cast"], ["pre", ["YCP", "YCE", "YCS", "YSCW", "YSW"], "CAST", "Cast"], ["pre", ["YFG"], "Y-FORGED", "Forged"], ["pre", ["YBS", "YFB"], "YBR", "Bar stock"], ["pre", ["YFEE", "YFE", "YFP", "YFS", "Y-FIRELINE"], "Y-FAB", "Fabricated"], ["re", "^TSTR.*-CA-", "T-CAST", "Cast"], ["pre", ["T STRAINER-CASTING"], "T-CAST", "Cast"], ["pre", ["TCA"], "T-CAST", "Cast"], ["pre", ["TFS"], "T-FAB", "Fabricated"], ["pre", ["TEMP.STR"], "CSTR", "Fabricated"], ["pre", ["TCE"], "HOLD", "On hold \u2014 to check"], ["pre", ["T-STRAINER", "TSTR"], "T-FAB", "Fabricated"], ["pre", ["CONICAL", "BASKET-", "PLATE-", "AR-S-"], "CSTR", "Fabricated"], ["pre", ["DP-", "DS-", "DS ", "DFS", "DSTR"], "DSTR-FAB", "Fabricated"], ["pre", ["ASC-", "ASTR"], "SCS", "Fabricated"], ["pre", ["HYC"], "HYC", "Fabricated"], ["pre", ["DB-CA", "DTB-CA"], "CAST", "Cast"], ["pre", ["DB-", "DTB"], "PENDING", "Fabricated"], ["pre", ["OPA"], "OPA--ORIFICE-PLATE", "Fabricated"], ["pre", ["MCH", "ARS"], "PENDING", "Fabricated"], ["re", "^[0-9]+-STL-", "PENDING", "Fabricated"], ["pre", ["MSEP", "AV-CS", "AR-SL"], "TRADE", "Traded (buy & sell)"]];
 const MFG_WORD = { PENDING:"Template to come from the Production Head", BOI:"Bought out (BOI) — no route", HOLD:"On hold — to check" };
@@ -84949,11 +85080,11 @@ async function ospStageUpsert(cn, patch){
   if(error) throw new Error(/pa_|pos_override/.test(error.message||"") ? "Run "+LABEL_SQL+" first (both companies)." : /order_stage_tbl/.test(error.message||"") ? "Run "+UMA_SQL+" first (both companies)." : error.message);
   return row;
 }
-async function ospTaskCards(cn, client, names, postOf, title, due, note){
+async function ospTaskCards(cn, client, names, postOf, title, due, note, stg){
   const ids = [];
   for(const n of Array.from(new Set((names||[]).filter(Boolean)))){
     try{ let dept = null; try{ const { data: e } = await sb.from("employee_tbl").select("department").eq("employee_name",n).limit(1).maybeSingle(); dept = (e && e.department)||null; }catch(x){}
-      const row = { title, assignee:n, department:dept, labels:["Order Status"], links:[], ref:String(cn), customer:client||null, created_by:"App", status:"open", checklists:[], due_date:due||null, notes:note||"Made by the app from the Order Status board. It closes itself when the step is done.", post_key:postOf(n)||null };
+      const row = { title, assignee:n, department:dept, labels:stg ? ["Order Status","STG:"+stg] : ["Order Status"], links:[], ref:String(cn), customer:client||null, created_by:"App", status:"open", checklists:[], due_date:due||null, notes:note||"Made by the app from the Order Status board. It closes itself when the step is done.", post_key:postOf(n)||null };
       // 2026-11-10T15:00: an open card of this step for this person already exists (another screen made it) → use it
       { const { data: ex2, error: e2 } = await sb.from("task_tbl").select("id").eq("assignee",n).eq("ref",String(cn)).eq("title",title).neq("status","done").limit(1);
         if(e2) continue; if(ex2 && ex2.length){ ids.push(ex2[0].id); continue; } }
@@ -85061,6 +85192,7 @@ async function ospSync(only, by, Min){
         if(want.has(k) || closed[k]) continue;
         await ospTasksClose(tasks[k], by||"App", x.hold ? "Paused — "+cn+" is ON HOLD ("+(x.hold.reason_label||"")+")" : "Done — "+cn+" moved on");
         await notifDone("osstage:"+cn+":"+k, by||"App");
+        await stgPushClose(cn, k, by||"App", x.hold ? "Paused — on hold" : "Taken — "+cn+" moved on");
         closed[k] = today; dirty = true;
       }
       // 2026-11-13T12:00:00Z: a stage marked Not needed stays shut while it is wanted; it is forgotten once the order moves past it
@@ -85086,8 +85218,9 @@ async function ospSync(only, by, Min){
         const due = k==="oacust" ? today : k==="so" ? wdAdd(today,3) : (k==="pr"||k==="pa"||k==="pas") ? wdAdd(today,2) : (k==="start"||k==="pbm"||k==="pbe"||k==="pbp"||k==="pba") ? wdAdd(today,3) : null;
         const title = OSP_TITLE[k](cn, client);
         if(names.length){
-          const ids = await ospTaskCards(cn, client, names, postOf, title, due, null);
-          await notifyPeople(names, title+(due?" — by "+fmtDMY(due):"")+".", "order_status", { kind:"act", open:{ tab:"order_board" }, group:"osstage:"+cn+":"+k, help:{ btn:"Open the Order Status board", what:title, do:OSP_DO[k] } });
+          const ids = await ospTaskCards(cn, client, names, postOf, title, due, OSP_DO[k] ? "Made by the app from the Order Status board. It closes itself when the step is done.\n\nWhat to do:\n• "+OSP_DO[k].join("\n• ") : null, k);
+          // 2026-11-26T06:30:00Z (babu): no bell — the card sits in the receiver's list; whoever pushed it gets the 📤 card
+          if(only && only.length && by && by!=="App"){ try{ await stgPushCard(cn, k, names, title, by, due, ospLabelOf(x.stage)); }catch(e){} }
           tasks[k] = ids;
         } else tasks[k] = [];
         opened[k] = new Date().toISOString(); delete closed[k]; dirty = true;
@@ -86119,12 +86252,14 @@ async function osPlaceAtCol(cn, fromLabel, col, user, why, so){
 }
 async function osColTell(col, msg){
   try{ await loadPostPeople(true); const k = (OS_COLS[col-1]||{}).key; const names = postHolders(OS_COL_POST[k]||"");
-    if(names.length) await notifyPeople(Array.from(new Set(names)), msg, "order_status", { kind:"open", open:{ tab:"order_board" } }); }catch(e){}
+    // 2026-11-26T06:30:00Z (babu): a stage move is never a bell — the stage's card in the owner's list carries it; the move stays on the move log
+    if(names.length && false) await notifyPeople(Array.from(new Set(names)), msg, "order_status", { kind:"open", open:{ tab:"order_board" } }); }catch(e){}
 }
 async function ospMoveTell(cn, k, msg){
   try{ await loadPostPeople(true); const col = OSP_COLS.find(c=>c.k===k);
     const names = k==="prod" ? postHolders("production_manager") : col ? (col.sa ? await superAdminNames() : (col.posts||[]).flatMap(p=>postHolders(p))) : [];
-    if(names.length) await notifyPeople(Array.from(new Set(names)), msg, "order_status", { kind:"open", open:{ tab:"order_board" } }); }catch(e){}
+    // 2026-11-26T06:30:00Z (babu): a stage move is never a bell — the stage's card in the owner's list carries it; the move stays on the move log
+    if(names.length && false) await notifyPeople(Array.from(new Set(names)), msg, "order_status", { kind:"open", open:{ tab:"order_board" } }); }catch(e){}
 }
 // --- Name plate and Packing box: every Production BOM / Gantt must carry them
 const PG_MAND = [ { form:"Name plate", re:/name\s*-?\s*plate|tag\s*plate/i }, { form:"Packing box", re:/packing|wooden\s*box|crate/i } ];
@@ -88314,6 +88449,122 @@ async function delLoadAll(){
 }
 const CRQ_KIND = { rush:["Rush / advance despatch","#fdecea","#a3312a"], desp:["Despatch details / schedule","#e6f1fb","#1d5f9e"], doc:["Document","#e6f1fb","#1d5f9e"], meet:["Meeting called","#f3ecfb","#5b3fa3"], insp:["Inspection / TPI","#fff4d6","#7a5200"], other:["Other","#eeece4","#5c5a50"] };
 const crqPill = (k, extra)=>{ const c = CRQ_KIND[k]||CRQ_KIND.other; return h("span",{style:{display:"inline-block",fontSize:10.5,fontWeight:700,borderRadius:8,padding:"1px 7px",margin:"1px 2px",background:c[1],color:c[2]}},c[0]+(extra||"")); };
+// ===================== 2026-11-26T06:30:00Z (babu): 🏭 PRODUCTION REVIEW — Production › 📊 Reports =====================
+// Live: every open order not fully despatched, sorted by its delivery due (the app's delivery rule), with the stage as the
+// Order Status board shows it. One meeting note per contract (only the last one is kept — order_stage_tbl.esc.pr_note), shown
+// as a badge with the date and who wrote it. Anyone who can open the report can write. 🎤 speaks the note (English (India) / Tamil).
+const PRV_SR = (typeof window!=="undefined") ? (window.SpeechRecognition || window.webkitSpeechRecognition || null) : null;
+async function prvLoad(){
+  const [rows, B] = await Promise.all([delLoadAll(), osLoadAll()]);
+  let M = null; try{ M = await ospLoad(); }catch(e){}
+  const own = {}; try{ const r = await sb.from("contract_owner_tbl").select("contract_number,purchase_owner,qc_owner"); (r.data||[]).forEach(o=>{ own[String(o.contract_number)] = o; }); }catch(e){}
+  const po = {}; try{ const ls = await fetchPaged(()=>sb.from("contract_register_line_tbl").select("contract_number,due_date").not("due_date","is",null));
+    (ls||[]).forEach(l=>{ const k = String(l.contract_number); const d = toISODate(l.due_date); if(d && (!po[k] || d<po[k])) po[k] = d; }); }catch(e){}
+  const dcBy = new Map((B.dcs||[]).map(d=>[String(d.id), d]));
+  const place = {}; (B.place||[]).forEach(p=>{ place[String(p.contract_number)] = p; });
+  // items and quantities from the OA's quote
+  const sos = {}; try{ const s2 = await fetchPaged(()=>sb.from("sale_order_tbl").select("contract_number,quote_reference_number,status")); (s2||[]).forEach(s=>{ sos[String(s.contract_number)] = s; }); }catch(e){}
+  const refs = Array.from(new Set(Object.values(sos).map(s=>String(s.quote_reference_number||"").split(" · ")[0]).filter(Boolean)));
+  const items = {}; for(let i=0;i<refs.length;i+=150){ try{ const { data } = await sb.from("estimates").select("reference_number,item_sl_no,order_qty").in("reference_number", refs.slice(i,i+150)).gt("order_qty",0);
+    (data||[]).forEach(e=>{ const k = e.reference_number; if(!items[k]) items[k] = { n:0, q:0 }; items[k].n++; items[k].q += Number(e.order_qty)||0; }); }catch(e){} }
+  // route cards: cards and steps marked
+  const rc = {}; try{ const cards = await fetchPaged(()=>sb.from("route_card_tbl").select("id,contract_number"));
+    const cardCn = new Map((cards||[]).map(c=>[c.id, String(c.contract_number)])); (cards||[]).forEach(c=>{ const k = String(c.contract_number); if(!rc[k]) rc[k] = { cards:0, marked:0, last:null }; rc[k].cards++; });
+    const cells = await fetchPaged(()=>sb.from("route_cell_tbl").select("card_id,mark,at").not("mark","is",null));
+    (cells||[]).forEach(x=>{ if(!x.mark) return; const k = cardCn.get(x.card_id); if(!k || !rc[k]) return; rc[k].marked++; const d = x.at ? String(x.at).slice(0,10) : null; if(d && (!rc[k].last || d>rc[k].last)) rc[k].last = d; }); }catch(e){}
+  const out = [];
+  for(const r of (rows||[])){
+    const cn = String(r.cn); const so = sos[cn]; if(!so || /cancel|closed/i.test(so.status||"")) continue;
+    const L = (B.lots||[]).filter(l=>String(l.contract_number)===cn && l.status!=="Returned");
+    if(L.length && L.every(l=>l.shipped_at)) continue;   // fully despatched
+    const x = r.ps || (M && !M.missing ? ospStage(cn, M) : null);
+    let stage = "—";
+    if(x && x.hold) stage = "On hold — "+(x.hold.reason_label||x.hold.reason||"");
+    else if(x && x.stage && x.stage!=="prod") stage = (OBS_LABEL[x.stage] || ospLabelOf(x.stage))+(x.stage==="pur"||x.stage==="ps" ? " ("+(x.pct||0)+"% in)" : "");
+    else if(L.length) stage = L.map(l=>{ const c = osLotCol(l, l.dc_id ? dcBy.get(String(l.dc_id)) : null); return (L.length>1 ? "Lot "+(l.lot_no||"")+": " : "")+(osColOf(c).label||"—"); }).join(" · ");
+    else if(place[cn] && Number(place[cn].col)>1) stage = osColOf(place[cn].col).label || "Production in progress";
+    else if(x && x.stage==="prod") stage = "Production in progress";
+    const st = (M && M.st && M.st.get(cn)) || {}; const note = (st.esc||{}).pr_note || null;
+    const it = items[String(so.quote_reference_number||"").split(" · ")[0]] || null;
+    const forms = x && x.forms ? x.forms.length : 0;
+    out.push({ cn, client:r.client||"", due:r.date||null, dueState:r.state, poDue:po[cn]||null, var: (r.date && po[cn]) ? insDays(po[cn], r.date) : null,
+      stage, stageK:(x && x.stage)||"", items: it ? it.n+" item"+(it.n===1?"":"s")+" · "+it.q+" Nos" : "",
+      pown:(own[cn]||{}).purchase_owner||"", qown:(own[cn]||{}).qc_owner||"",
+      mat: forms ? (x.facN||0)+"/"+forms+" forms in ("+(x.pct||0)+"%)" : (x && x.plan ? "All in" : "No Gantt yet"),
+      prodn: rc[cn] ? rc[cn].cards+" card"+(rc[cn].cards===1?"":"s")+" · "+rc[cn].marked+" marked"+(rc[cn].last ? " · last "+fmtDMY(rc[cn].last) : "") : "No route cards",
+      lots: L.length ? L.length+" lot"+(L.length===1?"":"s")+(L.some(l=>l.shipped_at) ? " · "+L.filter(l=>l.shipped_at).length+" shipped" : "") : "",
+      note });
+  }
+  return out.sort((a,b)=> String(a.due||"9999").localeCompare(String(b.due||"9999")) || a.cn.localeCompare(b.cn));
+}
+function PrvNoteBox({ row, me, onSaved, onClose }){
+  const [t,setT] = useState(""); const [lang,setLang] = useState("en-IN"); const [rec,setRec] = useState(null); const [busy,setBusy] = useState(false); const [err,setErr] = useState("");
+  const start = ()=>{ if(!PRV_SR){ setErr("This browser cannot take voice — use Chrome or Edge (or the 🎤 key on the phone keyboard)."); return; }
+    try{ const r = new PRV_SR(); r.lang = lang; r.interimResults = true; r.continuous = true; const base = t ? t.replace(/\s*$/," ") : "";
+      r.onresult = (e)=>{ let s = ""; for(let i=0;i<e.results.length;i++) s += e.results[i][0].transcript; setT(base+s); };
+      r.onerror = (e)=>{ setErr(e && e.error==="not-allowed" ? "The microphone is blocked — allow it for this site in the browser, then press 🎤 again." : "Voice stopped ("+((e&&e.error)||"error")+")."); setRec(null); };
+      r.onend = ()=> setRec(null); r.start(); setRec(r); setErr(""); }catch(e){ setErr(String(e.message||e)); } };
+  const stop = ()=>{ try{ rec && rec.stop(); }catch(e){} setRec(null); };
+  const save = async()=>{ const txt = t.trim(); if(!txt){ setErr("Type or speak the note first."); return; } stop(); setBusy(true); setErr("");
+    try{ const { data: ex } = await sb.from("order_stage_tbl").select("esc").eq("contract_number",String(row.cn)).maybeSingle();
+      const esc = { ...((ex&&ex.esc)||{}), pr_note:{ t:txt, by:me||"", at:new Date().toISOString() } };
+      await ospStageUpsert(String(row.cn), { esc }); onSaved(esc.pr_note); }catch(e){ setErr("Not saved: "+(e.message||e)); } setBusy(false); };
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(20,22,18,.45)",zIndex:3000,display:"flex",alignItems:"flex-start",justifyContent:"center",paddingTop:80}},
+    h("div",{"data-testid":"prv-note-box",style:{background:"#fff",borderRadius:10,width:560,maxWidth:"94vw",padding:16,boxShadow:"0 10px 30px rgba(0,0,0,.3)"}},
+      h("div",{style:{fontSize:16,fontWeight:700,marginBottom:4}},"Meeting note — "+row.cn+(row.client?" · "+row.client:"")),
+      h("div",{style:{fontSize:12,color:colors.muted,marginBottom:8}}, row.note ? "Last time ("+fmtDMY(row.note.at)+" · "+(row.note.by||"—")+"): "+row.note.t : "No note yet."),
+      h("div",{style:{fontWeight:600,fontSize:12}},"Today's note ",h("span",{style:{color:"#dc2626"}},"*")),
+      h("textarea",{"data-testid":"prv-note-text",value:t,onChange:e=>setT(e.target.value),placeholder:"What was agreed today",style:{width:"100%",height:90,padding:8,border:"1px solid "+colors.border,borderRadius:6,font:"inherit",boxSizing:"border-box",marginTop:3}}),
+      h("div",{style:{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginTop:6}},
+        h("button",{type:"button","data-testid":"prv-mic",onClick:rec?stop:start,style:{...btnSmall,background:rec?"#c0392b":"#fff",color:rec?"#fff":colors.text}}, rec ? "■ Stop" : "🎤 Speak"),
+        h("select",{value:lang,onChange:e=>setLang(e.target.value),disabled:!!rec,style:{...inputStyle,width:150,padding:"3px 6px",fontSize:12}}, h("option",{value:"en-IN"},"English (India)"), h("option",{value:"ta-IN"},"Tamil")),
+        rec ? h("span",{style:{fontSize:12,color:"#c0392b",fontWeight:700}},"● Listening…") : null, h("span",{style:{flex:1}}),
+        h("button",{type:"button",onClick:()=>{ stop(); onClose(); },style:btnSmall},"Cancel"),
+        h("button",{type:"button","data-testid":"prv-note-save",onClick:save,disabled:busy,style:{...btnSmall,background:colors.dark,color:"#fff",borderColor:colors.dark}}, busy?"Saving…":"Save note")),
+      h("div",{style:{fontSize:11,color:colors.muted,marginTop:6}},"Saving replaces the last note — only the last one is kept. Voice turns into text you can correct before saving; the recording is never kept."),
+      err ? h("div",{style:{color:colors.danger,fontSize:12,marginTop:6}},err) : null));
+}
+function ProdReviewScreen({ user }){
+  const [rows,setRows] = useState(null); const [err,setErr] = useState(""); const [q,setQ] = useState(""); const [ed,setEd] = useState(null); const [me,setMe] = useState("");
+  const load = async()=>{ setErr(""); try{ setRows(await prvLoad()); }catch(e){ setErr(String(e.message||e)); setRows([]); } };
+  useEffect(()=>{ load(); (async()=>{ setMe((await despMe(user).catch(()=>"")) || user?.username || ""); })(); },[]);
+  const today = toISODate(new Date());
+  const shown = (rows||[]).filter(r=>!q || (r.cn+" "+r.client+" "+r.stage+" "+r.pown+" "+r.qown).toLowerCase().includes(q.toLowerCase()));
+  const dueTxt = (r)=> r.dueState==="ON HOLD" ? "clock on hold" : r.due ? fmtDMY(r.due)+(r.dueState && !/FIRM|OVERRIDDEN|REGISTER/.test(r.dueState) ? " ("+String(r.dueState).toLowerCase()+")" : "") : "—";
+  const noteTxt = (r)=> r.note ? r.note.t+" ("+fmtDMY(r.note.at)+" · "+(r.note.by||"")+")" : "";
+  const COLS = [ {label:"Delivery due",get:r=>dueTxt(r)},{label:"By PO",get:r=>r.poDue?fmtDMY(r.poDue):""},{label:"Variance (days)",get:r=>r.var==null?"":r.var},{label:"Contract",get:r=>r.cn},{label:"Customer",get:r=>r.client},
+    {label:"Items & Qty",get:r=>r.items},{label:"Stage on the board",get:r=>r.stage},{label:"Purchase owner",get:r=>r.pown},{label:"QC owner",get:r=>r.qown},{label:"Material in",get:r=>r.mat},
+    {label:"Production",get:r=>r.prodn},{label:"Lots",get:r=>r.lots},{label:"Last meeting note",get:r=>noteTxt(r)} ];
+  const th = { textAlign:"left", padding:"6px 8px", fontSize:11.5, borderBottom:"1px solid "+colors.border, background:"#f4f2ea", whiteSpace:"nowrap", position:"sticky", top:0 };
+  const td = { padding:"6px 8px", fontSize:12, borderBottom:"1px solid #eeece4", verticalAlign:"top" };
+  const fname = "Production_review_"+today;
+  return h("div",{"data-testid":"prod-review",style:{padding:"12px 16px"}},
+    h("div",{style:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:8}},
+      h("b",{style:{fontSize:18}},"Production review"), h("span",{style:{fontSize:12.5,color:colors.muted}},"Live — what the board shows now · sorted by delivery due"),
+      h("span",{style:{flex:1}}),
+      h("input",{value:q,onChange:e=>setQ(e.target.value),placeholder:"Search contract, customer, stage, owner",style:{...inputStyle,width:260,padding:"4px 8px",fontSize:12.5}}),
+      h("button",{onClick:load,style:btnSmall},"Refresh"),
+      h("button",{disabled:!shown.length,onClick:()=>exportRowsToExcel(COLS, shown, "Production review", fname),style:btnSmall},"Excel"),
+      h("button",{disabled:!shown.length,onClick:()=>exportRowsToPdf("Production review — "+fmtDMY(today), COLS, shown, fname),style:btnSmall},"PDF")),
+    err ? h("div",{style:{color:colors.danger,marginBottom:6}},err) : null,
+    !rows ? h("div",{style:{color:colors.muted}},"Reading the board, the delivery dates and the route cards…") :
+    h("div",{style:{overflow:"auto",maxHeight:"calc(100vh - 190px)",border:"1px solid "+colors.border,borderRadius:8,background:"#fff"}},
+      h("table",{style:{borderCollapse:"collapse",width:"100%"}},
+        h("thead",null,h("tr",null, ["#","Delivery due","By PO","Var","Contract","Customer","Items & Qty","Stage on the board","Purchase","QC","Material in","Production","Lots","Last meeting note"].map(c=>h("th",{key:c,style:th},c)))),
+        h("tbody",null, shown.map((r,i)=>h("tr",{key:r.cn},
+          h("td",{style:{...td,color:colors.muted}},i+1),
+          h("td",{style:{...td,whiteSpace:"nowrap",fontWeight:600,color:r.due && r.due<today ? "#a3312a" : "inherit"}}, dueTxt(r)),
+          h("td",{style:{...td,whiteSpace:"nowrap"}}, r.poDue?fmtDMY(r.poDue):"—"),
+          h("td",{style:{...td,textAlign:"right",fontWeight:r.var>0?700:400,color:r.var>0?"#a3312a":"inherit"}}, r.var==null?"":r.var),
+          h("td",{style:{...td,fontWeight:700}}, h(QtRef,{q:r.cn})), h("td",{style:td}, r.client), h("td",{style:{...td,whiteSpace:"nowrap"}}, r.items),
+          h("td",{style:td}, r.stage), h("td",{style:td}, r.pown||"—"), h("td",{style:td}, r.qown||"—"), h("td",{style:{...td,whiteSpace:"nowrap"}}, r.mat), h("td",{style:td}, r.prodn), h("td",{style:td}, r.lots),
+          h("td",{style:{...td,minWidth:200}}, r.note
+            ? h("div",{"data-testid":"prv-badge",onClick:()=>setEd(r),title:"Click to write today's note",style:{cursor:"pointer",background:"#fff8e1",border:"1px solid #f0d97a",borderRadius:6,padding:"4px 7px",fontSize:11.5}},
+                r.note.t, h("div",{style:{fontSize:10.5,color:colors.muted}}, fmtDMY(r.note.at)+" · "+(r.note.by||"")))
+            : h("button",{type:"button",onClick:()=>setEd(r),style:{...btnSmall,fontSize:11.5}},"Note…")))))),
+      !shown.length ? h("div",{style:{padding:12,color:colors.muted}},"No open orders.") : null),
+    ed ? h(PrvNoteBox,{ row:ed, me, onClose:()=>setEd(null), onSaved:(n)=>{ setRows(rs=>(rs||[]).map(x=>x.cn===ed.cn?{ ...x, note:n }:x)); setEd(null); try{ appToast("✓ Meeting note saved — "+ed.cn); }catch(e){} } }) : null);
+}
 function DeliveryScreen({ user, onOpenContract }){
   const [cfx,setCfx] = useState("");   // 2026-11-06 contract lookup
   const [rows,setRows] = useState(null); const [f,setF] = useState(""); const [q,setQ] = useState(""); const [hold,setHold] = useState(null); const [crq,setCrq] = useState(null);
