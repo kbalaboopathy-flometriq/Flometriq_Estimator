@@ -60,7 +60,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-27T08:00:00Z";
+  var APP_BUILD_VERSION = "2026-11-27T08:30:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -7519,6 +7519,28 @@ function UsersEditor({ user }) {
     const names = Array.from(new Set((data||[]).map(r=>String(r.employee_name||"").trim()).filter(Boolean))).sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:"base"}));
     setEmployeeOptions(names); return names.length; },[]);
   useEffect(()=>{ loadEmps(); },[loadEmps]);
+  // 2026-11-27T08:30:00Z: 💬 send the login (username + password) to the employee by WhatsApp — Super Admins only, logged
+  const [waSent,setWaSent]=useState({});   // username -> time sent (cleared by a later password reset)
+  const loadWaSent = useCallback(async()=>{ try{
+      const { data } = await sb.from("audit_log").select("record_id,record_summary,performed_at").eq("table_name","app_users").or("record_summary.ilike.Login details sent by WhatsApp*,record_summary.ilike.Password reset for*").order("performed_at",{ascending:true}).limit(2000);
+      const m = {}; (data||[]).forEach(a=>{ const u = String(a.record_id||""); if(/^Login details sent/i.test(a.record_summary||"")) m[u] = a.performed_at||true; else delete m[u]; }); setWaSent(m);
+    }catch(e){} },[]);
+  useEffect(()=>{ loadWaSent(); },[loadWaSent]);
+  const sendLogin = (r)=>{
+    if(!r.employee_name){ alert("Link "+r.username+" to an employee first (Employee column) — the WhatsApp goes to that employee's mobile."); return; }
+    if(r.is_active===false){ alert(r.username+" is Inactive — reactivate first."); return; }
+    const co = (companies.find(c=>c.id===r.company_id)||{}).company_name || "our company";
+    const link = (()=>{ try{ return window.location.origin + window.location.pathname; }catch(e){ return ""; } })();
+    const first = String(r.employee_name).split(" ")[0];
+    const L = ["Dear "+first+",", "", "Your login for the "+co+" app:"];
+    if(link) L.push("Link: "+link);
+    L.push("Username: "+r.username, "Password: "+(r.password||""), "",
+      "*Do not give your password to anyone.* Everything you do in the app is recorded in your name — if someone else uses your login, it will show as your work.", "",
+      "After you sign in, the app asks whether to save the password on this device — say Yes. Then delete this message.", "", "— "+(user?.employee_name||user?.username||""));
+    waOpen(r.employee_name, L.join(String.fromCharCode(10)), async(how)=>{
+      try{ await logAudit("NOTE","app_users",r.username,"Login details sent by WhatsApp to "+r.employee_name+" ("+how+") by "+(user?.username||""),user?.username||"unknown",null,null); }catch(e){}
+      setWaSent(m=>({ ...m, [r.username]:new Date().toISOString() })); });
+  };
   const refreshAll = async()=>{ setRefBusy(true); setEmpMsg(""); try{ try{ WA_PH.at = 0; }catch(e){} const n = await loadEmps(); await load(); setEmpMsg("✓ Refreshed — "+n+" employees in the drop-down"); }catch(e){ setEmpMsg("✗ "+(e.message||e)); } setRefBusy(false); };
   const usrPass = r=> fltHas(r.employee_name, uf.emp) && fltHas(r.username, uf.user) && fltHas(r.role, uf.role)
     && (!uf.status || (uf.status==="Inactive" ? r.is_active===false : uf.status==="Active" ? r.is_active!==false : true))
@@ -7548,6 +7570,7 @@ function UsersEditor({ user }) {
     const { error:err } = await sb.from("app_users").update({password:resetVal}).eq("id",resetTarget.id);
     if(err){ alert("Failed: "+err.message); return; }
     await logAudit("UPDATE","app_users",resetTarget.username,"Password reset for \""+resetTarget.username+"\" by "+(user?.username||"unknown"),user?.username||"unknown",null,null);
+    setWaSent(m=>{ const n = { ...m }; delete n[resetTarget.username]; return n; });   // a new password can be sent again
     setResetTarget(null); setResetVal(""); load();
   };
   const addUser=async()=>{ if(!draft.username.trim()||!draft.password.trim()){alert("Username and password required.");return;} const{error:err}=await sb.from("app_users").insert({username:draft.username.trim(),password:draft.password,role:draft.role,employee_name:draft.employee_name||null}); if(err){alert("Failed: "+err.message);return;} await logAudit("CREATE","app_users",draft.username.trim(),"New user \""+draft.username.trim()+"\" created with role "+draft.role+(draft.employee_name?" for employee \""+draft.employee_name+"\"":"")+" and an initial password set",user?.username||"unknown",null,{username:draft.username.trim(),role:draft.role,employee_name:draft.employee_name}); setAdding(false);setDraft({username:"",password:"",role:"user",employee_name:""});load(); };
@@ -7609,7 +7632,10 @@ function UsersEditor({ user }) {
         isSuperAdmin && h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
           h("span",{style:{fontFamily:"monospace",fontSize:12,marginRight:8}},revealed.has(r.id)?r.password:"••••••••"),
           h("button",{onClick:()=>toggleReveal(r),style:{...btnSmall,fontSize:10.5,padding:"3px 8px",marginRight:4}},revealed.has(r.id)?"Hide":"Show"),
-          h("button",{onClick:()=>startReset(r),style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Reset")
+          h("button",{onClick:()=>startReset(r),style:{...btnSmall,fontSize:10.5,padding:"3px 8px"}},"Reset"),
+          waSent[r.username]
+            ? h("span",{title:"Login sent by WhatsApp"+(typeof waSent[r.username]==="string"?" on "+fmtDMYTime(waSent[r.username]):"")+". Reset the password to send again.",style:{marginLeft:6,fontSize:10.5,fontWeight:700,color:"#0f6b4f"}},"💬 Sent ✓")
+            : h("button",{"data-testid":"user-wa-"+r.username,onClick:()=>sendLogin(r),title:r.employee_name?"WhatsApp the username and password to "+r.employee_name:"Link an employee first",style:{...btnSmall,fontSize:10.5,padding:"3px 8px",marginLeft:4,background:"#25d366",color:"#fff",borderColor:"#25d366",opacity:r.employee_name?1:.5}},"💬 WhatsApp login")
         ),
         isSuperAdmin && h("td",{style:{padding:"8px 10px",whiteSpace:"nowrap"}},
           h("span",{style:{fontSize:10.5,fontWeight:700,padding:"2px 9px",borderRadius:9,background:r.is_active===false?"#fdecea":"#eafaf1",color:r.is_active===false?colors.danger:"#0f6e3f",marginRight:6}},r.is_active===false?"Inactive":"Active"),
@@ -37920,6 +37946,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"27 Nov 2026", summary:"Built on 2026-11-27T08:30:00Z, on top of 2026-11-27T08:00:00Z. No SQL. ADMIN › USERS: 💬 WhatsApp login on every row (Super Admins only) — a ready message to the linked employee with the app link, username and password, and: do not give your password to anyone; everything you do in the app is recorded in your name, so if someone else uses your login it shows as your work; say Yes to save the password on the device, then delete the message. The mobile comes from Employees (asked once and saved if missing). Every send is in the audit log; the row then shows 💬 Sent ✓ until the password is reset. Needs a linked employee; not for Inactive users." },
   { date:"27 Nov 2026", summary:"Built on 2026-11-27T08:00:00Z, on top of 2026-11-27T07:30:00Z. No SQL. NO SIRENS FOR SUPER ADMINS, PERMANENTLY: no approvals siren (approvals stay on the ✅ Approvals button and the board), no stage-move or overdue siren, no master-stall siren; the health-watch alarm (database failing) is now a plain message — no sound, no blinking; every sound in the app is silent in a Super Admin session. The 🔔 panel shows a Super Admin only the monthly rate review, silently. Everyone else is as in 07:00." },
   { date:"27 Nov 2026", summary:"Built on 2026-11-27T07:30:00Z, on top of 2026-11-27T07:00:00Z. No SQL. ADMIN › USERS: ↻ Refresh button — reads the users and the Employees master again, says how many employees are in the drop-down. The Employee drop-down now reads every employee (it stopped at 1,000 rows before) and sorts ignoring capitals (a name typed in small letters went to the end of the list). A user linked to a name that is not in Employees shows it as “(not in Employees)” instead of a blank." },
   { date:"27 Nov 2026", summary:"Built on 2026-11-27T07:00:00Z, on top of 2026-11-27T05:00:00Z (SIREN build). No SQL. SUPER ADMINS: the siren sounds only for approvals waiting on them (hourly, every 30 min from 2 days old, every 10 min from 3 days); no stage-move or overdue siren, no master-stall stop; the monthly rate review still shows in the panel but does not sound. 💬 WHATSAPP on every line of the 🔔 panel to the department head of that card (a head's own lines go to a Super Admin); lines that go to the same person make ONE message with all of them, and the send is logged on the cards. ⏰ POSTPONE 1 HR (3 times a day, logged) and – minimise; there is no close. ESCALATION after the 3 days of sirens: the block on new task cards starts and the Super Admins get a bell (once a day per person); the block box has a Siren release code field (24 hours, once, for that person) and Ask a Super Admin. Admin › Health › 🚨 Siren escalations (Super Admins): who is past 3 days, their oldest card, Make a Siren release code (sent to the person's bell)." },
