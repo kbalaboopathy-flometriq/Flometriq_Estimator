@@ -4,6 +4,20 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>BOM Estimator</title>
+<script>
+/* 2026-11-27T10:00:00Z: SERVER CLOCK — the app runs on the server's time, not the computer's. After sign-in (and every 30 min) the app
+   reads the server time (app_now) and sets the difference here; every new Date() / Date.now() in the app then gives server time,
+   so a wrong Windows clock on one computer cannot put wrong times into the data. The last known difference is reused for 12 hours. */
+(function(){ var RD = window.Date, SK = 0;
+  try{ var c = JSON.parse(localStorage.getItem("srv_skew")||"null"); if(c && typeof c.s==="number" && RD.now()-c.at < 12*3600e3) SK = c.s; }catch(e){}
+  function D(){ if(!(this instanceof D)) return new D().toString(); var a = Array.prototype.slice.call(arguments);
+    if(!a.length) return new RD(RD.now()+SK); return new (Function.prototype.bind.apply(RD, [null].concat(a)))(); }
+  D.prototype = RD.prototype; D.now = function(){ return RD.now()+SK; }; D.UTC = RD.UTC; D.parse = RD.parse;
+  try{ Object.setPrototypeOf(D, RD); }catch(e){}
+  window.__RealDate = RD; window.__getSkew = function(){ return SK; };
+  window.__setSkew = function(s){ SK = s; try{ localStorage.setItem("srv_skew", JSON.stringify({ s:s, at:RD.now() })); }catch(e){} };
+  window.Date = D; })();
+</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -60,7 +74,7 @@ td:hover > .hoverPeekPop { display:block; }
 // sessionStorage guard prevents a reload loop if version.txt is ever
 // missing, unreachable, or the network is offline.
 (function(){
-  var APP_BUILD_VERSION = "2026-11-27T08:30:00Z";
+  var APP_BUILD_VERSION = "2026-11-27T10:00:00Z";
   // Published so the app can read it — issue reports record the build they
   // were raised on, which answers a good share of them outright. ONE source:
   // declaring a second copy in the app script would drift on the first build
@@ -2626,7 +2640,8 @@ function LoginScreen({ onLogin }) {
         // 23 Sep — which company's copy this is, so nobody signs in to the
         // wrong one. Blank on Flometriq, where there is no settings.js.
         APP_INSTANCE_LABEL && h("div",{style:{fontSize:13,fontWeight:700,color:colors.text,marginTop:4}},APP_INSTANCE_LABEL),
-        h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"Authored by K.Bala Boopathy")
+        h("div",{style:{fontSize:11,color:colors.mutedLight,marginTop:4}},"Authored by K.Bala Boopathy"),
+        h(LiveClock,{ big:true })   // 2026-11-27T10:00:00Z
       ),
       outMsg ? h("div",{"data-testid":"login-out-msg",style:{background:"#fff4d6",color:"#5c3d06",borderRadius:6,padding:"7px 10px",fontSize:12.5,marginBottom:14}},outMsg) : null,
       h("form",{onSubmit:submit},
@@ -2845,6 +2860,26 @@ function NotificationBell({ user }){
 // letter. Hover = the same moment in India time. For the first 24 hours this
 // browser sees a version, it turns yellow and says "new today" so staff know
 // the screens may have changed. Super Admins can click it for Version History.
+// 2026-11-27T10:00:00Z: 🕒 live clock in server time — updates its own text once a second, never redraws the screen, sends nothing
+function clkFmt(d){ try{ const p = d.toLocaleString("en-IN",{ timeZone:"Asia/Kolkata", hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:true }).toUpperCase();
+    const q = d.toLocaleDateString("en-GB",{ timeZone:"Asia/Kolkata", day:"2-digit", month:"2-digit", year:"numeric" }).replace(/\//g,"-"); return p+" · "+q; }catch(e){ return d.toString(); } }
+function LiveClock({ big }){
+  const tRef = useRef(null), wRef = useRef(null);
+  useEffect(()=>{ let dead = false;
+    const paint = ()=>{ if(dead || !tRef.current) return; tRef.current.textContent = (big ? "" : "🕒 ") + clkFmt(new Date()) + (CLK.ok ? "" : big ? " (this computer)" : "");
+      if(wRef.current){ const bad = clkBad(); wRef.current.style.display = bad || big ? "" : "none";
+        wRef.current.textContent = bad ? "⚠ This computer's clock is "+clkTxt()+(big ? ". Fix it: right-click the clock › Adjust date and time › Set time automatically › Sync now." : "") : (big && CLK.ok ? "✓ Your computer's clock is right" : "");
+        wRef.current.style.color = bad ? (big ? "#a3312a" : "#ffb4a8") : (big ? "#0f6b4f" : ""); } };
+    clkCheck().then(paint).catch(()=>{}); paint(); const t = setInterval(paint, 1000); return ()=>{ dead = true; clearInterval(t); }; },[]);
+  const fix = ()=>{ alert("This computer's clock is "+clkTxt()+".\n\nThe app uses the server's time, so your work is stamped correctly. Please fix the Windows clock anyway:\n1. Right-click the clock at the bottom-right › Adjust date and time.\n2. Turn ON Set time automatically and Set time zone automatically ((UTC+05:30) Chennai, Kolkata, Mumbai, New Delhi).\n3. Press Sync now."); };
+  return big
+    ? h("div",{"data-testid":"login-clock",style:{marginTop:12,textAlign:"center"}},
+        h("div",{ref:tRef,style:{fontSize:20,fontWeight:700,color:colors.text,fontFamily:"ui-monospace,Consolas,monospace",letterSpacing:".02em"}}),
+        h("div",{style:{fontSize:10.5,color:colors.mutedLight}},"India time (from the server)"),
+        h("div",{ref:wRef,style:{fontSize:11.5,marginTop:4,lineHeight:1.4}}))
+    : h("div",{"data-testid":"top-clock",style:{fontSize:10,color:"#c9cdbf",marginTop:1,fontFamily:"ui-monospace,Consolas,monospace",whiteSpace:"nowrap",display:"flex",gap:6}},
+        h("span",{ref:tRef,title:"India time from the server"}), h("span",{ref:wRef,onClick:fix,title:"Click: how to fix the computer's clock",style:{cursor:"pointer",display:"none"}}));
+}
 function VersionLine({ onOpen }){
   const ver = (typeof window!=="undefined" && window.APP_BUILD_VERSION) || "";
   if(!ver) return null;
@@ -2860,7 +2895,7 @@ function VersionLine({ onOpen }){
   const tip = (ist ? "Saved "+ist+" India time" : "") + (onOpen ? " · click for what changed" : "");
   return h("div",{title:tip,onClick:onOpen||undefined,
     style:{fontSize:10,color:isNew?"#ffe27a":"#c9cdbf",marginTop:2,fontFamily:"ui-monospace,Consolas,monospace",letterSpacing:".02em",cursor:onOpen?"pointer":"default",whiteSpace:"nowrap"}},
-    "Version "+ver+(isNew?" · new today":""));
+    "Version "+ver+(isNew?" · new today":""), h(LiveClock,null));
 }
 
 
@@ -37946,6 +37981,7 @@ function FaqScreen(){
 // Manually maintained — a new entry is added here each time a new Index.html
 // is shipped, alongside the corresponding User Manual update. Super Admin only.
 const VERSION_HISTORY = [
+  { date:"27 Nov 2026", summary:"Built on 2026-11-27T10:00:00Z (replaces 09:00 and 09:30, not deployed), on top of 2026-11-27T08:30:00Z. SERVER CLOCK: the app runs on the server's time — at sign-in and every 30 min it reads app_now and corrects every date and time the app uses, so a wrong Windows clock on one computer cannot put wrong times into the data (no PDF block; a gentle reminder every 4 hours to fix the Windows clock). LIVE CLOCK: 🕒 on the login screen (large, with ✓ right / ⚠ wrong and how to fix) and in the top bar under the version on every screen (turns red when the computer is off; click for the fix) — it updates its own text once a second, never redraws the screen and sends nothing to the server. ALSO FROM 09:00: SQL: structure_clock_guard_2026-11-27.sql (both companies). After the 27-11 12:24 runaway-load alarm on Production review: (1) the alarm now needs two busy minutes in a row — one heavy action (opening a big screen, ↻ Refresh, switching company) is a burst, not a loop; the report now lists the screens visited in the last 3 minutes. (2) CLOCK GUARD: Mokesh's computer clock was hours ahead and stamped every background sweep in the future, so no other browser ran them. The app now reads the server time (app_now); a computer more than 5 minutes off runs no sweeps, its user gets a message to fix the Windows clock and the Super Admins an incident; sweep times are written in server time; a sweep stamped in the future is treated as due. The SQL also resets the future stamps." },
   { date:"27 Nov 2026", summary:"Built on 2026-11-27T08:30:00Z, on top of 2026-11-27T08:00:00Z. No SQL. ADMIN › USERS: 💬 WhatsApp login on every row (Super Admins only) — a ready message to the linked employee with the app link, username and password, and: do not give your password to anyone; everything you do in the app is recorded in your name, so if someone else uses your login it shows as your work; say Yes to save the password on the device, then delete the message. The mobile comes from Employees (asked once and saved if missing). Every send is in the audit log; the row then shows 💬 Sent ✓ until the password is reset. Needs a linked employee; not for Inactive users." },
   { date:"27 Nov 2026", summary:"Built on 2026-11-27T08:00:00Z, on top of 2026-11-27T07:30:00Z. No SQL. NO SIRENS FOR SUPER ADMINS, PERMANENTLY: no approvals siren (approvals stay on the ✅ Approvals button and the board), no stage-move or overdue siren, no master-stall siren; the health-watch alarm (database failing) is now a plain message — no sound, no blinking; every sound in the app is silent in a Super Admin session. The 🔔 panel shows a Super Admin only the monthly rate review, silently. Everyone else is as in 07:00." },
   { date:"27 Nov 2026", summary:"Built on 2026-11-27T07:30:00Z, on top of 2026-11-27T07:00:00Z. No SQL. ADMIN › USERS: ↻ Refresh button — reads the users and the Employees master again, says how many employees are in the drop-down. The Employee drop-down now reads every employee (it stopped at 1,000 rows before) and sorts ignoring capitals (a name typed in small letters went to the end of the list). A user linked to a name that is not in Employees shows it as “(not in Employees)” instead of a blank." },
@@ -61799,6 +61835,7 @@ function App() {
     try{ const raw=sessionStorage.getItem("flometriq_user"); return raw?JSON.parse(raw):null; } catch(e){ return null; }
   });
   const [tab,setTab]=useState("home");
+  if(window.__curTab !== tab){ try{ (window.__tabTrail = window.__tabTrail || []).push({ tab, at:Date.now() }); if(window.__tabTrail.length>20) window.__tabTrail.shift(); }catch(e){} }   // 2026-11-27T09:00:00Z: screens visited, for the incident report
   window.__curTab = tab; window.__svUser = user && user.username;   // 2026-11-13T00:00: the stale gate knows a quote PDF from an order-side one
   // 225: Full screen — the browser goes full screen (Windows taskbar and browser bars hidden) and the app's top bar and menu fold away
   const [focusMode,setFocusMode]=useState(false); const [focusMenu,setFocusMenu]=useState(false);
@@ -70177,11 +70214,56 @@ const SWEEPS = [
   { k:"crq",      l:"Gantt actual dates from POs / GRNs", m:240, run:()=>crqSweep() },
   { k:"stgdue",   l:"Stage cards with no due date", m:240, run:()=>{ STG_DUE_FIXED = false; return stgDueFix(); } } ];
 const sweepCn = (k)=>"__sweep:"+k+"__";
-async function sweepMarkers(){
-  const { data, error } = await sb.from("order_stage_tbl").select("contract_number,updated_at,esc").like("contract_number","\\_\\_sweep:%");
-  if(error) throw error; const M = {}; (data||[]).forEach(r=>{ M[String(r.contract_number).slice(8,-2)] = { at:r.updated_at, by:(r.esc&&r.esc.by)||"", err:(r.esc&&r.esc.err)||"" }; }); return M; }
+// 2026-11-27T09:00:00Z: CLOCK GUARD — a computer whose clock is wrong stamped the sweeps hours in the future (27-11 incident: every sweep
+// "last run" 19:47–22:28 while it was 12:24), so no other browser ran them. Server time comes from app_now() (SQL), cached 30 min.
+let CLK = { skew:0, at:0, ok:false };
+async function clkCheck(){
+  if(CLK.at && (window.__RealDate||Date).now()-CLK.at < 30*60e3) return CLK;
+  const RD = window.__RealDate || Date;
+  try{ const t0 = RD.now(); const { data, error } = await sb.rpc("app_now"); const t1 = RD.now();
+    if(!error && data){ const srv = new RD(Array.isArray(data) ? data[0] : data).getTime(); if(isFinite(srv)){ CLK = { skew: srv - (t0+t1)/2, at:RD.now(), ok:true }; try{ if(window.__setSkew) window.__setSkew(Math.abs(CLK.skew) < 60e3 ? 0 : CLK.skew); }catch(e){} } else CLK = { skew:0, at:RD.now(), ok:false }; }
+    else CLK = { skew:0, at:RD.now(), ok:false };
+  }catch(e){ CLK = { skew:0, at:RD.now(), ok:false }; }
+  if(CLK.ok && Math.abs(CLK.skew) > 5*60e3) clkWarn().catch(()=>{});
+  else if(CLK.ok){ try{ if(clkWarnN()) localStorage.removeItem(clkKey()); }catch(e){} }
+  return CLK;
+}
+const nowS = ()=> Date.now();   // Date is already server time (the SERVER CLOCK shim at the top)
+const clkBad = ()=> CLK.ok && Math.abs(CLK.skew) > 5*60e3;
+function clkTxt(){ const m = Math.round(Math.abs(CLK.skew)/60e3); const t = m>=90 ? (Math.round(m/6)/10)+" hours" : m+" minutes"; return t+(CLK.skew<0 ? " ahead" : " behind"); }
+let CLK_WARNED = 0;
+const CLK_MAX_WARN = 3;
+function clkWho(){ const u = hwMe(); return (u && (u.employee_name||u.username)) || ""; }
+function clkKey(){ const u = hwMe(); return "clkWarnN|"+((u && u.username)||""); }
+function clkWarnN(){ try{ return Number(localStorage.getItem(clkKey()))||0; }catch(e){ return 0; } }
+function clkBlocked(){ return clkBad() && clkWarnN() >= CLK_MAX_WARN; }
+async function clkHeads(){   // the user's department head (by post) and the Super Admins
+  let dept = SIR.dept || ""; const me = clkWho();
+  if(!dept){ try{ const { data } = await sb.from("employee_tbl").select("department").eq("employee_name",me).limit(1).maybeSingle(); dept = (data && data.department)||""; }catch(e){} }
+  let head = []; try{ await loadPostPeople(); const hp = deptHeadPost(dept); head = hp ? (postHolders(hp)||[]).filter(n=>!sameName(n,me)) : []; }catch(e){}
+  let sas = []; try{ sas = await superAdminNames(); }catch(e){}
+  return { dept, head, sas };
+}
+function clkSteps(){ return "1. Right-click the clock at the bottom-right of the screen › Adjust date and time.\n2. Turn ON “Set time automatically” and “Set time zone automatically” (time zone: (UTC+05:30) Chennai, Kolkata, Mumbai, New Delhi).\n3. Press “Sync now”.\n4. Come back to the app and press ⟳ Reload app."; }
+function clkModal(title, body, tone){
+  try{ const old = document.getElementById("clk-modal"); if(old) old.remove();
+    const w = document.createElement("div"); w.id = "clk-modal"; w.setAttribute("data-svnolock","1");
+    w.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:99500;display:flex;align-items:center;justify-content:center;font-family:inherit";
+    const b = document.createElement("div"); b.style.cssText = "background:#fff;border-radius:12px;max-width:560px;width:92%;padding:18px 20px;box-shadow:0 10px 40px rgba(0,0,0,.3);border-top:6px solid "+(tone==="red"?"#c9372c":"#d4a017");
+    const h3 = document.createElement("div"); h3.style.cssText = "font-size:18px;font-weight:800;color:"+(tone==="red"?"#a3312a":"#8a6100")+";margin-bottom:8px"; h3.textContent = title;
+    const p = document.createElement("div"); p.style.cssText = "font-size:13.5px;line-height:1.55;white-space:pre-wrap;color:#172b4d"; p.textContent = body;
+    const ok = document.createElement("button"); ok.textContent = "OK, I'll fix it"; ok.style.cssText = "margin-top:14px;padding:8px 16px;background:#1d3a33;color:#fff;border:none;border-radius:7px;font-weight:600;cursor:pointer";
+    ok.onclick = ()=>w.remove(); b.appendChild(h3); b.appendChild(p); b.appendChild(ok); w.appendChild(b); document.body.appendChild(w);
+  }catch(e){ try{ alert(title+"\n\n"+body); }catch(x){} }
+}
+async function clkWarn(){   // 2026-11-27T10:00:00Z: a gentle reminder only — the app already works on server time
+  if(Date.now()-CLK_WARNED < 4*3600e3) return; CLK_WARNED = Date.now();
+  try{ appToast("⏰ Your computer's clock is "+clkTxt()+". The app uses the server's time, so your work is safe — but please fix the Windows clock: right-click the clock › Adjust date and time › Set time automatically › Sync now."); }catch(e){}
+  try{ const who = clkWho(), k = "clkLog|"+who+"|"+toISODate(new Date()); if(!localStorage.getItem(k)){ localStorage.setItem(k,"1"); await logAudit("NOTE","clock",who,"Computer clock "+clkTxt()+" — app corrected to server time",who); } }catch(e){}
+}
+function clkPdfGate(){ return true; }   // 2026-11-27T10:00:00Z: no PDF block — a wrong computer clock no longer harms the data
 async function sweepClaim(k, old, by, force){
-  const cn = sweepCn(k), at = new Date().toISOString(), esc = { by, at };
+  const cn = sweepCn(k), at = new Date(nowS()).toISOString(), esc = { by, at };
   if(old && !force){ const { data, error } = await sb.from("order_stage_tbl").update({ updated_at:at, esc }).eq("contract_number",cn).eq("updated_at",old).select("contract_number"); return !error && !!(data && data.length); }
   if(old || force){ const { data, error } = await sb.from("order_stage_tbl").update({ updated_at:at, esc }).eq("contract_number",cn).select("contract_number"); if(!error && data && data.length) return true; }
   const { error } = await sb.from("order_stage_tbl").insert({ contract_number:cn, tasks:{}, opened:{}, esc, updated_at:at }); return !error; }
@@ -70190,8 +70272,8 @@ function sweepUnguard(){ try{ const re = /^(osStaleSweep|bellPurge|billAge|calSw
     for(let i=localStorage.length-1;i>=0;i--){ const k = localStorage.key(i); if(k && re.test(k)) localStorage.removeItem(k); } }catch(e){}
   try{ PGA_AT = 0; }catch(e){} try{ DREG_SYNC_AT = 0; }catch(e){} try{ DREG_CARD_AT = 0; }catch(e){} try{ BELL_PURGE_RUN = false; }catch(e){} try{ CHASE_SWEEP_AT = 0; }catch(e){} }
 async function sweepOne(k, user){   // a screen that wants one sweep: still once per interval for everyone
-  try{ const s = SWEEPS.find(x=>x.k===k); if(!s || hwDbBad()) return; const M = await sweepMarkers(); const last = M[k]; const at = last ? new Date(last.at).getTime() : 0;
-    if(at && Date.now()-at < s.m*60000) return; const by = (user && user.username) || "App"; if(await sweepClaim(k, last ? last.at : null, by)) await sweepRunOne(s, by, user); }catch(e){} }
+  try{ const s = SWEEPS.find(x=>x.k===k); if(!s || hwDbBad()) return; await clkCheck(); const M = await sweepMarkers(); const last = M[k]; const at = last ? new Date(last.at).getTime() : 0;
+    if(at && nowS()-at < s.m*60000 && at <= nowS()+5*60000) return; /* a stamp in the future = written by a wrong clock: run it */ const by = (user && user.username) || "App"; if(await sweepClaim(k, last ? last.at : null, by)) await sweepRunOne(s, by, user); }catch(e){} }
 async function sweepRunOne(s, by, user, force){
   if(force) sweepUnguard();
   try{ await s.run(by, user); return ""; }
@@ -70203,15 +70285,18 @@ let SWEEP_TICK_AT = 0, SWEEP_RUNNING = false;
 async function sweepTick(user){
   if(SWEEP_RUNNING || Date.now()-SWEEP_TICK_AT < 9*60000) return; SWEEP_TICK_AT = Date.now(); SWEEP_RUNNING = true;
   const by = (user && user.username) || "App";
-  try{ if(hwDbBad()) return; let M; try{ M = await sweepMarkers(); }catch(e){ return; }
+  try{ if(hwDbBad()) return; await clkCheck();   // 2026-11-27T10:00:00Z: times are server time now, so every computer may run sweeps
+    let M; try{ M = await sweepMarkers(); }catch(e){ return; }
     for(const s of SWEEPS){ const last = M[s.k]; const lastAt = last ? new Date(last.at).getTime() : 0;
-      if(lastAt && Date.now()-lastAt < s.m*60000) continue;
+      if(lastAt && nowS()-lastAt < s.m*60000 && lastAt <= nowS()+5*60000) continue;   // a stamp in the future is treated as due
       if(hwDbBad()) break;
       if(!(await sweepClaim(s.k, last ? last.at : null, by))) continue;
       await sweepRunOne(s, by, user);
       await new Promise(r=>setTimeout(r, 4000)); } }
   finally{ SWEEP_RUNNING = false; } }
 function sweepStart(user){
+  setTimeout(()=>{ clkCheck().catch(()=>{}); }, 8000);
+  if(!window.__clkTimer) window.__clkTimer = setInterval(()=>{ clkCheck().catch(()=>{}); }, 30*60e3 + 5000);   // warnings come every 30 min while it stays wrong   // 2026-11-27T09:00:00Z: tell a user whose clock is wrong, soon after sign-in
   setTimeout(()=>sweepTick(user), 30000);
   if(!window.__sweepTimer) window.__sweepTimer = setInterval(()=>sweepTick(user), 10*60000); }
 
@@ -70268,8 +70353,11 @@ function hwCheck(){
     if(lf >= HW_T.loginN) hwRaise("login", "Sign-in failing", lf+" sign-in requests failed in the last 5 minutes.", "Check Supabase is Healthy; restart the project if not.", { lf });
     const storm = hwTop(HW_T.stormWin, x=>x.st>=400 && x.st<500 && x.tbl!=="app_incident_tbl", 5).filter(r=>r[2] >= HW_T.stormN);
     if(storm.length) hwRaise("storm", "Error storm", "The same request failed "+storm[0][2]+" times in 10 minutes: "+storm[0][0]+" ("+storm[0][1]+").", "No restart needed. Send the incident report to Claude — it names the failing request so it can be fixed.", { top:storm });
-    const n60 = hwRecent(60e3);
-    if(up > 180e3 && n60 > HW_T.loopN) hwRaise("loop", "Runaway load — one screen in a loop", "This browser made "+n60+" requests in the last minute (normal is well under 100). Screen: "+String(window.__curTab||"—")+".", "Close and reopen the app on this computer. Send the incident report to Claude to find the loop.", { n60, top:hwTop(60e3, null, 8) });
+    const n60 = hwRecent(60e3), nPrev = hwRecent(120e3) - n60;
+    // 2026-11-27T09:00:00Z: a loop keeps going — raise only when the minute before was busy too. One heavy action (opening a big screen,
+    // ↻ Refresh, switching company) is a burst, not a loop, and no longer raises the alarm.
+    const trail = (window.__tabTrail||[]).filter(x=>Date.now()-x.at < 180e3).map(x=>x.tab);
+    if(up > 180e3 && n60 > HW_T.loopN && nPrev > HW_T.loopN*0.6) hwRaise("loop", "Runaway load — one screen in a loop", "This browser made "+n60+" requests in the last minute and "+nPrev+" the minute before (normal is well under 100). Screen: "+String(window.__curTab||"—")+(trail.length>1?" (screens in the last 3 min: "+trail.join(" → ")+")":"")+".", "Close and reopen the app on this computer. Send the incident report to Claude to find the loop.", { n60, top:hwTop(60e3, null, 8) });
   }catch(e){}
   hwFlush(); hwPoll(); }
 if(!window.__hwTimer) window.__hwTimer = setInterval(hwCheck, 15000);
